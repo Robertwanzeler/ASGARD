@@ -1,0 +1,2 @@
+SwitchToMmWave 0.0542144 imsi = 1 cellId = 3 rnti = 1 
+SwitchToMmWave 0.0542145 imsi = 2 cellId = 2 rnti = 1 
