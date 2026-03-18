@@ -10,10 +10,13 @@ echo "=========================================="
 
 # Limpar processos antigos
 echo "[1] Limpando processos antigos..."
-pkill -9 -f "nearRT-RIC" 2>/dev/null
-pkill -9 -f "xapp" 2>/dev/null
-pkill -9 -f "ns3.42" 2>/dev/null
+pkill -9 -f "nearRT-RIC" 2>/dev/null || true
+pkill -9 -f "xapp" 2>/dev/null || true
+pkill -9 -f "ns3.42" 2>/dev/null || true
 sleep 2
+
+echo "    Threshold configurado: 100ms (100000 us)"
+echo "    Rede instavel: delay 50-150ms simulado"
 
 # LD_LIBRARY_PATH com caminhos absolutos
 echo "[2] Configurando LD_LIBRARY_PATH..."
