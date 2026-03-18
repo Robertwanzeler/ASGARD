@@ -15,8 +15,8 @@ pkill -9 -f "xapp" 2>/dev/null || true
 pkill -9 -f "ns3.42" 2>/dev/null || true
 sleep 2
 
-echo "    Threshold configurado: 100ms (100000 us)"
-echo "    Rede instavel: delay 50-150ms simulado"
+echo "    Threshold configurado: 3ms (3000 us)"
+echo "    Rede instavel: delay 10-250ms + taxa 15-100 Mbps"
 
 # LD_LIBRARY_PATH com caminhos absolutos
 echo "[2] Configurando LD_LIBRARY_PATH..."
