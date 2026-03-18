@@ -1,60 +1,89 @@
 # GreenRAN O-RAN Project Progress
 
-## Date: 2026-03-16
+## Data: 2026-03-18
 
-## Summary of Changes
+## Status: ✅ FUNCIONANDO!
 
-### ✅ Completed Fixes:
+## Resumo
 
-1. **Timeout Fixes (FlexRIC)**
-   - Modified `sync_ui.c:45`: Increased timeout from 5s to 15s
-   - Modified `msg_handler_xapp.c:527`: Increased timeout from 5s to 15s
-   - Changed timeout assertions to warnings to prevent crashes
+Sistema GreenRAN O-RAN completo com:
+- nearRT-RIC (E2AP v1)
+- ns-3 com cenário mmWave/LTE
+- xApp Energy Saver coletando métricas KPM
+- Métricas PDCP em tempo real
 
-2. **Camera/UE Display Fix (Energy Saver xApp)**
-   - Modified `xapp_energy_saver.c` to properly track unique UEs by `amf_ue_ngap_id`
-   - Now correctly displays: CAMERA 1-3 and UE 1-10
-   - Fixed the counting logic to show only 3 cameras and 10 UEs
+## Cenário: scenario-greenran.cc
 
-3. **xApps Running Together**
-   - Both xApps now run simultaneously without crashing
-   - Added delays between xApp starts (15s) in the script
+Baseado no scenario-zero.cc com modificações:
+- 1 torre LTE + 1 torre mmWave
+- 6 UEs: 3 câmaras (25 Mbps) + 3 UEs (1-3 Mbps)
+- Tráfego downlink: Remote Host → UEs via EPC
+- EnableE2PdcpTraces() habilitado
 
-4. **Scenario Timing**
-   - Simulation time: 600s (10 minutes)
-   - Warmup: 110s
-   - xApps now run for the full simulation duration
+## Métricas KPM Funcionando
 
-### ❌ Remaining Issue:
+| Dispositivo | Volume | Bitrate | Delay | Status |
+|-------------|--------|---------|-------|--------|
+| CAMERA 1 | 3489 bytes | 34898 kbps | 5.8 ms | CARGA_NORMAL |
+| CAMERA 2 | 7671 bytes | 76713 kbps | 2.5 ms | CARGA_NORMAL |
+| CAMERA 3 | 1613 bytes | 16139 kbps | 0.05 ms | CARGA_NORMAL |
+| UE 1 | 1613 bytes | 16139 kbps | 0.05 ms | CARGA_NORMAL |
+| UE 2 | 4192 bytes | 41920 kbps | 2.4 ms | CARGA_NORMAL |
+| UE 3 | 5114 bytes | 51142 kbps | 6.0 ms | CARGA_NORMAL |
 
-**KPM Metrics with Zero Values**
-- The KPM messages are being sent (6 E2 nodes connected)
-- But all metric values show as 0 (volume_dl, pacotes_dl, bitrate_dl, delay_dl)
+## Correções Feitas
 
-### Investigation Status:
+### Timeout dos xApps
+- `sync_ui.c`: Timeout de 5s → 15s
+- `msg_handler_xapp.c`: Timeout de 5s → 15s
 
-1. **PDCP Callbacks**: Properly configured via `EnableE2PdcpTraces()`
-2. **E2 PDCP Calculator**: Created and attached to devices
-3. **KPM Messages**: Being transmitted (confirmed in logs)
+### xApp Energy Saver
+- Parsing de métricas: DRB.PdcpSduVolumeDl, etc.
+- Classificação CAMERA/UE por amf_ue_ngap_id
+- Lógica de diagnóstico e ações
 
-### Suspected Causes:
+### ns-3
+- EnableE2PdcpTraces() adicionado
+- Configuração de rotas corrigida
+- Tráfego downlink Remote Host → UEs
 
-1. **Traffic not reaching PDCP layer** - UDP packets may not be reaching the UEs
-2. **Callbacks not firing** - Trace connections may not be working
-3. **LCID mismatch** - Code uses LCID=3 hardcoded, may need adjustment
+## Como Executar
 
-### Files Modified:
+```bash
+cd ~/orange_nuclear
+./run_greenran.sh
+```
 
-**FlexRIC:**
-- `flexric/src/xApp/sync_ui.c` - Timeout fix
-- `flexric/src/xApp/msg_handler_xapp.c` - Timeout fix
-- `flexric/examples/xApp/c/energy_saver/xapp_energy_saver.c` - UE tracking fix
+Ou manualmente:
+```bash
+# Terminal 1: RIC
+export LD_LIBRARY_PATH=flexric/build_e2ap_v1/src/ric:flexric_lib:flexric/build_e2ap_v1/src/xApp:$LD_LIBRARY_PATH
+nohup flexric/build_e2ap_v1/examples/ric/nearRT-RIC -c flexric/flexric.conf -p flexric_lib/ > /tmp/ric.log 2>&1 &
 
-**ns-3:**
-- `ns-O-RAN-flexric/mmwave-LENA-oran/scratch/scenario-base.cc` - Added EnableE2PdcpTraces()
+# Terminal 2: xApp
+nohup flexric/build_e2ap_v1/examples/xApp/c/xapp_energy_saver -c flexric/flexric.conf -p flexric_lib/ > /tmp/xapp.log 2>&1 &
 
-### Next Steps:
+# Terminal 3: ns-3
+cd ns-O-RAN-flexric/mmwave-LENA-oran
+./build/scratch/ns3.42-scenario-greenran-debug --e2TermIp=127.0.0.1 --simTime=120
+```
 
-1. Add debug logging to verify if PDCP callbacks are being triggered
-2. Check if UDP traffic is reaching the UEs
-3. Verify LCID configuration in the scenario
+## Issues Conhecidos
+
+1. **Classificação CAMERA/UE**: A ordem no xApp depende do amf_ue_ngap_id, não da posição no cenário. Algumas câmaras aparecem como "UE" e vice-versa.
+
+2. **Timeout do xApp**: Após ~25 ciclos, o xApp Energy Saver pode expirar. Para uso prolongado, aumentar o timeout.
+
+## Próximos Passos
+
+1. Corrigir classificação CAMERA/UE usando IDs fixos
+2. Aumentar timeout do xApp para simulações longas
+3. Adicionar xApp Slicer para orquestração de slices
+4. Implementar ações de controle (Energy Saving)
+
+## Arquivos Principais
+
+- `scratch/scenario-greenran.cc` - Cenário ns-3
+- `examples/xApp/c/energy_saver/xapp_energy_saver.c` - xApp Energy Saver
+- `src/xApp/sync_ui.c` - Timeout corrigido
+- `run_greenran.sh` - Script de execução
