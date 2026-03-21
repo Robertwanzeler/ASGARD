@@ -15,6 +15,17 @@ NC='\033[0m'
 DB_PATH="/tmp/rapp_data_lake.db"
 METRICS_FILE="/tmp/xapp_metrics/extended_metrics.json"
 
+# Função para query SQLite via Python
+query_sqlite() {
+    python3 -c "import sqlite3; conn=sqlite3.connect('$DB_PATH'); print(conn.execute('$1').fetchone()[0])" 2>/dev/null || echo "N/A"
+}
+
+# Contadores
+EXTENDED_COUNT=$(query_sqlite "SELECT COUNT(*) FROM extended_metrics")
+UE_COUNT=$(query_sqlite "SELECT COUNT(*) FROM ue_metrics")
+METRICS_COUNT=$(query_sqlite "SELECT COUNT(*) FROM metrics_history")
+DECISIONS_COUNT=$(query_sqlite "SELECT COUNT(*) FROM decisions_history")
+
 echo ""
 echo -e "${BOLD}╔════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}║${NC}        ${CYAN}rApp-ResourceOptimizer - Data Collection Monitor${NC}        ${BOLD}║${NC}"
@@ -34,15 +45,10 @@ fi
 echo -e "${BOLD}[1] REGISTROS NO DATA LAKE${NC}"
 echo "----------------------------------------"
 
-EXTENDED_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM extended_metrics" 2>/dev/null || echo "0")
-UE_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM ue_metrics" 2>/dev/null || echo "0")
-METRICS_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM metrics_history" 2>/dev/null || echo "0")
-DECISIONS_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM decisions_history" 2>/dev/null || echo "0")
-
-echo "  extended_metrics: $(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM extended_metrics" 2>/dev/null || echo "0") registros"
-echo "  ue_metrics:       $(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM ue_metrics" 2>/dev/null || echo "0") registros"
-echo "  metrics_history:   $(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM metrics_history" 2>/dev/null || echo "0") registros"
-echo "  decisions:         $(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM decisions_history" 2>/dev/null || echo "0") registros"
+echo "  extended_metrics: $EXTENDED_COUNT registros"
+echo "  ue_metrics:       $UE_COUNT registros"
+echo "  metrics_history:   $METRICS_COUNT registros"
+echo "  decisions:         $DECISIONS_COUNT registros"
 
 # ============================================
 # 2. Período de Coleta
