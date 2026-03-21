@@ -54,8 +54,12 @@ class PatternRecognition:
     Detecta:
     - Padrões horários (ex: 22:00-06:00 = baixa atividade)
     - Padrões por dia da semana (ex: sábado = menos cameras)
-    - Tendências (latência subindo/descendo)
+    - Tendências (latência, throughput, jitter, packet loss)
     - Janelas ótimas para economia de energia
+    
+    Usa métricas estendidas:
+    - Latência (us), Jitter (us), Throughput (kbps)
+    - Packet Loss Rate, PDCP PDUs, MCS/TB Size
     """
     
     def __init__(self, data_lake=None, db_path="/tmp/rapp_data_lake.db"):
@@ -72,6 +76,16 @@ class PatternRecognition:
             self.dl = data_lake
         
         self.current_analysis = {}
+        self.extended_thresholds = {
+            'good_throughput_kbps': 1000,
+            'acceptable_throughput_kbps': 500,
+            'good_jitter_us': 1000,
+            'acceptable_jitter_us': 5000,
+            'good_packet_loss': 0.01,
+            'acceptable_packet_loss': 0.05,
+            'critical_latency_us': 10000,
+            'warning_latency_us': 5000,
+        }
     
     def calculate_moving_average(self, metric='latency', window_minutes=30):
         """
@@ -595,6 +609,7 @@ class PatternRecognition:
         window = self.calculate_energy_window()
         decision = self.should_allow_energy_saving()
         trend = self.analyze_trend('latency', 60)
+        extended = self.analyze_extended_metrics()
         
         return {
             'timestamp': int(time.time()),
@@ -603,8 +618,314 @@ class PatternRecognition:
             'energy_window': window,
             'energy_decision': decision,
             'latency_trend': trend,
-            'thresholds': THRESHOLDS
+            'extended_metrics_analysis': extended,
+            'thresholds': THRESHOLDS,
+            'extended_thresholds': self.extended_thresholds
         }
+    
+    def get_extended_metrics_history(self, minutes=60):
+        """Retorna histórico de métricas estendidas."""
+        try:
+            if not self.dl.conn:
+                return []
+            cursor = self.dl.conn.cursor()
+            cutoff = int(time.time()) - (minutes * 60)
+            cursor.execute("""
+                SELECT timestamp, datetime, sim_time_s,
+                       global_worst_latency_us, global_avg_latency_us,
+                       global_min_latency_us, global_max_latency_us,
+                       global_jitter_us, global_packet_loss_rate,
+                       total_active_ues, total_tx_bytes, total_rx_bytes,
+                       throughput_kbps
+                FROM extended_metrics
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+            """, (cutoff,))
+            
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"[PatternEngine] ERRO ao buscar métricas estendidas: {e}")
+            return []
+    
+    def get_ue_metrics_history(self, imsi=None, minutes=60):
+        """Retorna histórico de métricas por UE."""
+        try:
+            if not self.dl.conn:
+                return []
+            cursor = self.dl.conn.cursor()
+            cutoff = int(time.time()) - (minutes * 60)
+            
+            if imsi:
+                cursor.execute("""
+                    SELECT timestamp, imsi, device_type, cell_id,
+                           latency_us, latency_avg_us, latency_min_us, latency_max_us,
+                           jitter_us, tx_bytes, rx_bytes, throughput_kbps,
+                           packet_count, mcs_avg, tb_size_avg, is_critical
+                    FROM ue_metrics
+                    WHERE timestamp >= ? AND imsi = ?
+                    ORDER BY timestamp ASC
+                """, (cutoff, imsi))
+            else:
+                cursor.execute("""
+                    SELECT timestamp, imsi, device_type, cell_id,
+                           latency_us, latency_avg_us, jitter_us,
+                           throughput_kbps, mcs_avg, is_critical
+                    FROM ue_metrics
+                    WHERE timestamp >= ?
+                    ORDER BY timestamp ASC
+                """, (cutoff,))
+            
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"[PatternEngine] ERRO ao buscar métricas UE: {e}")
+            return []
+    
+    def analyze_extended_metrics(self, window_minutes=30):
+        """
+        Analisa métricas estendidas (throughput, jitter, packet loss).
+        
+        Returns:
+            Dict com análise completa das métricas expandidas.
+        """
+        history = self.get_extended_metrics_history(window_minutes)
+        
+        if not history:
+            return {
+                'status': 'no_data',
+                'message': 'Sem dados suficientes para análise estendida',
+                'sample_count': 0
+            }
+        
+        latencies = [h['global_avg_latency_us'] for h in history if h['global_avg_latency_us']]
+        worst_latencies = [h['global_worst_latency_us'] for h in history if h['global_worst_latency_us']]
+        jitters = [h['global_jitter_us'] for h in history if h['global_jitter_us']]
+        packet_losses = [h['global_packet_loss_rate'] for h in history if h['global_packet_loss_rate'] is not None]
+        throughputs = [h['throughput_kbps'] for h in history if h['throughput_kbps']]
+        ues_counts = [h['total_active_ues'] for h in history if h['total_active_ues'] is not None]
+        
+        def avg(lst):
+            return sum(lst) / len(lst) if lst else 0
+        
+        def trend_list(lst):
+            if len(lst) < 4:
+                return 'unknown'
+            half = len(lst) // 2
+            first = avg(lst[half:])
+            second = avg(lst[:half])
+            if first == 0:
+                first = 1
+            change = (second - first) / first
+            if change > 0.1:
+                return 'increasing'
+            elif change < -0.1:
+                return 'decreasing'
+            return 'stable'
+        
+        th = self.extended_thresholds
+        avg_latency = avg(latencies)
+        avg_jitter = avg(jitters)
+        avg_throughput = avg(throughputs)
+        avg_packet_loss = avg(packet_losses)
+        
+        quality_score = 100
+        if avg_latency > th['critical_latency_us']:
+            quality_score -= 40
+        elif avg_latency > th['warning_latency_us']:
+            quality_score -= 20
+        elif avg_latency < th['warning_latency_us']:
+            quality_score += 10
+            
+        if avg_jitter > th['acceptable_jitter_us']:
+            quality_score -= 25
+        elif avg_jitter < th['good_jitter_us']:
+            quality_score += 10
+            
+        if avg_packet_loss > th['acceptable_packet_loss']:
+            quality_score -= 30
+        elif avg_packet_loss < th['good_packet_loss']:
+            quality_score += 10
+            
+        if avg_throughput < th['acceptable_throughput_kbps']:
+            quality_score -= 15
+        elif avg_throughput > th['good_throughput_kbps']:
+            quality_score += 10
+        
+        quality_score = max(0, min(100, quality_score))
+        
+        return {
+            'status': 'analyzed',
+            'sample_count': len(history),
+            'window_minutes': window_minutes,
+            'global_metrics': {
+                'avg_latency_us': avg_latency,
+                'max_latency_us': max(worst_latencies) if worst_latencies else 0,
+                'avg_jitter_us': avg_jitter,
+                'avg_throughput_kbps': avg_throughput,
+                'avg_packet_loss_rate': avg_packet_loss,
+                'avg_active_ues': avg(ues_counts),
+            },
+            'trends': {
+                'latency': trend_list(latencies),
+                'jitter': trend_list(jitters),
+                'throughput': trend_list(throughputs),
+                'packet_loss': trend_list(packet_losses),
+            },
+            'quality_score': quality_score,
+            'quality_grade': self._quality_grade(quality_score),
+            'latency_status': self._metric_status(avg_latency, th['warning_latency_us'], th['critical_latency_us']),
+            'jitter_status': self._metric_status(avg_jitter, th['good_jitter_us'], th['acceptable_jitter_us']),
+            'throughput_status': 'good' if avg_throughput >= th['good_throughput_kbps'] else ('acceptable' if avg_throughput >= th['acceptable_throughput_kbps'] else 'poor'),
+            'packet_loss_status': self._metric_status(avg_packet_loss, th['good_packet_loss'], th['acceptable_packet_loss']),
+        }
+    
+    def _metric_status(self, value, good_threshold, poor_threshold):
+        """Determina status de uma métrica."""
+        if value <= good_threshold:
+            return 'good'
+        elif value <= poor_threshold:
+            return 'acceptable'
+        return 'poor'
+    
+    def _quality_grade(self, score):
+        """Converte score numérico em letra."""
+        if score >= 90:
+            return 'A'
+        elif score >= 75:
+            return 'B'
+        elif score >= 60:
+            return 'C'
+        elif score >= 40:
+            return 'D'
+        return 'F'
+    
+    def analyze_ue_performance(self, window_minutes=30):
+        """
+        Analisa performance por UE.
+        
+        Returns:
+            Dict com ranking de UEs por performance.
+        """
+        history = self.get_ue_metrics_history(minutes=window_minutes)
+        
+        if not history:
+            return {'status': 'no_data', 'message': 'Sem dados de UEs'}
+        
+        ue_scores = defaultdict(lambda: {'latencies': [], 'jitters': [], 'throughputs': [], 'packets': 0})
+        
+        for rec in history:
+            imsi = rec['imsi']
+            ue_scores[imsi]['latencies'].append(rec.get('latency_us', 0) or 0)
+            ue_scores[imsi]['jitters'].append(rec.get('jitter_us', 0) or 0)
+            ue_scores[imsi]['throughputs'].append(rec.get('throughput_kbps', 0) or 0)
+            ue_scores[imsi]['packets'] += rec.get('packet_count', 0) or 0
+        
+        results = []
+        for imsi, data in ue_scores.items():
+            if not data['latencies']:
+                continue
+            
+            avg_lat = sum(data['latencies']) / len(data['latencies'])
+            avg_jit = sum(data['jitters']) / len(data['jitters'])
+            avg_tp = sum(data['throughputs']) / len(data['throughputs'])
+            
+            score = 100
+            th = self.extended_thresholds
+            if avg_lat > th['critical_latency_us']:
+                score -= 50
+            elif avg_lat > th['warning_latency_us']:
+                score -= 25
+            if avg_jit > th['acceptable_jitter_us']:
+                score -= 25
+            if avg_tp < th['acceptable_throughput_kbps']:
+                score -= 20
+            
+            results.append({
+                'imsi': imsi,
+                'avg_latency_us': avg_lat,
+                'avg_jitter_us': avg_jit,
+                'avg_throughput_kbps': avg_tp,
+                'total_packets': data['packets'],
+                'score': max(0, score),
+                'grade': self._quality_grade(score)
+            })
+        
+        results.sort(key=lambda x: x['score'], reverse=True)
+        
+        return {
+            'status': 'analyzed',
+            'total_ues': len(results),
+            'ue_rankings': results,
+            'worst_performer': results[-1] if results else None,
+            'best_performer': results[0] if results else None
+        }
+    
+    def calculate_network_efficiency(self, window_minutes=30):
+        """
+        Calcula eficiência geral da rede baseado em métricas estendidas.
+        
+        Returns:
+            Dict com métricas de eficiência.
+        """
+        extended = self.analyze_extended_metrics(window_minutes)
+        ue_analysis = self.analyze_ue_performance(window_minutes)
+        
+        if extended.get('status') != 'analyzed':
+            return {'status': 'no_data'}
+        
+        th = self.extended_thresholds
+        gm = extended['global_metrics']
+        
+        latency_efficiency = max(0, 100 - (gm['avg_latency_us'] / th['critical_latency_us'] * 100))
+        jitter_efficiency = max(0, 100 - (gm['avg_jitter_us'] / th['acceptable_jitter_us'] * 100))
+        throughput_efficiency = min(100, gm['avg_throughput_kbps'] / th['good_throughput_kbps'] * 100)
+        packet_efficiency = max(0, 100 - (gm['avg_packet_loss_rate'] * 1000))
+        
+        overall = (latency_efficiency * 0.35 + 
+                   jitter_efficiency * 0.20 + 
+                   throughput_efficiency * 0.30 + 
+                   packet_efficiency * 0.15)
+        
+        return {
+            'status': 'analyzed',
+            'overall_efficiency': round(overall, 1),
+            'components': {
+                'latency_efficiency': round(latency_efficiency, 1),
+                'jitter_efficiency': round(jitter_efficiency, 1),
+                'throughput_efficiency': round(throughput_efficiency, 1),
+                'packet_efficiency': round(packet_efficiency, 1),
+            },
+            'quality_score': extended['quality_score'],
+            'quality_grade': extended['quality_grade'],
+            'recommendations': self._generate_recommendations(extended, ue_analysis)
+        }
+    
+    def _generate_recommendations(self, extended, ue_analysis):
+        """Gera recomendações baseadas na análise."""
+        recs = []
+        th = self.extended_thresholds
+        
+        if extended['latency_status'] == 'poor':
+            recs.append({'priority': 'high', 'action': 'Investigar causas de alta latência', 'metric': 'latency'})
+        
+        if extended['jitter_status'] == 'poor':
+            recs.append({'priority': 'high', 'action': 'Reduzir jitter - verificar congestionamento', 'metric': 'jitter'})
+        
+        if extended['packet_loss_status'] == 'poor':
+            recs.append({'priority': 'critical', 'action': 'Packet loss alto - verificar enlace', 'metric': 'packet_loss'})
+        
+        if extended['throughput_status'] == 'poor':
+            recs.append({'priority': 'medium', 'action': 'Melhorar throughput - considerar rebalanceamento', 'metric': 'throughput'})
+        
+        worst = ue_analysis.get('worst_performer')
+        if worst and worst['score'] < 50:
+            recs.append({'priority': 'medium', 'action': f'UE {worst["imsi"]} com performance baixa - investigar', 'metric': 'ue_performance'})
+        
+        if extended['quality_score'] >= 80:
+            recs.append({'priority': 'info', 'action': 'Rede em bom estado', 'metric': 'overall'})
+        
+        return recs
 
 
 def main():
@@ -622,8 +943,40 @@ def main():
     for key, value in current.items():
         print(f"    {key}: {value}")
     
+    # Análise de métricas estendidas (NOVO)
+    print("\n[2] Métricas Estendidas (Throughput, Jitter, Packet Loss):")
+    extended = pe.analyze_extended_metrics(30)
+    if extended.get('status') == 'analyzed':
+        gm = extended['global_metrics']
+        print(f"    Latência Média: {gm['avg_latency_us']:.1f} us ({extended['latency_status']})")
+        print(f"    Jitter Médio: {gm['avg_jitter_us']:.1f} us ({extended['jitter_status']})")
+        print(f"    Throughput: {gm['avg_throughput_kbps']:.1f} kbps ({extended['throughput_status']})")
+        print(f"    Packet Loss: {gm['avg_packet_loss_rate']*100:.2f}% ({extended['packet_loss_status']})")
+        print(f"    Quality Score: {extended['quality_score']:.0f}/100 (Grade: {extended['quality_grade']})")
+        print(f"    Tendências: Latência={extended['trends']['latency']}, "
+              f"Jitter={extended['trends']['jitter']}, "
+              f"Throughput={extended['trends']['throughput']}")
+    else:
+        print(f"    Status: {extended.get('message', 'Sem dados')}")
+    
+    # Eficiência da rede (NOVO)
+    print("\n[3] Eficiência da Rede:")
+    efficiency = pe.calculate_network_efficiency(30)
+    if efficiency.get('status') == 'analyzed':
+        print(f"    Eficiência Geral: {efficiency['overall_efficiency']:.1f}%")
+        comp = efficiency['components']
+        print(f"    Latência: {comp['latency_efficiency']:.1f}%")
+        print(f"    Jitter: {comp['jitter_efficiency']:.1f}%")
+        print(f"    Throughput: {comp['throughput_efficiency']:.1f}%")
+        print(f"    Packet Loss: {comp['packet_efficiency']:.1f}%")
+        print(f"    Recomendações:")
+        for rec in efficiency.get('recommendations', []):
+            print(f"      [{rec['priority'].upper()}] {rec['action']}")
+    else:
+        print(f"    Status: {efficiency.get('message', 'Sem dados')}")
+    
     # Padrões horários
-    print("\n[2] Padrões Horários (top 5 horas de baixa atividade):")
+    print("\n[4] Padrões Horários (top 5 horas de baixa atividade):")
     hourly = pe.detect_seasonal_patterns(7)
     low_hours = sorted(hourly, key=lambda x: x['low_activity_ratio'], reverse=True)[:5]
     for h in low_hours:
@@ -632,7 +985,7 @@ def main():
               f"Confidence: {h['confidence']*100:.0f}%")
     
     # Padrões por dia
-    print("\n[3] Padrões por Dia da Semana:")
+    print("\n[5] Padrões por Dia da Semana:")
     daily = pe.detect_day_of_week_pattern(7)
     for d in daily:
         weekend_tag = " [FIM DE SEMANA]" if d['is_weekend'] else ""
@@ -640,7 +993,7 @@ def main():
               f"Latency: {d['avg_latency_us']/1000:.0f}ms{weekend_tag}")
     
     # Janela de economia
-    print("\n[4] Janela de Economia Calculada:")
+    print("\n[6] Janela de Economia Calculada:")
     window = pe.calculate_energy_window()
     print(f"    Janela: {window['window_start']} - {window['window_end']}")
     print(f"    Confiança: {window['confidence']*100:.0f}%")
@@ -649,13 +1002,13 @@ def main():
     print(f"    Motivo: {window['reason']}")
     
     # Predição
-    print("\n[5] Predição para Próxima Hora:")
+    print("\n[7] Predição para Próxima Hora:")
     pred = pe.predict_next_hour()
     for key, value in pred.items():
         print(f"    {key}: {value}")
     
     # Decisão de economia
-    print("\n[6] Decisão de Economia de Energia:")
+    print("\n[8] Decisão de Economia de Energia:")
     decision = pe.should_allow_energy_saving()
     print(f"    Recomendação: {decision['recommendation']}")
     print(f"    Score: {decision['score']*100:.0f}%")
@@ -665,10 +1018,11 @@ def main():
         print(f"      - {r}")
     
     # Resumo
-    print("\n[7] Resumo Completo:")
+    print("\n[9] Resumo Completo:")
     summary = pe.get_summary()
     print(f"    Timestamp: {summary['datetime']}")
     print(f"    Tendência Latência: {summary['latency_trend']}")
+    print(f"    Quality Score: {summary['extended_metrics_analysis'].get('quality_score', 'N/A')}")
     print(f"    Janela Economia: {summary['energy_window']['window_start']} - "
           f"{summary['energy_window']['window_end']}")
     print(f"    Decisão Energia: {summary['energy_decision']['recommendation']}")
