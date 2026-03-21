@@ -142,6 +142,74 @@ class DataLake:
             ON decisions_history(timestamp)
         """)
         
+        # Tabela de métricas estendidas (novo)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS extended_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                sim_time_s REAL,
+                cell_id INTEGER,
+                global_worst_latency_us REAL,
+                global_avg_latency_us REAL,
+                global_min_latency_us REAL,
+                global_max_latency_us REAL,
+                global_jitter_us REAL,
+                global_packet_loss_rate REAL,
+                total_active_ues INTEGER,
+                total_active_cameras INTEGER,
+                total_critical_ues INTEGER,
+                total_tx_bytes INTEGER,
+                total_rx_bytes INTEGER,
+                total_tx_pdus INTEGER,
+                total_rx_pdus INTEGER,
+                throughput_kbps REAL,
+                energy_state TEXT,
+                slicer_state TEXT,
+                UNIQUE(timestamp)
+            )
+        """)
+        
+        # Tabela de métricas por UE (novo)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ue_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                imsi INTEGER,
+                device_type TEXT,
+                cell_id INTEGER,
+                latency_us REAL,
+                latency_avg_us REAL,
+                latency_min_us REAL,
+                latency_max_us REAL,
+                jitter_us REAL,
+                pdu_size_avg REAL,
+                tx_bytes INTEGER,
+                rx_bytes INTEGER,
+                tx_pdus INTEGER,
+                rx_pdus INTEGER,
+                throughput_kbps REAL,
+                packet_count INTEGER,
+                mcs_avg REAL,
+                tb_size_avg REAL,
+                is_critical INTEGER
+            )
+        """)
+        
+        # Índices para métricas extendidas
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_extended_timestamp 
+            ON extended_metrics(timestamp)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ue_timestamp 
+            ON ue_metrics(timestamp)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ue_imsi 
+            ON ue_metrics(imsi)
+        """)
+        
         self.conn.commit()
         print(f"[DataLake] Tabelas inicializadas em {self.db_path}")
     
@@ -221,6 +289,173 @@ class DataLake:
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar decisão: {e}")
+    
+    def record_extended_metric(self, timestamp=None, sim_time_s=0, cell_id=0,
+                               global_worst_latency=0, global_avg_latency=0,
+                               global_min_latency=0, global_max_latency=0,
+                               global_jitter=0, packet_loss=0,
+                               total_active_ues=0, total_active_cameras=0,
+                               total_critical=0, total_tx_bytes=0, total_rx_bytes=0,
+                               total_tx_pdus=0, total_rx_pdus=0, throughput_kbps=0,
+                               energy_state=None, slicer_state=None):
+        """
+        Registra métricas estendidas no Data Lake.
+        
+        Args:
+            timestamp: Unix timestamp (default: now)
+            sim_time_s: Tempo de simulação em segundos
+            cell_id: ID da célula
+            global_worst_latency: Pior latência global em us
+            global_avg_latency: Latência média global em us
+            global_min_latency: Melhor latência global em us
+            global_max_latency: Pior latência global em us
+            global_jitter: Jitter global em us
+            packet_loss: Taxa de perda de pacotes
+            total_active_ues: Total de UEs ativas
+            total_active_cameras: Total de câmeras ativas
+            total_critical: Total de UEs críticas
+            total_tx_bytes: Total de bytes transmitidos
+            total_rx_bytes: Total de bytes recebidos
+            total_tx_pdus: Total de PDUs transmitidos
+            total_rx_pdus: Total de PDUs recebidos
+            throughput_kbps: Throughput em kbps
+            energy_state: Estado do Energy Saver
+            slicer_state: Estado do SLICER
+        """
+        if timestamp is None:
+            timestamp = int(time.time())
+        
+        dt = datetime.fromtimestamp(timestamp)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO extended_metrics 
+                (timestamp, datetime, sim_time_s, cell_id,
+                 global_worst_latency_us, global_avg_latency_us,
+                 global_min_latency_us, global_max_latency_us,
+                 global_jitter_us, global_packet_loss_rate,
+                 total_active_ues, total_active_cameras, total_critical_ues,
+                 total_tx_bytes, total_rx_bytes,
+                 total_tx_pdus, total_rx_pdus, throughput_kbps,
+                 energy_state, slicer_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (timestamp, dt_str, sim_time_s, cell_id,
+                  global_worst_latency, global_avg_latency,
+                  global_min_latency, global_max_latency,
+                  global_jitter, packet_loss,
+                  total_active_ues, total_active_cameras, total_critical,
+                  total_tx_bytes, total_rx_bytes,
+                  total_tx_pdus, total_rx_pdus, throughput_kbps,
+                  energy_state, slicer_state))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar métrica estendida: {e}")
+    
+    def record_ue_metrics(self, timestamp=None, ue_metrics_list=None):
+        """
+        Registra métricas de múltiplos UEs.
+        
+        Args:
+            timestamp: Unix timestamp (default: now)
+            ue_metrics_list: Lista de dicts com métricas por UE
+        """
+        if timestamp is None:
+            timestamp = int(time.time())
+        
+        if not ue_metrics_list:
+            return
+        
+        try:
+            cursor = self.conn.cursor()
+            for ue in ue_metrics_list:
+                cursor.execute("""
+                    INSERT INTO ue_metrics 
+                    (timestamp, imsi, device_type, cell_id,
+                     latency_us, latency_avg_us, latency_min_us, latency_max_us,
+                     jitter_us, pdu_size_avg,
+                     tx_bytes, rx_bytes, tx_pdus, rx_pdus,
+                     throughput_kbps, packet_count,
+                     mcs_avg, tb_size_avg, is_critical)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (timestamp, ue.get('imsi'), ue.get('device_type'), ue.get('cell_id'),
+                      ue.get('latency_us'), ue.get('latency_avg_us'), ue.get('latency_min_us'), ue.get('latency_max_us'),
+                      ue.get('jitter_us'), ue.get('pdu_size_avg'),
+                      ue.get('tx_bytes', 0), ue.get('rx_bytes', 0), ue.get('tx_pdus', 0), ue.get('rx_pdus', 0),
+                      ue.get('throughput_kbps'), ue.get('packet_count', 0),
+                      ue.get('mcs_avg', 0), ue.get('tb_size_avg', 0), 
+                      1 if ue.get('is_critical') else 0))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar métricas de UE: {e}")
+    
+    def record_extended_from_json(self, extended_json, energy_state=None, slicer_state=None):
+        """
+        Registra métricas estendidas diretamente de JSON.
+        
+        Args:
+            extended_json: Dict com métricas do csv_to_metrics.py
+            energy_state: Estado do Energy Saver
+            slicer_state: Estado do SLICER
+        """
+        if not extended_json:
+            return
+        
+        timestamp = int(time.time())
+        gm = extended_json.get('global_metrics', {})
+        sim_range = extended_json.get('sim_time_range', {})
+        
+        self.record_extended_metric(
+            timestamp=timestamp,
+            sim_time_s=sim_range.get('end', 0),
+            cell_id=0,
+            global_worst_latency=gm.get('global_worst_latency_us', 0),
+            global_avg_latency=gm.get('global_avg_latency_us', 0),
+            global_min_latency=gm.get('global_min_latency_us', 0),
+            global_max_latency=gm.get('global_max_latency_us', 0),
+            global_jitter=gm.get('global_jitter_us', 0),
+            packet_loss=gm.get('global_packet_loss_rate', 0),
+            total_active_ues=gm.get('total_active_ues', 0),
+            total_active_cameras=gm.get('total_active_cameras', 0),
+            total_critical=gm.get('total_critical_ues', 0),
+            total_tx_bytes=gm.get('total_tx_bytes', 0),
+            total_rx_bytes=gm.get('total_rx_bytes', 0),
+            total_tx_pdus=gm.get('total_tx_pdus', 0),
+            total_rx_pdus=gm.get('total_rx_pdus', 0),
+            throughput_kbps=gm.get('throughput_kbps', 0),
+            energy_state=energy_state,
+            slicer_state=slicer_state
+        )
+        
+        ue_list = []
+        for imsi, ue_data in extended_json.get('ue_metrics', {}).items():
+            try:
+                ue_list.append({
+                    'imsi': int(imsi),
+                    'device_type': ue_data.get('device_type'),
+                    'cell_id': ue_data.get('cell_id'),
+                    'latency_us': ue_data.get('latency_us', 0),
+                    'latency_avg_us': ue_data.get('latency_avg_us', 0),
+                    'latency_min_us': ue_data.get('latency_min_us', 0),
+                    'latency_max_us': ue_data.get('latency_max_us', 0),
+                    'jitter_us': ue_data.get('jitter_us', 0),
+                    'pdu_size_avg': ue_data.get('pdu_size_avg', 0),
+                    'tx_bytes': ue_data.get('tx_bytes', 0),
+                    'rx_bytes': ue_data.get('rx_bytes', 0),
+                    'tx_pdus': ue_data.get('tx_pdus', 0),
+                    'rx_pdus': ue_data.get('rx_pdus', 0),
+                    'throughput_kbps': ue_data.get('throughput_kbps', 0),
+                    'packet_count': ue_data.get('packet_count', 0),
+                    'mcs_avg': ue_data.get('mcs_avg', 0),
+                    'tb_size_avg': ue_data.get('tb_size_avg', 0),
+                    'is_critical': ue_data.get('is_critical', False)
+                })
+            except (ValueError, TypeError):
+                continue
+        
+        if ue_list:
+            self.record_ue_metrics(timestamp, ue_list)
     
     def get_hourly_stats(self, hours_back=24):
         """

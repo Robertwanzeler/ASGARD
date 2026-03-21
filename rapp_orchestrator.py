@@ -38,6 +38,7 @@ import sys
 import time
 import argparse
 import signal
+import json
 from datetime import datetime
 
 sys.path.insert(0, '/home/robert/orange_nuclear')
@@ -51,6 +52,7 @@ from rapp_synthetic_generator import SyntheticDataGenerator
 SLICER_INTENT_PATH = "/tmp/xapp_intents/slicer.txt"
 ENERGY_INTENT_PATH = "/tmp/xapp_intents/energy_saver.txt"
 RAPP_DECISION_PATH = "/tmp/xapp_intents/rapp_decision.txt"
+EXTENDED_METRICS_PATH = "/tmp/xapp_metrics/extended_metrics.json"
 
 DEFAULT_INTERVAL = 5  # Non-RT RIC: ≥1 segundo (O-RAN spec)
 
@@ -166,6 +168,17 @@ class RappResourceOptimizer:
             print(f"[rApp] ERRO ao ler ENERGY: {e}")
             return None
     
+    def read_extended_metrics(self):
+        """Lê métricas estendidas do JSON."""
+        try:
+            if not os.path.exists(EXTENDED_METRICS_PATH):
+                return None
+            
+            with open(EXTENDED_METRICS_PATH, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            return None
+    
     def record_current_metrics(self, slicer_intent, energy_intent):
         """Registra métricas atuais no Data Lake."""
         latency = 0
@@ -188,6 +201,14 @@ class RappResourceOptimizer:
             energy_state=energy_state,
             slicer_state=slicer_state
         )
+        
+        extended_metrics = self.read_extended_metrics()
+        if extended_metrics:
+            self.data_lake.record_extended_from_json(
+                extended_metrics,
+                energy_state=energy_state,
+                slicer_state=slicer_state
+            )
     
     def make_decision(self, slicer_intent, energy_intent):
         """
