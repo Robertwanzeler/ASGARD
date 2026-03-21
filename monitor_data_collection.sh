@@ -17,7 +17,7 @@ METRICS_FILE="/tmp/xapp_metrics/extended_metrics.json"
 
 # Função para query SQLite via Python
 query_sqlite() {
-    python3 -c "import sqlite3; conn=sqlite3.connect('$DB_PATH'); print(conn.execute('$1').fetchone()[0])" 2>/dev/null || echo "N/A"
+    python3 -c "import sqlite3; conn=sqlite3.connect('$DB_PATH'); c=conn.execute('$1'); r=c.fetchone(); print(r[0] if r else 'N/A')" 2>/dev/null || echo "N/A"
 }
 
 # Contadores
@@ -57,15 +57,15 @@ echo ""
 echo -e "${BOLD}[2] PERÍODO DE COLETA${NC}"
 echo "----------------------------------------"
 
-PRIMEIRO=$(sqlite3 "$DB_PATH" "SELECT MIN(datetime) FROM extended_metrics" 2>/dev/null)
-ULTIMO=$(sqlite3 "$DB_PATH" "SELECT MAX(datetime) FROM extended_metrics" 2>/dev/null)
+PRIMEIRO=$(query_sqlite "SELECT MIN(datetime) FROM extended_metrics")
+ULTIMO=$(query_sqlite "SELECT MAX(datetime) FROM extended_metrics")
 
 if [ ! -z "$PRIMEIRO" ]; then
     echo "  Primeiro registro: $PRIMEIRO"
     echo "  Último registro:  $ULTIMO"
     
     # Tempo decorrido
-    PRIMEIRO_EPOCH=$(sqlite3 "$DB_PATH" "SELECT MIN(timestamp) FROM extended_metrics" 2>/dev/null)
+    PRIMEIRO_EPOCH=$(query_sqlite "SELECT MIN(timestamp) FROM extended_metrics")
     AGORA=$(date +%s)
     DECORRIDO=$((AGORA - PRIMEIRO_EPOCH))
     HORAS=$((DECORRIDO / 3600))
@@ -84,11 +84,11 @@ echo -e "${BOLD}[3] MÉTRICAS ATUAIS${NC}"
 echo "----------------------------------------"
 
 # Última métrica estendida
-LAT_AVG=$(sqlite3 "$DB_PATH" "SELECT AVG(global_avg_latency_us)/1000 FROM extended_metrics" 2>/dev/null | head -1)
-LAT_WORST=$(sqlite3 "$DB_PATH" "SELECT MAX(global_worst_latency_us)/1000 FROM extended_metrics" 2>/dev/null | head -1)
-LAT_MIN=$(sqlite3 "$DB_PATH" "SELECT MIN(global_min_latency_us)/1000 FROM extended_metrics" 2>/dev/null | head -1)
-JITTER=$(sqlite3 "$DB_PATH" "SELECT AVG(global_jitter_us)/1000 FROM extended_metrics" 2>/dev/null | head -1)
-THROUGHPUT=$(sqlite3 "$DB_PATH" "SELECT AVG(throughput_kbps) FROM extended_metrics" 2>/dev/null | head -1)
+LAT_AVG=$(query_sqlite "SELECT AVG(global_avg_latency_us)/1000 FROM extended_metrics")
+LAT_WORST=$(query_sqlite "SELECT MAX(global_worst_latency_us)/1000 FROM extended_metrics")
+LAT_MIN=$(query_sqlite "SELECT MIN(global_min_latency_us)/1000 FROM extended_metrics")
+JITTER=$(query_sqlite "SELECT AVG(global_jitter_us)/1000 FROM extended_metrics")
+THROUGHPUT=$(query_sqlite "SELECT AVG(throughput_kbps) FROM extended_metrics")
 
 echo "  Latência Média:    ${LAT_AVG:-N/A} ms"
 echo "  Latência Pior:     ${LAT_WORST:-N/A} ms"
@@ -103,9 +103,9 @@ echo ""
 echo -e "${BOLD}[4] UEs E CÂMERAS${NC}"
 echo "----------------------------------------"
 
-CAM_ATIVAS=$(sqlite3 "$DB_PATH" "SELECT AVG(total_active_cameras) FROM extended_metrics" 2>/dev/null | head -1)
-UE_ATIVAS=$(sqlite3 "$DB_PATH" "SELECT AVG(total_active_ues) FROM extended_metrics" 2>/dev/null | head -1)
-UE_CRITICAS=$(sqlite3 "$DB_PATH" "SELECT AVG(total_critical_ues) FROM extended_metrics" 2>/dev/null | head -1)
+CAM_ATIVAS=$(query_sqlite "SELECT AVG(total_active_cameras) FROM extended_metrics")
+UE_ATIVAS=$(query_sqlite "SELECT AVG(total_active_ues) FROM extended_metrics")
+UE_CRITICAS=$(query_sqlite "SELECT AVG(total_critical_ues) FROM extended_metrics")
 
 echo "  Câmeras Ativas (média): ${CAM_ATIVAS:-N/A}"
 echo "  UEs Ativas (média):     ${UE_ATIVAS:-N/A}"
@@ -118,9 +118,9 @@ echo ""
 echo -e "${BOLD}[5] DECISÕES DO RAPP${NC}"
 echo "----------------------------------------"
 
-BLOCKED=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM decisions_history WHERE decision = 'BLOCKED'" 2>/dev/null || echo "0")
-ALLOWED=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM decisions_history WHERE decision = 'ALLOWED'" 2>/dev/null || echo "0")
-CONDITIONAL=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM decisions_history WHERE decision = 'CONDITIONAL'" 2>/dev/null || echo "0")
+BLOCKED=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision = 'BLOCKED'" | grep -E '^[0-9]+$' || echo "0")
+ALLOWED=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision = 'ALLOWED'" | grep -E '^[0-9]+$' || echo "0")
+CONDITIONAL=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision = 'CONDITIONAL'" | grep -E '^[0-9]+$' || echo "0")
 TOTAL_DEC=$((BLOCKED + ALLOWED + CONDITIONAL))
 
 echo "  BLOCKED:      $BLOCKED"
