@@ -166,6 +166,10 @@ class DataLake:
                 throughput_kbps REAL,
                 energy_state TEXT,
                 slicer_state TEXT,
+                latency_p5_us REAL,
+                latency_p95_us REAL,
+                latency_min_nonzero_us REAL,
+                valid_samples INTEGER,
                 UNIQUE(timestamp)
             )
         """)
@@ -297,7 +301,9 @@ class DataLake:
                                total_active_ues=0, total_active_cameras=0,
                                total_critical=0, total_tx_bytes=0, total_rx_bytes=0,
                                total_tx_pdus=0, total_rx_pdus=0, throughput_kbps=0,
-                               energy_state=None, slicer_state=None):
+                               energy_state=None, slicer_state=None,
+                               latency_p5_us=0, latency_p95_us=0,
+                               latency_min_nonzero_us=0, valid_samples=0):
         """
         Registra métricas estendidas no Data Lake.
         
@@ -321,6 +327,10 @@ class DataLake:
             throughput_kbps: Throughput em kbps
             energy_state: Estado do Energy Saver
             slicer_state: Estado do SLICER
+            latency_p5_us: Percentil 5 de latência (métrica robusta)
+            latency_p95_us: Percentil 95 de latência (métrica robusta)
+            latency_min_nonzero_us: Menor latência > 0
+            valid_samples: Número de amostras válidas
         """
         if timestamp is None:
             timestamp = int(time.time())
@@ -339,8 +349,9 @@ class DataLake:
                  total_active_ues, total_active_cameras, total_critical_ues,
                  total_tx_bytes, total_rx_bytes,
                  total_tx_pdus, total_rx_pdus, throughput_kbps,
-                 energy_state, slicer_state)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 energy_state, slicer_state,
+                 latency_p5_us, latency_p95_us, latency_min_nonzero_us, valid_samples)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (timestamp, dt_str, sim_time_s, cell_id,
                   global_worst_latency, global_avg_latency,
                   global_min_latency, global_max_latency,
@@ -348,7 +359,8 @@ class DataLake:
                   total_active_ues, total_active_cameras, total_critical,
                   total_tx_bytes, total_rx_bytes,
                   total_tx_pdus, total_rx_pdus, throughput_kbps,
-                  energy_state, slicer_state))
+                  energy_state, slicer_state,
+                  latency_p5_us, latency_p95_us, latency_min_nonzero_us, valid_samples))
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar métrica estendida: {e}")
@@ -425,7 +437,11 @@ class DataLake:
             total_rx_pdus=gm.get('total_rx_pdus', 0),
             throughput_kbps=gm.get('throughput_kbps', 0),
             energy_state=energy_state,
-            slicer_state=slicer_state
+            slicer_state=slicer_state,
+            latency_p5_us=gm.get('latency_p5_us', 0),
+            latency_p95_us=gm.get('latency_p95_us', 0),
+            latency_min_nonzero_us=gm.get('latency_min_nonzero_us', 0),
+            valid_samples=gm.get('valid_samples', 0)
         )
         
         ue_list = []

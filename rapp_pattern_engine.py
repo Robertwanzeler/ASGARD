@@ -705,6 +705,11 @@ class PatternRecognition:
         throughputs = [h['throughput_kbps'] for h in history if h['throughput_kbps']]
         ues_counts = [h['total_active_ues'] for h in history if h['total_active_ues'] is not None]
         
+        # Métricas robustas dos percentis
+        latency_p5_list = [h.get('latency_p5_us', 0) for h in history if h.get('latency_p5_us', 0) > 0]
+        latency_p95_list = [h.get('latency_p95_us', 0) for h in history if h.get('latency_p95_us', 0) > 0]
+        latency_min_nonzero_list = [h.get('latency_min_nonzero_us', 0) for h in history if h.get('latency_min_nonzero_us', 0) > 0]
+        
         def avg(lst):
             return sum(lst) / len(lst) if lst else 0
         
@@ -778,6 +783,14 @@ class PatternRecognition:
             'jitter_status': self._metric_status(avg_jitter, th['good_jitter_us'], th['acceptable_jitter_us']),
             'throughput_status': 'good' if avg_throughput >= th['good_throughput_kbps'] else ('acceptable' if avg_throughput >= th['acceptable_throughput_kbps'] else 'poor'),
             'packet_loss_status': self._metric_status(avg_packet_loss, th['good_packet_loss'], th['acceptable_packet_loss']),
+            'robust_metrics': {
+                'avg_p5_latency_us': avg(latency_p5_list) if latency_p5_list else 0,
+                'avg_p95_latency_us': avg(latency_p95_list) if latency_p95_list else 0,
+                'avg_min_nonzero_latency_us': avg(latency_min_nonzero_list) if latency_min_nonzero_list else 0,
+                'p5_count': len(latency_p5_list),
+                'p95_count': len(latency_p95_list),
+                'min_nonzero_count': len(latency_min_nonzero_list),
+            },
         }
     
     def _metric_status(self, value, good_threshold, poor_threshold):

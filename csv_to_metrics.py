@@ -30,8 +30,8 @@ DEFAULT_EXTENDED_OUTPUT_FILE = "/tmp/xapp_metrics/extended_metrics.json"
 DEFAULT_POLL_INTERVAL = 1.0
 
 CAMERA_IMSI_RANGE = (1, 3)
-UE_IMSI_RANGE = (1, 20)
-
+SENSOR_IMSI_RANGE = (4, 50)
+UE_IMSI_RANGE = (51, 100)
 
 class ExtendedMetricsCollector:
     def __init__(self, input_dir, output_file, extended_output_file, poll_interval):
@@ -41,6 +41,10 @@ class ExtendedMetricsCollector:
         self.poll_interval = poll_interval
         self.running = True
         self.lock = threading.Lock()
+        
+        # Persistência de UEs (Memória de 5 segundos)
+        self.active_ues_cache = {} # imsi -> last_seen_timestamp
+        self.activity_window = 5.0 # 5 segundos
         
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         os.makedirs(os.path.dirname(extended_output_file), exist_ok=True)
@@ -57,6 +61,10 @@ class ExtendedMetricsCollector:
             imsi_num = int(imsi)
             if CAMERA_IMSI_RANGE[0] <= imsi_num <= CAMERA_IMSI_RANGE[1]:
                 return "camera"
+            elif SENSOR_IMSI_RANGE[0] <= imsi_num <= SENSOR_IMSI_RANGE[1]:
+                return "sensor"
+            elif UE_IMSI_RANGE[0] <= imsi_num <= UE_IMSI_RANGE[1]:
+                return "background"
         except ValueError:
             pass
         return "background"
@@ -225,6 +233,25 @@ class ExtendedMetricsCollector:
         
         return metrics
     
+    def percentile(self, data, p):
+        """Retorna percentil p (0-100)"""
+        if not data:
+            return 0
+        sorted_data = sorted(data)
+        idx = int(len(sorted_data) * p / 100)
+        return sorted_data[min(idx, len(sorted_data)-1)]
+    
+    def percentile_5(self, data):
+        return self.percentile(data, 5)
+    
+    def percentile_95(self, data):
+        return self.percentile(data, 95)
+    
+    def min_nonzero(self, data):
+        """Retorna menor valor > 0, ou 0 se todos forem zero"""
+        nonzero = [x for x in data if x > 0]
+        return min(nonzero) if nonzero else 0
+    
     def aggregate_metrics(self, pdcp_metrics, mac_metrics):
         """Aggregate all metrics into comprehensive JSON"""
         
@@ -286,6 +313,16 @@ class ExtendedMetricsCollector:
         all_latencies = []
         all_jitters = []
         
+        # Atualizar cache de atividade dos UEs
+        current_sim_time = recent_metrics[-1]['time_end'] if recent_metrics else self.last_processed_time
+        for m in recent_metrics:
+            self.active_ues_cache[m['imsi']] = m['time_end']
+            
+        # Remover UEs inativos (mais de 5 segundos sem pacotes)
+        active_imsis = [imsi for imsi, last_seen in self.active_ues_cache.items() 
+                       if (current_sim_time - last_seen) < self.activity_window]
+        self.active_ues_cache = {imsi: self.active_ues_cache[imsi] for imsi in active_imsis}
+
         for m in recent_metrics:
             imsi = m['imsi']
             ue_data[imsi]['latencies'].append(m['delay_us'])
@@ -302,12 +339,19 @@ class ExtendedMetricsCollector:
             
             all_latencies.append(m['delay_us'])
             all_jitters.append(m['delay_stddev_us'])
+            
+        # Garantir que UEs no cache mas sem tráfego recente também sejam processados
+        for imsi in active_imsis:
+            if imsi not in ue_data:
+                ue_data[imsi]['device_type'] = self.get_device_type(imsi)
+                ue_data[imsi]['latencies'] = [] # Ativo mas sem dados novos
         
         camera_count = 0
         critical_count = 0
         total_tx_bytes = 0
         total_rx_bytes = 0
         worst_latency = 0
+        worst_camera_latency = 0
         
         SLA_THRESHOLD_US = 100000
         
@@ -346,6 +390,8 @@ class ExtendedMetricsCollector:
             
             if data['device_type'] == 'camera':
                 camera_count += 1
+                if max_latency > worst_camera_latency:
+                    worst_camera_latency = max_latency
             
             if max_latency >= SLA_THRESHOLD_US:
                 critical_count += 1
@@ -358,11 +404,17 @@ class ExtendedMetricsCollector:
         global_min_latency = min(all_latencies) if all_latencies else 0
         global_max_latency = max(all_latencies) if all_latencies else 0
         
+        # Métricas robustas (percentis)
+        latency_p5 = self.percentile_5(all_latencies)
+        latency_p95 = self.percentile_95(all_latencies)
+        latency_min_nonzero = self.min_nonzero(all_latencies)
+        
         total_throughput = total_tx_bytes + total_rx_bytes
         total_throughput_kbps = (total_throughput * 8) / (recent_window * 1000) if recent_window > 0 else 0
         
         result['global_metrics'] = {
             'global_worst_latency_us': worst_latency,
+            'global_worst_camera_latency_us': worst_camera_latency,
             'global_avg_latency_us': global_avg_latency,
             'global_min_latency_us': global_min_latency,
             'global_max_latency_us': global_max_latency,
@@ -375,7 +427,12 @@ class ExtendedMetricsCollector:
             'total_rx_bytes': total_rx_bytes,
             'total_tx_pdus': sum(d['tx_pdus'] for d in ue_data.values()),
             'total_rx_pdus': sum(d['rx_pdus'] for d in ue_data.values()),
-            'throughput_kbps': total_throughput_kbps
+            'throughput_kbps': total_throughput_kbps,
+            # Métricas robustas
+            'latency_p5_us': latency_p5,
+            'latency_p95_us': latency_p95,
+            'latency_min_nonzero_us': latency_min_nonzero,
+            'valid_samples': len(all_latencies)
         }
         
         result['active_cameras'] = camera_count
