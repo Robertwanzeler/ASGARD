@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}xApps - GreenRAN rApp{% endblock %}
+{% block content %}
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>Status dos xApps</h5></div>
+            <div class="card-body">
+                <table class="table">
+                    {% for name, data in xapp_status.items() %}
+                    <tr>
+                        <td><strong>{{ name }}</strong></td>
+                        <td>
+                            {% if data.status == 'RUNNING' %}
+                                <span class="badge bg-success">RODANDO</span>
+                            {% elif data.status == 'UNRESPONSIVE' %}
+                                <span class="badge bg-warning">UNRESPONSIVE</span>
+                            {% else %}
+                                <span class="badge bg-danger">{{ data.status }}</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr><td>PID</td><td>{{ data.pid or 'N/A' }}</td></tr>
+                    <tr><td>Último Cycle</td><td>{{ data.last_cycle or 'N/A' }}</td></tr>
+                    <tr><td>Total Restarts</td><td>{{ data.total_restarts or 0 }}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>Políticas A1</h5></div>
+            <div class="card-body">
+                <p><strong>Pendentes:</strong> {{ policy_status.pending|length if policy_status.pending else 0 }}</p>
+                {% if policy_status.pending %}
+                <pre>{{ policy_status.pending|tojson(indent=2) }}</pre>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

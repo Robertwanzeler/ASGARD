@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - GreenRAN rApp{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Métricas Principais -->
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Latência Pior Caso</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if metrics and metrics.global_metrics %}
+                    <div class="metric-value {% if metrics.global_metrics.global_worst_latency_us > 100000 %}status-critical{% elif metrics.global_metrics.global_worst_latency_us > 50000 %}status-warning{% else %}status-ok{% endif %}">
+                        {{ "%.1f"|format(metrics.global_metrics.global_worst_latency_us / 1000) }} ms
+                    </div>
+                {% else %}
+                    <div class="metric-value status-warning">N/A</div>
+                {% endif %}
+                <div class="metric-label">Pior latência no momento</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Câmeras Ativas</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if metrics %}
+                    <div class="metric-value status-ok">{{ metrics.active_cameras }}</div>
+                {% else %}
+                    <div class="metric-value status-warning">N/A</div>
+                {% endif %}
+                <div class="metric-label">Câmeras de vigilância</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Quality Score</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if pattern_summary and pattern_summary.extended_metrics_analysis %}
+                    {% set score = pattern_summary.extended_metrics_analysis.quality_score %}
+                    <div class="metric-value {% if score >= 80 %}status-ok{% elif score >= 60 %}status-warning{% else %}status-critical{% endif %}">
+                        {{ "%.0f"|format(score) }}
+                    </div>
+                {% else %}
+                    <div class="metric-value status-warning">N/A</div>
+                {% endif %}
+                <div class="metric-label">Qualidade da rede (A-F)</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">xApps Status</h5>
+            </div>
+            <div class="card-body text-center">
+                {% set slicer_ok = xapp_status.SLICER.status == 'RUNNING' if xapp_status.SLICER else false %}
+                {% set energy_ok = xapp_status.ENERGY.status == 'RUNNING' if xapp_status.ENERGY else false %}
+                {% if slicer_ok and energy_ok %}
+                    <div class="metric-value status-ok">✓</div>
+                {% else %}
+                    <div class="metric-value status-warning">⚠</div>
+                {% endif %}
+                <div class="metric-label">SLICER & ENERGY</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Gráfico de Latência -->
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Histórico de Latência (60 min)</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="latencyChart"></canvas>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Status dos xApps -->
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">xApps</h5>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm">
+                    {% for name, data in xapp_status.items() %}
+                    <tr>
+                        <td><strong>{{ name }}</strong></td>
+                        <td>
+                            {% if data.status == 'RUNNING' %}
+                                <span class="badge badge-ok">RODANDO</span>
+                            {% elif data.status == 'UNRESPONSIVE' %}
+                                <span class="badge badge-warning">UNRESPONSIVE</span>
+                            {% else %}
+                                <span class="badge badge-critical">{{ data.status }}</span>
+                            {% endif %}
+                        </td>
+                        <td>PID: {{ data.pid or 'N/A' }}</td>
+                    </tr>
+                    {% endfor %}
+                </table>
+            </div>
+        </div>
+        
+        <!-- Decisões Recentes -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Estatísticas (24h)</h5>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm">
+                    <tr>
+                        <td>Total</td>
+                        <td>{{ decision_stats.total }}</td>
+                    </tr>
+                    <tr>
+                        <td>Allow</td>
+                        <td class="status-ok">{{ decision_stats.allowed }}</td>
+                    </tr>
+                    <tr>
+                        <td>Block</td>
+                        <td class="status-critical">{{ decision_stats.blocked }}</td>
+                    </tr>
+                    <tr>
+                        <td>Conditional</td>
+                        <td class="status-warning">{{ decision_stats.conditional }}</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Alertas Recentes -->
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Alertas Recentes</h5>
+            </div>
+            <div class="card-body">
+                {% if recent_alerts %}
+                    <pre>{{ recent_alerts|join('\n') }}</pre>
+                {% else %}
+                    <p class="text-muted">Nenhum alerta recente</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ctx = document.getElementById('latencyChart').getContext('2d');
+const latencyChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: {{ range(latency_history|length)|list|tojson }},
+        datasets: [{
+            label: 'Latência (ms)',
+            data: {{ latency_history|tojson }},
+            borderColor: '#00ff88',
+            backgroundColor: 'rgba(0, 255, 136, 0.1)',
+            fill: true,
+            tension: 0.4
+        }]
+    },
+    options: {
+        responsive: true,
+        scales: {
+            y: {
+                beginAtZero: true,
+                grid: { color: '#333' },
+                ticks: { color: '#aaa' }
+            },
+            x: {
+                grid: { color: '#333' },
+                ticks: { color: '#aaa' }
+            }
+        },
+        plugins: {
+            legend: { labels: { color: '#eee' } }
+        }
+    }
+});
+</script>
+{% endblock %}
