@@ -76,6 +76,16 @@ if [ ! -z "$PRIMEIRO" ]; then
     MINUTOS=$(((DECORRIDO % 3600) / 60))
     SEGUNDOS=$((DECORRIDO % 60))
     echo -e "  Tempo de coleta: ${GREEN}${BOLD}${HORAS}h ${MINUTOS}m ${SEGUNDOS}s${NC}"
+    
+    # Mostrar informação sobre zeros nos dados
+    ZERO_COUNT=$(query_sqlite "SELECT SUM(zero_samples) FROM extended_metrics")
+    if [ ! -z "$ZERO_COUNT" ] && [ "$ZERO_COUNT" -gt 0 ] 2>/dev/null; then
+        if [[ "$ZERO_COUNT" =~ ^[0-9]+$ ]] && [ "$ZERO_COUNT" -gt 0 ]; then
+            echo ""
+            echo -e "  ${YELLOW}Nota: ${ZERO_COUNT} samples com delay=0 detectados${NC}"
+            echo -e "  ${YELLOW}(valores filtrados das métricas Min/P5)${NC}"
+        fi
+    fi
 else
     echo -e "  ${RED}Nenhum registro encontrado${NC}"
 fi
@@ -95,9 +105,17 @@ JITTER=$(query_sqlite "SELECT AVG(global_jitter_us)/1000 FROM extended_metrics")
 THROUGHPUT=$(query_sqlite "SELECT AVG(throughput_kbps) FROM extended_metrics")
 
 # Métricas robustas (percentis)
-LAT_P5=$(query_sqlite "SELECT AVG(latency_p5_us)/1000 FROM extended_metrics WHERE latency_p5_us > 0")
-LAT_P95=$(query_sqlite "SELECT AVG(latency_p95_us)/1000 FROM extended_metrics WHERE latency_p95_us > 0")
-LAT_MINNZ=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics WHERE latency_min_nonzero_us > 0")
+LAT_MINNZ=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics")
+LAT_P95=$(query_sqlite "SELECT AVG(latency_p95_us)/1000 FROM extended_metrics")
+
+# Fallback: usar latency_min_nonzero_us se global_min_latency_us for 0 ou vazio
+LAT_MIN_FALLBACK=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics")
+if [ -z "$LAT_MIN" ] || [ "$LAT_MIN" = "None" ]; then
+    LAT_MIN="$LAT_MIN_FALLBACK"
+fi
+
+# Fallback P5: usar latency_min_nonzero_us
+LAT_P5="$LAT_MIN_FALLBACK"
 
 # Formatação com cores para métricas críticas
 COLOR_LAT_AVG="${YELLOW}"
@@ -129,9 +147,16 @@ CAM_ATIVAS=$(query_sqlite "SELECT AVG(total_active_cameras) FROM extended_metric
 UE_ATIVAS=$(query_sqlite "SELECT AVG(total_active_ues) FROM extended_metrics")
 UE_CRITICAS=$(query_sqlite "SELECT AVG(total_critical_ues) FROM extended_metrics")
 
-echo -e "  Câmeras Ativas (média): ${BOLD}${CAM_ATIVAS:-N/A}${NC}"
+echo -e "  Câmeras Ativas (média):  ${BOLD}${GREEN}${CAM_ATIVAS:-N/A}${NC}"
 echo -e "  UEs Ativas (média):     ${BOLD}${UE_ATIVAS:-N/A}${NC}"
 echo -e "  UEs Críticas (média):   ${BOLD}${RED}${UE_CRITICAS:-N/A}${NC}"
+
+# Mostrar proporção
+if [ ! -z "$CAM_ATIVAS" ] && [ ! -z "$UE_ATIVAS" ] && [ "$CAM_ATIVAS" != "N/A" ] && [ "$UE_ATIVAS" != "N/A" ]; then
+    TOTAL=$(python3 -c "print($UE_ATIVAS + $CAM_ATIVAS)")
+    echo ""
+    echo -e "  ${CYAN}Proporção: ${UE_ATIVAS} UEs + ${CAM_ATIVAS} Câmeras = ${TOTAL} total${NC}"
+fi
 
 # ============================================
 # 5. Decisões do rApp
