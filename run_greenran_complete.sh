@@ -10,8 +10,14 @@
 #   - xApp-ENERGY
 #   - csv_to_metrics
 #   - rApp-ResourceOptimizer
+#   - (Opcional) rApp-Dashboard Flask
+#   - (Opcional) Watchdog xApps
 #
-# Uso: ./run_greenran_complete.sh
+# Uso: 
+#   ./run_greenran_complete.sh          # Sem dashboard
+#   ./run_greenran_complete.sh --dashboard  # Com dashboard
+#   ./run_greenran_complete.sh --watchdog    # Com watchdog
+#   ./run_greenran_complete.sh --all        # Com tudo
 # =============================================================================
 
 set -e
@@ -71,19 +77,51 @@ stop_all() {
     pkill -9 -f "ns3.42-scenario" 2>/dev/null || true
     pkill -9 -f "csv_to_metrics" 2>/dev/null || true
     pkill -9 -f "rapp_orchestrator" 2>/dev/null || true
+    pkill -9 -f "rapp_dashboard" 2>/dev/null || true
+    pkill -9 -f "watchdog_xapps" 2>/dev/null || true
+    rm -f /tmp/dashboard.pid /tmp/watchdog.pid 2>/dev/null || true
     sleep 2
     log_success "Processos antigos parados"
 }
 
-# Limpar dados antigos
+# Limpar dados (DESATIVADO - dataset é persistente)
 clean_data() {
-    log_info "Limpando dados antigos..."
-    rm -f /tmp/rapp_data_lake.db 2>/dev/null || true
-    rm -f "$NS3_DIR"/*.txt 2>/dev/null || true
-    rm -f /tmp/xapp_metrics/*.json 2>/dev/null || true
-    rm -f /tmp/rapp_policies/*.json 2>/dev/null || true
+    # NÃO APAGA DADOS - dataset é persistente entre execuções
+    # Para limpar manualmente: rm /tmp/rapp_data_lake.db
     mkdir -p /tmp/xapp_metrics /tmp/xapp_intents /tmp/rapp_policies
-    log_success "Dados limpos"
+    log_info "Diretórios verificados (dataset persistente)"
+}
+
+# Mostrar status do dataset existente
+show_dataset_status() {
+    if [ -f /tmp/rapp_data_lake.db ]; then
+        local size=$(du -h /tmp/rapp_data_lake.db | cut -f1)
+        local records=$(python3 -c "import sqlite3; conn=sqlite3.connect('/tmp/rapp_data_lake.db'); c=conn.cursor(); c.execute('SELECT COUNT(*) FROM extended_metrics'); print(c.fetchone()[0])" 2>/dev/null || echo "0")
+        local period=$(python3 -c "import sqlite3; conn=sqlite3.connect('/tmp/rapp_data_lake.db'); c=conn.cursor(); c.execute('SELECT MIN(timestamp), MAX(timestamp) FROM extended_metrics'); r=c.fetchone(); print(f'{int(r[1]-r[0])}')" 2>/dev/null || echo "0")
+        local hours=$((period / 3600))
+        local mins=$(((period % 3600) / 60))
+        
+        echo ""
+        log_info "=========================================="
+        log_info "  DATASET EXISTENTE ENCONTRADO"
+        log_info "=========================================="
+        echo "  Arquivo:  /tmp/rapp_data_lake.db"
+        echo "  Tamanho:  ${size}"
+        echo "  Registros: ${records}"
+        if [ "$period" -gt 0 ]; then
+            echo "  Período:  ${hours}h ${mins}m de dados"
+        fi
+        echo ""
+        echo -e "  ${YELLOW}Novos dados serão ADICIONADOS aos existentes${NC}"
+        echo "  Para LIMPAR: rm /tmp/rapp_data_lake.db"
+        echo ""
+        log_info "=========================================="
+        echo ""
+    else
+        echo ""
+        log_info "Iniciando NOVO dataset..."
+        echo ""
+    fi
 }
 
 # Verificar dependências
@@ -107,7 +145,7 @@ check_deps() {
     fi
     
     # ns-3
-    if [ ! -f "$NS3_DIR/build_rebuild/scratch/ns3.42-scenario-greenran-debug" ]; then
+    if [ ! -f "$NS3_DIR/build/scratch/ns3.42-scenario-greenran-default" ]; then
         log_error "ns-3 não encontrado"
         exit 1
     fi
@@ -140,7 +178,7 @@ start_ric() {
 start_ns3() {
     log_info "Iniciando ns-3 (20 UEs)..."
     cd "$NS3_DIR"
-    ./build_rebuild/scratch/ns3.42-scenario-greenran-debug --e2TermIp=127.0.0.1 > /tmp/ns3.log 2>&1 &
+    ./build/scratch/ns3.42-scenario-greenran-default --e2TermIp=127.0.0.1 --simTime=100000 > /tmp/ns3.log 2>&1 &
     echo $! > /tmp/ns3.pid
     sleep 2
     log_success "ns-3 iniciado (PID: $(cat /tmp/ns3.pid))"
@@ -200,6 +238,15 @@ show_status() {
     echo -e "  csv_to_metrics:  $([ $csv -gt 0 ] && echo -e "${GREEN}✓ Rodando${NC}" || echo -e "${RED}✗ Parado${NC}")"
     echo -e "  rApp:           $([ $rapp -gt 0 ] && echo -e "${GREEN}✓ Rodando${NC}" || echo -e "${RED}✗ Parado${NC}")"
     
+    # Dashboard e Watchdog
+    local dashboard=$(ps aux | grep rapp_dashboard | grep -v grep | wc -l)
+    local watchdog=$(ps aux | grep watchdog_xapps | grep -v grep | wc -l)
+    echo ""
+    echo -e "${YELLOW}[1b] COMPONENTES OPCIONAIS${NC}"
+    echo "----------------------------------------"
+    echo -e "  Dashboard Flask: $([ $dashboard -gt 0 ] && echo -e "${GREEN}✓ Rodando${NC}" || echo -e "${RED}✗ Parado${NC}")"
+    echo -e "  Watchdog:       $([ $watchdog -gt 0 ] && echo -e "${GREEN}✓ Rodando${NC}" || echo -e "${RED}✗ Parado${NC}")"
+    
     echo ""
     echo -e "${YELLOW}[2] DATA LAKE${NC}"
     echo "----------------------------------------"
@@ -247,6 +294,12 @@ PYEOF
     fi
     
     echo ""
+    
+    # Verificar dashboard
+    if [ -f /tmp/dashboard.pid ] && kill -0 $(cat /tmp/dashboard.pid) 2>/dev/null; then
+        echo -e "${CYAN}  Dashboard: http://localhost:5000${NC}"
+    fi
+    
     separator
     echo -e "${CYAN}Logs: /tmp/rapp.log | /tmp/xapp_slicer.log | /tmp/xapp_energy.log${NC}"
     separator
@@ -262,15 +315,63 @@ show_menu() {
     show_menu
 }
 
+# Iniciar Dashboard Flask (opcional)
+start_dashboard() {
+    log_info "Iniciando rApp-Dashboard Flask..."
+    cd "$ORANGE_DIR"
+    python3 ./rapp_dashboard.py --host 0.0.0.0 --port 5000 > /tmp/dashboard.log 2>&1 &
+    echo $! > /tmp/dashboard.pid
+    sleep 2
+    
+    if kill -0 $(cat /tmp/dashboard.pid) 2>/dev/null; then
+        log_success "Dashboard iniciado (PID: $(cat /tmp/dashboard.pid))"
+        echo ""
+        echo -e "${CYAN}  Dashboard disponível em: http://localhost:5000${NC}"
+    else
+        log_error "Falha ao iniciar dashboard. Verifique: python3 -m pip install flask"
+    fi
+}
+
+# Iniciar Watchdog (opcional)
+start_watchdog() {
+    log_info "Iniciando Watchdog xApps..."
+    cd "$ORANGE_DIR"
+    python3 ./watchdog_xapps.py > /tmp/watchdog.log 2>&1 &
+    echo $! > /tmp/watchdog.pid
+    sleep 1
+    log_success "Watchdog iniciado (PID: $(cat /tmp/watchdog.pid))"
+}
+
 # =============================================================================
 # MAIN
 # =============================================================================
 
 main() {
+    # Parse argumentos
+    DASHBOARD=false
+    WATCHDOG=false
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --dashboard|--all)
+                DASHBOARD=true
+                ;;
+            --watchdog|--all)
+                WATCHDOG=true
+                ;;
+        esac
+        shift
+    done
+    
     clear
     separator
     echo -e "${CYAN}        GreenRAN O-RAN - Sistema Completo${NC}"
     separator
+    echo ""
+    
+    echo "Opções selecionadas:"
+    echo "  Dashboard: $DASHBOARD"
+    echo "  Watchdog:  $WATCHDOG"
     echo ""
     
     # Verificar se já está rodando
@@ -279,8 +380,11 @@ main() {
     # Parar processos antigos
     stop_all
     
-    # Limpar dados
+    # Limpar/preparar dados (DESATIVADO - dataset é persistente)
     clean_data
+    
+    # Mostrar status do dataset existente
+    show_dataset_status
     
     # Verificar dependências
     check_deps
@@ -296,10 +400,25 @@ main() {
     start_xapps
     start_collectors
     
+    # Iniciar Dashboard se solicitado
+    if [ "$DASHBOARD" = true ]; then
+        start_dashboard
+    fi
+    
+    # Iniciar Watchdog se solicitado
+    if [ "$WATCHDOG" = true ]; then
+        start_watchdog
+    fi
+    
     echo ""
     separator
     log_success "Sistema GreenRAN iniciado com sucesso!"
     separator
+    
+    if [ "$DASHBOARD" = true ]; then
+        echo -e "${CYAN}  Dashboard: http://localhost:5000${NC}"
+    fi
+    echo ""
     
     # Menu de monitoramento
     show_menu
