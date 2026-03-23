@@ -85,6 +85,10 @@ class PatternRecognition:
             'acceptable_packet_loss': 0.05,
             'critical_latency_us': 10000,
             'warning_latency_us': 5000,
+            # Thresholds de MCS (Modulation and Coding Scheme)
+            'good_mcs': 20,       # MCS >= 20 = enlace excelente
+            'acceptable_mcs': 15,  # MCS >= 15 = enlace bom
+            'poor_mcs': 10,       # MCS < 10 = enlace ruim
         }
     
     def calculate_moving_average(self, metric='latency', window_minutes=30):
@@ -423,6 +427,10 @@ class PatternRecognition:
         
         if len(current_block) >= 3:
             blocks.append(current_block)
+        
+        # Se não houver blocos suficientes, retorna None
+        if not blocks:
+            return None
         
         # Seleciona melhor bloco (mais horas + maior confiança)
         best_block = max(blocks, key=lambda b: (len(b), 
@@ -791,6 +799,89 @@ class PatternRecognition:
                 'p95_count': len(latency_p95_list),
                 'min_nonzero_count': len(latency_min_nonzero_list),
             },
+        }
+    
+    def analyze_link_quality(self, window_minutes=30):
+        """
+        Analisa qualidade do enlace usando MCS.
+        
+        MCS (Modulation and Coding Scheme):
+        - MCS 0-9: QPSK, enlaces ruins
+        - MCS 10-15: 16-QAM, enlaces médios
+        - MCS 16-23: 64-QAM, enlaces bons
+        - MCS 24+: 256-QAM, enlaces excelentes
+        
+        Returns:
+            Dict com análise de qualidade do enlace.
+        """
+        history = self.get_extended_metrics_history(window_minutes)
+        
+        if not history:
+            return {
+                'status': 'no_data',
+                'message': 'Sem dados de MCS',
+                'sample_count': 0
+            }
+        
+        mcs_values = [h.get('global_mcs_avg', 0) for h in history if h.get('global_mcs_avg', 0) > 0]
+        tb_sizes = [h.get('global_tb_size_avg', 0) for h in history if h.get('global_tb_size_avg', 0) > 0]
+        
+        if not mcs_values:
+            return {
+                'status': 'no_mcs_data',
+                'message': 'Sem dados de MCS no histórico',
+                'sample_count': 0
+            }
+        
+        avg_mcs = sum(mcs_values) / len(mcs_values) if mcs_values else 0
+        min_mcs = min(mcs_values) if mcs_values else 0
+        max_mcs = max(mcs_values) if mcs_values else 0
+        
+        th = self.extended_thresholds
+        
+        # Determina qualidade do enlace
+        if avg_mcs >= th['good_mcs']:
+            quality = 'good'
+            description = 'Enlace excelente'
+        elif avg_mcs >= th['acceptable_mcs']:
+            quality = 'acceptable'
+            description = 'Enlace bom'
+        else:
+            quality = 'poor'
+            description = 'Enlace ruim'
+        
+        # Score de qualidade (0-100)
+        mcs_score = min(100, (avg_mcs / 28) * 100)  # 28 = MCS máximo teórico
+        
+        # Recomendação de energia baseada em MCS
+        if quality == 'good':
+            energy_recommendation = 'ALLOW'
+            energy_reason = 'Enlace excelente permite economia'
+        elif quality == 'acceptable':
+            energy_recommendation = 'CONDITIONAL'
+            energy_reason = 'Enlace moderado requer cautela'
+        else:
+            energy_recommendation = 'DENY'
+            energy_reason = 'Enlace ruim - não permitir economia'
+        
+        return {
+            'status': 'analyzed',
+            'sample_count': len(mcs_values),
+            'window_minutes': window_minutes,
+            'global_mcs_avg': avg_mcs,
+            'global_mcs_min': min_mcs,
+            'global_mcs_max': max_mcs,
+            'global_tb_size_avg': sum(tb_sizes) / len(tb_sizes) if tb_sizes else 0,
+            'quality': quality,
+            'description': description,
+            'mcs_score': mcs_score,
+            'energy_recommendation': energy_recommendation,
+            'energy_reason': energy_reason,
+            'thresholds': {
+                'good_mcs': th['good_mcs'],
+                'acceptable_mcs': th['acceptable_mcs'],
+                'poor_mcs': th['poor_mcs']
+            }
         }
     
     def _metric_status(self, value, good_threshold, poor_threshold):

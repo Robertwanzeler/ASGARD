@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+GreenRAN O-RAN - rApp xApp Manager
+===================================
+
+Responsabilidade: Controla o ciclo de vida dos xApps
+- Iniciar/Parar processos de xApps
+- Verificar status de execução
+- Garantir fallback do Slicer se rApp parar
+
+Arquitetura:
+    rApp → XAppManager → xApp_Slicer (sempre ativo)
+                       → xApp_Energy (controlado pelo rApp)
+
+Uso:
+    from rapp_xapp_manager import XAppManager
+    
+    xm = XAppManager()
+    xm.start("slicer")           # Inicia Slicer (prioridade)
+    xm.start("energy_saver")      # Inicia Energy se permitido
+    xm.stop("energy_saver")       # Para Energy se necessário
+    xm.is_running("slicer")        # Verifica status
+"""
+
+import os
+import sys
+import signal
+import subprocess
+import time
+from datetime import datetime
+from pathlib import Path
+
+BASE_DIR = "/home/robert/orange_nuclear"
+FLEXRIC_DIR = f"{BASE_DIR}/flexric"
+FLEXRIC_LIB = f"{BASE_DIR}/flexric_lib"
+FLEXRIC_BUILD = f"{FLEXRIC_DIR}/build_e2ap_v1"
+
+XAPP_PATHS = {
+    "slicer": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_slicer",
+    "energy_saver": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_energy_saver"
+}
+
+XAPP_LOG_PATHS = {
+    "slicer": "/tmp/xapp_slicer.log",
+    "energy_saver": "/tmp/xapp_energy.log"
+}
+
+XAPP_PID_PATHS = {
+    "slicer": "/tmp/xapp_slicer.pid",
+    "energy_saver": "/tmp/xapp_energy.pid"
+}
+
+
+class XAppManager:
+    """
+    Gerenciador de ciclo de vida dos xApps.
+    
+    Funcionalidades:
+    - Iniciar xApp como subprocesso
+    - Parar xApp via signals
+    - Verificar se xApp está rodando
+    - Fallback: Slicer continua se rApp morrer
+    """
+    
+    def __init__(self, base_dir=BASE_DIR):
+        """
+        Inicializa o XAppManager.
+        
+        Args:
+            base_dir: Diretório base do projeto
+        """
+        self.base_dir = base_dir
+        self.flexric_dir = f"{base_dir}/flexric"
+        self.flexric_lib = f"{base_dir}/flexric_lib"
+        self.flexric_build = f"{self.flexric_dir}/build_e2ap_v1"
+        
+        self.processes = {}
+        self.ld_library_path = f"{self.flexric_build}/src/ric:{self.flexric_lib}:{self.flexric_build}/src/xApp"
+        
+        self.config_file = f"{base_dir}/flexric/flexric.conf"
+        
+        os.makedirs("/tmp", exist_ok=True)
+        
+        print("[XAppManager] Inicializado")
+    
+    def _get_env(self):
+        """Retorna environment com LD_LIBRARY_PATH configurado."""
+        env = os.environ.copy()
+        env['LD_LIBRARY_PATH'] = self.ld_library_path
+        return env
+    
+    def start(self, xapp_name):
+        """
+        Inicia um xApp.
+        
+        Args:
+            xapp_name: 'slicer' ou 'energy_saver'
+        
+        Returns:
+            bool: True se iniciou com sucesso
+        """
+        if xapp_name not in XAPP_PATHS:
+            print(f"[XAppManager] ERRO: xApp desconhecido '{xapp_name}'")
+            return False
+        
+        if self.is_running(xapp_name):
+            print(f"[XAppManager] {xapp_name} já está rodando (PID: {self.get_pid(xapp_name)})")
+            return True
+        
+        binary_path = XAPP_PATHS[xapp_name]
+        log_path = XAPP_LOG_PATHS[xapp_name]
+        pid_path = XAPP_PID_PATHS[xapp_name]
+        
+        if not os.path.exists(binary_path):
+            print(f"[XAppManager] ERRO: Binary não encontrado: {binary_path}")
+            return False
+        
+        try:
+            with open(log_path, 'w') as log_file:
+                process = subprocess.Popen(
+                    [binary_path, "-c", self.config_file, "-p", f"{self.flexric_lib}/"],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=self._get_env(),
+                    preexec_fn=os.setsid
+                )
+            
+            self.processes[xapp_name] = process
+            
+            with open(pid_path, 'w') as f:
+                f.write(str(process.pid))
+            
+            print(f"[XAppManager] {xapp_name} iniciado (PID: {process.pid})")
+            return True
+            
+        except Exception as e:
+            print(f"[XAppManager] ERRO ao iniciar {xapp_name}: {e}")
+            return False
+    
+    def stop(self, xapp_name, timeout=2):
+        """
+        Para um xApp.
+        
+        Args:
+            xapp_name: 'slicer' ou 'energy_saver'
+            timeout: Segundos para esperar graceful shutdown
+        
+        Returns:
+            bool: True se parou com sucesso
+        """
+        if xapp_name not in XAPP_PATHS:
+            print(f"[XAppManager] ERRO: xApp desconhecido '{xapp_name}'")
+            return False
+        
+        if not self.is_running(xapp_name):
+            print(f"[XAppManager] {xapp_name} não está rodando")
+            return True
+        
+        process = self.processes.get(xapp_name)
+        pid = self.get_pid(xapp_name)
+        
+        if process is None and pid is None:
+            print(f"[XAppManager] {xapp_name} não está rodando")
+            return True
+        
+        try:
+            if process:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            elif pid:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            
+            time.sleep(0.2)
+            
+            if self.is_running(xapp_name):
+                print(f"[XAppManager] SIGTERM não funcionou, enviando SIGKILL...")
+                if process:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                elif pid:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                time.sleep(0.2)
+            
+            self._cleanup(xapp_name)
+            print(f"[XAppManager] {xapp_name} parado")
+            return True
+            
+        except ProcessLookupError:
+            print(f"[XAppManager] {xapp_name} já estava parado")
+            self._cleanup(xapp_name)
+            return True
+        except Exception as e:
+            print(f"[XAppManager] ERRO ao parar {xapp_name}: {e}")
+            return False
+    
+    def is_running(self, xapp_name):
+        """
+        Verifica se xApp está rodando.
+        
+        Args:
+            xapp_name: 'slicer' ou 'energy_saver'
+        
+        Returns:
+            bool: True se está rodando
+        """
+        pid = self.get_pid(xapp_name)
+        
+        if pid is None:
+            return False
+        
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            self._cleanup(xapp_name)
+            return False
+    
+    def get_pid(self, xapp_name):
+        """
+        Obtém PID do xApp.
+        
+        Args:
+            xapp_name: 'slicer' ou 'energy_saver'
+        
+        Returns:
+            int: PID ou None se não está rodando
+        """
+        pid_path = XAPP_PID_PATHS.get(xapp_name)
+        
+        if pid_path and os.path.exists(pid_path):
+            try:
+                with open(pid_path, 'r') as f:
+                    return int(f.read().strip())
+            except:
+                return None
+        
+        if xapp_name in self.processes and self.processes[xapp_name]:
+            return self.processes[xapp_name].poll()
+        
+        return None
+    
+    def restart(self, xapp_name):
+        """
+        Reinicia um xApp.
+        
+        Args:
+            xapp_name: 'slicer' ou 'energy_saver'
+        
+        Returns:
+            bool: True se reiniciou com sucesso
+        """
+        print(f"[XAppManager] Reiniciando {xapp_name}...")
+        self.stop(xapp_name)
+        time.sleep(0.3)
+        return self.start(xapp_name)
+    
+    def _cleanup(self, xapp_name):
+        """Remove arquivos PID e limpa processo."""
+        pid_path = XAPP_PID_PATHS.get(xapp_name)
+        
+        if pid_path and os.path.exists(pid_path):
+            try:
+                os.remove(pid_path)
+            except:
+                pass
+        
+        if xapp_name in self.processes:
+            del self.processes[xapp_name]
+    
+    def stop_all(self):
+        """Para todos os xApps."""
+        print("[XAppManager] Parando todos os xApps...")
+        for xapp_name in list(XAPP_PATHS.keys()):
+            self.stop(xapp_name)
+    
+    def get_status(self):
+        """
+        Retorna status de todos os xApps.
+        
+        Returns:
+            dict: Status de cada xApp
+        """
+        status = {}
+        for xapp_name in XAPP_PATHS.keys():
+            status[xapp_name] = {
+                'running': self.is_running(xapp_name),
+                'pid': self.get_pid(xapp_name)
+            }
+        return status
+    
+    def wait_for_ready(self, xapp_name, timeout=10):
+        """
+        Espera xApp ficar pronto (conectar ao RIC).
+        
+        Args:
+            xapp_name: 'slicer' ou 'energy_saver'
+            timeout: Segundos máximo para esperar
+        
+        Returns:
+            bool: True se ficou pronto a tempo
+        """
+        print(f"[XAppManager] Aguardando {xapp_name} ficar pronto...")
+        
+        log_path = XAPP_LOG_PATHS.get(xapp_name)
+        start = time.time()
+        
+        while time.time() - start < timeout:
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, 'r') as f:
+                        content = f.read()
+                        if 'Connected' in content or 'registered' in content.lower() or 'ready' in content.lower():
+                            print(f"[XAppManager] {xapp_name} pronto!")
+                            return True
+                except:
+                    pass
+            
+            if not self.is_running(xapp_name):
+                print(f"[XAppManager] {xapp_name} morreu!")
+                return False
+            
+            time.sleep(0.2)
+        
+        print(f"[XAppManager] Timeout esperando {xapp_name}")
+        return False
+
+
+if __name__ == '__main__':
+    xm = XAppManager()
+    
+    print("\n=== XAppManager - Teste ===\n")
+    
+    print("Status inicial:")
+    for name, info in xm.get_status().items():
+        print(f"  {name}: {'RODANDO' if info['running'] else 'PARADO'} (PID: {info['pid']})")
+    
+    print("\nIniciando Slicer...")
+    xm.start("slicer")
+    
+    print("\nStatus após iniciar Slicer:")
+    for name, info in xm.get_status().items():
+        print(f"  {name}: {'RODANDO' if info['running'] else 'PARADO'} (PID: {info['pid']})")
+    
+    print("\nParando Slicer...")
+    xm.stop("slicer")
+    
+    print("\nStatus final:")
+    for name, info in xm.get_status().items():
+        print(f"  {name}: {'RODANDO' if info['running'] else 'PARADO'} (PID: {info['pid']})")

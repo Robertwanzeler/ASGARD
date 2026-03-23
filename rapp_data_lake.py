@@ -57,7 +57,7 @@ class DataLake:
     def _connect(self):
         """Conecta ao banco SQLite"""
         try:
-            self.conn = sqlite3.connect(self.db_path)
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
         except Exception as e:
             print(f"[DataLake] ERRO ao conectar: {e}")
@@ -170,6 +170,8 @@ class DataLake:
                 latency_p95_us REAL,
                 latency_min_nonzero_us REAL,
                 valid_samples INTEGER,
+                valid_samples_nonzero INTEGER,
+                zero_samples INTEGER,
                 UNIQUE(timestamp)
             )
         """)
@@ -229,9 +231,14 @@ class DataLake:
             critical_cameras: Número de câmeras críticas
             energy_state: Estado do Energy Saver
             slicer_state: Estado do SLICER
+        
+        Nota: Registros com latência_us = 0 são ignorados (dados inválidos).
         """
         if timestamp is None:
             timestamp = int(time.time())
+        
+        if latency_us == 0:
+            return
         
         dt = datetime.fromtimestamp(timestamp)
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")

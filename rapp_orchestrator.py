@@ -48,13 +48,14 @@ from rapp_pattern_engine import PatternRecognition
 from rapp_agent_openran import AgentOpenRAN
 from rapp_a1_interface import A1PolicyInterface
 from rapp_synthetic_generator import SyntheticDataGenerator
+from rapp_xapp_manager import XAppManager
 
 SLICER_INTENT_PATH = "/tmp/xapp_intents/slicer.txt"
 ENERGY_INTENT_PATH = "/tmp/xapp_intents/energy_saver.txt"
 RAPP_DECISION_PATH = "/tmp/xapp_intents/rapp_decision.txt"
 EXTENDED_METRICS_PATH = "/tmp/xapp_metrics/extended_metrics.json"
 
-DEFAULT_INTERVAL = 5  # Non-RT RIC: ≥1 segundo (O-RAN spec)
+DEFAULT_INTERVAL = 1  # Non-RT RIC: ≥1 segundo (O-RAN spec) - 1s para máxima responsividade
 
 
 class RappResourceOptimizer:
@@ -88,7 +89,10 @@ class RappResourceOptimizer:
             'conditional': 0,
             'agent_overrides': 0,
             'pattern_detected': 0,
-            'sla_violations': 0
+            'sla_violations': 0,
+            'ack_received': 0,
+            'ack_pending': 0,
+            'ack_timeout': 0
         }
         
         # Inicializa componentes
@@ -106,6 +110,9 @@ class RappResourceOptimizer:
         # A1 Interface
         self.a1 = A1PolicyInterface()
         
+        # XApp Manager (controla ciclo de vida dos xApps)
+        self.xapp_manager = XAppManager()
+        
         # Gera dados sintéticos se solicitado
         if synthetic_days > 0:
             self._generate_synthetic_data(synthetic_days)
@@ -116,6 +123,13 @@ class RappResourceOptimizer:
         
         # Cria diretórios
         os.makedirs("/tmp/xapp_intents", exist_ok=True)
+        
+        # INICIA xApps CONTROLADOS PELO RAPP
+        # Slicer SEMPRE inicia com rApp (prioridade)
+        self._start_slicer()
+        
+        # Energy Saver NÃO inicia automaticamente - rApp decide quando ativar
+        self._energy_active = False
         
         print(f"[rApp] Inicializado - Intervalo: {self.interval}s")
     
@@ -133,6 +147,86 @@ class RappResourceOptimizer:
         """Handler para sinais de shutdown."""
         print("\n[rApp] Sinal de shutdown recebido")
         self.running = False
+    
+    def _start_slicer(self):
+        """Inicia o xApp SLICER (prioridade - sempre ativo)."""
+        print("[rApp] Iniciando xApp SLICER (prioridade)...")
+        if self.xapp_manager.start("slicer"):
+            if self.xapp_manager.wait_for_ready("slicer", timeout=10):
+                print("[rApp] xApp SLICER pronto e ativo")
+            else:
+                print("[rApp] AVISO: xApp SLICER pode não estar pronto")
+        else:
+            print("[rApp] ERRO: Não foi possível iniciar xApp SLICER")
+    
+    def _start_energy_saver(self):
+        """Inicia o xApp ENERGY SAVER (se condições permitirem)."""
+        if self._energy_active:
+            return True
+        
+        print("[rApp] Iniciando xApp ENERGY SAVER...")
+        if self.xapp_manager.start("energy_saver"):
+            if self.xapp_manager.wait_for_ready("energy_saver", timeout=10):
+                self._energy_active = True
+                print("[rApp] xApp ENERGY SAVER ativo")
+                return True
+            else:
+                print("[rApp] AVISO: xApp ENERGY SAVER pode não estar pronto")
+                self._energy_active = True
+                return True
+        else:
+            print("[rApp] ERRO: Não foi possível iniciar xApp ENERGY SAVER")
+            return False
+    
+    def _stop_energy_saver(self):
+        """Para o xApp ENERGY SAVER (se estiver ativo)."""
+        if not self._energy_active:
+            return True
+        
+        print("[rApp] Parando xApp ENERGY SAVER...")
+        if self.xapp_manager.stop("energy_saver"):
+            self._energy_active = False
+            print("[rApp] xApp ENERGY SAVER parado")
+            return True
+        else:
+            print("[rApp] ERRO ao parar xApp ENERGY SAVER")
+            return False
+    
+    def decide_xapp_activation(self, decision):
+        """
+        Decide quais xApps devem estar ativos baseado na decisão.
+        
+        Regras:
+        - SLICER: SEMPRE ativo (prioridade)
+        - ENERGY SAVER: Ativo se decision['energy_saver'] == 'ALLOWED'
+        
+        Args:
+            decision: Dict com decisão do rApp
+        """
+        slicer_state = decision.get('slicer_state', 'UNKNOWN')
+        
+        # ENERGY SAVER: controlado pelo rApp
+        if decision.get('energy_saver') == 'ALLOWED':
+            # Slicer OK → Energy pode ativar
+            if not self._energy_active:
+                self._start_energy_saver()
+        else:
+            # Slicer com problema ou decisão BLOCKED → Energy para
+            if self._energy_active:
+                self._stop_energy_saver()
+        
+        # SLICER: NUNCA para (fallback de segurança)
+        # Mesmo se rApp morrer, Slicer continua rodando
+        return {
+            'slicer_active': self.xapp_manager.is_running("slicer"),
+            'energy_active': self._energy_active
+        }
+    
+    def get_xapp_status(self):
+        """Retorna status dos xApps."""
+        status = self.xapp_manager.get_status()
+        status['energy_decision'] = self._energy_active
+        return status
     
     def read_slicer_intent(self):
         """Lê intenção do SLICER."""
@@ -214,10 +308,10 @@ class RappResourceOptimizer:
         """
         Toma decisão estratégica.
         
-        Fluxo:
-        1. Se SLICER=CRITICAL/WARNING → BLOCK (regra obrigatória)
-        2. Se não, consulta Pattern Engine
-        3. Se Agent-Al tem política ativa, aplica override
+        FLUXO UNIFICADO:
+        1. Pattern Engine retorna análise completa (ML)
+        2. REGRA SLA > ENERGY (mandatory override)
+        3. Agent-Al Override (se ativo)
         
         Returns:
             Dict com decisão completa.
@@ -237,7 +331,6 @@ class RappResourceOptimizer:
             'ml_decision': None
         }
         
-        # Extrai estados
         slicer_state = 'UNKNOWN'
         energy_state = 'UNKNOWN'
         
@@ -250,7 +343,36 @@ class RappResourceOptimizer:
             decision['energy_state'] = energy_state
         
         # ========================================
-        # 1. REGRA SLA > ENERGY (OBRIGATÓRIO)
+        # ETAPA 1: PATTERN ENGINE (ML) - fonte única
+        # ========================================
+        pattern_analysis = self.pattern_engine.analyze_current()
+        decision['pattern_analysis'] = pattern_analysis
+        
+        ml_decision = self.pattern_engine.should_allow_energy_saving()
+        decision['ml_decision'] = ml_decision
+        
+        if ml_decision['recommendation'] == 'ALLOW':
+            decision['energy_saver'] = 'ALLOWED'
+            decision['action'] = 'ACTIVATE_ENERGY_SAVING'
+            decision['reason'] = f"ML: {ml_decision['reasons'][0]}" if ml_decision['reasons'] else 'LOW_ACTIVITY'
+            decision['confidence'] = ml_decision['confidence']
+            decision['pattern'] = pattern_analysis.get('pattern')
+            self.stats['pattern_detected'] += 1
+        
+        elif ml_decision['recommendation'] == 'CONDITIONAL':
+            decision['energy_saver'] = 'CONDITIONAL'
+            decision['action'] = 'MONITOR'
+            decision['reason'] = f"ML: Score={ml_decision['score']:.2f}"
+            decision['confidence'] = ml_decision['confidence']
+        
+        else:  # DENY
+            decision['energy_saver'] = 'BLOCKED'
+            decision['action'] = 'AWAIT_CONDITIONS'
+            decision['reason'] = f"ML: {ml_decision['reasons'][0]}" if ml_decision['reasons'] else 'HIGH_ACTIVITY'
+            decision['confidence'] = ml_decision['confidence']
+        
+        # ========================================
+        # ETAPA 2: REGRA SLA > ENERGY (MANDATORY)
         # ========================================
         if slicer_state in ['CRITICAL', 'WARNING']:
             decision['energy_saver'] = 'BLOCKED'
@@ -258,45 +380,10 @@ class RappResourceOptimizer:
             decision['reason'] = 'SLA_VIOLATED'
             decision['confidence'] = 1.0
             self.stats['sla_violations'] += 1
-            
-            return decision
         
         # ========================================
-        # 2. PATTERN ENGINE (ML)
+        # ETAPA 3: AGENT-AL OVERRIDE
         # ========================================
-        if slicer_state in ['NORMAL', 'IDLE', 'UNKNOWN']:
-            # Analisa padrões atuais
-            pattern_analysis = self.pattern_engine.analyze_current()
-            decision['pattern_analysis'] = pattern_analysis
-            
-            # Verifica se deve permitir economia
-            ml_decision = self.pattern_engine.should_allow_energy_saving()
-            decision['ml_decision'] = ml_decision
-            
-            if ml_decision['recommendation'] == 'ALLOW':
-                decision['energy_saver'] = 'ALLOWED'
-                decision['action'] = 'ACTIVATE_ENERGY_SAVING'
-                decision['reason'] = f"ML: {ml_decision['reasons'][0]}" if ml_decision['reasons'] else 'LOW_ACTIVITY'
-                decision['confidence'] = ml_decision['confidence']
-                decision['pattern'] = pattern_analysis.get('pattern')
-                self.stats['pattern_detected'] += 1
-            
-            elif ml_decision['recommendation'] == 'CONDITIONAL':
-                decision['energy_saver'] = 'CONDITIONAL'
-                decision['action'] = 'MONITOR'
-                decision['reason'] = f"ML: Score={ml_decision['score']:.2f}"
-                decision['confidence'] = ml_decision['confidence']
-            
-            else:  # DENY
-                decision['energy_saver'] = 'BLOCKED'
-                decision['action'] = 'AWAIT_CONDITIONS'
-                decision['reason'] = f"ML: {ml_decision['reasons'][0]}" if ml_decision['reasons'] else 'HIGH_ACTIVITY'
-                decision['confidence'] = ml_decision['confidence']
-        
-        # ========================================
-        # 3. AGENT-AL OVERRIDE
-        # ========================================
-        # Lê intenção do Agent
         agent_intent = self.agent.read_intent()
         if agent_intent:
             agent_policy = self.agent.translate_to_policy(agent_intent)
@@ -406,8 +493,7 @@ class RappResourceOptimizer:
             return False
     
     def send_a1_policies(self, decision):
-        """Envia políticas via interface A1."""
-        # Política de energia
+        """Envia políticas via interface A1 com confirmação ACK."""
         pattern_info = None
         if decision.get('pattern_analysis'):
             pa = decision['pattern_analysis']
@@ -419,12 +505,22 @@ class RappResourceOptimizer:
             }
         
         self.a1.send_energy_policy(decision, pattern_info)
-        
-        # Política de fatia
         self.a1.send_slice_policy(
             decision['slicer_state'],
             {'active': int(decision['pattern_analysis']['current_cameras'])} if decision.get('pattern_analysis') else None
         )
+    
+    def check_and_handle_acks(self):
+        """Verifica ACKs pendentes e atualiza estatísticas."""
+        pending = self.a1.check_pending_acks()
+        
+        for ptype, info in pending.items():
+            if not info['pending']:
+                self.stats['ack_received'] += 1
+            else:
+                self.stats['ack_pending'] += 1
+                if info['attempts'] >= 3:
+                    self.stats['ack_timeout'] += 1
     
     def record_decision(self, decision):
         """Registra decisão no Data Lake."""
@@ -441,8 +537,11 @@ class RappResourceOptimizer:
         elif decision['energy_saver'] == 'CONDITIONAL':
             self.stats['conditional'] += 1
     
-    def print_status(self, decision):
+    def print_status(self, decision, xapp_status=None):
         """Imprime status do ciclo."""
+        if xapp_status is None:
+            xapp_status = {'slicer_active': True, 'energy_active': self._energy_active}
+        
         if self.cycle % 5 == 0 or decision['energy_saver'] == 'BLOCKED' or decision['agent_override']:
             print("")
             print("=" * 70)
@@ -451,7 +550,16 @@ class RappResourceOptimizer:
             print(f"  Ciclo: {self.cycle}  |  Tempo: {datetime.now().strftime('%H:%M:%S')}")
             print("")
             
-            # SLICER
+            # xAPPS STATUS
+            slicer_active = xapp_status.get('slicer_active', False)
+            energy_active = xapp_status.get('energy_active', False)
+            slicer_status = "\033[1;32m[ATIVO]\033[0m" if slicer_active else "\033[1;31m[PARADO]\033[0m"
+            energy_status = "\033[1;32m[ATIVO]\033[0m" if energy_active else "\033[1;33m[PARADO]\033[0m"
+            print(f"  xApp SLICER:      {slicer_status} (prioridade - sempre ativo)")
+            print(f"  xApp ENERGY:      {energy_status} (controlado pelo rApp)")
+            print("")
+            
+            # SLICER STATE
             slicer = decision['slicer_state']
             if slicer == 'CRITICAL':
                 slicer_display = "\033[1;31m[CRITICAL]\033[0m <- PROBLEMA: Latencia > 100ms!"
@@ -464,7 +572,7 @@ class RappResourceOptimizer:
             else:
                 slicer_display = "[UNKNOWN]"
             
-            print(f"  SLICER:   {slicer_display}")
+            print(f"  SLICER STATE:     {slicer_display}")
             
             # ENERGY
             energy = decision['energy_state']
@@ -475,12 +583,12 @@ class RappResourceOptimizer:
             else:
                 energy_display = "[UNKNOWN]"
             
-            print(f"  ENERGY:   {energy_display}")
+            print(f"  ENERGY STATE:     {energy_display}")
             
             # Pattern
             if decision.get('pattern_analysis'):
                 pa = decision['pattern_analysis']
-                print(f"  ML:       Pattern={pa['pattern']}, Cameras={pa['current_cameras']:.1f}")
+                print(f"  ML:               Pattern={pa['pattern']}, Cameras={pa['current_cameras']:.1f}")
             
             print("")
             print("-" * 70)
@@ -518,6 +626,9 @@ class RappResourceOptimizer:
         print(f"  Agent-Al Overrides: {self.stats['agent_overrides']}")
         print(f"  Padrões detectados: {self.stats['pattern_detected']}")
         print(f"  SLA Violations: {self.stats['sla_violations']}")
+        print(f"  ACK Recebidos: {self.stats['ack_received']}")
+        print(f"  ACK Pendentes: {self.stats['ack_pending']}")
+        print(f"  ACK Timeout: {self.stats['ack_timeout']}")
         print("")
         
         # Database stats
@@ -552,11 +663,17 @@ class RappResourceOptimizer:
             # 3. Toma decisão estratégica
             decision = self.make_decision(slicer_intent, energy_intent)
             
+            # 3.1 Controla xApps baseado na decisão
+            xapp_status = self.decide_xapp_activation(decision)
+            
             # 4. Escreve decisão
             self.write_decision(decision)
             
             # 5. Envia políticas A1
             self.send_a1_policies(decision)
+            
+            # 5.1 Verifica ACKs pendentes
+            self.check_and_handle_acks()
             
             # 6. Registra decisão no Data Lake
             self.record_decision(decision)
@@ -565,19 +682,29 @@ class RappResourceOptimizer:
             self.update_stats(decision)
             
             # 8. Imprime status
-            self.print_status(decision)
+            self.print_status(decision, xapp_status)
             
             # 9. Espera próximo ciclo
             time.sleep(self.interval)
         
         # Shutdown
+        print("\n[rApp] Encerrando...")
+        
+        # Para Energy Saver (rApp controla)
+        self._stop_energy_saver()
+        
+        # Mantém Slicer rodando (fallback de segurança)
+        # Slicer é prioridade e deve continuar mesmo se rApp morrer
+        if self.xapp_manager.is_running("slicer"):
+            print("[rApp] Mantendo xApp SLICER ativo (fallback de segurança)")
+        
         self.print_final_stats()
         
         # Cleanup
         self.data_lake.close()
         self.agent.clear_intent()
         
-        print("[rApp] Encerrado")
+        print("[rApp] Encerrado (Slicer continua rodando)")
 
 
 def main():

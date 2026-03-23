@@ -347,6 +347,7 @@ class ExtendedMetricsCollector:
                 ue_data[imsi]['latencies'] = [] # Ativo mas sem dados novos
         
         camera_count = 0
+        camera_critical_count = 0
         critical_count = 0
         total_tx_bytes = 0
         total_rx_bytes = 0
@@ -390,6 +391,8 @@ class ExtendedMetricsCollector:
             
             if data['device_type'] == 'camera':
                 camera_count += 1
+                if max_latency >= SLA_THRESHOLD_US:
+                    camera_critical_count += 1
                 if max_latency > worst_camera_latency:
                     worst_camera_latency = max_latency
             
@@ -401,11 +404,14 @@ class ExtendedMetricsCollector:
         
         global_avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else 0
         global_avg_jitter = sum(all_jitters) / len(all_jitters) if all_jitters else 0
-        global_min_latency = min(all_latencies) if all_latencies else 0
+        
+        # Filtrar valores zero para métricas de min (valores 0 são artefatos)
+        all_latencies_nonzero = [l for l in all_latencies if l > 0]
+        global_min_latency = min(all_latencies_nonzero) if all_latencies_nonzero else 0
         global_max_latency = max(all_latencies) if all_latencies else 0
         
-        # Métricas robustas (percentis)
-        latency_p5 = self.percentile_5(all_latencies)
+        # Métricas robustas (percentis) - usar apenas valores não-zero
+        latency_p5 = self.percentile_5(all_latencies_nonzero) if all_latencies_nonzero else 0
         latency_p95 = self.percentile_95(all_latencies)
         latency_min_nonzero = self.min_nonzero(all_latencies)
         
@@ -432,18 +438,33 @@ class ExtendedMetricsCollector:
             'latency_p5_us': latency_p5,
             'latency_p95_us': latency_p95,
             'latency_min_nonzero_us': latency_min_nonzero,
-            'valid_samples': len(all_latencies)
+            'valid_samples': len(all_latencies),
+            'valid_samples_nonzero': len(all_latencies_nonzero),
+            'zero_samples': len(all_latencies) - len(all_latencies_nonzero)
         }
         
         result['active_cameras'] = camera_count
-        result['critical_cameras'] = critical_count
+        result['critical_cameras'] = camera_critical_count
+        result['critical_ues'] = critical_count
         
         if mac_metrics:
             mac_by_imsi = defaultdict(lambda: {'mcs': [], 'tb_sizes': []})
+            all_mcs = []
+            all_tb_sizes = []
+            
             for m in mac_metrics[-1000:]:
                 imsi = m['imsi']
                 mac_by_imsi[imsi]['mcs'].append(m['mcs_tb1'])
                 mac_by_imsi[imsi]['tb_sizes'].append(m['size_tb1'] + m['size_tb2'])
+                all_mcs.append(m['mcs_tb1'])
+                all_tb_sizes.append(m['size_tb1'] + m['size_tb2'])
+            
+            # Métricas globais de MAC
+            if all_mcs:
+                result['global_metrics']['global_mcs_avg'] = sum(all_mcs) / len(all_mcs) if all_mcs else 0
+                result['global_metrics']['global_mcs_min'] = min(all_mcs) if all_mcs else 0
+                result['global_metrics']['global_mcs_max'] = max(all_mcs) if all_mcs else 0
+                result['global_metrics']['global_tb_size_avg'] = sum(all_tb_sizes) / len(all_tb_sizes) if all_tb_sizes else 0
             
             for imsi, data in mac_by_imsi.items():
                 if imsi in result['ue_metrics']:
