@@ -82,7 +82,7 @@ echo -e "${BLUE}    - xApp SLICER: iniciado com rApp (prioridade) ===${NC}"
 echo -e "${BLUE}    - xApp ENERGY: ativado pelo rApp quando permitido ===${NC}"
 
 echo -e "${BLUE}=== [5/6] Iniciando rApp Orchestrator (TREINAMENTO ML) ===${NC}"
-nohup python3 ./rapp_orchestrator.py --synthetic 7 > /tmp/rapp.log 2>&1 &
+nohup python3 ./rapp_orchestrator.py --synthetic 0 --interval 5 > /tmp/rapp.log 2>&1 &
 sleep 3
 
 # Aguarda rApp iniciar e reportar status
