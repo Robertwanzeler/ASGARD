@@ -56,7 +56,7 @@ echo -e "${BLUE}=== [2/6] Iniciando ns-3 (Scenario GreenRAN) ===${NC}"
 cd $BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran
 # Forçamos o LD_LIBRARY_PATH aqui também para o ns-3
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH
-    nohup ./build/scratch/ns3.42-scenario-greenran-default --e2TermIp=127.0.0.1 > /tmp/ns3.log 2>&1 &
+    nohup ./build/scratch/ns3.42-scenario-greenran-optimized --e2TermIp=127.0.0.1 > /tmp/ns3.log 2>&1 &
 cd $BASE_DIR
 
 # Aguarda o ns-3 estabelecer conexão E2
