@@ -207,6 +207,18 @@ class XAppManager:
         if pid is None:
             return False
         
+        # Verificar se o processo é zumbi/defunct
+        try:
+            with open(f'/proc/{pid}/status', 'r') as f:
+                status = f.read()
+                # Processos zumbis têm "State: Z (zombie)"
+                if 'State: Z' in status:
+                    print(f"[XAppManager] {xapp_name} (PID: {pid}) é zumbi - limpando")
+                    self._cleanup(xapp_name)
+                    return False
+        except (FileNotFoundError, PermissionError):
+            pass
+        
         try:
             os.kill(pid, 0)
             return True
@@ -265,6 +277,30 @@ class XAppManager:
         
         if xapp_name in self.processes:
             del self.processes[xapp_name]
+    
+    def cleanup_zombies(self):
+        """Limpa TODOS os processos zumbis de xApps."""
+        import subprocess
+        print("[XAppManager] Limpando processos zumbis...")
+        
+        # Matar processos zumbis de xApps
+        for pattern in ['xapp_slicer', 'xapp_energy_sav', 'run_slicer', 'run_energy']:
+            try:
+                subprocess.run(['pkill', '-9', '-f', pattern], 
+                              capture_output=True, timeout=2)
+            except:
+                pass
+        
+        # Remover todos os PID files antigos
+        for xapp_name, pid_path in XAPP_PID_PATHS.items():
+            if os.path.exists(pid_path):
+                try:
+                    os.remove(pid_path)
+                    print(f"[XAppManager] PID file {pid_path} removido")
+                except:
+                    pass
+        
+        print("[XAppManager] Limpeza de zumbis concluída")
     
     def stop_all(self):
         """Para todos os xApps."""

@@ -113,6 +113,9 @@ class RappResourceOptimizer:
         # XApp Manager (controla ciclo de vida dos xApps)
         self.xapp_manager = XAppManager()
         
+        # Limpar processos zumbis antes de iniciar
+        self.xapp_manager.cleanup_zombies()
+        
         # Gera dados sintéticos se solicitado
         if synthetic_days > 0:
             self._generate_synthetic_data(synthetic_days)
