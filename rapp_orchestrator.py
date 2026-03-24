@@ -377,11 +377,18 @@ class RappResourceOptimizer:
         # ========================================
         # ETAPA 2: REGRA SLA > ENERGY (MANDATORY)
         # ========================================
-        if slicer_state in ['CRITICAL', 'WARNING']:
+        if slicer_state == 'CRITICAL':
             decision['energy_saver'] = 'BLOCKED'
             decision['action'] = 'PRIORIZE_SLA'
             decision['reason'] = 'SLA_VIOLATED'
             decision['confidence'] = 1.0
+            self.stats['sla_violations'] += 1
+        
+        elif slicer_state == 'WARNING':
+            decision['energy_saver'] = 'BLOCKED'
+            decision['action'] = 'MONITOR'
+            decision['reason'] = 'SLA_WARNING'
+            decision['confidence'] = 0.8
             self.stats['sla_violations'] += 1
         
         # ========================================
