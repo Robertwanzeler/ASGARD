@@ -252,6 +252,17 @@ class ExtendedMetricsCollector:
         nonzero = [x for x in data if x > 0]
         return min(nonzero) if nonzero else 0
     
+    def median(self, data):
+        """Retorna mediana dos dados"""
+        if not data:
+            return 0
+        sorted_data = sorted(data)
+        n = len(sorted_data)
+        if n % 2 == 0:
+            return (sorted_data[n//2 - 1] + sorted_data[n//2]) / 2
+        else:
+            return sorted_data[n//2]
+    
     def aggregate_metrics(self, pdcp_metrics, mac_metrics):
         """Aggregate all metrics into comprehensive JSON"""
         
@@ -414,6 +425,7 @@ class ExtendedMetricsCollector:
         latency_p5 = self.percentile_5(all_latencies_nonzero) if all_latencies_nonzero else 0
         latency_p95 = self.percentile_95(all_latencies)
         latency_min_nonzero = self.min_nonzero(all_latencies)
+        latency_median = self.median(all_latencies_nonzero) if all_latencies_nonzero else 0
         
         total_throughput = total_tx_bytes + total_rx_bytes
         total_throughput_kbps = (total_throughput * 8) / (recent_window * 1000) if recent_window > 0 else 0
@@ -438,6 +450,7 @@ class ExtendedMetricsCollector:
             'latency_p5_us': latency_p5,
             'latency_p95_us': latency_p95,
             'latency_min_nonzero_us': latency_min_nonzero,
+            'latency_median_us': latency_median,
             'valid_samples': len(all_latencies),
             'valid_samples_nonzero': len(all_latencies_nonzero),
             'zero_samples': len(all_latencies) - len(all_latencies_nonzero)
