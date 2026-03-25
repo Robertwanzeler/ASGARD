@@ -451,6 +451,21 @@ class RappResourceOptimizer:
                     decision['agent_override'] = True
                     self.stats['agent_overrides'] += 1
         
+        # ========================================
+        # ETAPA 4: rApp OVERRIDE (ARBITRO SUPERIOR)
+        # O rApp pode sobrescrever Agent-Al se mediana OK
+        # ========================================
+        if slicer_state == 'CRITICAL' and median_latency is not None and median_latency < MEDIAN_THRESHOLD_US:
+            # rApp sobrescreve tanto Slicer quanto Agent-Al
+            decision['energy_saver'] = 'ALLOWED'
+            decision['action'] = 'ACTIVATE_ENERGY_SAVING'
+            decision['reason'] = f'RAP_ARBITER: Median OK ({median_latency/1000:.1f}ms) - Overriding all'
+            decision['confidence'] = 0.7
+            decision['median_latency_us'] = median_latency
+            decision['rap_override'] = True
+            self.stats['rap_overrides'] = self.stats.get('rap_overrides', 0) + 1
+            print(f"\033[1;33m[rApp] ARBITER: Sobrescrevendo Slicer CRITICAL e Agent-Al - Mediana OK: {median_latency/1000:.1f}ms\033[0m")
+        
         return decision
     
     def write_decision(self, decision):

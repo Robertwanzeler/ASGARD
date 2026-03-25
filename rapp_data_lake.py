@@ -627,13 +627,18 @@ class DataLake:
         """
         cursor = self.conn.cursor()
         
+        # Usar timestamp para comparação (mais preciso)
+        import time
+        cutoff_time = int(time.time()) - (minutes * 60)
+        
+        # Usar extended_metrics (tem dados mais recentes)
         cursor.execute("""
-            SELECT timestamp, latency_us, cameras_active, critical_cameras,
-                   energy_state, slicer_state
-            FROM metrics_history
-            WHERE datetime >= datetime('now', '-' || ? || ' minutes')
+            SELECT timestamp, global_avg_latency_us, total_active_cameras, 
+                   total_critical_ues, energy_state, slicer_state
+            FROM extended_metrics
+            WHERE timestamp >= ?
             ORDER BY timestamp DESC
-        """, (minutes,))
+        """, (cutoff_time,))
         
         results = []
         for row in cursor.fetchall():
