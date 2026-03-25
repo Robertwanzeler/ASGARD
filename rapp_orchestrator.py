@@ -88,6 +88,7 @@ class RappResourceOptimizer:
             'allowed': 0,
             'conditional': 0,
             'agent_overrides': 0,
+            'rap_overrides': 0,  # rApp sobrescreve Slicer CRITICAL
             'pattern_detected': 0,
             'sla_violations': 0,
             'ack_received': 0,
@@ -307,6 +308,34 @@ class RappResourceOptimizer:
                 slicer_state=slicer_state
             )
     
+    def calculate_median_latency(self, minutes=5):
+        """
+        Calcula a mediana da latência dos últimos N minutos.
+        
+        Args:
+            minutes: Número de minutos para buscar
+            
+        Returns:
+            float: Mediana da latência em microssegundos, ou None se não houver dados
+        """
+        metrics = self.data_lake.get_recent_metrics(minutes)
+        
+        if not metrics:
+            return None
+        
+        latencies = [m['latency_us'] for m in metrics if m['latency_us'] > 0]
+        
+        if not latencies:
+            return None
+        
+        sorted_lat = sorted(latencies)
+        n = len(sorted_lat)
+        
+        if n % 2 == 0:
+            return (sorted_lat[n//2 - 1] + sorted_lat[n//2]) / 2
+        else:
+            return sorted_lat[n//2]
+    
     def make_decision(self, slicer_intent, energy_intent):
         """
         Toma decisão estratégica.
@@ -377,12 +406,30 @@ class RappResourceOptimizer:
         # ========================================
         # ETAPA 2: REGRA SLA > ENERGY (MANDATORY)
         # ========================================
+        
+        # rApp: Verificar mediana para sobrescrever se necessário
+        median_latency = self.calculate_median_latency(minutes=5)
+        MEDIAN_THRESHOLD_US = 80000  # 80ms
+        
         if slicer_state == 'CRITICAL':
-            decision['energy_saver'] = 'BLOCKED'
-            decision['action'] = 'PRIORIZE_SLA'
-            decision['reason'] = 'SLA_VIOLATED'
-            decision['confidence'] = 1.0
-            self.stats['sla_violations'] += 1
+            # Verificar se o CRITICAL é um falso positivo usando mediana
+            if median_latency is not None and median_latency < MEDIAN_THRESHOLD_US:
+                # Mediana OK → rApp sobrescreve o Slicer CRITICAL
+                decision['energy_saver'] = 'ALLOWED'
+                decision['action'] = 'ACTIVATE_ENERGY_SAVING'
+                decision['reason'] = f'RAP_OVERRIDE: Median OK ({median_latency/1000:.1f}ms) - Slicer CRITICAL ignored'
+                decision['confidence'] = 0.7
+                decision['median_latency_us'] = median_latency
+                self.stats['rap_overrides'] = self.stats.get('rap_overrides', 0) + 1
+                print(f"\033[1;33m[rApp] SOBRESCREVENDO Slicer CRITICAL - Mediana OK: {median_latency/1000:.1f}ms\033[0m")
+            else:
+                # Mediana também alta → respeitar CRITICAL
+                decision['energy_saver'] = 'BLOCKED'
+                decision['action'] = 'PRIORIZE_SLA'
+                decision['reason'] = 'SLA_VIOLATED'
+                decision['confidence'] = 1.0
+                decision['median_latency_us'] = median_latency
+                self.stats['sla_violations'] += 1
         
         elif slicer_state == 'WARNING':
             decision['energy_saver'] = 'BLOCKED'
@@ -634,6 +681,7 @@ class RappResourceOptimizer:
         print(f"  Decisões ALLOWED: {self.stats['allowed']} ({self.stats['allowed']/total*100:.1f}%)")
         print(f"  Decisões CONDITIONAL: {self.stats['conditional']} ({self.stats['conditional']/total*100:.1f}%)")
         print(f"  Agent-Al Overrides: {self.stats['agent_overrides']}")
+        print(f"  rApp Overrides (CRITICAL→OK): {self.stats.get('rap_overrides', 0)}")
         print(f"  Padrões detectados: {self.stats['pattern_detected']}")
         print(f"  SLA Violations: {self.stats['sla_violations']}")
         print(f"  ACK Recebidos: {self.stats['ack_received']}")
