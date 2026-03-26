@@ -726,7 +726,154 @@ class DataLake:
         
         row = cursor.fetchone()
         return row[0] if row and row[0] else 0
-    
+
+    def calculate_cvar(self, alpha=0.95, window_minutes=5):
+        """
+        Calcula CVaR (Conditional Value at Risk) - Média dos piores valores.
+        
+        USA latency_p95_us (P95 por janela) em vez de global_avg_latency_us
+        para capturar corretamente os UEs críticos.
+        
+        Args:
+            alpha: Nível de confiança (0.95 = 95% = calcula média dos 5% piores)
+            window_minutes: Janela de tempo em minutos (não usado - usa últimos registros)
+        
+        Returns:
+            Float com CVaR em microsegundos, ou None se não houver dados.
+        """
+        cursor = self.conn.cursor()
+        
+        # Usar últimos N registros ao invés de filtro de tempo
+        cursor.execute("""
+            SELECT latency_p95_us
+            FROM extended_metrics
+            WHERE latency_p95_us < 500000
+            AND latency_p95_us > 0
+            ORDER BY timestamp DESC
+            LIMIT 100
+        """)
+        
+        latencies = [row[0] for row in cursor.fetchall() if row[0] > 0]
+        
+        if not latencies:
+            return None
+        
+        # Ordenar latências
+        latencies_sorted = sorted(latencies)
+        
+        # Calcular índice do percentil
+        n = len(latencies_sorted)
+        k = int(n * alpha)
+        
+        # CVaR = média dos valores acima do percentil
+        if k >= n:
+            return latencies_sorted[-1]  # Se todos são ruins
+        
+        worst_values = latencies_sorted[k:]
+        
+        if not worst_values:
+            return latencies_sorted[-1]
+        
+        cvar = sum(worst_values) / len(worst_values)
+        return cvar
+
+    def calculate_variance(self, window_minutes=5):
+        """
+        Calcula a variância das latências na janela.
+        
+        USA latency_p95_us (P95 por janela) em vez de global_avg_latency_us.
+        
+        Variância alta = rede instável.
+        Variância baixa = rede estável.
+        
+        Args:
+            window_minutes: Janela de tempo em minutos (não usado - usa últimos registros)
+        
+        Returns:
+            Float com variância (µs²), ou None se não houver dados.
+        """
+        cursor = self.conn.cursor()
+        
+        # Usar últimos N registros ao invés de filtro de tempo
+        cursor.execute("""
+            SELECT latency_p95_us
+            FROM extended_metrics
+            WHERE latency_p95_us < 500000
+            AND latency_p95_us > 0
+            ORDER BY timestamp DESC
+            LIMIT 100
+        """)
+        
+        latencies = [row[0] for row in cursor.fetchall() if row[0] > 0]
+        
+        if len(latencies) < 2:
+            return None
+        
+        mean = sum(latencies) / len(latencies)
+        variance = sum((x - mean) ** 2 for x in latencies) / len(latencies)
+        return variance
+
+    def get_network_health(self, window_minutes=5):
+        """
+        Retorna métricas de saúde da rede para o rApp.
+        
+        USA latency_p95_us (P95 por janela) em vez de global_avg_latency_us
+        para capturar corretamente os UEs críticos.
+        
+        Returns:
+            Dict com: median, p95, cvar, variance, stability_score
+        """
+        cursor = self.conn.cursor()
+        
+        # Usar últimos N registros ao invés de filtro de tempo
+        # (evita problemas de timezone)
+        cursor.execute("""
+            SELECT latency_p95_us
+            FROM extended_metrics
+            WHERE latency_p95_us < 500000
+            AND latency_p95_us > 0
+            ORDER BY timestamp DESC
+            LIMIT 100
+        """)
+        
+        latencies = [row[0] for row in cursor.fetchall() if row[0] > 0]
+        
+        if not latencies:
+            return None
+        
+        # Calcular métricas
+        latencies_sorted = sorted(latencies)
+        n = len(latencies_sorted)
+        
+        median = latencies_sorted[n // 2] if n > 0 else 0
+        p95_idx = int(n * 0.95)
+        p95 = latencies_sorted[min(p95_idx, n - 1)] if n > 0 else 0
+        
+        # CVaR: média dos 5% piores
+        cvar_idx = int(n * 0.95)
+        worst_values = latencies_sorted[cvar_idx:] if cvar_idx < n else [latencies_sorted[-1]]
+        cvar = sum(worst_values) / len(worst_values) if worst_values else 0
+        
+        # Variância
+        mean = sum(latencies) / n
+        variance = sum((x - mean) ** 2 for x in latencies) / n if n > 1 else 0
+        
+        # Score de estabilidade (0-100, maior = mais estável)
+        # Baseado na variância relativa (coeficiente de variação)
+        cv = (variance ** 0.5) / mean if mean > 0 else 0
+        stability_score = max(0, min(100, 100 - (cv * 100)))
+        
+        return {
+            'median_us': median,
+            'p95_us': p95,
+            'cvar_us': cvar,
+            'variance_us2': variance,
+            'variance_us': variance ** 0.5,  # Desvio padrão
+            'stability_score': stability_score,
+            'sample_count': n,
+            'window_minutes': window_minutes
+        }
+
     def export_to_json(self, filepath="/tmp/rapp_data_export.json"):
         """
         Exporta todos os dados para JSON.
@@ -806,6 +953,107 @@ class DataLake:
             'first_record': row[0],
             'last_record': row[1],
             'db_size_bytes': os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+        }
+    
+    def calculate_slope(self, window_minutes=5):
+        """
+        Calcula slope da latência usando regressão linear simples.
+        
+        Retorna a "velocidade" de mudança da latência em µs/segundo.
+        Positivo = latência subindo, Negativo = latência descendo.
+        
+        Args:
+            window_minutes: Janela de tempo para análise
+        
+        Returns:
+            dict com slope, intercept, r_squared, trend, confidence
+        """
+        metrics = self.get_recent_metrics(window_minutes)
+        
+        if not metrics or len(metrics) < 3:
+            return {
+                'slope_us_per_sec': 0,
+                'slope_ms_per_sec': 0,
+                'trend': 'unknown',
+                'confidence': 0.0,
+                'valid': False,
+                'n_samples': len(metrics) if metrics else 0
+            }
+        
+        # Preparar dados
+        base_time = metrics[-1]['timestamp']
+        x_values = []
+        y_values = []
+        
+        for m in reversed(metrics):
+            if m['latency_us'] > 0:
+                x_values.append(m['timestamp'] - base_time)
+                y_values.append(m['latency_us'])
+        
+        if len(x_values) < 3:
+            return {
+                'slope_us_per_sec': 0,
+                'slope_ms_per_sec': 0,
+                'trend': 'unknown',
+                'confidence': 0.0,
+                'valid': False,
+                'n_samples': len(x_values)
+            }
+        
+        # Regressão linear
+        n = len(x_values)
+        x_mean = sum(x_values) / n
+        y_mean = sum(y_values) / n
+        
+        numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values))
+        denominator = sum((x - x_mean) ** 2 for x in x_values)
+        
+        if denominator == 0:
+            return {
+                'slope_us_per_sec': 0,
+                'slope_ms_per_sec': 0,
+                'trend': 'stable',
+                'confidence': 0.0,
+                'valid': False,
+                'n_samples': n
+            }
+        
+        slope = numerator / denominator
+        intercept = y_mean - slope * x_mean
+        
+        # R-squared
+        y_pred = [intercept + slope * x for x in x_values]
+        ss_res = sum((y - yp) ** 2 for y, yp in zip(y_values, y_pred))
+        ss_tot = sum((y - y_mean) ** 2 for y in y_values)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+        
+        # Classificar tendência
+        slope_ms = slope / 1000.0
+        if slope_ms > 5:
+            trend = 'rising_fast'
+        elif slope_ms > 2:
+            trend = 'rising_slow'
+        elif slope_ms > 0.5:
+            trend = 'stable'
+        elif slope_ms > -2:
+            trend = 'falling_slow'
+        else:
+            trend = 'falling_fast'
+        
+        # Confiança
+        r2_weight = min(1.0, r_squared * 2)
+        sample_weight = min(1.0, n / 20.0)
+        confidence = (r2_weight * 0.6) + (sample_weight * 0.4)
+        
+        return {
+            'slope_us_per_sec': slope,
+            'slope_ms_per_sec': slope_ms,
+            'intercept_us': intercept,
+            'trend': trend,
+            'confidence': round(confidence, 3),
+            'r_squared': round(max(0, r_squared), 3),
+            'valid': True,
+            'n_samples': n
         }
     
     def close(self):

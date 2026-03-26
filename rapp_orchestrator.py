@@ -47,8 +47,10 @@ from rapp_data_lake import DataLake
 from rapp_pattern_engine import PatternRecognition
 from rapp_agent_openran import AgentOpenRAN
 from rapp_a1_interface import A1PolicyInterface
-from rapp_synthetic_generator import SyntheticDataGenerator
+# from rapp_synthetic_generator import SyntheticDataGenerator  # Removed - not available
 from rapp_xapp_manager import XAppManager
+from rapp_trend_analysis import TrendAnalysis
+from energy_command_protocol import EnergyCommand
 
 SLICER_INTENT_PATH = "/tmp/xapp_intents/slicer.txt"
 ENERGY_INTENT_PATH = "/tmp/xapp_intents/energy_saver.txt"
@@ -89,6 +91,7 @@ class RappResourceOptimizer:
             'conditional': 0,
             'agent_overrides': 0,
             'rap_overrides': 0,  # rApp sobrescreve Slicer CRITICAL
+            'preventive_blocks': 0,  # Blocos preventivos por trend
             'pattern_detected': 0,
             'sla_violations': 0,
             'ack_received': 0,
@@ -104,6 +107,12 @@ class RappResourceOptimizer:
         
         # Pattern Engine (ML)
         self.pattern_engine = PatternRecognition(self.data_lake)
+        
+        # Trend Analysis (Slope/Predição)
+        self.trend_analysis = TrendAnalysis(self.data_lake)
+        
+        # Energy Command Protocol
+        self.energy_cmd = EnergyCommand()
         
         # Agent-Al-OpenRAN
         self.agent = AgentOpenRAN()
@@ -136,16 +145,6 @@ class RappResourceOptimizer:
         self._energy_active = False
         
         print(f"[rApp] Inicializado - Intervalo: {self.interval}s")
-    
-    def _generate_synthetic_data(self, days):
-        """Gera dados sintéticos para treinar patterns."""
-        print(f"[rApp] Gerando {days} dias de dados sintéticos...")
-        
-        generator = SyntheticDataGenerator(seed=42)
-        generator.generate_week_data(resolution_minutes=5, days=days)
-        generator.load_into_data_lake(self.data_lake)
-        
-        print(f"[rApp] Dados sintéticos carregados no Data Lake")
     
     def _signal_handler(self, signum, frame):
         """Handler para sinais de shutdown."""
@@ -340,10 +339,12 @@ class RappResourceOptimizer:
         """
         Toma decisão estratégica.
         
-        FLUXO UNIFICADO:
+        FLUXO UNIFICADO (Hierárquico):
+        0. TREND ANALYSIS (Slope) - Predição preventiva
         1. Pattern Engine retorna análise completa (ML)
-        2. REGRA SLA > ENERGY (mandatory override)
+        2. CVaR/Variância - Reação a problemas reais
         3. Agent-Al Override (se ativo)
+        4. rApp ARBITER - Override final baseado em trend+CVaR
         
         Returns:
             Dict com decisão completa.
@@ -360,7 +361,9 @@ class RappResourceOptimizer:
             'slicer_state': 'UNKNOWN',
             'energy_state': 'UNKNOWN',
             'pattern_analysis': None,
-            'ml_decision': None
+            'ml_decision': None,
+            'trend_analysis': None,
+            'preventive_block': False
         }
         
         slicer_state = 'UNKNOWN'
@@ -375,6 +378,30 @@ class RappResourceOptimizer:
             decision['energy_state'] = energy_state
         
         # ========================================
+        # ETAPA 0: TREND ANALYSIS (SLOPE) - PREDITIVA
+        # O rApp detecta se latência está SUBINDO antes de bater crítico
+        # ========================================
+        trend_info = self.trend_analysis.calculate_latency_slope(window_minutes=5)
+        trend_decision = self.trend_analysis.should_preempt_energy(trend_info)
+        decision['trend_analysis'] = {
+            'slope_ms_per_sec': trend_info.get('slope_ms_per_sec', 0),
+            'trend': trend_info.get('trend', 'unknown'),
+            'confidence': trend_info.get('confidence', 0),
+            'time_to_critical': trend_info.get('time_to_critical_ms'),
+            'current_latency_ms': trend_info.get('current_latency_ms', 0)
+        }
+        
+        # Decisão preventiva baseada em tendência
+        if trend_decision['preventive']:
+            decision['energy_saver'] = 'BLOCKED'
+            decision['action'] = 'PREVENTIVE_BLOCK'
+            decision['reason'] = f"TREND: {trend_decision['reason']}"
+            decision['confidence'] = trend_decision['confidence']
+            decision['preventive_block'] = True
+            self.stats['pattern_detected'] += 1
+            print(f"\033[1;35m[rApp] PREVENTIVE: {trend_decision['reason']}\033[0m")
+        
+        # ========================================
         # ETAPA 1: PATTERN ENGINE (ML) - fonte única
         # ========================================
         pattern_analysis = self.pattern_engine.analyze_current()
@@ -383,60 +410,124 @@ class RappResourceOptimizer:
         ml_decision = self.pattern_engine.should_allow_energy_saving()
         decision['ml_decision'] = ml_decision
         
-        if ml_decision['recommendation'] == 'ALLOW':
-            decision['energy_saver'] = 'ALLOWED'
-            decision['action'] = 'ACTIVATE_ENERGY_SAVING'
-            decision['reason'] = f"ML: {ml_decision['reasons'][0]}" if ml_decision['reasons'] else 'LOW_ACTIVITY'
-            decision['confidence'] = ml_decision['confidence']
-            decision['pattern'] = pattern_analysis.get('pattern')
-            self.stats['pattern_detected'] += 1
-        
-        elif ml_decision['recommendation'] == 'CONDITIONAL':
-            decision['energy_saver'] = 'CONDITIONAL'
-            decision['action'] = 'MONITOR'
-            decision['reason'] = f"ML: Score={ml_decision['score']:.2f}"
-            decision['confidence'] = ml_decision['confidence']
-        
-        else:  # DENY
-            decision['energy_saver'] = 'BLOCKED'
-            decision['action'] = 'AWAIT_CONDITIONS'
-            decision['reason'] = f"ML: {ml_decision['reasons'][0]}" if ml_decision['reasons'] else 'HIGH_ACTIVITY'
-            decision['confidence'] = ml_decision['confidence']
-        
-        # ========================================
-        # ETAPA 2: REGRA SLA > ENERGY (MANDATORY)
-        # ========================================
-        
-        # rApp: Verificar mediana para sobrescrever se necessário
-        median_latency = self.calculate_median_latency(minutes=5)
-        MEDIAN_THRESHOLD_US = 80000  # 80ms
-        
-        if slicer_state == 'CRITICAL':
-            # Verificar se o CRITICAL é um falso positivo usando mediana
-            if median_latency is not None and median_latency < MEDIAN_THRESHOLD_US:
-                # Mediana OK → rApp sobrescreve o Slicer CRITICAL
+        # Só aplica se não houve bloco preventivo por tendência
+        if not decision['preventive_block']:
+            if ml_decision['recommendation'] == 'ALLOW':
                 decision['energy_saver'] = 'ALLOWED'
                 decision['action'] = 'ACTIVATE_ENERGY_SAVING'
-                decision['reason'] = f'RAP_OVERRIDE: Median OK ({median_latency/1000:.1f}ms) - Slicer CRITICAL ignored'
-                decision['confidence'] = 0.7
-                decision['median_latency_us'] = median_latency
-                self.stats['rap_overrides'] = self.stats.get('rap_overrides', 0) + 1
-                print(f"\033[1;33m[rApp] SOBRESCREVENDO Slicer CRITICAL - Mediana OK: {median_latency/1000:.1f}ms\033[0m")
+                decision['reason'] = f"ML: {ml_decision['reasons'][0]}" if ml_decision['reasons'] else 'LOW_ACTIVITY'
+                decision['confidence'] = ml_decision['confidence']
+                decision['pattern'] = pattern_analysis.get('pattern')
+                self.stats['pattern_detected'] += 1
+            
+            elif ml_decision['recommendation'] == 'CONDITIONAL':
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = 'MONITOR'
+                decision['reason'] = f"ML: Score={ml_decision['score']:.2f}"
+                decision['confidence'] = ml_decision['confidence']
+            
+            else:  # DENY
+                decision['energy_saver'] = 'BLOCKED'
+                decision['action'] = 'AWAIT_CONDITIONS'
+                decision['reason'] = f"ML: {ml_decision['reasons'][0]}" if ml_decision['reasons'] else 'HIGH_ACTIVITY'
+                decision['confidence'] = ml_decision['confidence']
+        
+        # ========================================
+        # ETAPA 2: CVaR/VARIÂNCIA - Lógica de 3 Faixas
+        # NORMAL (<60ms), PREVENÇÃO (60-80ms), CRÍTICO (≥80ms)
+        # ========================================
+        
+        # rApp: Usar métricas avançadas (CVaR, Variância)
+        network_health = self.data_lake.get_network_health(window_minutes=5)
+        
+        # Thresholds com faixa de prevenção de 20ms
+        CVAR_NORMAL_US = 60000       # 60ms - Faixa normal
+        CVAR_CRITICAL_US = 80000     # 80ms - Faixa crítica (SLA)
+        VARIANCE_THRESHOLD_US2 = 100000000000  # Variância alta
+        STABILITY_THRESHOLD = 50     # Score mínimo de estabilidade
+        
+        if network_health:
+            cvar_us = network_health['cvar_us']
+            variance_us2 = network_health['variance_us2']
+            median_us = network_health['median_us']
+            p95_us = network_health['p95_us']
+            stability_score = network_health['stability_score']
+            
+            # Armazenar no decision para debugging
+            decision['network_health'] = {
+                'median_us': median_us,
+                'p95_us': p95_us,
+                'cvar_us': cvar_us,
+                'variance_us2': variance_us2,
+                'stability_score': stability_score
+            }
+        else:
+            # Fallback para mediana se network_health não disponível
+            cvar_us = self.calculate_median_latency(minutes=5)
+            variance_us2 = 0
+            stability_score = 100
+            decision['network_health'] = {'fallback': True, 'cvar_us': cvar_us}
+        
+        # Só aplica CVaR se não houve bloco preventivo
+        if not decision['preventive_block'] and cvar_us is not None:
+            
+            # ===== LÓGICA DE 3 FAIXAS =====
+            
+            # FAIXA 1: NORMAL (< 60ms) - Pode economizar
+            if cvar_us < CVAR_NORMAL_US:
+                if slicer_state == 'CRITICAL':
+                    # CVaR OK mas Slicer detectou problema → rApp sobrescreve
+                    if stability_score >= STABILITY_THRESHOLD:
+                        decision['energy_saver'] = 'ALLOWED'
+                        decision['action'] = 'ACTIVATE_ENERGY_SAVING'
+                        decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms < 60ms - Slicer CRITICAL sobrescrito'
+                        decision['confidence'] = 0.85
+                        self.stats['rap_overrides'] = self.stats.get('rap_overrides', 0) + 1
+                    else:
+                        decision['energy_saver'] = 'CONDITIONAL'
+                        decision['action'] = 'MONITOR'
+                        decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms OK, mas estabilidade={stability_score:.0f}%'
+                        decision['confidence'] = 0.7
+                else:
+                    decision['energy_saver'] = 'ALLOWED'
+                    decision['action'] = 'ACTIVATE_ENERGY_SAVING'
+                    decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms < 60ms - Energia pode economizar'
+                    decision['confidence'] = 0.9
+            
+            # FAIXA 2: PREVENÇÃO (60-80ms) - Analisar tendência
+            elif cvar_us < CVAR_CRITICAL_US:
+                slope = trend_info.get('slope_ms_per_sec', 0) if trend_info.get('valid') else 0
+                
+                # Se tendência subindo rápido → BLOCKED preventivo
+                if slope > 2:
+                    decision['energy_saver'] = 'BLOCKED'
+                    decision['action'] = 'PREVENTIVE_BLOCK'
+                    decision['reason'] = f'PREVENÇÃO: CVaR={cvar_us/1000:.1f}ms + slope=+{slope:.1f}ms/s → Bloqueio preventivo'
+                    decision['confidence'] = 0.8
+                    decision['preventive_block'] = True
+                    self.stats['preventive_blocks'] = self.stats.get('preventive_blocks', 0) + 1
+                
+                # Se tendência descendo → ALLOWED (melhorando)
+                elif slope < 0:
+                    decision['energy_saver'] = 'ALLOWED'
+                    decision['action'] = 'ACTIVATE_ENERGY_SAVING'
+                    decision['reason'] = f'PREVENÇÃO: CVaR={cvar_us/1000:.1f}ms + slope={slope:.1f}ms/s (melhorando)'
+                    decision['confidence'] = 0.75
+                
+                # Caso contrário → CONDITIONAL (monitorar)
+                else:
+                    decision['energy_saver'] = 'CONDITIONAL'
+                    decision['action'] = 'MONITOR'
+                    decision['reason'] = f'PREVENÇÃO: CVaR={cvar_us/1000:.1f}ms (60-80ms) - Monitorando'
+                    decision['confidence'] = 0.6
+            
+            # FAIXA 3: CRÍTICO (≥ 80ms) - Bloquear
             else:
-                # Mediana também alta → respeitar CRITICAL
                 decision['energy_saver'] = 'BLOCKED'
                 decision['action'] = 'PRIORIZE_SLA'
-                decision['reason'] = 'SLA_VIOLATED'
+                decision['reason'] = f'CRÍTICO: CVaR={cvar_us/1000:.1f}ms ≥ 80ms - SLA em risco!'
                 decision['confidence'] = 1.0
-                decision['median_latency_us'] = median_latency
                 self.stats['sla_violations'] += 1
-        
-        elif slicer_state == 'WARNING':
-            decision['energy_saver'] = 'BLOCKED'
-            decision['action'] = 'MONITOR'
-            decision['reason'] = 'SLA_WARNING'
-            decision['confidence'] = 0.8
-            self.stats['sla_violations'] += 1
         
         # ========================================
         # ETAPA 3: AGENT-AL OVERRIDE
@@ -452,19 +543,18 @@ class RappResourceOptimizer:
                     self.stats['agent_overrides'] += 1
         
         # ========================================
-        # ETAPA 4: rApp OVERRIDE (ARBITRO SUPERIOR)
-        # O rApp pode sobrescrever Agent-Al se mediana OK
+        # ETAPA 4: rApp ARBITER FINAL (TREND)
+        # Consolidação final - tendência rápida sempre bloqueia
         # ========================================
-        if slicer_state == 'CRITICAL' and median_latency is not None and median_latency < MEDIAN_THRESHOLD_US:
-            # rApp sobrescreve tanto Slicer quanto Agent-Al
-            decision['energy_saver'] = 'ALLOWED'
-            decision['action'] = 'ACTIVATE_ENERGY_SAVING'
-            decision['reason'] = f'RAP_ARBITER: Median OK ({median_latency/1000:.1f}ms) - Overriding all'
-            decision['confidence'] = 0.7
-            decision['median_latency_us'] = median_latency
-            decision['rap_override'] = True
-            self.stats['rap_overrides'] = self.stats.get('rap_overrides', 0) + 1
-            print(f"\033[1;33m[rApp] ARBITER: Sobrescrevendo Slicer CRITICAL e Agent-Al - Mediana OK: {median_latency/1000:.1f}ms\033[0m")
+        
+        # Se tendência diz SUBINDO muito rápido (>5ms/s) → SEMPRE bloquear
+        if trend_info.get('valid') and trend_info['slope_ms_per_sec'] > 5 and trend_info['current_latency_ms'] > 50:
+            decision['energy_saver'] = 'BLOCKED'
+            decision['action'] = 'PREVENTIVE_BLOCK'
+            decision['reason'] = f"ARBITER_TREND: Slope +{trend_info['slope_ms_per_sec']:.1f}ms/s > 5ms/s - Prevenção total"
+            decision['confidence'] = min(0.9, trend_info['confidence'] + 0.1)
+            decision['preventive_block'] = True
+            self.stats['sla_violations'] += 1
         
         return decision
     
@@ -484,8 +574,6 @@ class RappResourceOptimizer:
                 f.write(f"|  Estado: {decision['slicer_state']:<46}|\n")
                 if decision['slicer_state'] == 'CRITICAL':
                     f.write("|  \033[1;31mPROBLEMA: Latencia > 100ms (SLA VIOLADO!)\033[0m             |\n")
-                elif decision['slicer_state'] == 'WARNING':
-                    f.write("|  AVISO: Latencia entre 50-100ms                       |\n")
                 elif decision['slicer_state'] == 'NORMAL':
                     f.write("|  OK: Latencia < 100ms                                  |\n")
                 elif decision['slicer_state'] == 'IDLE':
@@ -506,6 +594,36 @@ class RappResourceOptimizer:
                     f.write("|  Aguardando dados...                                  |\n")
                 f.write("+----------------------------------------------------+\n")
                 f.write("\n")
+                
+                # Network Health (métricas avançadas)
+                if decision.get('network_health'):
+                    nh = decision['network_health']
+                    f.write("+---------------- NETWORK HEALTH ----------------------+\n")
+                    f.write(f"|  CVaR (95%): {nh.get('cvar_us', 0)/1000:.1f}ms{' '*42}|\n")
+                    f.write(f"|  P95: {nh.get('p95_us', 0)/1000:.1f}ms{' '*48}|\n")
+                    f.write(f"|  Mediana: {nh.get('median_us', 0)/1000:.1f}ms{' '*43}|\n")
+                    f.write(f"|  Estabilidade: {nh.get('stability_score', 0):.0f}%{' '*39}|\n")
+                    f.write("+----------------------------------------------------+\n")
+                    f.write("\n")
+                
+                # Trend Analysis (Slope)
+                if decision.get('trend_analysis'):
+                    ta = decision['trend_analysis']
+                    slope_ms = ta.get('slope_ms_per_sec', 0)
+                    trend = ta.get('trend', 'unknown')
+                    current_ms = ta.get('current_latency_ms', 0)
+                    time_crit = ta.get('time_to_critical')
+                    
+                    f.write("+---------------- TREND ANALYSIS ----------------------+\n")
+                    f.write(f"|  Slope: {slope_ms:+.2f} ms/s{' '*42}|\n")
+                    f.write(f"|  Tendencia: {trend:<40}|\n")
+                    f.write(f"|  Latencia atual: {current_ms:.1f}ms{' '*32}|\n")
+                    if time_crit and time_crit > 0:
+                        f.write(f"|  ⚠  Em {time_crit:.0f}s atinge 150ms!{' '*29}|\n")
+                    if decision.get('preventive_block'):
+                        f.write(f"|  [PREVENTIVE BLOCK ATIVO]{' '*29}|\n")
+                    f.write("+----------------------------------------------------+\n")
+                    f.write("\n")
                 
                 # Pattern Analysis
                 if decision['pattern_analysis']:
@@ -557,6 +675,15 @@ class RappResourceOptimizer:
                 f.write(f"ENERGY_STATE={decision['energy_state']}\n")
                 f.write(f"AGENT_OVERRIDE={str(decision['agent_override']).lower()}\n")
                 f.write(f"PATTERN={decision['pattern'] or 'none'}\n")
+                f.write(f"PREVENTIVE_BLOCK={str(decision.get('preventive_block', False)).lower()}\n")
+                if decision.get('trend_analysis'):
+                    ta = decision['trend_analysis']
+                    f.write(f"SLOPE_MS_PER_SEC={ta.get('slope_ms_per_sec', 0):.2f}\n")
+                    f.write(f"TREND={ta.get('trend', 'unknown')}\n")
+                    f.write(f"CURRENT_LATENCY_MS={ta.get('current_latency_ms', 0):.1f}\n")
+                    tc = ta.get('time_to_critical')
+                    if tc:
+                        f.write(f"TIME_TO_CRITICAL={tc:.1f}\n")
                 f.flush()
             
             return True
@@ -581,6 +708,40 @@ class RappResourceOptimizer:
             decision['slicer_state'],
             {'active': int(decision['pattern_analysis']['current_cameras'])} if decision.get('pattern_analysis') else None
         )
+    
+    def send_energy_command(self, decision):
+        """
+        Envia comando JSON para xApp Energy Saver.
+        
+        Converte a decisão do rApp em comando específico para o atuador.
+        
+        Args:
+            decision: Decisão do rApp
+        """
+        energy_state = decision['energy_saver']
+        reason = decision['reason']
+        
+        # Mapear decisão do rApp para comando do atuador
+        if energy_state == 'BLOCKED' or decision.get('preventive_block'):
+            # Bloqueio → FULL_POWER (não economizar)
+            self.energy_cmd.send_full_power(reason=f"BLOCKED: {reason}")
+            
+        elif energy_state == 'ALLOWED':
+            # Permitido → POWER_DOWN (economizar)
+            # Verificar nível de confiança para escolher nível
+            confidence = decision.get('confidence', 0)
+            if confidence >= 0.8:
+                self.energy_cmd.send_power_down(reason=f"ALLOWED: {reason}")
+            else:
+                self.energy_cmd.send_reduce_power(reason=f"ALLOWED (cautela): {reason}")
+                
+        elif energy_state == 'CONDITIONAL':
+            # Condicional → REDUCE_POWER (economizar parcialmente)
+            self.energy_cmd.send_reduce_power(reason=f"CONDITIONAL: {reason}")
+            
+        else:
+            # Estado desconhecido → MAINTAIN
+            self.energy_cmd.send_maintain(reason=f"UNKNOWN: {reason}")
     
     def check_and_handle_acks(self):
         """Verifica ACKs pendentes e atualiza estatísticas."""
@@ -608,6 +769,9 @@ class RappResourceOptimizer:
             self.stats['allowed'] += 1
         elif decision['energy_saver'] == 'CONDITIONAL':
             self.stats['conditional'] += 1
+        
+        if decision.get('preventive_block'):
+            self.stats['preventive_blocks'] += 1
     
     def print_status(self, decision, xapp_status=None):
         """Imprime status do ciclo."""
@@ -635,8 +799,6 @@ class RappResourceOptimizer:
             slicer = decision['slicer_state']
             if slicer == 'CRITICAL':
                 slicer_display = "\033[1;31m[CRITICAL]\033[0m <- PROBLEMA: Latencia > 100ms!"
-            elif slicer == 'WARNING':
-                slicer_display = "\033[1;33m[WARNING]\033[0m <- AVISO: Latencia 50-100ms"
             elif slicer == 'NORMAL':
                 slicer_display = "\033[1;32m[NORMAL]\033[0m <- OK"
             elif slicer == 'IDLE':
@@ -661,6 +823,33 @@ class RappResourceOptimizer:
             if decision.get('pattern_analysis'):
                 pa = decision['pattern_analysis']
                 print(f"  ML:               Pattern={pa['pattern']}, Cameras={pa['current_cameras']:.1f}")
+            
+            # Trend Analysis
+            if decision.get('trend_analysis'):
+                ta = decision['trend_analysis']
+                slope = ta.get('slope_ms_per_sec', 0)
+                trend_str = ta.get('trend', 'unknown')
+                current_ms = ta.get('current_latency_ms', 0)
+                time_crit = ta.get('time_to_critical')
+                
+                # Formatar tendência
+                if trend_str == 'rising_fast':
+                    trend_display = f"\033[1;31m↑ RAPIDO (+{slope:.1f}ms/s)\033[0m"
+                elif trend_str == 'rising_slow':
+                    trend_display = f"\033[1;33m↑ DEVAGAR (+{slope:.1f}ms/s)\033[0m"
+                elif trend_str == 'falling_fast':
+                    trend_display = f"\033[1;32m↓ RAPIDO ({slope:.1f}ms/s)\033[0m"
+                elif trend_str == 'falling_slow':
+                    trend_display = f"\033[1;32m↓ DEVAGAR ({slope:.1f}ms/s)\033[0m"
+                else:
+                    trend_display = f"\033[1;36m→ ESTAVEL ({slope:.2f}ms/s)\033[0m"
+                
+                print(f"  TREND:            {trend_display}, Lat={current_ms:.0f}ms")
+                
+                if time_crit and time_crit > 0:
+                    print(f"  ⚠  PREVISAO: Atinge 150ms em {time_crit:.0f}s!")
+                if decision.get('preventive_block'):
+                    print(f"  \033[1;35m>>> PREVENTIVE BLOCK: Prevenindo pico de latencia\033[0m")
             
             print("")
             print("-" * 70)
@@ -697,6 +886,7 @@ class RappResourceOptimizer:
         print(f"  Decisões CONDITIONAL: {self.stats['conditional']} ({self.stats['conditional']/total*100:.1f}%)")
         print(f"  Agent-Al Overrides: {self.stats['agent_overrides']}")
         print(f"  rApp Overrides (CRITICAL→OK): {self.stats.get('rap_overrides', 0)}")
+        print(f"  Blocos Preventivos (Trend): {self.stats.get('preventive_blocks', 0)}")
         print(f"  Padrões detectados: {self.stats['pattern_detected']}")
         print(f"  SLA Violations: {self.stats['sla_violations']}")
         print(f"  ACK Recebidos: {self.stats['ack_received']}")
@@ -745,7 +935,10 @@ class RappResourceOptimizer:
             # 5. Envia políticas A1
             self.send_a1_policies(decision)
             
-            # 5.1 Verifica ACKs pendentes
+            # 5.1 Envia comando JSON para Energy Saver (atuador puro)
+            self.send_energy_command(decision)
+            
+            # 5.2 Verifica ACKs pendentes
             self.check_and_handle_acks()
             
             # 6. Registra decisão no Data Lake

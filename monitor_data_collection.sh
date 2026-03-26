@@ -19,6 +19,11 @@ export LC_NUMERIC=C
 DB_PATH="/tmp/rapp_data_lake.db"
 METRICS_FILE="/tmp/xapp_metrics/extended_metrics.json"
 
+# Threshold para filtrar dados aberrantes (bug do tempo de simulação)
+# NOTA: 100ms é o SLA! Violações reais (>100ms) devem ser visíveis.
+# O bug do ns-3 gera valores absurdos (>5000ms), então usamos 500ms como teto.
+MAX_VALID_LATENCY_US=500000  # 500ms em microsegundos (filtra bug, mantém violações reais)
+
 # Função para query SQLite via Python
 query_sqlite() {
     python3 -c "import sqlite3; conn=sqlite3.connect('$DB_PATH'); c=conn.execute(\"\"\"$1\"\"\"); r=c.fetchone(); print(r[0] if r else 'N/A')" 2>/dev/null || echo "N/A"
@@ -91,25 +96,54 @@ else
 fi
 
 # ============================================
-# 3. Métricas Atuais
+# 3. QUALIDADE DOS DADOS
 # ============================================
 echo ""
-echo -e "${YELLOW}${BOLD}[3] MÉTRICAS DE LATÊNCIA (MÉDIA GERAL)${NC}"
+echo -e "${RED}${BOLD}[3] QUALIDADE DOS DADOS (FILTRAGEM)${NC}"
+echo -e "${RED}----------------------------------------${NC}"
+
+# Contar dados aberrantes (bug do tempo de simulação)
+TOTAL_RAW=$(query_sqlite "SELECT COUNT(*) FROM extended_metrics")
+VALID_COUNT=$(query_sqlite "SELECT COUNT(*) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+INVALID_COUNT=$(query_sqlite "SELECT COUNT(*) FROM extended_metrics WHERE global_avg_latency_us >= $MAX_VALID_LATENCY_US")
+
+if [ "$TOTAL_RAW" -gt 0 ] 2>/dev/null; then
+    VALID_PCT=$(python3 -c "print(f'{$VALID_COUNT/$TOTAL_RAW*100:.1f}')")
+    INVALID_PCT=$(python3 -c "print(f'{$INVALID_COUNT/$TOTAL_RAW*100:.1f}')")
+    
+    echo -e "  Registros Válidos (<500ms):    ${GREEN}${BOLD}$VALID_COUNT${NC} (${GREEN}${VALID_PCT}%${NC})"
+    echo -e "  Registros Aberrantes (>500ms): ${RED}${BOLD}$INVALID_COUNT${NC} (${RED}${INVALID_PCT}%${NC})"
+    echo -e "  Total Bruto:                   ${BOLD}$TOTAL_RAW${NC}"
+    
+    if [ "$INVALID_COUNT" -gt 0 ] 2>/dev/null; then
+        echo ""
+        echo -e "  ${YELLOW}⚠ NOTA: Dados aberrantes são bugs do tempo de simulação (ns-3)${NC}"
+        echo -e "  ${YELLOW}  (latências >500ms são bugs, não violações reais de SLA)${NC}"
+        echo -e "  ${YELLOW}  Filtrando automaticamente para métricas corretas.${NC}"
+        echo -e "  ${YELLOW}  Violações reais de SLA (>100ms) são mantidas!${NC}"
+    fi
+fi
+
+# ============================================
+# 4. Métricas de Latência (DADOS FILTRADOS)
+# ============================================
+echo ""
+echo -e "${YELLOW}${BOLD}[4] MÉTRICAS DE LATÊNCIA (DADOS VÁLIDOS)${NC}"
 echo -e "${YELLOW}----------------------------------------${NC}"
 
-# Métricas básicas
-LAT_AVG=$(query_sqlite "SELECT AVG(global_avg_latency_us)/1000 FROM extended_metrics")
-LAT_WORST=$(query_sqlite "SELECT MAX(global_worst_latency_us)/1000 FROM extended_metrics")
-LAT_MIN=$(query_sqlite "SELECT MIN(global_min_latency_us)/1000 FROM extended_metrics WHERE global_min_latency_us > 0")
-JITTER=$(query_sqlite "SELECT AVG(global_jitter_us)/1000 FROM extended_metrics")
-THROUGHPUT=$(query_sqlite "SELECT AVG(throughput_kbps) FROM extended_metrics")
+# Métricas básicas (FILTRADAS - excluindo dados aberrantes)
+LAT_AVG=$(query_sqlite "SELECT AVG(global_avg_latency_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+LAT_WORST=$(query_sqlite "SELECT MAX(global_worst_latency_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+LAT_MIN=$(query_sqlite "SELECT MIN(global_min_latency_us)/1000 FROM extended_metrics WHERE global_min_latency_us > 0 AND global_avg_latency_us < $MAX_VALID_LATENCY_US")
+JITTER=$(query_sqlite "SELECT AVG(global_jitter_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+THROUGHPUT=$(query_sqlite "SELECT AVG(throughput_kbps) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
 
-# Métricas robustas (percentis)
-LAT_MINNZ=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics")
-LAT_P95=$(query_sqlite "SELECT AVG(latency_p95_us)/1000 FROM extended_metrics")
+# Métricas robustas (percentis) - FILTRADAS
+LAT_MINNZ=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+LAT_P95=$(query_sqlite "SELECT AVG(latency_p95_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
 
 # Fallback: usar latency_min_nonzero_us se global_min_latency_us for 0 ou vazio
-LAT_MIN_FALLBACK=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics")
+LAT_MIN_FALLBACK=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
 if [ -z "$LAT_MIN" ] || [ "$LAT_MIN" = "None" ]; then
     LAT_MIN="$LAT_MIN_FALLBACK"
 fi
@@ -123,7 +157,7 @@ COLOR_LAT_WORST="${RED}"
 COLOR_LAT_MIN="${GREEN}"
 COLOR_THROUGHPUT="${CYAN}"
 
-echo -e "  ${CYAN}Métricas Básicas:${NC}"
+echo -e "  ${CYAN}Métricas Básicas (filtradas):${NC}"
 echo -e "    Latência Média:    ${BOLD}${COLOR_LAT_AVG}${LAT_AVG:-N/A}${NC} ms"
 echo -e "    Latência Pior:     ${BOLD}${COLOR_LAT_WORST}${LAT_WORST:-N/A}${NC} ms \033[1;30m(SLA: 100ms)\033[0m"
 echo -e "    Latência Melhor:   ${BOLD}${COLOR_LAT_MIN}${LAT_MIN:-N/A}${NC} ms"
@@ -137,15 +171,15 @@ echo -e "    Latência P95:      ${BOLD}${YELLOW}${LAT_P95:-N/A}${NC} ms \033[1;
 echo -e "    Latência Min>0:    ${BOLD}${GREEN}${LAT_MINNZ:-N/A}${NC} ms \033[1;30m(menor valor real)${NC}"
 
 # ============================================
-# 4. UEs e Câmeras
+# 5. UEs e Câmeras
 # ============================================
 echo ""
-echo -e "${MAGENTA}${BOLD}[4] UEs E CÂMERAS${NC}"
+echo -e "${MAGENTA}${BOLD}[5] UEs E CÂMERAS${NC}"
 echo -e "${MAGENTA}----------------------------------------${NC}"
 
-CAM_ATIVAS=$(query_sqlite "SELECT AVG(total_active_cameras) FROM extended_metrics")
-UE_ATIVAS=$(query_sqlite "SELECT AVG(total_active_ues) FROM extended_metrics")
-UE_CRITICAS=$(query_sqlite "SELECT AVG(total_critical_ues) FROM extended_metrics")
+CAM_ATIVAS=$(query_sqlite "SELECT AVG(total_active_cameras) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+UE_ATIVAS=$(query_sqlite "SELECT AVG(total_active_ues) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+UE_CRITICAS=$(query_sqlite "SELECT AVG(total_critical_ues) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
 
 echo -e "  Câmeras Ativas (média):  ${BOLD}${GREEN}${CAM_ATIVAS:-N/A}${NC}"
 echo -e "  UEs Ativas (média):     ${BOLD}${UE_ATIVAS:-N/A}${NC}"
@@ -159,10 +193,10 @@ if [ ! -z "$CAM_ATIVAS" ] && [ ! -z "$UE_ATIVAS" ] && [ "$CAM_ATIVAS" != "N/A" ]
 fi
 
 # ============================================
-# 5. Decisões do rApp
+# 6. Decisões do rApp
 # ============================================
 echo ""
-echo -e "${CYAN}${BOLD}[5] DECISÕES DO RAPP${NC}"
+echo -e "${CYAN}${BOLD}[6] DECISÕES DO RAPP${NC}"
 echo -e "${CYAN}----------------------------------------${NC}"
 
 BLOCKED=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision = 'BLOCKED'" | grep -E '^[0-9]+$' || echo "0")
@@ -192,10 +226,10 @@ if [ "$TOTAL_DEC" -gt 0 ]; then
 fi
 
 # ============================================
-# 6. Tamanho do Database
+# 7. Tamanho do Database
 # ============================================
 echo ""
-echo -e "${BOLD}[6] TAMANHO DO DATABASE${NC}"
+echo -e "${BOLD}[7] TAMANHO DO DATABASE${NC}"
 echo "----------------------------------------"
 
 TAMANHO=$(du -h "$DB_PATH" 2>/dev/null | cut -f1 || echo "N/A")
@@ -203,10 +237,10 @@ echo -e "  Arquivo: ${BOLD}$DB_PATH${NC}"
 echo -e "  Tamanho: ${BOLD}$TAMANHO${NC}"
 
 # ============================================
-# 7. Métricas em Tempo Real
+# 8. Métricas em Tempo Real
 # ============================================
 echo ""
-echo -e "${BOLD}${CYAN}[7] MÉTRICAS EM TEMPO REAL${NC}"
+echo -e "${BOLD}${CYAN}[8] MÉTRICAS EM TEMPO REAL${NC}"
 echo -e "${CYAN}----------------------------------------${NC}"
 
 if [ -f "$METRICS_FILE" ]; then
@@ -226,10 +260,10 @@ else
 fi
 
 # ============================================
-# 8. Status dos Processos
+# 9. Status dos Processos
 # ============================================
 echo ""
-echo -e "${BOLD}${BLUE}[8] STATUS DOS PROCESSOS${NC}"
+echo -e "${BOLD}${BLUE}[9] STATUS DOS PROCESSOS${NC}"
 echo -e "${BLUE}----------------------------------------${NC}"
 
 CSV_PID=$(pgrep -f "csv_to_metrics" | head -1)
@@ -266,15 +300,15 @@ echo -e "${BOLD}║${NC}                        ${BOLD}RESUMO DA COLETA${NC}    
 echo -e "${BOLD}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Verificar se há dados suficientes para ML
-if [ "$EXTENDED_COUNT" -lt 60 ]; then
-    echo -e "${YELLOW}${BOLD}[COLETANDO]${NC} Dados sendo acumulados... (${EXTENDED_COUNT} registros)"
+# Verificar se há dados suficientes para ML (usando dados válidos)
+if [ "$VALID_COUNT" -lt 60 ]; then
+    echo -e "${YELLOW}${BOLD}[COLETANDO]${NC} Dados sendo acumulados... (${VALID_COUNT} registros válidos)"
     echo "             Mínimo recomendado para ML: 60 registros"
-elif [ "$EXTENDED_COUNT" -lt 300 ]; then
-    echo -e "${YELLOW}${BOLD}[TREINAMENTO]${NC} Base suficiente para análise básica (${EXTENDED_COUNT} registros)"
+elif [ "$VALID_COUNT" -lt 300 ]; then
+    echo -e "${YELLOW}${BOLD}[TREINAMENTO]${NC} Base suficiente para análise básica (${VALID_COUNT} registros válidos)"
     echo "               Para melhor acurácia, continue a coleta."
 else
-    echo -e "${GREEN}${BOLD}[PRONTO]${NC} Dataset robusto para Machine Learning completo (${EXTENDED_COUNT} registros)"
+    echo -e "${GREEN}${BOLD}[PRONTO]${NC} Dataset robusto para Machine Learning completo (${VALID_COUNT} registros válidos)"
 fi
 
 echo ""

@@ -503,11 +503,13 @@ class ExtendedMetricsCollector:
                     'ues': {},
                     'cell_average_latency_us': extended_metrics.get('global_metrics', {}).get('global_avg_latency_us', 0),
                     'worst_latency_us': extended_metrics.get('global_metrics', {}).get('global_worst_latency_us', 0),
+                    'latency_p95_us': extended_metrics.get('global_metrics', {}).get('latency_p95_us', 0),
                     'active_ues': extended_metrics.get('global_metrics', {}).get('total_active_ues', 0),
                     'time_window_s': extended_metrics.get('sim_time_range', {}).get('window_s', 30)
                 }
             },
             'global_worst_latency_us': extended_metrics.get('global_metrics', {}).get('global_worst_latency_us', 0),
+            'latency_p95_us': extended_metrics.get('global_metrics', {}).get('latency_p95_us', 0),
             'active_cameras': extended_metrics.get('active_cameras', 0),
             'critical_cameras': extended_metrics.get('critical_cameras', 0)
         }
