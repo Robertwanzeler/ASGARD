@@ -15,8 +15,8 @@
 BASE_DIR="/home/robert/orange_nuclear"
 cd $BASE_DIR
 
-# 100.000 segundos (~27 horas de simulação)
-SIM_TIME=100000
+# 3600 segundos (1 hora de simulação - 2 períodos de 30min)
+SIM_TIME=3600
 
 # Cores para o terminal
 GREEN='\033[0;32m'
@@ -95,11 +95,11 @@ echo -e "${BLUE}=== [4/6] Iniciando nearRT-RIC ===${NC}"
 nohup $BASE_DIR/flexric/build_e2ap_v1/examples/ric/nearRT-RIC -c $BASE_DIR/flexric/flexric.conf -p $BASE_DIR/flexric_lib/ > /tmp/ric.log 2>&1 &
 sleep 3
 
-echo -e "${BLUE}=== [5/6] Iniciando ns-3 (Scenario GreenRAN) ===${NC}"
+echo -e "${BLUE}=== [5/6] Iniciando ns-3 (Scenario GreenRAN - 1 hora) ===${NC}"
 cd $BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran
 # Forçamos o LD_LIBRARY_PATH aqui também para o ns-3
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH
-    nohup ./build/scratch/ns3.42-scenario-greenran-optimized --e2TermIp=127.0.0.1 > /tmp/ns3.log 2>&1 &
+    nohup ./build/scratch/ns3.42-scenario-greenran-optimized --e2TermIp=127.0.0.1 --simTime=$SIM_TIME > /tmp/ns3.log 2>&1 &
 cd $BASE_DIR
 
 # Aguarda o ns-3 estabelecer conexão E2
