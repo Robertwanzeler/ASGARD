@@ -427,6 +427,33 @@ class ExtendedMetricsCollector:
         latency_min_nonzero = self.min_nonzero(all_latencies)
         latency_median = self.median(all_latencies_nonzero) if all_latencies_nonzero else 0
         
+        # NOVO: Calcular métricas POR UE para capturar UEs críticos
+        # Isso corrige o problema onde P95 agregado não reflete UEs com latência alta
+        ue_avg_latencies = []
+        for imsi, data in ue_data.items():
+            if data['latencies']:
+                # Usar a MÉDIA de cada UE (não máximo)
+                ue_avg = sum(data['latencies']) / len(data['latencies'])
+                ue_avg_latencies.append(ue_avg)
+        
+        # CVaR e Variância agora usam latência POR UE
+        if ue_avg_latencies:
+            # P95 por UE - captura quando 5% dos UEs têm latência alta
+            latency_p95_per_ue = self.percentile_95(ue_avg_latencies)
+            
+            # Variância por UE - mede dispersão entre UEs
+            ue_mean = sum(ue_avg_latencies) / len(ue_avg_latencies)
+            variance_per_ue = sum((x - ue_mean) ** 2 for x in ue_avg_latencies) / len(ue_avg_latencies)
+            
+            # CVaR por UE - média dos 5% piores UEs
+            sorted_ue_latencies = sorted(ue_avg_latencies)
+            cvar_idx = int(len(sorted_ue_latencies) * 0.95)
+            cvar_per_ue = sum(sorted_ue_latencies[cvar_idx:]) / len(sorted_ue_latencies[cvar_idx:]) if cvar_idx < len(sorted_ue_latencies) else sorted_ue_latencies[-1]
+        else:
+            latency_p95_per_ue = latency_p95
+            variance_per_ue = 0
+            cvar_per_ue = 0
+        
         total_throughput = total_tx_bytes + total_rx_bytes
         total_throughput_kbps = (total_throughput * 8) / (recent_window * 1000) if recent_window > 0 else 0
         
@@ -451,9 +478,11 @@ class ExtendedMetricsCollector:
             'latency_p95_us': latency_p95,
             'latency_min_nonzero_us': latency_min_nonzero,
             'latency_median_us': latency_median,
-            'valid_samples': len(all_latencies),
-            'valid_samples_nonzero': len(all_latencies_nonzero),
-            'zero_samples': len(all_latencies) - len(all_latencies_nonzero)
+            # NOVO: Métricas POR UE (capturam UEs críticos)
+            'latency_p95_per_ue_us': latency_p95_per_ue,
+            'variance_per_ue_us2': variance_per_ue,
+            'cvar_per_ue_us': cvar_per_ue,
+            'ue_count': len(ue_avg_latencies)
         }
         
         result['active_cameras'] = camera_count

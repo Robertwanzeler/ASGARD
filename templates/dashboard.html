@@ -8,17 +8,17 @@
     <div class="col-md-3">
         <div class="card">
             <div class="card-header">
-                <h5 class="mb-0">Latência Pior Caso</h5>
+                <h5 class="mb-0">Latência P95</h5>
             </div>
             <div class="card-body text-center">
                 {% if metrics and metrics.global_metrics %}
-                    <div class="metric-value {% if metrics.global_metrics.global_worst_latency_us > 100000 %}status-critical{% elif metrics.global_metrics.global_worst_latency_us > 50000 %}status-warning{% else %}status-ok{% endif %}">
-                        {{ "%.1f"|format(metrics.global_metrics.global_worst_latency_us / 1000) }} ms
+                    <div class="metric-value {% if metrics.global_metrics.latency_p95_us > 80000 %}status-critical{% elif metrics.global_metrics.latency_p95_us > 60000 %}status-warning{% else %}status-ok{% endif %}">
+                        {{ "%.1f"|format(metrics.global_metrics.latency_p95_us / 1000) }} ms
                     </div>
                 {% else %}
                     <div class="metric-value status-warning">N/A</div>
                 {% endif %}
-                <div class="metric-label">Pior latência no momento</div>
+                <div class="metric-label">95% dos pacotes abaixo deste valor</div>
             </div>
         </div>
     </div>

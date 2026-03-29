@@ -91,11 +91,11 @@ rm -f /tmp/xapp_metrics/*.json
 mkdir -p /tmp/xapp_intents /tmp/xapp_metrics
 sleep 2
 
-echo -e "${BLUE}=== [4/6] Iniciando nearRT-RIC ===${NC}"
+echo -e "${BLUE}=== [3/9] Iniciando nearRT-RIC ===${NC}"
 nohup $BASE_DIR/flexric/build_e2ap_v1/examples/ric/nearRT-RIC -c $BASE_DIR/flexric/flexric.conf -p $BASE_DIR/flexric_lib/ > /tmp/ric.log 2>&1 &
 sleep 3
 
-echo -e "${BLUE}=== [5/6] Iniciando ns-3 (Scenario GreenRAN - 1 hora) ===${NC}"
+echo -e "${BLUE}=== [4/9] Iniciando ns-3 (Scenario GreenRAN - 1 hora) ===${NC}"
 cd $BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran
 # Forçamos o LD_LIBRARY_PATH aqui também para o ns-3
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH
@@ -112,7 +112,7 @@ for i in {1..30}; do
     sleep 1
 done
 
-echo -e "${BLUE}=== [6/6] Iniciando Leitor de Métricas ===${NC}"
+echo -e "${BLUE}=== [5/9] Iniciando Leitor de Métricas ===${NC}"
 nohup python3 ./csv_to_metrics.py --input-dir ./ns-O-RAN-flexric/mmwave-LENA-oran --output /tmp/xapp_metrics/metrics.json > /tmp/csv_metrics.log 2>&1 &
 sleep 2
 
@@ -120,11 +120,11 @@ sleep 2
 # O rApp controla o ciclo de vida dos xApps:
 #   - SLICER: iniciado automaticamente pelo rApp (prioridade)
 #   - ENERGY: iniciado pelo rApp quando condições permitirem
-echo -e "${BLUE}=== [7/6] xApps serao iniciados pelo rApp ===${NC}"
+echo -e "${BLUE}=== [6/9] xApps serao iniciados pelo rApp ===${NC}"
 echo -e "${BLUE}    - xApp SLICER: iniciado com rApp (prioridade) ===${NC}"
 echo -e "${BLUE}    - xApp ENERGY: ativado pelo rApp quando permitido ===${NC}"
 
-echo -e "${BLUE}=== [8/6] Iniciando rApp Orchestrator (TREINAMENTO ML) ===${NC}"
+echo -e "${BLUE}=== [7/9] Iniciando rApp Orchestrator (TREINAMENTO ML) ===${NC}"
 nohup python3 ./rapp_orchestrator.py --synthetic 0 --interval 5 > /tmp/rapp.log 2>&1 &
 sleep 3
 
@@ -138,14 +138,71 @@ for i in {1..10}; do
     sleep 1
 done
 
+echo -e "${BLUE}=== [8/9] Iniciando Monitoramento (Grafana + InfluxDB) ===${NC}"
+# Verificar se Docker está disponível
+if command -v docker-compose &> /dev/null; then
+    # Verificar acesso ao Docker
+    if docker info &>/dev/null; then
+        DOCKER_CMD="docker-compose"
+        echo -e "${GREEN}    Acesso Docker OK${NC}"
+    else
+        DOCKER_CMD="sudo docker-compose"
+        echo -e "${YELLOW}    Sem acesso Docker, usando sudo${NC}"
+    fi
+    
+    cd $BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/GUI
+    
+    # Parar serviços existentes
+    $DOCKER_CMD down 2>/dev/null || true
+    
+    # Iniciar serviços
+    if $DOCKER_CMD up -d 2>/dev/null; then
+        echo -e "${GREEN}    Grafana iniciado em http://localhost:3000${NC}"
+        echo -e "${GREEN}    InfluxDB iniciado em http://localhost:8086${NC}"
+        echo -e "${GREEN}    GUI iniciado em http://localhost:8000${NC}"
+    else
+        echo -e "${RED}    ERRO ao iniciar Docker services${NC}"
+        echo -e "${RED}    Tentando com sudo...${NC}"
+        sudo docker-compose down 2>/dev/null || true
+        if sudo docker-compose up -d 2>/dev/null; then
+            echo -e "${GREEN}    Grafana iniciado em http://localhost:3000${NC}"
+            echo -e "${GREEN}    InfluxDB iniciado em http://localhost:8086${NC}"
+            echo -e "${GREEN}    GUI iniciado em http://localhost:8000${NC}"
+        else
+            echo -e "${RED}    ERRO: Não foi possível iniciar Docker services${NC}"
+        fi
+    fi
+    
+    cd $BASE_DIR
+    
+    # Iniciar push de stats para InfluxDB
+    sleep 5
+    echo -e "${BLUE}    Iniciando Push Stats para InfluxDB...${NC}"
+    nohup python3 ./push_stats_to_influx.py --interval 5 > /tmp/push_stats.log 2>&1 &
+    echo -e "${GREEN}    Push Stats iniciado (logs: /tmp/push_stats.log)${NC}"
+else
+    echo -e "${RED}    AVISO: Docker-compose não encontrado. Execute:${NC}"
+    echo -e "${RED}    sudo apt install docker-compose${NC}"
+fi
+
+echo -e "${BLUE}=== [9/9] Iniciando Dashboard Python ===${NC}"
+nohup python3 ./rapp_dashboard.py > /tmp/dashboard.log 2>&1 &
+sleep 2
+echo -e "${GREEN}    Dashboard disponível em http://localhost:5000${NC}"
+
 echo -e "${BLUE}=== Sistema GreenRAN ativo ===${NC}"
 
 echo -e "\n${GREEN}==========================================${NC}"
-echo -e "${GREEN}  MODO DE COLETA INFINITA ATIVADO!${NC}"
+echo -e "${GREEN}  SISTEMA GREENRAN INICIADO!${NC}"
 echo -e "${GREEN}==========================================${NC}"
+echo -e "Monitoramento:"
+echo -e "  - Grafana:   http://localhost:3000 (admin/admin)"
+echo -e "  - Dashboard: http://localhost:5000"
+echo -e "  - GUI:       http://localhost:8000"
+echo -e ""
 echo -e "O rApp controla automaticamente os xApps:"
 echo -e "  - SLICER: sempre ativo (prioridade)"
 echo -e "  - ENERGY: ativado quando permitido"
-echo -e "O sistema continuara rodando mesmo se voce fechar o terminal."
+echo -e ""
 echo -e "Use './stop_all.sh' para parar manualmente."
 echo -e "==========================================\n"

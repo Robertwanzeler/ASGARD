@@ -1,0 +1,28 @@
+
+# Build artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+nohup.out
+*.log
+
+# Binary libraries
+flexric_lib/
+
+# Simulation data files (stats)
+*.txt
+!requirements.txt
+!README*.txt
+
+# Temporary files
+/tmp/
+
+# Docker
+nohup.out
+
+# IDE
+.vscode/
+.idea/
+

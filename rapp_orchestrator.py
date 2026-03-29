@@ -453,6 +453,9 @@ class RappResourceOptimizer:
             p95_us = network_health['p95_us']
             stability_score = network_health['stability_score']
             
+            # DEBUG: Log do CVaR calculado
+            print(f"[rApp DEBUG] network_health.cvar_us = {cvar_us}us = {cvar_us/1000:.1f}ms")
+            
             # Armazenar no decision para debugging
             decision['network_health'] = {
                 'median_us': median_us,
@@ -467,6 +470,7 @@ class RappResourceOptimizer:
             variance_us2 = 0
             stability_score = 100
             decision['network_health'] = {'fallback': True, 'cvar_us': cvar_us}
+            print(f"[rApp DEBUG] Fallback CVaR = {cvar_us}us = {cvar_us/1000:.1f}ms")
         
         # Só aplica CVaR se não houve bloco preventivo
         if not decision['preventive_block'] and cvar_us is not None:

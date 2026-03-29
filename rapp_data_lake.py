@@ -172,6 +172,11 @@ class DataLake:
                 valid_samples INTEGER,
                 valid_samples_nonzero INTEGER,
                 zero_samples INTEGER,
+                -- Novas métricas POR UE (corrigem problema de P95 agregado)
+                latency_p95_per_ue_us REAL DEFAULT 0,
+                variance_per_ue_us2 REAL DEFAULT 0,
+                cvar_per_ue_us REAL DEFAULT 0,
+                ue_count INTEGER DEFAULT 0,
                 UNIQUE(timestamp)
             )
         """)
@@ -310,7 +315,8 @@ class DataLake:
                                total_tx_pdus=0, total_rx_pdus=0, throughput_kbps=0,
                                energy_state=None, slicer_state=None,
                                latency_p5_us=0, latency_p95_us=0,
-                               latency_min_nonzero_us=0, valid_samples=0):
+                               latency_min_nonzero_us=0, valid_samples=0,
+                               extended_metrics=None):
         """
         Registra métricas estendidas no Data Lake.
         
@@ -332,6 +338,7 @@ class DataLake:
             total_tx_pdus: Total de PDUs transmitidos
             total_rx_pdus: Total de PDUs recebidos
             throughput_kbps: Throughput em kbps
+            extended_metrics: Dict com métricas POR UE (opcional)
             energy_state: Estado do Energy Saver
             slicer_state: Estado do SLICER
             latency_p5_us: Percentil 5 de latência (métrica robusta)
@@ -345,6 +352,18 @@ class DataLake:
         dt = datetime.fromtimestamp(timestamp)
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
         
+        # Extrair métricas POR UE se disponíveis
+        latency_p95_per_ue = extended_metrics.get('latency_p95_per_ue_us', 0) if extended_metrics else 0
+        variance_per_ue = extended_metrics.get('variance_per_ue_us2', 0) if extended_metrics else 0
+        cvar_per_ue = extended_metrics.get('cvar_per_ue_us', 0) if extended_metrics else 0
+        ue_count = extended_metrics.get('ue_count', 0) if extended_metrics else 0
+        
+        # Extrair métricas POR UE se disponíveis
+        latency_p95_per_ue = extended_metrics.get('latency_p95_per_ue_us', 0) if extended_metrics else 0
+        variance_per_ue = extended_metrics.get('variance_per_ue_us2', 0) if extended_metrics else 0
+        cvar_per_ue = extended_metrics.get('cvar_per_ue_us', 0) if extended_metrics else 0
+        ue_count = extended_metrics.get('ue_count', 0) if extended_metrics else 0
+        
         try:
             cursor = self.conn.cursor()
             cursor.execute("""
@@ -357,8 +376,9 @@ class DataLake:
                  total_tx_bytes, total_rx_bytes,
                  total_tx_pdus, total_rx_pdus, throughput_kbps,
                  energy_state, slicer_state,
-                 latency_p5_us, latency_p95_us, latency_min_nonzero_us, valid_samples)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 latency_p5_us, latency_p95_us, latency_min_nonzero_us, valid_samples,
+                 latency_p95_per_ue_us, variance_per_ue_us2, cvar_per_ue_us, ue_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (timestamp, dt_str, sim_time_s, cell_id,
                   global_worst_latency, global_avg_latency,
                   global_min_latency, global_max_latency,
@@ -367,7 +387,8 @@ class DataLake:
                   total_tx_bytes, total_rx_bytes,
                   total_tx_pdus, total_rx_pdus, throughput_kbps,
                   energy_state, slicer_state,
-                  latency_p5_us, latency_p95_us, latency_min_nonzero_us, valid_samples))
+                  latency_p5_us, latency_p95_us, latency_min_nonzero_us, valid_samples,
+                  latency_p95_per_ue, variance_per_ue, cvar_per_ue, ue_count))
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar métrica estendida: {e}")
@@ -425,6 +446,12 @@ class DataLake:
         gm = extended_json.get('global_metrics', {})
         sim_range = extended_json.get('sim_time_range', {})
         
+        # Extrair métricas POR UE
+        latency_p95_per_ue = gm.get('latency_p95_per_ue_us', 0)
+        variance_per_ue = gm.get('variance_per_ue_us2', 0)
+        cvar_per_ue = gm.get('cvar_per_ue_us', 0)
+        ue_count = gm.get('ue_count', 0)
+        
         self.record_extended_metric(
             timestamp=timestamp,
             sim_time_s=sim_range.get('end', 0),
@@ -448,7 +475,13 @@ class DataLake:
             latency_p5_us=gm.get('latency_p5_us', 0),
             latency_p95_us=gm.get('latency_p95_us', 0),
             latency_min_nonzero_us=gm.get('latency_min_nonzero_us', 0),
-            valid_samples=gm.get('valid_samples', 0)
+            valid_samples=gm.get('valid_samples', 0),
+            extended_metrics={
+                'latency_p95_per_ue_us': latency_p95_per_ue,
+                'variance_per_ue_us2': variance_per_ue,
+                'cvar_per_ue_us': cvar_per_ue,
+                'ue_count': ue_count
+            }
         )
         
         ue_list = []
@@ -690,11 +723,11 @@ class DataLake:
             
             results['total'] += count
             if decision == 'BLOCKED':
-                results['blocked'] = count
+                results['blocked'] += count
             elif decision == 'ALLOWED':
-                results['allowed'] = count
+                results['allowed'] += count
             elif decision == 'CONDITIONAL':
-                results['conditional'] = count
+                results['conditional'] += count
             
             results['by_reason'][reason] = count
         
@@ -731,7 +764,7 @@ class DataLake:
         """
         Calcula CVaR (Conditional Value at Risk) - Média dos piores valores.
         
-        USA latency_p95_us (P95 por janela) em vez de global_avg_latency_us
+        USA latency_p95_per_ue_us (P95 POR UE) em vez de latency_p95_us (agregado)
         para capturar corretamente os UEs críticos.
         
         Args:
@@ -743,36 +776,48 @@ class DataLake:
         """
         cursor = self.conn.cursor()
         
-        # Usar últimos N registros ao invés de filtro de tempo
+        # Usar métricas POR UE (não agregado)
         cursor.execute("""
-            SELECT latency_p95_us
+            SELECT cvar_per_ue_us
             FROM extended_metrics
-            WHERE latency_p95_us < 500000
-            AND latency_p95_us > 0
+            WHERE cvar_per_ue_us < 500000
+            AND cvar_per_ue_us > 0
             ORDER BY timestamp DESC
             LIMIT 100
         """)
         
-        latencies = [row[0] for row in cursor.fetchall() if row[0] > 0]
+        cvar_values = [row[0] for row in cursor.fetchall() if row[0] > 0]
         
-        if not latencies:
+        if not cvar_values:
+            # Fallback para métricas agregadas se per-UE não disponível
+            cursor.execute("""
+                SELECT latency_p95_us
+                FROM extended_metrics
+                WHERE latency_p95_us < 500000
+                AND latency_p95_us > 0
+                ORDER BY timestamp DESC
+                LIMIT 100
+            """)
+            cvar_values = [row[0] for row in cursor.fetchall() if row[0] > 0]
+        
+        if not cvar_values:
             return None
         
-        # Ordenar latências
-        latencies_sorted = sorted(latencies)
+        # Ordenar valores
+        cvar_sorted = sorted(cvar_values)
         
         # Calcular índice do percentil
-        n = len(latencies_sorted)
+        n = len(cvar_sorted)
         k = int(n * alpha)
         
         # CVaR = média dos valores acima do percentil
         if k >= n:
-            return latencies_sorted[-1]  # Se todos são ruins
+            return cvar_sorted[-1]  # Se todos são ruins
         
-        worst_values = latencies_sorted[k:]
+        worst_values = cvar_sorted[k:]
         
         if not worst_values:
-            return latencies_sorted[-1]
+            return cvar_sorted[-1]
         
         cvar = sum(worst_values) / len(worst_values)
         return cvar
@@ -781,10 +826,11 @@ class DataLake:
         """
         Calcula a variância das latências na janela.
         
-        USA latency_p95_us (P95 por janela) em vez de global_avg_latency_us.
+        USA variance_per_ue_us2 (Variância POR UE) em vez de latency_p95_us (agregado)
+        para capturar corretamente a instabilidade da rede.
         
-        Variância alta = rede instável.
-        Variância baixa = rede estável.
+        Variância alta = rede instável (UEs com latências muito diferentes).
+        Variância baixa = rede estável (UEs com latências similares).
         
         Args:
             window_minutes: Janela de tempo em minutos (não usado - usa últimos registros)
@@ -794,30 +840,50 @@ class DataLake:
         """
         cursor = self.conn.cursor()
         
-        # Usar últimos N registros ao invés de filtro de tempo
+        # Usar variância POR UE (não agregado)
         cursor.execute("""
-            SELECT latency_p95_us
+            SELECT variance_per_ue_us2
             FROM extended_metrics
-            WHERE latency_p95_us < 500000
-            AND latency_p95_us > 0
+            WHERE variance_per_ue_us2 < 50000000000000
+            AND variance_per_ue_us2 > 0
             ORDER BY timestamp DESC
             LIMIT 100
         """)
         
-        latencies = [row[0] for row in cursor.fetchall() if row[0] > 0]
+        variances = [row[0] for row in cursor.fetchall() if row[0] > 0]
         
-        if len(latencies) < 2:
+        if not variances:
+            # Fallback para métricas agregadas se per-UE não disponível
+            cursor.execute("""
+                SELECT latency_p95_us
+                FROM extended_metrics
+                WHERE latency_p95_us < 500000
+                AND latency_p95_us > 0
+                ORDER BY timestamp DESC
+                LIMIT 100
+            """)
+            
+            latencies = [row[0] for row in cursor.fetchall() if row[0] > 0]
+            
+            if len(latencies) < 2:
+                return None
+            
+            mean = sum(latencies) / len(latencies)
+            variance = sum((x - mean) ** 2 for x in latencies) / len(latencies)
+            return variance
+        
+        # Retornar média das variâncias por UE
+        if len(variances) < 1:
             return None
         
-        mean = sum(latencies) / len(latencies)
-        variance = sum((x - mean) ** 2 for x in latencies) / len(latencies)
-        return variance
+        mean_variance = sum(variances) / len(variances)
+        return mean_variance
 
     def get_network_health(self, window_minutes=5):
         """
         Retorna métricas de saúde da rede para o rApp.
         
-        USA latency_p95_us (P95 por janela) em vez de global_avg_latency_us
+        USA métricas POR UE (cvar_per_ue_us) em vez de métricas agregadas
         para capturar corretamente os UEs críticos.
         
         Returns:
@@ -825,41 +891,62 @@ class DataLake:
         """
         cursor = self.conn.cursor()
         
-        # Usar últimos N registros ao invés de filtro de tempo
-        # (evita problemas de timezone)
+        # Usar métricas POR UE (não agregado)
         cursor.execute("""
-            SELECT latency_p95_us
+            SELECT cvar_per_ue_us, variance_per_ue_us2, latency_p95_per_ue_us
             FROM extended_metrics
-            WHERE latency_p95_us < 500000
-            AND latency_p95_us > 0
+            WHERE cvar_per_ue_us > 0
             ORDER BY timestamp DESC
             LIMIT 100
         """)
         
-        latencies = [row[0] for row in cursor.fetchall() if row[0] > 0]
+        cvar_values = []
+        variance_values = []
+        p95_values = []
         
-        if not latencies:
-            return None
+        for row in cursor.fetchall():
+            if row[0] and row[0] > 0:
+                cvar_values.append(row[0])
+            if row[1] and row[1] > 0:
+                variance_values.append(row[1])
+            if row[2] and row[2] > 0:
+                p95_values.append(row[2])
         
-        # Calcular métricas
-        latencies_sorted = sorted(latencies)
-        n = len(latencies_sorted)
+        if not cvar_values:
+            # Fallback para métricas agregadas se per-UE não disponível
+            cursor.execute("""
+                SELECT latency_p95_us
+                FROM extended_metrics
+                WHERE latency_p95_us < 500000
+                AND latency_p95_us > 0
+                ORDER BY timestamp DESC
+                LIMIT 100
+            """)
+            cvar_values = [row[0] for row in cursor.fetchall() if row[0] > 0]
+            
+            if not cvar_values:
+                return None
         
-        median = latencies_sorted[n // 2] if n > 0 else 0
+        # Calcular métricas usando POR UE
+        n = len(cvar_values)
+        
+        cvar_sorted = sorted(cvar_values)
+        median = cvar_sorted[n // 2] if n > 0 else 0
+        
+        # P95 por UE
         p95_idx = int(n * 0.95)
-        p95 = latencies_sorted[min(p95_idx, n - 1)] if n > 0 else 0
+        p95 = cvar_sorted[min(p95_idx, n - 1)] if n > 0 else 0
         
         # CVaR: média dos 5% piores
         cvar_idx = int(n * 0.95)
-        worst_values = latencies_sorted[cvar_idx:] if cvar_idx < n else [latencies_sorted[-1]]
+        worst_values = cvar_sorted[cvar_idx:] if cvar_idx < n else [cvar_sorted[-1]]
         cvar = sum(worst_values) / len(worst_values) if worst_values else 0
         
         # Variância
-        mean = sum(latencies) / n
-        variance = sum((x - mean) ** 2 for x in latencies) / n if n > 1 else 0
+        mean = sum(cvar_values) / n
+        variance = sum((x - mean) ** 2 for x in cvar_values) / n if n > 1 else 0
         
         # Score de estabilidade (0-100, maior = mais estável)
-        # Baseado na variância relativa (coeficiente de variação)
         cv = (variance ** 0.5) / mean if mean > 0 else 0
         stability_score = max(0, min(100, 100 - (cv * 100)))
         
@@ -868,7 +955,7 @@ class DataLake:
             'p95_us': p95,
             'cvar_us': cvar,
             'variance_us2': variance,
-            'variance_us': variance ** 0.5,  # Desvio padrão
+            'variance_us': variance ** 0.5,
             'stability_score': stability_score,
             'sample_count': n,
             'window_minutes': window_minutes
