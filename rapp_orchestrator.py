@@ -443,7 +443,7 @@ class RappResourceOptimizer:
         # Thresholds com faixa de prevenção de 20ms
         CVAR_NORMAL_US = 60000       # 60ms - Faixa normal
         CVAR_CRITICAL_US = 80000     # 80ms - Faixa crítica (SLA)
-        VARIANCE_THRESHOLD_US2 = 100000000000  # Variância alta
+        SLOPE_PREVENTION = 2.0       # 2ms/s - Prevenção
         STABILITY_THRESHOLD = 50     # Score mínimo de estabilidade
         
         if network_health:
@@ -475,63 +475,66 @@ class RappResourceOptimizer:
         # Só aplica CVaR se não houve bloco preventivo
         if not decision['preventive_block'] and cvar_us is not None:
             
-            # ===== LÓGICA DE 3 FAIXAS =====
+            # Obter slope para decisões de prevenção
+            slope = trend_info.get('slope_ms_per_sec', 0) if trend_info.get('valid') else 0
             
-            # FAIXA 1: NORMAL (< 60ms) - Pode economizar
-            if cvar_us < CVAR_NORMAL_US:
-                if slicer_state == 'CRITICAL':
-                    # CVaR OK mas Slicer detectou problema → rApp sobrescreve
-                    if stability_score >= STABILITY_THRESHOLD:
-                        decision['energy_saver'] = 'ALLOWED'
-                        decision['action'] = 'ACTIVATE_ENERGY_SAVING'
-                        decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms < 60ms - Slicer CRITICAL sobrescrito'
-                        decision['confidence'] = 0.85
-                        self.stats['rap_overrides'] = self.stats.get('rap_overrides', 0) + 1
-                    else:
-                        decision['energy_saver'] = 'CONDITIONAL'
-                        decision['action'] = 'MONITOR'
-                        decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms OK, mas estabilidade={stability_score:.0f}%'
-                        decision['confidence'] = 0.7
-                else:
-                    decision['energy_saver'] = 'ALLOWED'
-                    decision['action'] = 'ACTIVATE_ENERGY_SAVING'
-                    decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms < 60ms - Energia pode economizar'
-                    decision['confidence'] = 0.9
+            # ===== LÓGICA DE COORDENAÇÃO rApp-xApps =====
+            # REGRAS:
+            # 1. CÂMERAS SÃO PRIORIDADE MÁXIMA (se Slicer CRITICAL → BLOCKED)
+            # 2. CVaR/UE > 80ms → BLOCKED
+            # 3. Slope > 2ms/s → BLOCKED (prevenção)
+            # 4. CVaR/UE < 60ms E Slope < 0 → ALLOWED
             
-            # FAIXA 2: PREVENÇÃO (60-80ms) - Analisar tendência
-            elif cvar_us < CVAR_CRITICAL_US:
-                slope = trend_info.get('slope_ms_per_sec', 0) if trend_info.get('valid') else 0
-                
-                # Se tendência subindo rápido → BLOCKED preventivo
-                if slope > 2:
-                    decision['energy_saver'] = 'BLOCKED'
-                    decision['action'] = 'PREVENTIVE_BLOCK'
-                    decision['reason'] = f'PREVENÇÃO: CVaR={cvar_us/1000:.1f}ms + slope=+{slope:.1f}ms/s → Bloqueio preventivo'
-                    decision['confidence'] = 0.8
-                    decision['preventive_block'] = True
-                    self.stats['preventive_blocks'] = self.stats.get('preventive_blocks', 0) + 1
-                
-                # Se tendência descendo → ALLOWED (melhorando)
-                elif slope < 0:
-                    decision['energy_saver'] = 'ALLOWED'
-                    decision['action'] = 'ACTIVATE_ENERGY_SAVING'
-                    decision['reason'] = f'PREVENÇÃO: CVaR={cvar_us/1000:.1f}ms + slope={slope:.1f}ms/s (melhorando)'
-                    decision['confidence'] = 0.75
-                
-                # Caso contrário → CONDITIONAL (monitorar)
-                else:
-                    decision['energy_saver'] = 'CONDITIONAL'
-                    decision['action'] = 'MONITOR'
-                    decision['reason'] = f'PREVENÇÃO: CVaR={cvar_us/1000:.1f}ms (60-80ms) - Monitorando'
-                    decision['confidence'] = 0.6
-            
-            # FAIXA 3: CRÍTICO (≥ 80ms) - Bloquear
-            else:
+            # REGRA 1: PRIORIDADE MÁXIMA - Câmeras em risco
+            if slicer_state == 'CRITICAL':
                 decision['energy_saver'] = 'BLOCKED'
-                decision['action'] = 'PRIORIZE_SLA'
+                decision['action'] = 'FULL_POWER'
+                decision['reason'] = f'CRÍTICO: Slicer CRITICAL - câmeras em risco - prioridade máxima'
+                decision['confidence'] = 1.0
+                self.stats['sla_violations'] += 1
+                print(f"\033[1;31m[rApp] REGRA 1: Slicer CRITICAL - BLOCKED\033[0m")
+            
+            # REGRA 2: CVaR/UE > 80ms → SLA em risco
+            elif cvar_us >= CVAR_CRITICAL_US:
+                decision['energy_saver'] = 'BLOCKED'
+                decision['action'] = 'FULL_POWER'
                 decision['reason'] = f'CRÍTICO: CVaR={cvar_us/1000:.1f}ms ≥ 80ms - SLA em risco!'
                 decision['confidence'] = 1.0
                 self.stats['sla_violations'] += 1
+                print(f"\033[1;31m[rApp] REGRA 2: CVaR ≥ 80ms - BLOCKED\033[0m")
+            
+            # REGRA 3: Slope > 2ms/s → PREVENÇÃO
+            elif slope > SLOPE_PREVENTION:
+                decision['energy_saver'] = 'BLOCKED'
+                decision['action'] = 'FULL_POWER'
+                decision['reason'] = f'PREVENÇÃO: CVaR={cvar_us/1000:.1f}ms + slope=+{slope:.1f}ms/s → Bloqueio preventivo'
+                decision['confidence'] = 0.8
+                decision['preventive_block'] = True
+                self.stats['preventive_blocks'] = self.stats.get('preventive_blocks', 0) + 1
+                print(f"\033[1;33m[rApp] REGRA 3: Slope > 2ms/s - BLOCKED\033[0m")
+            
+            # REGRA 4: CVaR < 60ms E Slope < 0 → PODE ECONOMIZAR
+            elif cvar_us < CVAR_NORMAL_US and slope < 0:
+                decision['energy_saver'] = 'ALLOWED'
+                decision['action'] = 'POWER_DOWN'
+                decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms < 60ms + slope={slope:.1f}ms/s (melhorando) → Pode economizar'
+                decision['confidence'] = 0.9
+                print(f"\033[1;32m[rApp] REGRA 4: CVaR < 60ms + Slope < 0 - ALLOWED\033[0m")
+            
+            # REGRA 5: CVaR < 60ms mas Slope > 0 → CONDITIONAL
+            elif cvar_us < CVAR_NORMAL_US:
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = 'MONITOR'
+                decision['reason'] = f'MONITORANDO: CVaR={cvar_us/1000:.1f}ms < 60ms mas slope=+{slope:.1f}ms/s'
+                decision['confidence'] = 0.6
+                print(f"\033[1;36m[rApp] REGRA 5: CVaR < 60ms mas Slope > 0 - CONDITIONAL\033[0m")
+            
+            # REGRA 6: Outros casos → CONDITIONAL
+            else:
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = 'MONITOR'
+                decision['reason'] = f'MONITORANDO: CVaR={cvar_us/1000:.1f}ms, slope={slope:.1f}ms/s'
+                decision['confidence'] = 0.5
         
         # ========================================
         # ETAPA 3: AGENT-AL OVERRIDE

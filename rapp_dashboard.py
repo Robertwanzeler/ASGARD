@@ -99,6 +99,29 @@ def index():
     latency_history = [m['latency_us'] / 1000 for m in recent]  # ms
     cameras_history = [m['cameras_active'] for m in recent]
     
+    # Obter métricas de coordenação rApp-xApps
+    network_health = DATA_LAKE.get_network_health(window_minutes=5)
+    
+    # Obter trend analysis (CORRETO!)
+    from rapp_trend_analysis import TrendAnalysis
+    trend_analyzer = TrendAnalysis(DATA_LAKE)
+    trend_analysis = trend_analyzer.calculate_latency_slope(window_minutes=5)
+    
+    # Obter estado dos xApps
+    slicer_state = xapp_status.get('SLICER', {}).get('status', 'UNKNOWN')
+    energy_saver = 'UNKNOWN'  # Será atualizado com decisões reais
+    
+    # Obter última decisão
+    try:
+        conn = DATA_LAKE.conn
+        cursor = conn.cursor()
+        cursor.execute("SELECT decision, reason FROM decisions_history ORDER BY timestamp DESC LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            energy_saver = row[0] if row[0] else 'UNKNOWN'
+    except:
+        pass
+    
     return render_template(
         'dashboard.html',
         metrics=metrics,
@@ -109,7 +132,12 @@ def index():
         recent_alerts=recent_alerts,
         latency_history=latency_history[-20:],
         cameras_history=cameras_history[-20:],
-        timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        # Novos dados para coordenação rApp-xApps
+        network_health=network_health,
+        trend_analysis=trend_analysis,
+        slicer_state=slicer_state,
+        energy_saver=energy_saver
     )
 
 
