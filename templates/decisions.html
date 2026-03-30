@@ -5,14 +5,34 @@
     <div class="card-header"><h5>Histórico de Decisões (60 min)</h5></div>
     <div class="card-body">
         <table class="table">
-            <thead><tr><th>Timestamp</th><th>Latência</th><th>Câmeras</th><th>Estado</th></tr></thead>
+            <thead><tr><th>Timestamp</th><th>Decisão</th><th>Estado</th><th>Razão</th></tr></thead>
             <tbody>
-            {% for m in recent %}
+            {% for d in recent_decisions %}
             <tr>
-                <td>{{ m.timestamp }}</td>
-                <td class="{% if m.latency_us > 100000 %}text-danger{% elif m.latency_us > 50000 %}text-warning{% endif %}">{{ "%.1f"|format(m.latency_us/1000) }} ms</td>
-                <td>{{ m.cameras_active }}</td>
-                <td>{{ m.slicer_state or 'N/A' }}</td>
+                <td>{{ d.datetime }}</td>
+                <td>
+                    {% if d.decision == 'ALLOWED' %}
+                        <span class="badge badge-ok">{{ d.decision }}</span>
+                    {% elif d.decision == 'BLOCKED' %}
+                        <span class="badge badge-critical">{{ d.decision }}</span>
+                    {% elif d.decision == 'CONDITIONAL' %}
+                        <span class="badge badge-warning">{{ d.decision }}</span>
+                    {% else %}
+                        {{ d.decision }}
+                    {% endif %}
+                </td>
+                <td>
+                    {% if d.estado == 'NORMAL' %}
+                        <span class="badge badge-ok">{{ d.estado }}</span>
+                    {% elif d.estado == 'CONDITIONAL' %}
+                        <span class="badge badge-warning">{{ d.estado }}</span>
+                    {% elif d.estado == 'CRITICAL' %}
+                        <span class="badge badge-critical">{{ d.estado }}</span>
+                    {% else %}
+                        {{ d.estado }}
+                    {% endif %}
+                </td>
+                <td>{{ d.reason[:60] }}{% if d.reason|length > 60 %}...{% endif %}</td>
             </tr>
             {% endfor %}
             </tbody>

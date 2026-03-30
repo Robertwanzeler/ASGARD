@@ -84,6 +84,45 @@ def get_recent_metrics(minutes=30):
     return DATA_LAKE.get_recent_metrics(minutes)
 
 
+def get_recent_decisions(minutes=60):
+    """
+    Obtém decisões recentes com estado.
+    
+    Returns:
+        List de decisões com: timestamp, decision, reason, estado
+    """
+    try:
+        cursor = DATA_LAKE.conn.cursor()
+        cursor.execute('''
+            SELECT timestamp, datetime, decision, reason,
+                   CASE 
+                       WHEN decision = 'BLOCKED' THEN 'CRITICAL'
+                       WHEN decision = 'ALLOWED' THEN 'NORMAL'
+                       WHEN decision = 'CONDITIONAL' THEN 'CONDITIONAL'
+                       ELSE 'UNKNOWN'
+                   END as estado
+            FROM decisions_history
+            WHERE timestamp > (SELECT MAX(timestamp) - ? * 60 FROM decisions_history)
+            ORDER BY timestamp DESC
+            LIMIT 20
+        ''', (minutes,))
+        
+        decisions = []
+        for row in cursor.fetchall():
+            decisions.append({
+                'timestamp': row[0],
+                'datetime': row[1],
+                'decision': row[2],
+                'reason': row[3],
+                'estado': row[4]
+            })
+        
+        return decisions
+    except Exception as e:
+        print(f"Erro ao obter decisões: {e}")
+        return []
+
+
 @app.route('/')
 def index():
     """Dashboard principal."""
@@ -95,7 +134,7 @@ def index():
     recent_alerts = ALERT_MANAGER.get_recent_alerts(5)
     
     # Métricas para gráficos
-    recent = get_recent_metrics(60)
+    recent = get_recent_metrics(120)  # 2 horas para incluir dados antigos
     latency_history = [m['latency_us'] / 1000 for m in recent]  # ms
     cameras_history = [m['cameras_active'] for m in recent]
     
@@ -161,12 +200,12 @@ def metrics_page():
 def decisions_page():
     """Página de histórico de decisões."""
     decision_stats = get_decision_stats()
-    recent = get_recent_metrics(60)
+    recent_decisions = get_recent_decisions(60)
     
     return render_template(
         'decisions.html',
         decision_stats=decision_stats,
-        recent=recent[-20:],
+        recent_decisions=recent_decisions,
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
 
