@@ -881,22 +881,24 @@ class DataLake:
         
         Args:
             alpha: Nível de confiança (0.95 = 95% = calcula média dos 5% piores)
-            window_minutes: Janela de tempo em minutos (não usado - usa últimos registros)
+            window_minutes: Janela de tempo em minutos para filtrar dados
         
         Returns:
             Float com CVaR em microsegundos, ou None se não houver dados.
         """
         cursor = self.conn.cursor()
         
-        # Usar métricas POR UE (não agregado)
+        cutoff = int(time.time()) - (window_minutes * 60)
+        
+        # Usar métricas POR UE (não agregado) com filtro de tempo
         cursor.execute("""
             SELECT cvar_per_ue_us
             FROM extended_metrics
             WHERE cvar_per_ue_us < 500000
             AND cvar_per_ue_us > 0
+            AND timestamp >= ?
             ORDER BY timestamp DESC
-            LIMIT 100
-        """)
+        """, (cutoff,))
         
         cvar_values = [row[0] for row in cursor.fetchall() if row[0] > 0]
         
@@ -907,9 +909,9 @@ class DataLake:
                 FROM extended_metrics
                 WHERE latency_p95_us < 500000
                 AND latency_p95_us > 0
+                AND timestamp >= ?
                 ORDER BY timestamp DESC
-                LIMIT 100
-            """)
+            """, (cutoff,))
             cvar_values = [row[0] for row in cursor.fetchall() if row[0] > 0]
         
         if not cvar_values:
@@ -998,19 +1000,24 @@ class DataLake:
         USA métricas POR UE (cvar_per_ue_us) em vez de métricas agregadas
         para capturar corretamente os UEs críticos.
         
+        Args:
+            window_minutes: Janela de tempo em minutos para filtrar dados
+        
         Returns:
             Dict com: median, p95, cvar, variance, stability_score
         """
         cursor = self.conn.cursor()
         
-        # Usar métricas POR UE (não agregado)
+        cutoff = int(time.time()) - (window_minutes * 60)
+        
+        # Usar métricas POR UE (não agregado) com filtro de tempo
         cursor.execute("""
             SELECT cvar_per_ue_us, variance_per_ue_us2, latency_p95_per_ue_us
             FROM extended_metrics
             WHERE cvar_per_ue_us > 0
+            AND timestamp >= ?
             ORDER BY timestamp DESC
-            LIMIT 100
-        """)
+        """, (cutoff,))
         
         cvar_values = []
         variance_values = []
@@ -1031,9 +1038,9 @@ class DataLake:
                 FROM extended_metrics
                 WHERE latency_p95_us < 500000
                 AND latency_p95_us > 0
+                AND timestamp >= ?
                 ORDER BY timestamp DESC
-                LIMIT 100
-            """)
+            """, (cutoff,))
             cvar_values = [row[0] for row in cursor.fetchall() if row[0] > 0]
             
             if not cvar_values:
