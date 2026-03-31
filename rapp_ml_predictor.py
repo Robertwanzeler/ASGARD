@@ -79,12 +79,13 @@ class MLPredictor:
         now = datetime.now()
 
         # Basic features
-        cvar_ms = metrics.get('cvar_per_ue_us', 0) / 1000.0
-        latency_p95_ms = metrics.get('latency_p95_per_ue_us', 0) / 1000.0
-        avg_latency_ms = metrics.get('global_avg_latency_us', 0) / 1000.0
-        variance_ms2 = metrics.get('variance_per_ue_us2', 0) / 1_000_000.0
-        total_cameras = metrics.get('total_active_cameras', 0)
-        total_ues = metrics.get('total_active_ues', 1)
+        cvar_ms = float(metrics.get('cvar_per_ue_us', 0)) / 1000.0
+        latency_p95_ms = float(metrics.get('latency_p95_per_ue_us', 0)) / 1000.0
+        avg_latency_ms = float(metrics.get('global_avg_latency_us', 0)) / 1000.0
+        variance_ms2 = float(metrics.get('variance_per_ue_us2', 0)) / 1_000_000.0
+        total_cameras = int(metrics.get('total_active_cameras', 0))
+        total_ues = int(metrics.get('total_active_ues', 1))
+        total_critical = int(metrics.get('total_critical_ues', 0))
 
         # Update CVaR history for trend calculation
         self._cvar_history.append(cvar_ms)
@@ -115,7 +116,7 @@ class MLPredictor:
         else:
             cvar_zone = 2  # red
 
-        sim_time_s = metrics.get('sim_time_s', 0)
+        sim_time_s = float(metrics.get('sim_time_s', 0))
 
         features = np.array([[
             cvar_ms,
@@ -128,7 +129,7 @@ class MLPredictor:
             total_cameras,
             total_ues,
             camera_ratio,
-            metrics.get('total_critical_ues', 0),
+            total_critical,
             hour_sin,
             hour_cos,
             is_night,
