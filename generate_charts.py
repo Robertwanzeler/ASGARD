@@ -39,6 +39,27 @@ plt.rcParams['text.color'] = '#eee'
 plt.rcParams['font.family'] = 'sans-serif'
 
 
+def detect_transition(metrics_df):
+    """Detecta automaticamente quando o período de congestionamento começa."""
+    if metrics_df is None or len(metrics_df) < 10:
+        return None
+
+    if 'sim_time_s' not in metrics_df.columns or 'lat_mean_ms' not in metrics_df.columns:
+        return None
+
+    # Ponto onde latência média ultrapassa 1.5x a mediana
+    median_lat = metrics_df['lat_mean_ms'].median()
+    threshold = median_lat * 1.5
+    high_latency = metrics_df[metrics_df['lat_mean_ms'] > threshold]
+
+    if len(high_latency) > 0:
+        transition = high_latency.iloc[0]['sim_time_s']
+        return transition
+
+    # Fallback: 75% dos dados
+    return metrics_df['sim_time_s'].quantile(0.75)
+
+
 def load_latency_data():
     """Lê DlPdcpStats.txt e processa latência por timestamp."""
     filepath = os.path.join(INPUT_DIR, "DlPdcpStats.txt")
@@ -175,7 +196,7 @@ def load_energy_commands():
     return df
 
 
-def plot_latencia_vs_tempo(metrics_df):
+def plot_latencia_vs_tempo(metrics_df, period_transition=None):
     """Gera gráfico de latência vs tempo."""
     print("    → Gerando: latencia_vs_tempo.png")
     
@@ -205,14 +226,11 @@ def plot_latencia_vs_tempo(metrics_df):
     ax.axhline(y=100, color='#ff4444', linestyle=':', linewidth=2, label='SLA (100ms)')
     
     # Linha de transição de período
-    period_transition = 300  # 5 minutos = 300 segundos
-    if metrics_df['sim_time_s'].max() > period_transition:
-        ax.axvline(x=period_transition, color='#00aaff', linestyle='--', 
-                   linewidth=2, label='Transição Período 1→2')
-    
-    # shaded region para período de congestionamento
-    ax.axvspan(period_transition, metrics_df['sim_time_s'].max(), 
-               alpha=0.2, color='#ff4444', label='Período 2 (Congestionamento)')
+    if period_transition is not None and metrics_df['sim_time_s'].max() > period_transition:
+        ax.axvline(x=period_transition, color='#00aaff', linestyle='--',
+                   linewidth=2, label=f'Transição ({period_transition:.0f}s)')
+        ax.axvspan(period_transition, metrics_df['sim_time_s'].max(),
+                   alpha=0.2, color='#ff4444', label='Período 2 (Congestionamento)')
     
     ax.set_xlabel('Tempo de Simulação (segundos)', fontsize=12)
     ax.set_ylabel('Latência (ms)', fontsize=12)
@@ -230,7 +248,7 @@ def plot_latencia_vs_tempo(metrics_df):
     plt.close()
 
 
-def plot_cvar_por_periodo(metrics_df):
+def plot_cvar_por_periodo(metrics_df, period_transition=None):
     """Gera gráfico de CVaR por período."""
     print("    → Gerando: cvar_por_periodo.png")
     
@@ -245,19 +263,31 @@ def plot_cvar_por_periodo(metrics_df):
         return
     
     # Separar períodos
-    periodo1 = metrics_df[metrics_df['sim_time_s'] < 300]['cvar_ms']
-    periodo2 = metrics_df[metrics_df['sim_time_s'] >= 300]['cvar_ms']
-    
+    if period_transition is not None:
+        periodo1 = metrics_df[metrics_df['sim_time_s'] < period_transition]['cvar_ms']
+        periodo2 = metrics_df[metrics_df['sim_time_s'] >= period_transition]['cvar_ms']
+    else:
+        periodo1 = metrics_df['cvar_ms']
+        periodo2 = pd.Series([], dtype=float)
+
     # Gráfico 1: Boxplot
     ax1 = axes[0]
-    box_data = [periodo1.dropna(), periodo2.dropna()]
-    bp = ax1.boxplot(box_data, labels=['Período 1\n(0-5min)\nTráfego Leve', 'Período 2\n(5-10min)\nCongestionamento'],
-                    patch_artist=True, widths=0.6)
-    
-    colors = ['#00ff88', '#ff4444']
-    for patch, color in zip(bp['boxes'], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.6)
+    if len(periodo1.dropna()) > 0 and len(periodo2.dropna()) > 0:
+        box_data = [periodo1.dropna(), periodo2.dropna()]
+        bp = ax1.boxplot(box_data, labels=[f'Período 1\n(0-{period_transition:.0f}s)\nTráfego Leve', f'Período 2\n({period_transition:.0f}s+)\nCongestionamento'],
+                        patch_artist=True, widths=0.6)
+
+        colors = ['#00ff88', '#ff4444']
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.6)
+    else:
+        box_data = [periodo1.dropna()]
+        bp = ax1.boxplot(box_data, labels=['Todos os Dados'],
+                        patch_artist=True, widths=0.6)
+        for patch in bp['boxes']:
+            patch.set_facecolor('#00aaff')
+            patch.set_alpha(0.6)
     
     ax1.axhline(y=80, color='#ffaa00', linestyle='--', linewidth=2, label='Limiar BLOCKED (80ms)')
     ax1.axhline(y=60, color='#00aaff', linestyle=':', linewidth=2, label='Limiar ALLOWED (60ms)')
@@ -276,7 +306,8 @@ def plot_cvar_por_periodo(metrics_df):
     
     ax2.axhline(y=80, color='#ff4444', linestyle='--', linewidth=2, label='Limiar BLOCKED (80ms)')
     ax2.axhline(y=60, color='#ffaa00', linestyle=':', linewidth=2, label='Limiar ALLOWED (60ms)')
-    ax2.axvline(x=300, color='#00ff88', linestyle='--', linewidth=2, label='Transição')
+    if period_transition is not None:
+        ax2.axvline(x=period_transition, color='#00ff88', linestyle='--', linewidth=2, label=f'Transição ({period_transition:.0f}s)')
     
     ax2.set_xlabel('Tempo de Simulação (segundos)', fontsize=12)
     ax2.set_ylabel('CVaR (ms)', fontsize=12)
@@ -290,7 +321,7 @@ def plot_cvar_por_periodo(metrics_df):
     plt.close()
 
 
-def plot_decisoes_rapp(decisions_df):
+def plot_decisoes_rapp(decisions_df, period_transition=None):
     """Gera gráfico de decisões do rApp."""
     print("    → Gerando: decisoes_rapp.png")
     
@@ -340,9 +371,9 @@ def plot_decisoes_rapp(decisions_df):
     ax1.grid(True, alpha=0.3)
     
     # Linha de transição se existir
-    if decisions_df['sim_time_s'].max() > 300:
-        ax1.axvline(x=300, color='#00aaff', linestyle='--', linewidth=2, label='Transição')
-        ax1.axvspan(300, decisions_df['sim_time_s'].max(), 
+    if period_transition is not None and decisions_df['sim_time_s'].max() > period_transition:
+        ax1.axvline(x=period_transition, color='#00aaff', linestyle='--', linewidth=2, label=f'Transição ({period_transition:.0f}s)')
+        ax1.axvspan(period_transition, decisions_df['sim_time_s'].max(),
                     alpha=0.1, color='#ff4444', label='Período 2')
         ax1.legend(loc='upper right')
     
@@ -450,7 +481,7 @@ def plot_energia_tempo(energy_df, decisions_df):
     plt.close()
 
 
-def plot_ues_cameras(metrics_df):
+def plot_ues_cameras(metrics_df, period_transition=None):
     """Gera gráfico de UEs e câmeras ao longo do tempo."""
     print("    → Gerando: ues_cameras.png")
     
@@ -469,9 +500,10 @@ def plot_ues_cameras(metrics_df):
     ax.plot(metrics_df['sim_time_s'], metrics_df['total_active_cameras'], 
             label='Câmeras Ativas', color='#ff4444', linewidth=2, marker='o', markersize=3)
     
-    ax.axvline(x=300, color='#00ff88', linestyle='--', linewidth=2, label='Transição')
-    ax.axvspan(300, metrics_df['sim_time_s'].max(), 
-               alpha=0.1, color='#ff4444', label='Período 2')
+    if period_transition is not None and metrics_df['sim_time_s'].max() > period_transition:
+        ax.axvline(x=period_transition, color='#00ff88', linestyle='--', linewidth=2, label=f'Transição ({period_transition:.0f}s)')
+        ax.axvspan(period_transition, metrics_df['sim_time_s'].max(),
+                   alpha=0.1, color='#ff4444', label='Período 2')
     
     ax.set_xlabel('Tempo de Simulação (segundos)', fontsize=12)
     ax.set_ylabel('Quantidade', fontsize=12)
@@ -513,18 +545,25 @@ def main():
     metrics_df = load_extended_metrics()
     decisions_df = load_rapp_decisions()
     energy_df = load_energy_commands()
-    
+
+    # Detectar transição de período
+    period_transition = detect_transition(metrics_df)
+    if period_transition is not None:
+        print(f"    → Transição detectada em: {period_transition:.0f}s")
+    else:
+        print("    → Sem transição detectada")
+
     # Gerar gráficos
     print()
     print("[GRÁFICOS]")
-    
+
     if metrics_df is not None and len(metrics_df) > 0:
-        plot_latencia_vs_tempo(metrics_df)
-        plot_cvar_por_periodo(metrics_df)
-        plot_ues_cameras(metrics_df)
-    
+        plot_latencia_vs_tempo(metrics_df, period_transition)
+        plot_cvar_por_periodo(metrics_df, period_transition)
+        plot_ues_cameras(metrics_df, period_transition)
+
     if decisions_df is not None and len(decisions_df) > 0:
-        plot_decisoes_rapp(decisions_df)
+        plot_decisoes_rapp(decisions_df, period_transition)
     
     if energy_df is not None or decisions_df is not None:
         plot_energia_tempo(energy_df, decisions_df)
