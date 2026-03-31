@@ -65,8 +65,8 @@ INTENT_TEMPLATES = {
             'end': '06:00',
             'days': [0, 1, 2, 3, 4, 5, 6]  # Todos os dias
         },
-        'allow_cell_shutdown': True,
-        'allow_mmwave_off': True,
+        'allow_cell_shutdown': False,
+        'allow_mmwave_off': False,  # mmWave SEMPRE ligado
         'keep_min_cameras': 1,
         'response_time': 'SCHEDULED',
         'valid_duration_minutes': 480,  # 8 horas
@@ -98,8 +98,8 @@ INTENT_TEMPLATES = {
         'name': 'Máxima Economia',
         'description': 'Prioriza economia de energia sobre todas as outras métricas',
         'priority': 'LOW',
-        'allow_cell_shutdown': True,
-        'allow_mmwave_off': True,
+        'allow_cell_shutdown': False,
+        'allow_mmwave_off': False,  # mmWave SEMPRE ligado
         'keep_min_cameras': 0,
         'block_energy_save': False,
         'response_time': 'OPPORTUNISTIC',

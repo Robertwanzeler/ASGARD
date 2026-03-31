@@ -26,7 +26,18 @@ MAX_VALID_LATENCY_US=500000  # 500ms em microsegundos (filtra bug, mantém viola
 
 # Função para query SQLite via Python
 query_sqlite() {
-    python3 -c "import sqlite3; conn=sqlite3.connect('$DB_PATH'); c=conn.execute(\"\"\"$1\"\"\"); r=c.fetchone(); print(r[0] if r else 'N/A')" 2>/dev/null || echo "N/A"
+    python3 -c "
+import sqlite3
+import sys
+try:
+    conn = sqlite3.connect('$DB_PATH')
+    c = conn.execute('''$1''')
+    r = c.fetchone()
+    print(r[0] if r and r[0] is not None else '0')
+    conn.close()
+except Exception as e:
+    print('0')
+" 2>/dev/null || echo "0"
 }
 
 # Contadores
@@ -34,6 +45,12 @@ EXTENDED_COUNT=$(query_sqlite "SELECT COUNT(*) FROM extended_metrics")
 UE_COUNT=$(query_sqlite "SELECT COUNT(*) FROM ue_metrics")
 METRICS_COUNT=$(query_sqlite "SELECT COUNT(*) FROM metrics_history")
 DECISIONS_COUNT=$(query_sqlite "SELECT COUNT(*) FROM decisions_history")
+
+# Forçar inteiros para operações matemáticas
+EXTENDED_COUNT=${EXTENDED_COUNT:-0}
+UE_COUNT=${UE_COUNT:-0}
+METRICS_COUNT=${METRICS_COUNT:-0}
+DECISIONS_COUNT=${DECISIONS_COUNT:-0}
 
 echo ""
 echo -e "${BOLD}╔════════════════════════════════════════════════════════════════╗${NC}"
@@ -69,22 +86,27 @@ echo -e "${BLUE}----------------------------------------${NC}"
 PRIMEIRO=$(query_sqlite "SELECT MIN(datetime) FROM extended_metrics")
 ULTIMO=$(query_sqlite "SELECT MAX(datetime) FROM extended_metrics")
 
-if [ ! -z "$PRIMEIRO" ]; then
+# Validar que há dados antes de calcular tempo
+if [ ! -z "$PRIMEIRO" ] && [ "$PRIMEIRO" != "None" ] && [ "$PRIMEIRO" != "0" ]; then
     echo -e "  Primeiro registro: ${BOLD}$PRIMEIRO${NC}"
     echo -e "  Último registro:  ${BOLD}$ULTIMO${NC}"
     
     # Tempo decorrido
     PRIMEIRO_EPOCH=$(query_sqlite "SELECT MIN(timestamp) FROM extended_metrics")
-    AGORA=$(date +%s)
-    DECORRIDO=$((AGORA - PRIMEIRO_EPOCH))
-    HORAS=$((DECORRIDO / 3600))
-    MINUTOS=$(((DECORRIDO % 3600) / 60))
-    SEGUNDOS=$((DECORRIDO % 60))
-    echo -e "  Tempo de coleta: ${GREEN}${BOLD}${HORAS}h ${MINUTOS}m ${SEGUNDOS}s${NC}"
+    if [ ! -z "$PRIMEIRO_EPOCH" ] && [ "$PRIMEIRO_EPOCH" != "None" ]; then
+        AGORA=$(date +%s)
+        DECORRIDO=$((AGORA - PRIMEIRO_EPOCH))
+        HORAS=$((DECORRIDO / 3600))
+        MINUTOS=$(((DECORRIDO % 3600) / 60))
+        SEGUNDOS=$((DECORRIDO % 60))
+        echo -e "  Tempo de coleta: ${GREEN}${BOLD}${HORAS}h ${MINUTOS}m ${SEGUNDOS}s${NC}"
+    else
+        echo -e "  Tempo de coleta: ${YELLOW}N/A${NC}"
+    fi
     
     # Mostrar informação sobre zeros nos dados
     ZERO_COUNT=$(query_sqlite "SELECT SUM(zero_samples) FROM extended_metrics")
-    if [ ! -z "$ZERO_COUNT" ] && [ "$ZERO_COUNT" -gt 0 ] 2>/dev/null; then
+    if [ ! -z "$ZERO_COUNT" ] && [ "$ZERO_COUNT" != "None" ] && [ "$ZERO_COUNT" -gt 0 ] 2>/dev/null; then
         if [[ "$ZERO_COUNT" =~ ^[0-9]+$ ]] && [ "$ZERO_COUNT" -gt 0 ]; then
             echo ""
             echo -e "  ${YELLOW}Nota: ${ZERO_COUNT} samples com delay=0 detectados${NC}"
@@ -92,7 +114,9 @@ if [ ! -z "$PRIMEIRO" ]; then
         fi
     fi
 else
-    echo -e "  ${RED}Nenhum registro encontrado${NC}"
+    echo -e "  Primeiro registro: ${YELLOW}N/A${NC}"
+    echo -e "  Último registro:  ${YELLOW}N/A${NC}"
+    echo -e "  Tempo de coleta:  ${YELLOW}Aguardando dados...${NC}"
 fi
 
 # ============================================
@@ -106,6 +130,11 @@ echo -e "${RED}----------------------------------------${NC}"
 TOTAL_RAW=$(query_sqlite "SELECT COUNT(*) FROM extended_metrics")
 VALID_COUNT=$(query_sqlite "SELECT COUNT(*) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
 INVALID_COUNT=$(query_sqlite "SELECT COUNT(*) FROM extended_metrics WHERE global_avg_latency_us >= $MAX_VALID_LATENCY_US")
+
+# Garantir inteiros
+TOTAL_RAW=${TOTAL_RAW:-0}
+VALID_COUNT=${VALID_COUNT:-0}
+INVALID_COUNT=${INVALID_COUNT:-0}
 
 if [ "$TOTAL_RAW" -gt 0 ] 2>/dev/null; then
     VALID_PCT=$(python3 -c "print(f'{$VALID_COUNT/$TOTAL_RAW*100:.1f}')")
@@ -131,44 +160,48 @@ echo ""
 echo -e "${YELLOW}${BOLD}[4] MÉTRICAS DE LATÊNCIA (DADOS VÁLIDOS)${NC}"
 echo -e "${YELLOW}----------------------------------------${NC}"
 
-# Métricas básicas (FILTRADAS - excluindo dados aberrantes)
-LAT_AVG=$(query_sqlite "SELECT AVG(global_avg_latency_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
-LAT_WORST=$(query_sqlite "SELECT MAX(global_worst_latency_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
-LAT_MIN=$(query_sqlite "SELECT MIN(global_min_latency_us)/1000 FROM extended_metrics WHERE global_min_latency_us > 0 AND global_avg_latency_us < $MAX_VALID_LATENCY_US")
-JITTER=$(query_sqlite "SELECT AVG(global_jitter_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
-THROUGHPUT=$(query_sqlite "SELECT AVG(throughput_kbps) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+if [ "$VALID_COUNT" -gt 0 ] 2>/dev/null; then
+    # Métricas básicas (FILTRADAS - excluindo dados aberrantes)
+    LAT_AVG=$(query_sqlite "SELECT AVG(global_avg_latency_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    LAT_WORST=$(query_sqlite "SELECT MAX(global_worst_latency_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    LAT_MIN=$(query_sqlite "SELECT MIN(global_min_latency_us)/1000 FROM extended_metrics WHERE global_min_latency_us > 0 AND global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    JITTER=$(query_sqlite "SELECT AVG(global_jitter_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    THROUGHPUT=$(query_sqlite "SELECT AVG(throughput_kbps) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
 
-# Métricas robustas (percentis) - FILTRADAS
-LAT_MINNZ=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
-LAT_P95=$(query_sqlite "SELECT AVG(latency_p95_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    # Métricas robustas (percentis) - FILTRADAS
+    LAT_MINNZ=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    LAT_P95=$(query_sqlite "SELECT AVG(latency_p95_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
 
-# Fallback: usar latency_min_nonzero_us se global_min_latency_us for 0 ou vazio
-LAT_MIN_FALLBACK=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
-if [ -z "$LAT_MIN" ] || [ "$LAT_MIN" = "None" ]; then
-    LAT_MIN="$LAT_MIN_FALLBACK"
+    # Fallback: usar latency_min_nonzero_us se global_min_latency_us for 0 ou vazio
+    LAT_MIN_FALLBACK=$(query_sqlite "SELECT AVG(latency_min_nonzero_us)/1000 FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    if [ -z "$LAT_MIN" ] || [ "$LAT_MIN" = "None" ]; then
+        LAT_MIN="$LAT_MIN_FALLBACK"
+    fi
+
+    # Fallback P5: usar latency_min_nonzero_us
+    LAT_P5="$LAT_MIN_FALLBACK"
+
+    # Formatação com cores para métricas críticas
+    COLOR_LAT_AVG="${YELLOW}"
+    COLOR_LAT_WORST="${RED}"
+    COLOR_LAT_MIN="${GREEN}"
+    COLOR_THROUGHPUT="${CYAN}"
+
+    echo -e "  ${CYAN}Métricas Básicas (filtradas):${NC}"
+    echo -e "    Latência Média:    ${BOLD}${COLOR_LAT_AVG}${LAT_AVG:-N/A}${NC} ms"
+    echo -e "    Latência Pior:     ${BOLD}${COLOR_LAT_WORST}${LAT_WORST:-N/A}${NC} ms \033[1;30m(SLA: 100ms)\033[0m"
+    echo -e "    Latência Melhor:   ${BOLD}${COLOR_LAT_MIN}${LAT_MIN:-N/A}${NC} ms"
+    echo -e "    Jitter Médio:      ${BOLD}${JITTER:-N/A}${NC} ms"
+    echo -e "    Vazão Média:       ${BOLD}${COLOR_THROUGHPUT}${THROUGHPUT:-N/A}${NC} kbps"
+
+    echo ""
+    echo -e "  ${GREEN}Métricas Robustas (Percentis):${NC}"
+    echo -e "    Latência P5:       ${BOLD}${GREEN}${LAT_P5:-N/A}${NC} ms \033[1;30m(5% melhor)${NC}"
+    echo -e "    Latência P95:      ${BOLD}${YELLOW}${LAT_P95:-N/A}${NC} ms \033[1;30m(5% pior)${NC}"
+    echo -e "    Latência Min>0:    ${BOLD}${GREEN}${LAT_MINNZ:-N/A}${NC} ms \033[1;30m(menor valor real)${NC}"
+else
+    echo -e "  ${YELLOW}    Aguardando dados...${NC}"
 fi
-
-# Fallback P5: usar latency_min_nonzero_us
-LAT_P5="$LAT_MIN_FALLBACK"
-
-# Formatação com cores para métricas críticas
-COLOR_LAT_AVG="${YELLOW}"
-COLOR_LAT_WORST="${RED}"
-COLOR_LAT_MIN="${GREEN}"
-COLOR_THROUGHPUT="${CYAN}"
-
-echo -e "  ${CYAN}Métricas Básicas (filtradas):${NC}"
-echo -e "    Latência Média:    ${BOLD}${COLOR_LAT_AVG}${LAT_AVG:-N/A}${NC} ms"
-echo -e "    Latência Pior:     ${BOLD}${COLOR_LAT_WORST}${LAT_WORST:-N/A}${NC} ms \033[1;30m(SLA: 100ms)\033[0m"
-echo -e "    Latência Melhor:   ${BOLD}${COLOR_LAT_MIN}${LAT_MIN:-N/A}${NC} ms"
-echo -e "    Jitter Médio:      ${BOLD}${JITTER:-N/A}${NC} ms"
-echo -e "    Vazão Média:       ${BOLD}${COLOR_THROUGHPUT}${THROUGHPUT:-N/A}${NC} kbps"
-
-echo ""
-echo -e "  ${GREEN}Métricas Robustas (Percentis):${NC}"
-echo -e "    Latência P5:       ${BOLD}${GREEN}${LAT_P5:-N/A}${NC} ms \033[1;30m(5% melhor)${NC}"
-echo -e "    Latência P95:      ${BOLD}${YELLOW}${LAT_P95:-N/A}${NC} ms \033[1;30m(5% pior)${NC}"
-echo -e "    Latência Min>0:    ${BOLD}${GREEN}${LAT_MINNZ:-N/A}${NC} ms \033[1;30m(menor valor real)${NC}"
 
 # ============================================
 # 5. UEs e Câmeras
@@ -177,19 +210,25 @@ echo ""
 echo -e "${MAGENTA}${BOLD}[5] UEs E CÂMERAS${NC}"
 echo -e "${MAGENTA}----------------------------------------${NC}"
 
-CAM_ATIVAS=$(query_sqlite "SELECT AVG(total_active_cameras) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
-UE_ATIVAS=$(query_sqlite "SELECT AVG(total_active_ues) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
-UE_CRITICAS=$(query_sqlite "SELECT AVG(total_critical_ues) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+if [ "$VALID_COUNT" -gt 0 ] 2>/dev/null; then
+    CAM_ATIVAS=$(query_sqlite "SELECT AVG(total_active_cameras) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    UE_ATIVAS=$(query_sqlite "SELECT AVG(total_active_ues) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
+    UE_CRITICAS=$(query_sqlite "SELECT AVG(total_critical_ues) FROM extended_metrics WHERE global_avg_latency_us < $MAX_VALID_LATENCY_US")
 
-echo -e "  Câmeras Ativas (média):  ${BOLD}${GREEN}${CAM_ATIVAS:-N/A}${NC}"
-echo -e "  UEs Ativas (média):     ${BOLD}${UE_ATIVAS:-N/A}${NC}"
-echo -e "  UEs Críticas (média):   ${BOLD}${RED}${UE_CRITICAS:-N/A}${NC}"
+    echo -e "  Câmeras Ativas (média):  ${BOLD}${GREEN}${CAM_ATIVAS:-N/A}${NC}"
+    echo -e "  UEs Ativas (média):     ${BOLD}${UE_ATIVAS:-N/A}${NC}"
+    echo -e "  UEs Críticas (média):   ${BOLD}${RED}${UE_CRITICAS:-N/A}${NC}"
 
-# Mostrar proporção
-if [ ! -z "$CAM_ATIVAS" ] && [ ! -z "$UE_ATIVAS" ] && [ "$CAM_ATIVAS" != "N/A" ] && [ "$UE_ATIVAS" != "N/A" ]; then
-    TOTAL=$(python3 -c "print($UE_ATIVAS + $CAM_ATIVAS)")
-    echo ""
-    echo -e "  ${CYAN}Proporção: ${UE_ATIVAS} UEs + ${CAM_ATIVAS} Câmeras = ${TOTAL} total${NC}"
+    # Mostrar proporção
+    if [ ! -z "$CAM_ATIVAS" ] && [ ! -z "$UE_ATIVAS" ] && [ "$CAM_ATIVAS" != "N/A" ] && [ "$UE_ATIVAS" != "N/A" ]; then
+        TOTAL=$(python3 -c "print($UE_ATIVAS + $CAM_ATIVAS)")
+        echo ""
+        echo -e "  ${CYAN}Proporção: ${UE_ATIVAS} UEs + ${CAM_ATIVAS} Câmeras = ${TOTAL} total${NC}"
+    fi
+else
+    echo -e "  Câmeras Ativas (média):  ${YELLOW}N/A${NC}"
+    echo -e "  UEs Ativas (média):     ${YELLOW}N/A${NC}"
+    echo -e "  UEs Críticas (média):   ${YELLOW}N/A${NC}"
 fi
 
 # ============================================
@@ -292,6 +331,104 @@ else
 fi
 
 # ============================================
+# 10. Economia de Energia
+# ============================================
+echo ""
+echo -e "${BOLD}${GREEN}[10] ECONOMIA DE ENERGIA${NC}"
+echo -e "${GREEN}----------------------------------------${NC}"
+
+# Query energy commands via Python
+ENERGY_STATS=$(python3 -c "
+import sqlite3
+import json
+
+conn = sqlite3.connect('$DB_PATH')
+c = conn.cursor()
+
+c.execute('''
+    SELECT 
+        command,
+        COUNT(*) as count,
+        AVG(power_percent) as avg_power
+    FROM energy_commands
+    GROUP BY command
+    ORDER BY count DESC
+''')
+
+results = {'total': 0, 'commands': {}, 'avg_power': 0, 'savings': 0}
+total_power = 0
+total_count = 0
+
+for row in c.fetchall():
+    cmd = row[0]
+    count = row[1]
+    avg_power = row[2] or 100
+    results['commands'][cmd] = {'count': count, 'avg_power': avg_power}
+    total_power += avg_power * count
+    total_count += count
+
+if total_count > 0:
+    results['total'] = total_count
+    results['avg_power'] = round(total_power / total_count, 1)
+    results['savings'] = round(100 - results['avg_power'], 1)
+
+print(json.dumps(results))
+conn.close()
+" 2>/dev/null)
+
+if [ ! -z "$ENERGY_STATS" ] && [ "$ENERGY_STATS" != "null" ]; then
+    TOTAL_CMDS=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total',0))" 2>/dev/null)
+    AVG_POWER=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('avg_power',0))" 2>/dev/null)
+    SAVINGS=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('savings',0))" 2>/dev/null)
+    
+    if [ "$TOTAL_CMDS" -gt 0 ] 2>/dev/null; then
+        echo -e "  Total de comandos:    ${BOLD}$TOTAL_CMDS${NC}"
+        echo -e "  Potência média:      ${BOLD}${AVG_POWER}%${NC}"
+        echo -e "  Economia média:      ${GREEN}${BOLD}${SAVINGS}%${NC}"
+        echo ""
+        echo -e "  ${CYAN}Distribuição por modo:${NC}"
+        
+        # Full Power
+        FP_COUNT=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['commands'].get('FULL_POWER',{}).get('count',0))" 2>/dev/null)
+        FP_PCT=$(python3 -c "print(round($FP_COUNT/$TOTAL_CMDS*100,1))" 2>/dev/null || echo "0")
+        echo -n "    FULL_POWER:         $FP_COUNT ($FP_PCT%)"
+        if [ "$FP_PCT" -gt 50 ]; then echo " ⚠️ ALTA POTÊNCIA"; else echo ""; fi
+        
+        # CONDITIONAL_REDUCE (70%)
+        CR_COUNT=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['commands'].get('CONDITIONAL_REDUCE',{}).get('count',0))" 2>/dev/null)
+        if [ ! -z "$CR_COUNT" ] && [ "$CR_COUNT" -gt 0 ]; then
+            CR_PCT=$(python3 -c "print(round($CR_COUNT/$TOTAL_CMDS*100,1))" 2>/dev/null || echo "0")
+            echo -e "    CONDITIONAL:        $CR_COUNT ($CR_PCT%) - 70% potência"
+        fi
+        
+        # POWER_DOWN (50%)
+        PD_COUNT=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['commands'].get('POWER_DOWN',{}).get('count',0))" 2>/dev/null)
+        if [ ! -z "$PD_COUNT" ] && [ "$PD_COUNT" -gt 0 ]; then
+            PD_PCT=$(python3 -c "print(round($PD_COUNT/$TOTAL_CMDS*100,1))" 2>/dev/null || echo "0")
+            echo -e "    POWER_DOWN:         $PD_COUNT ($PD_PCT%) - 50% potência"
+        fi
+        
+        # POWER_DOWN_ECO (25%)
+        PE_COUNT=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['commands'].get('POWER_DOWN_ECO',{}).get('count',0))" 2>/dev/null)
+        if [ ! -z "$PE_COUNT" ] && [ "$PE_COUNT" -gt 0 ]; then
+            PE_PCT=$(python3 -c "print(round($PE_COUNT/$TOTAL_CMDS*100,1))" 2>/dev/null || echo "0")
+            echo -e "    POWER_DOWN_ECO:     $PE_COUNT ($PE_PCT%) - 25% potência"
+        fi
+        
+        # POWER_DOWN_ECO
+        PE_COUNT=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['commands'].get('POWER_DOWN_ECO',{}).get('count',0))" 2>/dev/null)
+        if [ ! -z "$PE_COUNT" ] && [ "$PE_COUNT" -gt 0 ]; then
+            PE_PCT=$(python3 -c "print(round($PE_COUNT/$TOTAL_CMDS*100,1))" 2>/dev/null || echo "0")
+            echo -e "    POWER_DOWN_ECO:     $PE_COUNT ($PE_PCT%) - 10% potência"
+        fi
+    else
+        echo -e "  ${YELLOW}Nenhum comando de energia registrado ainda${NC}"
+    fi
+else
+    echo -e "  ${YELLOW}Nenhum comando de energia registrado ainda${NC}"
+fi
+
+# ============================================
 # Resumo Final
 # ============================================
 echo ""
@@ -301,14 +438,19 @@ echo -e "${BOLD}╚════════════════════�
 echo ""
 
 # Verificar se há dados suficientes para ML (usando dados válidos)
-if [ "$VALID_COUNT" -lt 60 ]; then
-    echo -e "${YELLOW}${BOLD}[COLETANDO]${NC} Dados sendo acumulados... (${VALID_COUNT} registros válidos)"
-    echo "             Mínimo recomendado para ML: 60 registros"
-elif [ "$VALID_COUNT" -lt 300 ]; then
-    echo -e "${YELLOW}${BOLD}[TREINAMENTO]${NC} Base suficiente para análise básica (${VALID_COUNT} registros válidos)"
-    echo "               Para melhor acurácia, continue a coleta."
+if [ "$VALID_COUNT" -gt 0 ] 2>/dev/null; then
+    if [ "$VALID_COUNT" -lt 60 ]; then
+        echo -e "${YELLOW}${BOLD}[COLETANDO]${NC} Dados sendo acumulados... (${VALID_COUNT} registros válidos)"
+        echo "             Mínimo recomendado para ML: 60 registros"
+    elif [ "$VALID_COUNT" -lt 300 ]; then
+        echo -e "${YELLOW}${BOLD}[TREINAMENTO]${NC} Base suficiente para análise básica (${VALID_COUNT} registros válidos)"
+        echo "               Para melhor acurácia, continue a coleta."
+    else
+        echo -e "${GREEN}${BOLD}[PRONTO]${NC} Dataset robusto para Machine Learning completo (${VALID_COUNT} registros válidos)"
+    fi
 else
-    echo -e "${GREEN}${BOLD}[PRONTO]${NC} Dataset robusto para Machine Learning completo (${VALID_COUNT} registros válidos)"
+    echo -e "${YELLOW}${BOLD}[AGUARDANDO]${NC} Execute uma simulação para iniciar a coleta de dados"
+    echo "             Exemplo: ./run_greenran_v2.sh"
 fi
 
 echo ""

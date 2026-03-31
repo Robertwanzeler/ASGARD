@@ -2,6 +2,31 @@
 
 {% block title %}Dashboard - GreenRAN rApp{% endblock %}
 
+{% block extra_head %}
+<style>
+    #energy-stats .metric-value {
+        color: #00ff88 !important;
+        font-size: 2.5rem;
+        font-weight: bold;
+    }
+    #energy-stats .metric-label {
+        color: #aaa !important;
+    }
+    #energy-stats .card-body {
+        color: #eee;
+    }
+    #energy-stats strong {
+        color: #fff !important;
+    }
+    .energy-cmd {
+        color: #aaa;
+        margin-bottom: 4px;
+    }
+    .energy-cmd-full { color: #ffc107; font-weight: bold; }
+    .energy-cmd-eco { color: #00ff88; font-weight: bold; }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="row">
     <!-- Métricas Principais -->
@@ -244,6 +269,36 @@
 </div>
 
 <div class="row">
+    <!-- Painel de Energia -->
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Economia de Energia</h5>
+            </div>
+            <div class="card-body">
+                <div id="energy-stats">
+                    <div class="text-center">
+                        <span class="text-muted">Carregando...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Timeline de Energia -->
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Histórico de Comandos de Energia</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="energyChart" height="80"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
     <!-- Regras de Coordenação -->
     <div class="col-md-12">
         <div class="card">
@@ -313,5 +368,145 @@ const latencyChart = new Chart(ctx, {
         }
     }
 });
+
+// Fetch energy stats
+function fetchEnergyStats() {
+    // Fetch both current state and historical stats
+    Promise.all([
+        fetch('/api/energy/current').then(r => r.json()),
+        fetch('/api/energy').then(r => r.json())
+    ])
+    .then(([currentData, historyData]) => {
+        const container = document.getElementById('energy-stats');
+        
+        // Current state
+        const current = currentData;
+        const currentPower = current.power_percent || 100;
+        const currentSavings = current.savings_percent || 0;
+        const currentAction = current.action || 'UNKNOWN';
+        
+        // Calculate color based on savings
+        let savingsColor = '#ff4444'; // Red - low savings
+        if (currentSavings >= 75) savingsColor = '#00ff88'; // Green - high savings
+        else if (currentSavings >= 50) savingsColor = '#28a745'; // Green
+        else if (currentSavings >= 25) savingsColor = '#ffaa00'; // Yellow
+        
+        // History stats
+        if (!historyData || !historyData.total_commands || historyData.total_commands === 0) {
+            container.innerHTML = `
+                <div class="text-center mb-3">
+                    <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings.toFixed(1)}%</div>
+                    <div style="color: #aaa; font-size: 0.9rem;">ECONOMIA ATUAL</div>
+                    <div style="color: #fff; font-size: 1.1rem; margin-top: 5px;">${currentAction}</div>
+                    <div style="color: #888; font-size: 0.85rem;">Potência: ${currentPower}%</div>
+                </div>
+                <div class="text-center text-muted">Aguardando dados...</div>
+            `;
+            return;
+        }
+        
+        const total = historyData.total_commands;
+        const avgPower = historyData.avg_power || 100;
+        const savings = historyData.total_savings_percent || (100 - avgPower);
+        const commands = historyData.by_command;
+        
+        let html = `
+            <div class="text-center mb-3">
+                <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings.toFixed(1)}%</div>
+                <div style="color: #aaa; font-size: 0.9rem;">ECONOMIA ATUAL</div>
+                <div style="background: #0f3460; padding: 8px; border-radius: 5px; margin-top: 8px;">
+                    <div style="color: ${savingsColor}; font-size: 1.2rem; font-weight: bold;">${currentAction}</div>
+                    <div style="color: #ccc; font-size: 0.85rem;">Potência: ${currentPower}%</div>
+                </div>
+            </div>
+            <div class="row text-center">
+                <div class="col-6">
+                    <div style="color: #888; font-size: 0.8rem;">Média Geral</div>
+                    <div style="color: #fff; font-weight: bold;">${savings.toFixed(1)}%</div>
+                </div>
+                <div class="col-6">
+                    <div style="color: #888; font-size: 0.8rem;">Total Cmd</div>
+                    <div style="color: #fff; font-weight: bold;">${total}</div>
+                </div>
+            </div>
+            <hr style="border-color: #333;">
+            <div style="color: #aaa; font-size: 0.85rem;">
+        `;
+        
+        const cmdOrder = ['FULL_POWER', 'CONDITIONAL_REDUCE', 'POWER_DOWN', 'POWER_DOWN_ECO'];
+        cmdOrder.forEach(cmd => {
+            if (commands[cmd]) {
+                const c = commands[cmd];
+                const pct = ((c.count / total) * 100).toFixed(1);
+                const power = c.avg_power_percent;
+                const cmdColor = cmd === 'FULL_POWER' ? '#ffc107' : '#00ff88';
+                html += `<div style="margin-bottom: 4px;"><span style="color: ${cmdColor}; font-weight: bold;">${cmd}</span> <span style="color: #888;">${c.count} (${pct}%)</span></div>`;
+            }
+        });
+        
+        html += '</div>';
+        container.innerHTML = html;
+    })
+    .catch(err => {
+        console.error('Error fetching energy stats:', err);
+    });
+}
+
+// Energy timeline chart
+let energyChart = null;
+function fetchEnergyTimeline() {
+    fetch('/api/history/60')
+        .then(response => response.json())
+        .then(data => {
+            if (!data || data.length === 0) return;
+            
+            const ctx = document.getElementById('energyChart');
+            if (!ctx) return;
+            
+            const labels = data.map(d => new Date(d.timestamp * 1000).toLocaleTimeString());
+            const powerData = data.map(d => d.power_percent || 100);
+            
+            if (energyChart) energyChart.destroy();
+            
+            energyChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Potência (%)',
+                        data: powerData,
+                        borderColor: '#28a745',
+                        backgroundColor: 'rgba(40, 167, 69, 0.1)',
+                        fill: true,
+                        tension: 0.3
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            min: 0,
+                            max: 100,
+                            ticks: { color: '#aaa' },
+                            title: { display: true, text: 'Potência %', color: '#aaa' }
+                        },
+                        x: {
+                            ticks: { color: '#aaa' }
+                        }
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#eee' } }
+                    }
+                }
+            });
+        })
+        .catch(err => console.error('Error fetching energy timeline:', err));
+}
+
+// Load energy data on page load
+fetchEnergyStats();
+setInterval(fetchEnergyStats, 30000);
+fetchEnergyTimeline();
+setInterval(fetchEnergyTimeline, 60000);
 </script>
 {% endblock %}

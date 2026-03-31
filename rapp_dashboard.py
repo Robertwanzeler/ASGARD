@@ -308,6 +308,36 @@ def api_efficiency():
     return jsonify(efficiency)
 
 
+@app.route('/api/energy')
+def api_energy():
+    """API: Estatísticas de energia."""
+    stats = DATA_LAKE.get_energy_stats(24)
+    return jsonify(stats)
+
+
+@app.route('/api/energy/current')
+def api_energy_current():
+    """API: Estado atual de energia."""
+    import os
+    energy_file = "/tmp/xapp_intents/energy_command.json"
+    if os.path.exists(energy_file):
+        try:
+            with open(energy_file, 'r') as f:
+                cmd = json.load(f)
+                power = cmd.get('power_level', 100)
+                savings = 100 - power
+                action = cmd.get('action', 'UNKNOWN')
+                return jsonify({
+                    'action': action,
+                    'power_percent': power,
+                    'savings_percent': savings,
+                    'timestamp': cmd.get('timestamp')
+                })
+        except:
+            pass
+    return jsonify({'action': 'UNKNOWN', 'power_percent': 100, 'savings_percent': 0})
+
+
 def main():
     import argparse
     

@@ -414,10 +414,33 @@ def main():
     
     cycle = 0
     total_pushed = 0
+    last_data_time = 0
+    SIMULATION_INACTIVE_TIMEOUT = 60
+    
+    def is_simulation_active(stats_dir):
+        """Verifica se a simulação está ativa verificando timestamps dos arquivos"""
+        import os
+        key_files = ['DlPdcpStats.txt', 'DlMacStats.txt', 'DlRlcStats.txt']
+        now = time.time()
+        
+        for f in key_files:
+            filepath = os.path.join(stats_dir, f)
+            if os.path.exists(filepath):
+                mtime = os.path.getmtime(filepath)
+                if (now - mtime) < SIMULATION_INACTIVE_TIMEOUT:
+                    return True
+        return False
     
     try:
         while True:
             cycle += 1
+            
+            if not is_simulation_active(args.stats_dir):
+                if cycle % 12 == 0:
+                    print(f"  [Cycle {cycle}] Simulação inativa - aguardando...")
+                time.sleep(args.interval)
+                continue
+            
             all_measurements = []
             
             # 1. Processar PDCP stats (latência por UE)

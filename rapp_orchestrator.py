@@ -111,8 +111,8 @@ class RappResourceOptimizer:
         # Trend Analysis (Slope/Predição)
         self.trend_analysis = TrendAnalysis(self.data_lake)
         
-        # Energy Command Protocol
-        self.energy_cmd = EnergyCommand()
+        # Energy Command Protocol (com DataLake para gravar comandos)
+        self.energy_cmd = EnergyCommand(data_lake=self.data_lake)
         
         # Agent-Al-OpenRAN
         self.agent = AgentOpenRAN()
@@ -201,7 +201,8 @@ class RappResourceOptimizer:
         
         Regras:
         - SLICER: SEMPRE ativo (prioridade)
-        - ENERGY SAVER: Ativo se decision['energy_saver'] == 'ALLOWED'
+        - ENERGY SAVER: Ativo se decision['energy_saver'] == 'ALLOWED' ou 'CONDITIONAL'
+        - ENERGY SAVER: Desativado apenas se BLOCKED
         
         Args:
             decision: Dict com decisão do rApp
@@ -209,14 +210,18 @@ class RappResourceOptimizer:
         slicer_state = decision.get('slicer_state', 'UNKNOWN')
         
         # ENERGY SAVER: controlado pelo rApp
-        if decision.get('energy_saver') == 'ALLOWED':
-            # Slicer OK → Energy pode ativar
+        # CONDITIONAL agora ATIVA o Energy Saver (economia moderada ativa)
+        energy_decision = decision.get('energy_saver')
+        
+        if energy_decision in ['ALLOWED', 'CONDITIONAL']:
+            # Slicer OK ou CONDITIONAL → Energy pode ativar/continuar
             if not self._energy_active:
                 self._start_energy_saver()
-        else:
-            # Slicer com problema ou decisão BLOCKED → Energy para
+        elif energy_decision == 'BLOCKED':
+            # Slicer CRITICAL ou decisão BLOCKED → Energy para
             if self._energy_active:
                 self._stop_energy_saver()
+        # Outros estados (UNKNOWN, etc) → mantém estado atual
         
         # SLICER: NUNCA para (fallback de segurança)
         # Mesmo se rApp morrer, Slicer continua rodando
@@ -515,11 +520,20 @@ class RappResourceOptimizer:
             
             # REGRA 4: CVaR < 60ms E Slope < 0 → PODE ECONOMIZAR
             elif cvar_us < CVAR_NORMAL_US and slope < 0:
-                decision['energy_saver'] = 'ALLOWED'
-                decision['action'] = 'POWER_DOWN'
-                decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms < 60ms + slope={slope:.1f}ms/s (melhorando) → Pode economizar'
-                decision['confidence'] = 0.9
-                print(f"\033[1;32m[rApp] REGRA 4: CVaR < 60ms + Slope < 0 - ALLOWED\033[0m")
+                # REGRA 4B: MODO ECO - Economia extrema quando CVaR < 20ms
+                if cvar_us < 20000:  # < 20ms
+                    decision['energy_saver'] = 'ALLOWED'
+                    decision['action'] = 'POWER_DOWN_ECO'
+                    decision['eco_mode'] = True
+                    decision['reason'] = f'ECO MODE: CVaR={cvar_us/1000:.1f}ms < 20ms + slope={slope:.1f}ms/s → Economia extrema (10%)'
+                    decision['confidence'] = 0.95
+                    print(f"\033[1;32m[rApp] REGRA 4B: CVaR < 20ms + Slope < 0 - ECO MODE\033[0m")
+                else:
+                    decision['energy_saver'] = 'ALLOWED'
+                    decision['action'] = 'POWER_DOWN'
+                    decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms < 60ms + slope={slope:.1f}ms/s (melhorando) → Pode economizar'
+                    decision['confidence'] = 0.9
+                    print(f"\033[1;32m[rApp] REGRA 4: CVaR < 60ms + Slope < 0 - ALLOWED\033[0m")
             
             # REGRA 5: CVaR < 60ms mas Slope > 0 → CONDITIONAL
             elif cvar_us < CVAR_NORMAL_US:
@@ -734,17 +748,22 @@ class RappResourceOptimizer:
             self.energy_cmd.send_full_power(reason=f"BLOCKED: {reason}")
             
         elif energy_state == 'ALLOWED':
-            # Permitido → POWER_DOWN (economizar)
-            # Verificar nível de confiança para escolher nível
-            confidence = decision.get('confidence', 0)
-            if confidence >= 0.8:
-                self.energy_cmd.send_power_down(reason=f"ALLOWED: {reason}")
+            # Verificar se é MODO ECO (CVaR < 20ms)
+            if decision.get('eco_mode'):
+                # ECO MODE → POWER_DOWN_ECO (10% potência)
+                self.energy_cmd.send_power_down_eco(reason=f"ALLOWED (ECO): {reason}")
             else:
-                self.energy_cmd.send_reduce_power(reason=f"ALLOWED (cautela): {reason}")
+                # Permitido → POWER_DOWN (economizar)
+                # Verificar nível de confiança para escolher nível
+                confidence = decision.get('confidence', 0)
+                if confidence >= 0.8:
+                    self.energy_cmd.send_power_down(reason=f"ALLOWED: {reason}")
+                else:
+                    self.energy_cmd.send_reduce_power(reason=f"ALLOWED (cautela): {reason}")
                 
         elif energy_state == 'CONDITIONAL':
-            # Condicional → REDUCE_POWER (economizar parcialmente)
-            self.energy_cmd.send_reduce_power(reason=f"CONDITIONAL: {reason}")
+            # Condicional → CONDITIONAL_REDUCE (economia moderada ativa)
+            self.energy_cmd.send_conditional_reduce(reason=f"CONDITIONAL: {reason}")
             
         else:
             # Estado desconhecido → MAINTAIN

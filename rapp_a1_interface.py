@@ -217,10 +217,11 @@ class A1PolicyInterface:
         previous_ack = self.check_ack('energy')
         
         # Determina regras de energia baseadas na decisão
+        # IMPORTANTE: mmWave NUNCA pode ser desligado (sobrecarregaria LTE)
         if decision.get('energy_saver') == 'BLOCKED':
             rules = {
                 'allow_cell_shutdown': False,
-                'allow_mmwave_off': False,
+                'allow_mmwave_off': False,  # mmWave SEMPRE ligado
                 'min_coverage': 'FULL',
                 'restore_immediately': True
             }
@@ -228,15 +229,15 @@ class A1PolicyInterface:
         elif decision.get('energy_saver') == 'CONDITIONAL':
             rules = {
                 'allow_cell_shutdown': False,
-                'allow_mmwave_off': True,
+                'allow_mmwave_off': False,  # mmWave SEMPRE ligado
                 'min_coverage': 'PARTIAL',
                 'restore_immediately': False
             }
             status = 'CONDITIONAL'
         else:
             rules = {
-                'allow_cell_shutdown': True,
-                'allow_mmwave_off': True,
+                'allow_cell_shutdown': False,
+                'allow_mmwave_off': False,  # mmWave SEMPRE ligado - apenas reduz potência
                 'min_coverage': 'BASIC',
                 'restore_immediately': False
             }

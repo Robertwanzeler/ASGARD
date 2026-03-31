@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
 GreenRAN O-RAN - Energy Command Protocol
-=========================================
+========================================
 
 Protocolo de comunicação entre rApp (Python) e xApp Energy Saver (C++).
+
+IMPORTANTE: O cenário GreenRAN usa:
+    - 1 RU (LTE)
+    - 1 mmWave
+    mmWave NUNCA pode ser desligado (sobrecarregaria LTE)
 
 Arquitetura:
     rApp (Cérebro) → energy_command.json → xApp Energy Saver (Atuador)
 
 Formato JSON:
     {
-        "action": "FULL_POWER|REDUCE_POWER|POWER_DOWN|MAINTAIN",
+        "action": "FULL_POWER|CONDITIONAL_REDUCE|POWER_DOWN|POWER_DOWN_ECO|MAINTAIN",
         "power_level": 0-100,
         "timestamp": unix_timestamp,
         "ttl_seconds": 5,
@@ -18,10 +23,11 @@ Formato JSON:
     }
 
 Ações:
-    FULL_POWER    → RU=2, mmWave=1 (potência máxima)
-    REDUCE_POWER  → RU=2, mmWave=0 (reduzir mmWave)
-    POWER_DOWN    → RU=1, mmWave=0 (economia máxima)
-    MAINTAIN      → Manter estado atual
+    FULL_POWER        → RU=1, mmWave=1, 100% (potência máxima)
+    CONDITIONAL_REDUCE → RU=1, mmWave=1, 70% (economia moderada)
+    POWER_DOWN        → RU=1, mmWave=1, 50% (economia média)
+    POWER_DOWN_ECO    → RU=1, mmWave=1, 25% (economia alta)
+    MAINTAIN          → Manter estado atual
 
 Watchdog (no xApp):
     Se não receber comando em TTL segundos → FULL_POWER (fail-safe)
@@ -30,7 +36,7 @@ Uso:
     from energy_command_protocol import EnergyCommand
     
     cmd = EnergyCommand()
-    cmd.write_command("REDUCE_POWER", 50, "CVaR=45ms, slope=-2ms/s")
+    cmd.write_command("CONDITIONAL_REDUCE", 70, "CVaR=45ms, slope=-2ms/s")
 """
 
 import json
@@ -42,27 +48,38 @@ ENERGY_COMMAND_PATH = "/tmp/xapp_intents/energy_command.json"
 ENERGY_INTENT_PATH = "/tmp/xapp_intents/energy_saver.txt"
 
 # Ações válidas
+# Cenário real: 1 RU (LTE) + 1 mmWave = 2 torres
+# IMPORTANTE: mmWave NUNCA pode ser desligado (sobrecarregaria LTE)
 ACTIONS = {
     'FULL_POWER': {
-        'ru_count': 2,
+        'ru_count': 1,
         'mmwave_count': 1,
         'power_level': 100,
-        'description': 'Potência máxima - RU=2, mmWave=1'
+        'description': 'Potência máxima - RU=1, mmWave=1'
     },
-    'REDUCE_POWER': {
-        'ru_count': 2,
-        'mmwave_count': 0,
-        'power_level': 50,
-        'description': 'Reduzir potência - RU=2, mmWave=0'
+    'CONDITIONAL_REDUCE': {
+        'ru_count': 1,
+        'mmwave_count': 1,
+        'power_level': 70,  # 70% - economia moderada
+        'ttl_seconds': 3,
+        'description': 'Economia moderada - RU=1, mmWave=1, 70% potência'
     },
     'POWER_DOWN': {
         'ru_count': 1,
-        'mmwave_count': 0,
-        'power_level': 25,
-        'description': 'Economia máxima - RU=1, mmWave=0'
+        'mmwave_count': 1,
+        'power_level': 50,  # 50% - economia média
+        'ttl_seconds': 5,
+        'description': 'Economia média - RU=1, mmWave=1, 50% potência'
+    },
+    'POWER_DOWN_ECO': {
+        'ru_count': 1,
+        'mmwave_count': 1,
+        'power_level': 25,  # 25% - economia alta
+        'ttl_seconds': 5,
+        'description': 'Modo ECO - RU=1, mmWave=1, 25% potência'
     },
     'MAINTAIN': {
-        'ru_count': -1,  # -1 = manter atual
+        'ru_count': -1,
         'mmwave_count': -1,
         'power_level': -1,
         'description': 'Manter estado atual'
@@ -77,15 +94,17 @@ class EnergyCommand:
     Classe para gerenciar comandos de energia do rApp para o xApp.
     """
     
-    def __init__(self, command_path=None):
+    def __init__(self, command_path=None, data_lake=None):
         """
         Inicializa o protocolo de comando.
         
         Args:
             command_path: Caminho do arquivo JSON (padrão: /tmp/xapp_intents/energy_command.json)
+            data_lake: Instância do DataLake para gravar comandos (opcional)
         """
         self.command_path = command_path or ENERGY_COMMAND_PATH
         self.intent_path = ENERGY_INTENT_PATH
+        self.data_lake = data_lake
         
         # Criar diretório se não existir
         os.makedirs(os.path.dirname(self.command_path), exist_ok=True)
@@ -140,6 +159,16 @@ class EnergyCommand:
             
             print(f"[EnergyProtocol] Comando enviado: {action} (power={power_level}%, TTL={ttl}s)")
             print(f"[EnergyProtocol] Motivo: {reason}")
+            
+            # Gravar no DataLake se disponível
+            if self.data_lake:
+                self.data_lake.record_energy_command(
+                    command=action,
+                    power_percent=power_level,
+                    ru_count=action_info['ru_count'],
+                    mmwave_count=action_info['mmwave_count'],
+                    reason=reason
+                )
             
             return True
             
@@ -207,16 +236,25 @@ class EnergyCommand:
         return (now - timestamp) < ttl
     
     def send_full_power(self, reason=""):
-        """Envia comando FULL_POWER."""
+        """Envia comando FULL_POWER - 100% potência."""
         return self.write_command('FULL_POWER', reason=reason)
     
     def send_reduce_power(self, reason=""):
-        """Envia comando REDUCE_POWER."""
-        return self.write_command('REDUCE_POWER', reason=reason)
+        """Envia comando POWER_DOWN - 50% potência."""
+        return self.write_command('POWER_DOWN', reason=reason)
+    
+    def send_conditional_reduce(self, reason=""):
+        """Envia comando CONDITIONAL_REDUCE - 70% potência."""
+        action_info = ACTIONS['CONDITIONAL_REDUCE']
+        return self.write_command('CONDITIONAL_REDUCE', ttl=action_info.get('ttl_seconds', 3), reason=reason)
     
     def send_power_down(self, reason=""):
-        """Envia comando POWER_DOWN."""
+        """Envia comando POWER_DOWN - 50% potência."""
         return self.write_command('POWER_DOWN', reason=reason)
+    
+    def send_power_down_eco(self, reason=""):
+        """Envia comando POWER_DOWN_ECO - 25% potência."""
+        return self.write_command('POWER_DOWN_ECO', reason=reason)
     
     def send_maintain(self, reason=""):
         """Envia comando MAINTAIN."""
@@ -243,9 +281,9 @@ def main():
         print(f"    Power: {current['power_level']}%")
         print(f"    TTL: {current['ttl_seconds']}s")
     
-    # Teste 3: REDUCE_POWER
-    print("\n[3] Enviando REDUCE_POWER:")
-    cmd.send_reduce_power(reason="CVaR=45ms, slope=-2ms/s")
+    # Teste 3: CONDITIONAL_REDUCE (70%)
+    print("\n[3] Enviando CONDITIONAL_REDUCE:")
+    cmd.send_conditional_reduce(reason="CVaR=45ms, slope=-2ms/s")
     
     # Teste 4: Verificar validade
     print("\n[4] Verificando validade:")

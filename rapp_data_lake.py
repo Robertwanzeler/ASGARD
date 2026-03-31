@@ -221,6 +221,25 @@ class DataLake:
             ON ue_metrics(imsi)
         """)
         
+        # Tabela de comandos de energia (novo)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS energy_commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                command TEXT NOT NULL,
+                power_percent INTEGER DEFAULT 100,
+                ru_count INTEGER DEFAULT 2,
+                mmwave_count INTEGER DEFAULT 1,
+                reason TEXT
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_energy_timestamp 
+            ON energy_commands(timestamp)
+        """)
+        
         self.conn.commit()
         print(f"[DataLake] Tabelas inicializadas em {self.db_path}")
     
@@ -358,11 +377,20 @@ class DataLake:
         cvar_per_ue = extended_metrics.get('cvar_per_ue_us', 0) if extended_metrics else 0
         ue_count = extended_metrics.get('ue_count', 0) if extended_metrics else 0
         
-        # Extrair métricas POR UE se disponíveis
         latency_p95_per_ue = extended_metrics.get('latency_p95_per_ue_us', 0) if extended_metrics else 0
         variance_per_ue = extended_metrics.get('variance_per_ue_us2', 0) if extended_metrics else 0
         cvar_per_ue = extended_metrics.get('cvar_per_ue_us', 0) if extended_metrics else 0
         ue_count = extended_metrics.get('ue_count', 0) if extended_metrics else 0
+        
+        MAX_VALID_LATENCY_US = 500000
+        
+        if global_worst_latency > MAX_VALID_LATENCY_US:
+            print(f"[DataLake] IGNORANDO outliers: latency={global_worst_latency/1000:.1f}ms > 500ms")
+            return
+        
+        if total_active_ues == 0:
+            print(f"[DataLake] IGNORANDO: sem UEs ativas")
+            return
         
         try:
             cursor = self.conn.cursor()
@@ -429,6 +457,90 @@ class DataLake:
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar métricas de UE: {e}")
+    
+    def record_energy_command(self, command, power_percent=100, ru_count=2, mmwave_count=1, reason=""):
+        """
+        Registra comando de energia enviado ao xApp Energy Saver.
+        
+        Args:
+            command: Comando enviado (FULL_POWER, CONDITIONAL_REDUCE, etc)
+            power_percent: Porcentagem de potência (100, 70, 50, 25, 10)
+            ru_count: Número de RUs ativas
+            mmwave_count: Número de mmWave ativas
+            reason: Motivo do comando
+        """
+        timestamp = int(time.time())
+        dt = datetime.fromtimestamp(timestamp)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT INTO energy_commands 
+                (timestamp, datetime, command, power_percent, ru_count, mmwave_count, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (timestamp, dt_str, command, power_percent, ru_count, mmwave_count, reason))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar comando de energia: {e}")
+    
+    def get_energy_stats(self, hours=24):
+        """
+        Retorna estatísticas de economia de energia.
+        
+        Args:
+            hours: Horas para análise
+            
+        Returns:
+            Dict com estatísticas de energia.
+        """
+        cursor = self.conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                command,
+                COUNT(*) as count,
+                AVG(power_percent) as avg_power,
+                MIN(datetime) as first,
+                MAX(datetime) as last
+            FROM energy_commands
+            WHERE timestamp >= ?
+            GROUP BY command
+            ORDER BY count DESC
+        """, (int(time.time()) - (hours * 3600),))
+        
+        results = {
+            'total_commands': 0,
+            'by_command': {},
+            'avg_power': 0,
+            'total_savings_percent': 0
+        }
+        
+        command_counts = []
+        total_power = 0
+        
+        for row in cursor.fetchall():
+            cmd = row[0]
+            count = row[1]
+            avg_power = row[2] or 100
+            
+            results['by_command'][cmd] = {
+                'count': count,
+                'avg_power_percent': avg_power,
+                'first': row[3],
+                'last': row[4]
+            }
+            
+            results['total_commands'] += count
+            command_counts.append((count, avg_power))
+            total_power += avg_power * count
+        
+        if command_counts:
+            results['avg_power'] = total_power / results['total_commands']
+            baseline_power = 100
+            results['total_savings_percent'] = baseline_power - results['avg_power']
+        
+        return results
     
     def record_extended_from_json(self, extended_json, energy_state=None, slicer_state=None):
         """

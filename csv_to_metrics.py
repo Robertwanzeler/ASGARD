@@ -295,6 +295,13 @@ class ExtendedMetricsCollector:
         if not pdcp_metrics:
             return result
         
+        MAX_LATENCY_THRESHOLD_US = 500000  # 500ms - filter outliers
+        
+        pdcp_metrics = [m for m in pdcp_metrics if m.get('delay_us', 0) <= MAX_LATENCY_THRESHOLD_US]
+        
+        if not pdcp_metrics:
+            return result
+        
         current_time = pdcp_metrics[0].get('time_start', 0)
         recent_window = 30.0
         recent_metrics = [m for m in pdcp_metrics if (current_time - m.get('time_start', 0)) <= recent_window]
@@ -429,26 +436,40 @@ class ExtendedMetricsCollector:
         
         # NOVO: Calcular métricas POR UE para capturar UEs críticos
         # Isso corrige o problema onde P95 agregado não reflete UEs com latência alta
+        # Filtro de outliers: ignorar latências > 500ms para evitar dados corrompidos
+        OUTLIER_THRESHOLD_US = 500000  # 500ms - filtrar outliers extremos
         ue_avg_latencies = []
+        ue_worst_latencies = []
         for imsi, data in ue_data.items():
             if data['latencies']:
-                # Usar a MÉDIA de cada UE (não máximo)
-                ue_avg = sum(data['latencies']) / len(data['latencies'])
+                # Filtrar outliers antes de calcular métricas
+                valid_latencies = [l for l in data['latencies'] if l < OUTLIER_THRESHOLD_US]
+                if not valid_latencies:
+                    valid_latencies = data['latencies']  # Fallback se todos forem outliers
+                # Usar a MÉDIA de cada UE
+                ue_avg = sum(valid_latencies) / len(valid_latencies)
                 ue_avg_latencies.append(ue_avg)
+                # Usar a PIOR latência de cada UE (para CVaR correto)
+                ue_worst = max(valid_latencies)
+                ue_worst_latencies.append(ue_worst)
         
         # CVaR e Variância agora usam latência POR UE
         if ue_avg_latencies:
-            # P95 por UE - captura quando 5% dos UEs têm latência alta
+            # P95 por UE - usa MÉDIA de cada UE
             latency_p95_per_ue = self.percentile_95(ue_avg_latencies)
             
             # Variância por UE - mede dispersão entre UEs
             ue_mean = sum(ue_avg_latencies) / len(ue_avg_latencies)
             variance_per_ue = sum((x - ue_mean) ** 2 for x in ue_avg_latencies) / len(ue_avg_latencies)
             
-            # CVaR por UE - média dos 5% piores UEs
-            sorted_ue_latencies = sorted(ue_avg_latencies)
-            cvar_idx = int(len(sorted_ue_latencies) * 0.95)
-            cvar_per_ue = sum(sorted_ue_latencies[cvar_idx:]) / len(sorted_ue_latencies[cvar_idx:]) if cvar_idx < len(sorted_ue_latencies) else sorted_ue_latencies[-1]
+            # CVaR por UE - P95 da PIOR latência de cada UE (não da média!)
+            # Isso captura quando os 5% piores UEs estão com latência alta
+            if ue_worst_latencies:
+                sorted_ue_worst = sorted(ue_worst_latencies, reverse=True)
+                cvar_idx = int(len(sorted_ue_worst) * 0.95)
+                cvar_per_ue = sum(sorted_ue_worst[:cvar_idx]) / cvar_idx if cvar_idx > 0 else sorted_ue_worst[0]
+            else:
+                cvar_per_ue = 0
         else:
             latency_p95_per_ue = latency_p95
             variance_per_ue = 0

@@ -15,8 +15,8 @@
 BASE_DIR="/home/robert/orange_nuclear"
 cd $BASE_DIR
 
-# 3600 segundos (1 hora de simulação - 2 períodos de 30min)
-SIM_TIME=3600
+# 600 segundos (10 minutos - 2 períodos de 5min)
+SIM_TIME=600
 
 # Cores para o terminal
 GREEN='\033[0;32m'
