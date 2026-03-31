@@ -15,6 +15,7 @@ flexric_lib/
 *.txt
 !requirements.txt
 !README*.txt
+!models/*.txt
 
 # Temporary files
 /tmp/
