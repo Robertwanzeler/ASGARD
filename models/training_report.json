@@ -1,0 +1,75 @@
+{
+  "timestamp": "2026-03-31T19:23:47.104849",
+  "dataset_size": 2964,
+  "features": [
+    "cvar_ms",
+    "cvar_diff",
+    "cvar_rolling_mean",
+    "cvar_rolling_std",
+    "latency_p95_ms",
+    "avg_latency_ms",
+    "variance_ms2",
+    "total_active_cameras",
+    "total_active_ues",
+    "camera_ratio",
+    "total_critical_ues",
+    "hour_sin",
+    "hour_cos",
+    "is_night",
+    "is_weekend",
+    "cvar_zone",
+    "sim_time_s"
+  ],
+  "classifier": {
+    "random_forest_accuracy": 0.9949409780775716,
+    "cross_validation_mean": 0.9957832556073729,
+    "cross_validation_std": 0.00352862217176914,
+    "confusion_matrix": [
+      [
+        8,
+        0,
+        1
+      ],
+      [
+        0,
+        502,
+        1
+      ],
+      [
+        1,
+        0,
+        80
+      ]
+    ],
+    "classes": [
+      "ALLOWED",
+      "BLOCKED",
+      "CONDITIONAL"
+    ],
+    "xgboost_accuracy": 0.9966273187183811
+  },
+  "regressor": {
+    "mae_ms": 0.02342244168637009,
+    "rmse_ms": 0.1574026109768592,
+    "r2": 0.9999499372862356
+  },
+  "feature_importance": {
+    "cvar_ms": 0.17749047693731437,
+    "cvar_diff": 0.0010156974315460507,
+    "cvar_rolling_mean": 0.2143969441427863,
+    "cvar_rolling_std": 0.004991367040487067,
+    "latency_p95_ms": 0.040292628822151365,
+    "avg_latency_ms": 0.03957120182312536,
+    "variance_ms2": 0.04832015281378705,
+    "total_active_cameras": 0.00011098045588882117,
+    "total_active_ues": 0.0,
+    "camera_ratio": 1.317047760945334e-05,
+    "total_critical_ues": 0.08376985088652585,
+    "hour_sin": 0.011081668831981282,
+    "hour_cos": 0.02638488155952232,
+    "is_night": 0.0018841206369102866,
+    "is_weekend": 0.0,
+    "cvar_zone": 0.0844340514279517,
+    "sim_time_s": 0.2662428067124128
+  }
+}

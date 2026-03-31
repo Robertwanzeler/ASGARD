@@ -47,6 +47,7 @@ from rapp_data_lake import DataLake
 from rapp_pattern_engine import PatternRecognition
 from rapp_agent_openran import AgentOpenRAN
 from rapp_a1_interface import A1PolicyInterface
+from rapp_ml_predictor import MLPredictor
 # from rapp_synthetic_generator import SyntheticDataGenerator  # Removed - not available
 from rapp_xapp_manager import XAppManager
 from rapp_trend_analysis import TrendAnalysis
@@ -119,7 +120,10 @@ class RappResourceOptimizer:
         
         # A1 Interface
         self.a1 = A1PolicyInterface()
-        
+
+        # ML Predictor (Random Forest / XGBoost)
+        self.ml_predictor = MLPredictor()
+
         # XApp Manager (controla ciclo de vida dos xApps)
         self.xapp_manager = XAppManager()
         
@@ -550,6 +554,31 @@ class RappResourceOptimizer:
                 decision['reason'] = f'MONITORANDO: CVaR={cvar_us/1000:.1f}ms, slope={slope:.1f}ms/s'
                 decision['confidence'] = 0.5
         
+        # ========================================
+        # ETAPA 2.5: ML PREDICTION (Random Forest)
+        # Predição baseada em modelo treinado
+        # ========================================
+
+        if self.ml_predictor.is_loaded() and not decision['preventive_block']:
+            ml_metrics = {
+                'cvar_per_ue_us': cvar_us if cvar_us else 0,
+                'latency_p95_per_ue_us': network_health.get('p95_us', 0) if network_health else 0,
+                'global_avg_latency_us': network_health.get('median_us', 0) if network_health else 0,
+                'variance_per_ue_us2': variance_us2 if variance_us2 else 0,
+                'total_active_cameras': slicer_intent.get('ACTIVE_CAMERAS', 0) if slicer_intent else 0,
+                'total_active_ues': slicer_intent.get('ACTIVE_UES', 20) if slicer_intent else 20,
+                'total_critical_ues': slicer_intent.get('CRITICAL_UES', 0) if slicer_intent else 0,
+                'sim_time_s': 0,
+            }
+
+            ml_result = self.ml_predictor.predict(ml_metrics)
+            decision['ml_rf_prediction'] = ml_result
+
+            # ML suggestion as additional input (does NOT override safety rules R1-R2)
+            if ml_result.get('decision') and ml_result['confidence'] > 0.7:
+                print(f"\033[0;36m[rApp ML] Predição: {ml_result['decision']} "
+                      f"(conf={ml_result['confidence']:.2f}, CVaR_prev={ml_result['predicted_cvar_ms']}ms)\033[0m")
+
         # ========================================
         # ETAPA 3: AGENT-AL OVERRIDE
         # ========================================
