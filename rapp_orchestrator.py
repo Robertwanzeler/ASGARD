@@ -928,8 +928,32 @@ class RappResourceOptimizer:
                     self.stats['ack_timeout'] += 1
     
     def record_decision(self, decision):
-        """Registra decisão no Data Lake."""
+        """Registra decisão no Data Lake e log estruturado."""
         self.data_lake.record_decision(decision)
+
+        # Structured logging to JSONL file
+        try:
+            log_entry = {
+                'timestamp': decision.get('timestamp', int(time.time())),
+                'datetime': datetime.now().isoformat(),
+                'cycle': self.cycle,
+                'decision': decision.get('energy_saver', 'UNKNOWN'),
+                'action': decision.get('action', 'NONE'),
+                'reason': decision.get('reason', ''),
+                'confidence': decision.get('confidence', 0),
+                'cvar_ms': decision.get('network_health', {}).get('cvar_us', 0) / 1000,
+                'slope_ms_per_sec': decision.get('trend_analysis', {}).get('slope_ms_per_sec', 0),
+                'pattern': decision.get('pattern', 'unknown'),
+                'ml_influenced': decision.get('ml_influenced', False),
+                'preventive_block': decision.get('preventive_block', False),
+                'eco_mode': decision.get('eco_mode', False),
+                'slicer_state': decision.get('slicer_state', 'UNKNOWN')
+            }
+
+            with open('/tmp/rapp_decisions.jsonl', 'a') as f:
+                f.write(json.dumps(log_entry) + '\n')
+        except Exception as e:
+            print(f"[rApp] Erro ao gravar log estruturado: {e}")
     
     def update_stats(self, decision):
         """Atualiza estatísticas."""
