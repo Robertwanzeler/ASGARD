@@ -475,24 +475,43 @@ class RappResourceOptimizer:
             }
         else:
             # Fallback para mediana se network_health não disponível
-            cvar_us = self.calculate_median_latency(minutes=5)
+            cvar_us = self.calculate_median_latency(minutes=5) or 0
             variance_us2 = 0
             stability_score = 100
             decision['network_health'] = {'fallback': True, 'cvar_us': cvar_us}
-            print(f"[rApp DEBUG] Fallback CVaR = {cvar_us}us = {cvar_us/1000:.1f}ms")
+            if cvar_us > 0:
+                print(f"[rApp DEBUG] Fallback CVaR = {cvar_us}us = {cvar_us/1000:.1f}ms")
+            else:
+                print(f"[rApp DEBUG] Sem dados de CVaR disponíveis")
         
-        # Só aplica CVaR se não houve bloco preventivo
-        if not decision['preventive_block'] and cvar_us is not None:
+        # Só aplica CVaR se não houve bloco preventivo e temos dados
+        if not decision['preventive_block'] and cvar_us is not None and cvar_us > 0:
             
             # Obter slope para decisões de prevenção
             slope = trend_info.get('slope_ms_per_sec', 0) if trend_info.get('valid') else 0
             
             # ===== LÓGICA DE COORDENAÇÃO rApp-xApps =====
-            # REGRAS:
+            # REGRAS (refinadas com slope negativo vs zero):
             # 1. CÂMERAS SÃO PRIORIDADE MÁXIMA (se Slicer CRITICAL → BLOCKED)
-            # 2. CVaR/UE > 80ms → BLOCKED
+            # 2. CVaR/UE ≥ 80ms → BLOCKED
             # 3. Slope > 2ms/s → BLOCKED (prevenção)
-            # 4. CVaR/UE < 60ms E Slope < 0 → ALLOWED
+            # 4a. CVaR < 20ms + slope ≤ 0 → ECO (25% potência)
+            # 4b. CVaR < 60ms + slope < -0.01 → ALLOWED (50%) - melhorando
+            # 4c. CVaR < 60ms + abs(slope) < 0.01 → ALLOWED (60%) - estável
+            # 4d. 60-80ms + slope < -0.01 → ALLOWED (70%) - melhorando
+            # 4e. 60-80ms + abs(slope) < 0.01 → ALLOWED (80%) - estável
+            # 5. CVaR < 60ms + slope > 0.01 → CONDITIONAL (70%) - piorando
+            # 6. 60-80ms + slope > 0.01 → CONDITIONAL (90%) - piorando
+            
+            # Classificar estado do slope
+            SLOPE_TOLERANCE = 0.01  # ms/s
+            
+            if slope < -SLOPE_TOLERANCE:
+                slope_state = 'improving'  # melhorando
+            elif slope > SLOPE_TOLERANCE:
+                slope_state = 'worsening'  # piorando
+            else:
+                slope_state = 'stable'     # estável
             
             # REGRA 1: PRIORIDADE MÁXIMA - Câmeras em risco
             if slicer_state == 'CRITICAL':
@@ -503,7 +522,7 @@ class RappResourceOptimizer:
                 self.stats['sla_violations'] += 1
                 print(f"\033[1;31m[rApp] REGRA 1: Slicer CRITICAL - BLOCKED\033[0m")
             
-            # REGRA 2: CVaR/UE > 80ms → SLA em risco
+            # REGRA 2: CVaR/UE ≥ 80ms → SLA em risco
             elif cvar_us >= CVAR_CRITICAL_US:
                 decision['energy_saver'] = 'BLOCKED'
                 decision['action'] = 'FULL_POWER'
@@ -522,38 +541,102 @@ class RappResourceOptimizer:
                 self.stats['preventive_blocks'] = self.stats.get('preventive_blocks', 0) + 1
                 print(f"\033[1;33m[rApp] REGRA 3: Slope > 2ms/s - BLOCKED\033[0m")
             
-            # REGRA 4: CVaR < 60ms E Slope < 0 → PODE ECONOMIZAR
-            elif cvar_us < CVAR_NORMAL_US and slope < 0:
-                # REGRA 4B: MODO ECO - Economia extrema quando CVaR < 20ms
-                if cvar_us < 20000:  # < 20ms
-                    decision['energy_saver'] = 'ALLOWED'
-                    decision['action'] = 'POWER_DOWN_ECO'
-                    decision['eco_mode'] = True
-                    decision['reason'] = f'ECO MODE: CVaR={cvar_us/1000:.1f}ms < 20ms + slope={slope:.1f}ms/s → Economia extrema (10%)'
-                    decision['confidence'] = 0.95
-                    print(f"\033[1;32m[rApp] REGRA 4B: CVaR < 20ms + Slope < 0 - ECO MODE\033[0m")
-                else:
-                    decision['energy_saver'] = 'ALLOWED'
-                    decision['action'] = 'POWER_DOWN'
-                    decision['reason'] = f'NORMAL: CVaR={cvar_us/1000:.1f}ms < 60ms + slope={slope:.1f}ms/s (melhorando) → Pode economizar'
-                    decision['confidence'] = 0.9
-                    print(f"\033[1;32m[rApp] REGRA 4: CVaR < 60ms + Slope < 0 - ALLOWED\033[0m")
+            # REGRA 4a: CVaR < 20ms + slope ≤ 0 → ECO MODE (25% potência)
+            elif cvar_us < 20000 and slope <= 0:
+                decision['energy_saver'] = 'ALLOWED'
+                decision['action'] = 'POWER_DOWN_ECO'
+                decision['eco_mode'] = True
+                decision['reason'] = f'ECO MODE: CVaR={cvar_us/1000:.1f}ms < 20ms + slope={slope:.2f}ms/s ({slope_state}) → Economia extrema (25%)'
+                decision['confidence'] = 0.95
+                print(f"\033[1;32m[rApp] REGRA 4a: CVaR < 20ms + Slope ≤ 0 - ECO MODE\033[0m")
             
-            # REGRA 5: CVaR < 60ms mas Slope > 0 → CONDITIONAL
-            elif cvar_us < CVAR_NORMAL_US:
+            # REGRA 4b: CVaR < 60ms + slope < -0.01 → ALLOWED (50%) - melhorando
+            elif cvar_us < CVAR_NORMAL_US and slope < -SLOPE_TOLERANCE:
+                decision['energy_saver'] = 'ALLOWED'
+                decision['action'] = 'POWER_DOWN'
+                decision['reason'] = f'MELHORANDO: CVaR={cvar_us/1000:.1f}ms < 60ms + slope={slope:.2f}ms/s (descendo) → Economia (50%)'
+                decision['confidence'] = 0.9
+                print(f"\033[1;32m[rApp] REGRA 4b: CVaR < 60ms + Slope < 0 - ALLOWED 50%\033[0m")
+            
+            # REGRA 4c: CVaR < 60ms + slope ≈ 0 → ALLOWED (60%) - estável
+            elif cvar_us < CVAR_NORMAL_US and abs(slope) < SLOPE_TOLERANCE:
+                decision['energy_saver'] = 'ALLOWED'
+                decision['action'] = 'POWER_DOWN'
+                decision['reason'] = f'ESTÁVEL: CVaR={cvar_us/1000:.1f}ms < 60ms + slope={slope:.2f}ms/s (zero) → Economia moderada (60%)'
+                decision['confidence'] = 0.85
+                print(f"\033[1;32m[rApp] REGRA 4c: CVaR < 60ms + Slope ≈ 0 - ALLOWED 60%\033[0m")
+            
+            # REGRA 4d: 60-80ms + slope < -0.01 → ALLOWED (70%) - melhorando
+            elif cvar_us < CVAR_CRITICAL_US and slope < -SLOPE_TOLERANCE:
+                decision['energy_saver'] = 'ALLOWED'
+                decision['action'] = 'POWER_DOWN'
+                decision['reason'] = f'MELHORANDO: CVaR={cvar_us/1000:.1f}ms (60-80ms) + slope={slope:.2f}ms/s (descendo) → Economia (70%)'
+                decision['confidence'] = 0.8
+                print(f"\033[1;33m[rApp] REGRA 4d: 60ms ≤ CVaR < 80ms + Slope < 0 - ALLOWED 70%\033[0m")
+            
+            # REGRA 4e: 60-80ms + slope ≈ 0 → ALLOWED (80%) - estável
+            elif cvar_us < CVAR_CRITICAL_US and abs(slope) < SLOPE_TOLERANCE:
+                decision['energy_saver'] = 'ALLOWED'
+                decision['action'] = 'POWER_DOWN'
+                decision['reason'] = f'ESTÁVEL: CVaR={cvar_us/1000:.1f}ms (60-80ms) + slope={slope:.2f}ms/s (zero) → Economia moderada (80%)'
+                decision['confidence'] = 0.75
+                print(f"\033[1;33m[rApp] REGRA 4e: 60ms ≤ CVaR < 80ms + Slope ≈ 0 - ALLOWED 80%\033[0m")
+            
+            # REGRA 5: CVaR < 60ms + slope > 0.01 → CONDITIONAL (70%) - piorando
+            elif cvar_us < CVAR_NORMAL_US and slope > SLOPE_TOLERANCE:
                 decision['energy_saver'] = 'CONDITIONAL'
                 decision['action'] = 'MONITOR'
-                decision['reason'] = f'MONITORANDO: CVaR={cvar_us/1000:.1f}ms < 60ms mas slope=+{slope:.1f}ms/s'
+                decision['reason'] = f'PIORANDO: CVaR={cvar_us/1000:.1f}ms < 60ms + slope=+{slope:.2f}ms/s (subindo) → Monitorar (70%)'
                 decision['confidence'] = 0.6
-                print(f"\033[1;36m[rApp] REGRA 5: CVaR < 60ms mas Slope > 0 - CONDITIONAL\033[0m")
+                print(f"\033[1;36m[rApp] REGRA 5: CVaR < 60ms + Slope > 0 - CONDITIONAL 70%\033[0m")
             
-            # REGRA 6: Outros casos → CONDITIONAL
+            # REGRA 6: 60-80ms + slope > 0.01 → CONDITIONAL (90%) - piorando
+            elif cvar_us < CVAR_CRITICAL_US and slope > SLOPE_TOLERANCE:
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = 'MONITOR'
+                decision['reason'] = f'PIORANDO: CVaR={cvar_us/1000:.1f}ms (60-80ms) + slope=+{slope:.2f}ms/s (subindo) → Monitorar (90%)'
+                decision['confidence'] = 0.4
+                print(f"\033[1;31m[rApp] REGRA 6: 60ms ≤ CVaR < 80ms + Slope > 0 - CONDITIONAL 90%\033[0m")
+            
+            # REGRA 7: Outros casos → CONDITIONAL
             else:
                 decision['energy_saver'] = 'CONDITIONAL'
                 decision['action'] = 'MONITOR'
-                decision['reason'] = f'MONITORANDO: CVaR={cvar_us/1000:.1f}ms, slope={slope:.1f}ms/s'
+                decision['reason'] = f'MONITORANDO: CVaR={cvar_us/1000:.1f}ms, slope={slope:.2f}ms/s ({slope_state})'
                 decision['confidence'] = 0.5
-        
+
+        # ========================================
+        # ETAPA 2.3: PATTERN ENGINE INTEGRATION
+        # Ajusta decisão baseada no padrão detectado
+        # ========================================
+
+        if pattern_analysis and not decision['preventive_block']:
+            pattern = pattern_analysis.get('pattern', 'unknown')
+            activity_level = pattern_analysis.get('activity_level', 'normal')
+
+            # Durante "peak_hours" → ser mais conservador
+            if pattern == 'peak_hours' and decision['energy_saver'] == 'ALLOWED':
+                # Reduz agressividade da economia em 10%
+                original_action = decision['action']
+                if 'ECO' in original_action:
+                    decision['action'] = 'POWER_DOWN'
+                    decision['reason'] += f' [PATTERN: peak_hours - economia reduzida]'
+                    decision['confidence'] *= 0.9
+                    print(f"\033[1;33m[rApp PATTERN] Peak hours: ECO → POWER_DOWN (10% menos agressivo)\033[0m")
+
+            # Durante "low_activity" → ser mais agressivo na economia
+            elif activity_level == 'low' and decision['energy_saver'] == 'ALLOWED':
+                original_action = decision['action']
+                if 'POWER_DOWN' in original_action and 'ECO' not in original_action:
+                    decision['action'] = 'POWER_DOWN_ECO'
+                    decision['eco_mode'] = True
+                    decision['reason'] += f' [PATTERN: low_activity - economia aumentada]'
+                    decision['confidence'] *= 1.1
+                    print(f"\033[1;32m[rApp PATTERN] Low activity: POWER_DOWN → ECO (20% mais agressivo)\033[0m")
+
+            decision['pattern'] = pattern
+            decision['activity_level'] = activity_level
+
         # ========================================
         # ETAPA 2.5: ML PREDICTION (Random Forest)
         # Predição baseada em modelo treinado
@@ -574,10 +657,44 @@ class RappResourceOptimizer:
             ml_result = self.ml_predictor.predict(ml_metrics)
             decision['ml_rf_prediction'] = ml_result
 
-            # ML suggestion as additional input (does NOT override safety rules R1-R2)
+            # ML influences decision based on confidence
             if ml_result.get('decision') and ml_result['confidence'] > 0.7:
-                print(f"\033[0;36m[rApp ML] Predição: {ml_result['decision']} "
-                      f"(conf={ml_result['confidence']:.2f}, CVaR_prev={ml_result['predicted_cvar_ms']}ms)\033[0m")
+                ml_decision = ml_result['decision']
+                ml_confidence = ml_result['confidence']
+
+                print(f"\033[0;36m[rApp ML] Predição: {ml_decision} "
+                      f"(conf={ml_confidence:.2f}, CVaR_prev={ml_result['predicted_cvar_ms']}ms)\033[0m")
+
+                # Save original decision for comparison
+                decision['ml_influenced'] = False
+
+                # Only influence if NOT a safety block (R1, R2, R3)
+                if not decision['preventive_block'] and decision['energy_saver'] != 'BLOCKED':
+                    rule_decision = decision['energy_saver']
+
+                    # ML says ALLOWED + Rules say CONDITIONAL + conf > 80% → ALLOWED
+                    if ml_decision == 'ALLOWED' and rule_decision == 'CONDITIONAL' and ml_confidence > 0.8:
+                        decision['energy_saver'] = 'ALLOWED'
+                        decision['action'] = 'POWER_DOWN'
+                        decision['reason'] = f'ML OVERRIDE: {decision["reason"]} + ML={ml_decision} (conf={ml_confidence:.0%})'
+                        decision['confidence'] = ml_confidence
+                        decision['ml_influenced'] = True
+                        print(f"\033[1;32m[rApp ML] OVERRIDE: CONDITIONAL → ALLOWED (ML conf={ml_confidence:.0%})\033[0m")
+
+                    # ML says BLOCKED + Rules say ALLOWED + conf > 80% → CONDITIONAL
+                    elif ml_decision == 'BLOCKED' and rule_decision == 'ALLOWED' and ml_confidence > 0.8:
+                        decision['energy_saver'] = 'CONDITIONAL'
+                        decision['action'] = 'MONITOR'
+                        decision['reason'] = f'ML CAUTION: {decision["reason"]} + ML={ml_decision} (conf={ml_confidence:.0%})'
+                        decision['confidence'] = ml_confidence
+                        decision['ml_influenced'] = True
+                        print(f"\033[1;33m[rApp ML] CAUTION: ALLOWED → CONDITIONAL (ML conf={ml_confidence:.0%})\033[0m")
+
+                # Log concordance
+                if ml_decision == decision['energy_saver']:
+                    print(f"\033[0;32m[rApp ML] ✓ Concordância ML={ml_decision} == Regras={decision['energy_saver']}\033[0m")
+                else:
+                    print(f"\033[0;33m[rApp ML] ✗ Discordância ML={ml_decision} != Regras={decision['energy_saver']}\033[0m")
 
         # ========================================
         # ETAPA 3: AGENT-AL OVERRIDE
