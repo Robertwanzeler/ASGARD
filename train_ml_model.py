@@ -22,6 +22,7 @@ Output:
 
 import os
 import sys
+import time
 import sqlite3
 import argparse
 import json
@@ -51,8 +52,13 @@ DEFAULT_DB = "/tmp/rapp_data_lake.db"
 DEFAULT_OUTPUT = "./models"
 
 
-def load_data(db_path):
-    """Load data from SQLite Data Lake."""
+def load_data(db_path, hours=None):
+    """Load data from SQLite Data Lake.
+
+    Args:
+        db_path: Path to SQLite database
+        hours: If specified, only load data from last N hours
+    """
     print(f"[1/6] Carregando dados de {db_path}...")
 
     if not os.path.exists(db_path):
@@ -61,8 +67,15 @@ def load_data(db_path):
 
     conn = sqlite3.connect(db_path)
 
+    # Build time filter
+    time_filter = ""
+    if hours:
+        cutoff = int(time.time()) - (hours * 3600)
+        time_filter = f"AND m.timestamp >= {cutoff}"
+        print(f"    → Filtrando últimas {hours} horas")
+
     # Load extended metrics joined with decisions
-    query = """
+    query = f"""
         SELECT
             m.timestamp,
             m.sim_time_s,
@@ -85,6 +98,7 @@ def load_data(db_path):
         JOIN decisions_history d
             ON m.timestamp = d.timestamp
         WHERE m.cvar_per_ue_us > 0
+        {time_filter}
         ORDER BY m.timestamp
     """
 
@@ -404,21 +418,30 @@ def main():
     parser = argparse.ArgumentParser(description='GreenRAN ML Training Pipeline')
     parser.add_argument('--db', default=DEFAULT_DB, help='Path to SQLite database')
     parser.add_argument('--output', default=DEFAULT_OUTPUT, help='Output directory for models')
+    parser.add_argument('--retrain', action='store_true', help='Retrain with recent data only (last 24h)')
+    parser.add_argument('--hours', type=int, default=24, help='Hours of data to use for retraining')
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
 
     print("=" * 60)
     print("  GreenRAN ML Training Pipeline")
+    if args.retrain:
+        print(f"  Mode: RETRAIN (last {args.hours}h)")
     print("=" * 60)
     print()
 
     # Load data
-    df = load_data(args.db)
+    df = load_data(args.db, hours=args.hours if args.retrain else None)
 
     if len(df) < 50:
         print(f"[ERRO] Dataset muito pequeno ({len(df)} registros). Mínimo: 50")
         sys.exit(1)
+
+    # Show class distribution
+    print(f"\n    Distribuição de classes:")
+    for cls, count in df['decision'].value_counts().items():
+        print(f"      {cls}: {count} ({count/len(df)*100:.1f}%)")
 
     # Feature engineering
     df, feature_cols = engineer_features(df)
@@ -430,7 +453,13 @@ def main():
     # Train regressor
     reg_results, rf_reg = train_regressor(df, feature_cols, args.output)
 
-    # Save report
+    # Save report with timestamp if retraining
+    if args.retrain:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        report_path = os.path.join(args.output, f'training_report_{timestamp}.json')
+    else:
+        report_path = os.path.join(args.output, 'training_report.json')
+
     save_report(clf_results, reg_results, feature_cols, args.output)
 
     # Plot

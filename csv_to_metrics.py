@@ -41,11 +41,16 @@ class ExtendedMetricsCollector:
         self.poll_interval = poll_interval
         self.running = True
         self.lock = threading.Lock()
-        
+
         # Persistência de UEs (Memória de 5 segundos)
         self.active_ues_cache = {} # imsi -> last_seen_timestamp
         self.activity_window = 5.0 # 5 segundos
-        
+
+        # Throughput delta tracking
+        self.last_total_tx_bytes = 0
+        self.last_total_rx_bytes = 0
+        self.last_sim_time = 0.0
+
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         os.makedirs(os.path.dirname(extended_output_file), exist_ok=True)
         
@@ -474,9 +479,26 @@ class ExtendedMetricsCollector:
             latency_p95_per_ue = latency_p95
             variance_per_ue = 0
             cvar_per_ue = 0
-        
-        total_throughput = total_tx_bytes + total_rx_bytes
-        total_throughput_kbps = (total_throughput * 8) / (recent_window * 1000) if recent_window > 0 else 0
+
+        # Calculate throughput using DELTA (not cumulative)
+        current_sim_time = recent_metrics[-1].get('time_end', 0) if recent_metrics else 0
+        sim_time_delta = current_sim_time - self.last_sim_time
+
+        if self.last_sim_time > 0 and sim_time_delta > 0:
+            # Use delta for real throughput
+            delta_tx = total_tx_bytes - self.last_total_tx_bytes
+            delta_rx = total_rx_bytes - self.last_total_rx_bytes
+            delta_throughput = (delta_tx + delta_rx) * 8 / (sim_time_delta * 1000)
+            total_throughput_kbps = max(0, delta_throughput)  # Avoid negative from counter reset
+        else:
+            # First reading, use window-based calculation
+            total_throughput = total_tx_bytes + total_rx_bytes
+            total_throughput_kbps = (total_throughput * 8) / (recent_window * 1000) if recent_window > 0 else 0
+
+        # Update tracking variables
+        self.last_total_tx_bytes = total_tx_bytes
+        self.last_total_rx_bytes = total_rx_bytes
+        self.last_sim_time = current_sim_time
         
         result['global_metrics'] = {
             'global_worst_latency_us': worst_latency,
