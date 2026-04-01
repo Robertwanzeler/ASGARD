@@ -282,37 +282,57 @@ def ml_page():
     last_prediction = {'decision': 'N/A', 'confidence': 0, 'predicted_cvar_ms': 0}
     try:
         cursor = PATTERN_ENGINE.dl.conn.execute(
-            """SELECT reason, confidence FROM decisions_history
-               WHERE reason LIKE '%ML%' ORDER BY timestamp DESC LIMIT 1"""
+            """SELECT ml_decision, ml_confidence, ml_predicted_cvar_ms, decision
+               FROM decisions_history
+               WHERE ml_decision IS NOT NULL AND ml_decision != ''
+               ORDER BY timestamp DESC LIMIT 1"""
         )
         row = cursor.fetchone()
         if row:
-            last_prediction['decision'] = 'ML influenced'
+            last_prediction['decision'] = row[0] or 'N/A'
             last_prediction['confidence'] = row[1] or 0
+            last_prediction['predicted_cvar_ms'] = row[2] or 0
     except Exception:
         pass
 
-    # Get prediction history
+    # Get prediction history with ML data
     prediction_history = []
     try:
         cursor = PATTERN_ENGINE.dl.conn.execute(
-            """SELECT datetime, decision, reason, confidence
+            """SELECT datetime, ml_decision, decision, ml_confidence,
+                      ml_predicted_cvar_ms, ml_influenced
                FROM decisions_history
                ORDER BY timestamp DESC LIMIT 20"""
         )
         for row in cursor.fetchall():
+            ml_dec = row[1] or 'N/A'
+            rule_dec = row[2]
+            ml_conf = row[3] or 0
+            ml_cvar = row[4] or 0
+            influenced = row[5] or 0
+
+            # Calculate concordance
+            concordance = (ml_dec == rule_dec) if ml_dec != 'N/A' else False
+
             prediction_history.append({
                 'timestamp': row[0],
-                'ml_decision': 'N/A',
-                'rule_decision': row[1],
-                'confidence': row[3] or 0,
-                'predicted_cvar_ms': 0
+                'ml_decision': ml_dec,
+                'rule_decision': rule_dec,
+                'confidence': ml_conf,
+                'predicted_cvar_ms': ml_cvar,
+                'ml_influenced': influenced,
+                'concordance': concordance
             })
     except Exception:
         pass
 
-    # Calculate concordance (simplified)
-    concordance_pct = 85.0  # Default estimate
+    # Calculate concordance percentage
+    concordance_pct = 85.0  # Default
+    if prediction_history:
+        concordant = sum(1 for p in prediction_history if p.get('concordance', False))
+        total = len([p for p in prediction_history if p['ml_decision'] != 'N/A'])
+        if total > 0:
+            concordance_pct = round(concordant / total * 100, 1)
 
     # Get feature importance
     feature_importance = {}

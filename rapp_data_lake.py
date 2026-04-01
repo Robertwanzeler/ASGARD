@@ -103,6 +103,10 @@ class DataLake:
                 agent_override INTEGER DEFAULT 0,
                 energy_state TEXT,
                 slicer_state TEXT,
+                ml_decision TEXT,
+                ml_confidence REAL,
+                ml_predicted_cvar_ms REAL,
+                ml_influenced INTEGER DEFAULT 0,
                 UNIQUE(timestamp)
             )
         """)
@@ -312,7 +316,7 @@ class DataLake:
     def record_decision(self, decision=None, timestamp=None):
         """
         Registra uma decisão do rApp.
-        
+
         Args:
             decision: Dict com campos:
                 - decision: 'BLOCKED', 'ALLOWED', 'CONDITIONAL'
@@ -322,17 +326,19 @@ class DataLake:
                 - agent_override: bool
                 - energy_state: estado do energy saver
                 - slicer_state: estado do slicer
+                - ml_rf_prediction: dict com predição ML
+                - ml_influenced: bool
             timestamp: Unix timestamp (default: now)
         """
         if timestamp is None:
             timestamp = int(time.time())
-        
+
         dt = datetime.fromtimestamp(timestamp)
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-        
+
         if decision is None:
             decision = {}
-        
+
         decision_str = decision.get('energy_saver', 'UNKNOWN')
         reason = decision.get('reason', '')
         confidence = decision.get('confidence', 0.0)
@@ -340,16 +346,25 @@ class DataLake:
         agent_override = 1 if decision.get('agent_override', False) else 0
         energy_state = decision.get('energy_state', '')
         slicer_state = decision.get('slicer_state', '')
-        
+
+        # ML prediction data
+        ml_prediction = decision.get('ml_rf_prediction', {})
+        ml_decision = ml_prediction.get('decision', '')
+        ml_confidence = ml_prediction.get('confidence', 0.0)
+        ml_predicted_cvar = ml_prediction.get('predicted_cvar_ms', 0.0)
+        ml_influenced = 1 if decision.get('ml_influenced', False) else 0
+
         try:
             cursor = self.conn.cursor()
             cursor.execute("""
-                INSERT OR REPLACE INTO decisions_history 
-                (timestamp, datetime, decision, reason, confidence, pattern, 
-                 agent_override, energy_state, slicer_state)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO decisions_history
+                (timestamp, datetime, decision, reason, confidence, pattern,
+                 agent_override, energy_state, slicer_state,
+                 ml_decision, ml_confidence, ml_predicted_cvar_ms, ml_influenced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (timestamp, dt_str, decision_str, reason, confidence, pattern,
-                  agent_override, energy_state, slicer_state))
+                  agent_override, energy_state, slicer_state,
+                  ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced))
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar decisão: {e}")

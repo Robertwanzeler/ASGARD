@@ -86,8 +86,9 @@
                             <th>Timestamp</th>
                             <th>Decisão ML</th>
                             <th>Decisão Regras</th>
-                            <th>Confiança</th>
+                            <th>Conf. ML</th>
                             <th>CVaR Previsto</th>
+                            <th>ML Influenciou</th>
                             <th>Concordância</th>
                         </tr>
                     </thead>
@@ -96,7 +97,7 @@
                         <tr>
                             <td>{{ pred.timestamp }}</td>
                             <td>
-                                <span class="badge {% if pred.ml_decision == 'ALLOWED' %}badge-ok{% elif pred.ml_decision == 'BLOCKED' %}badge-critical{% else %}badge-warning{% endif %}">
+                                <span class="badge {% if pred.ml_decision == 'ALLOWED' %}badge-ok{% elif pred.ml_decision == 'BLOCKED' %}badge-critical{% elif pred.ml_decision == 'N/A' %}badge-warning{% else %}badge-warning{% endif %}">
                                     {{ pred.ml_decision }}
                                 </span>
                             </td>
@@ -108,7 +109,14 @@
                             <td>{{ "%.0f"|format(pred.confidence * 100) }}%</td>
                             <td>{{ "%.1f"|format(pred.predicted_cvar_ms) }} ms</td>
                             <td>
-                                {% if pred.ml_decision == pred.rule_decision %}
+                                {% if pred.ml_influenced %}
+                                <span style="color: #00ff88;">Sim</span>
+                                {% else %}
+                                <span style="color: #888888;">Não</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if pred.concordance %}
                                 <span style="color: #00ff88;">✓</span>
                                 {% else %}
                                 <span style="color: #ffaa00;">✗</span>
