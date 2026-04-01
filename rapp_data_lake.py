@@ -55,10 +55,18 @@ class DataLake:
             os.makedirs(db_dir, exist_ok=True)
     
     def _connect(self):
-        """Conecta ao banco SQLite"""
+        """Conecta ao banco SQLite com otimizações"""
         try:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
+
+            # Enable WAL mode for better concurrency
+            self.conn.execute("PRAGMA journal_mode=WAL")
+
+            # Performance optimizations
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+            self.conn.execute("PRAGMA temp_store=MEMORY")
         except Exception as e:
             print(f"[DataLake] ERRO ao conectar: {e}")
             raise
@@ -239,9 +247,30 @@ class DataLake:
             CREATE INDEX IF NOT EXISTS idx_energy_timestamp 
             ON energy_commands(timestamp)
         """)
-        
+
+        # Additional indexes for performance
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_extended_metrics_timestamp
+            ON extended_metrics(timestamp)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_decisions_timestamp
+            ON decisions_history(timestamp)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_extended_metrics_cvar
+            ON extended_metrics(cvar_per_ue_us)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ue_metrics_timestamp
+            ON ue_metrics(timestamp)
+        """)
+
         self.conn.commit()
-        print(f"[DataLake] Tabelas inicializadas em {self.db_path}")
+        print(f"[DataLake] Tabelas e índices inicializados em {self.db_path}")
     
     def record_metric(self, timestamp=None, latency_us=0, cameras_active=0, 
                       critical_cameras=0, energy_state=None, slicer_state=None):
@@ -1261,7 +1290,46 @@ class DataLake:
             'valid': True,
             'n_samples': n
         }
-    
+
+    def cleanup_old_data(self, days=7):
+        """
+        Remove dados mais antigos que N dias.
+
+        Args:
+            days: Número de dias para manter (default: 7)
+        """
+        cutoff = int(time.time()) - (days * 86400)
+        cursor = self.conn.cursor()
+
+        try:
+            # Clean extended_metrics
+            cursor.execute("DELETE FROM extended_metrics WHERE timestamp < ?", (cutoff,))
+            metrics_deleted = cursor.rowcount
+
+            # Clean decisions_history
+            cursor.execute("DELETE FROM decisions_history WHERE timestamp < ?", (cutoff,))
+            decisions_deleted = cursor.rowcount
+
+            # Clean ue_metrics
+            cursor.execute("DELETE FROM ue_metrics WHERE timestamp < ?", (cutoff,))
+            ue_deleted = cursor.rowcount
+
+            # Clean energy_commands
+            cursor.execute("DELETE FROM energy_commands WHERE timestamp < ?", (cutoff,))
+            energy_deleted = cursor.rowcount
+
+            self.conn.commit()
+
+            # Vacuum to reclaim space
+            self.conn.execute("VACUUM")
+
+            total = metrics_deleted + decisions_deleted + ue_deleted + energy_deleted
+            if total > 0:
+                print(f"[DataLake] Limpeza: {total} registros antigos removidos (> {days} dias)")
+
+        except Exception as e:
+            print(f"[DataLake] Erro na limpeza: {e}")
+
     def close(self):
         """Fecha conexão com o banco"""
         if self.conn:
