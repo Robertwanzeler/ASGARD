@@ -121,8 +121,13 @@ class RappResourceOptimizer:
         # A1 Interface
         self.a1 = A1PolicyInterface()
 
-        # ML Predictor (Random Forest / XGBoost)
-        self.ml_predictor = MLPredictor()
+        # ML Predictor (Random Forest / XGBoost) com acesso ao banco
+        self.ml_predictor = MLPredictor(data_lake=self.data_lake)
+
+        # Retreinamento automático do ML (2x por dia = a cada 12h)
+        self.ml_retrain_interval = 12 * 3600  # 12 horas em segundos
+        self.ml_last_retrain = time.time()
+        self.ml_retrain_count = 0
 
         # XApp Manager (controla ciclo de vida dos xApps)
         self.xapp_manager = XAppManager()
@@ -654,18 +659,35 @@ class RappResourceOptimizer:
                 'sim_time_s': 0,
             }
 
-            ml_result = self.ml_predictor.predict(ml_metrics)
+            # Usar predição com contexto do banco de dados
+            ml_result = self.ml_predictor.predict_with_db_context(ml_metrics)
             decision['ml_rf_prediction'] = ml_result
 
+            # Log da predição com fonte
+            ml_decision = ml_result.get('decision')
+            ml_confidence = ml_result.get('confidence', 0)
+            ml_source = ml_result.get('source', 'unknown')
+            ml_cvar_prev = ml_result.get('predicted_cvar_ms', 0)
+            db_dist = ml_result.get('db_distribution', {})
+            db_total = ml_result.get('db_total', 0)
+
+            if ml_decision:
+                source_color = {
+                    'ml_only': '\033[0;36m',
+                    'ml_boosted': '\033[1;36m',
+                    'database_override': '\033[1;33m',
+                }.get(ml_source, '\033[0m')
+
+                print(f"{source_color}[rApp ML] {ml_decision} (conf={ml_confidence:.2f}, "
+                      f"CVaR={ml_cvar_prev}ms, fonte={ml_source}, "
+                      f"banco={db_total}regs)\033[0m")
+
+                if db_dist:
+                    dist_str = ', '.join(f"{k}:{v}%" for k, v in db_dist.items())
+                    print(f"\033[0;90m[rApp ML] Distribuição banco: {dist_str}\033[0m")
+
             # ML influences decision based on confidence
-            if ml_result.get('decision') and ml_result['confidence'] > 0.7:
-                ml_decision = ml_result['decision']
-                ml_confidence = ml_result['confidence']
-
-                print(f"\033[0;36m[rApp ML] Predição: {ml_decision} "
-                      f"(conf={ml_confidence:.2f}, CVaR_prev={ml_result['predicted_cvar_ms']}ms)\033[0m")
-
-                # Save original decision for comparison
+            if ml_decision and ml_confidence > 0.7:
                 decision['ml_influenced'] = False
 
                 # Only influence if NOT a safety block (R1, R2, R3)
@@ -676,7 +698,7 @@ class RappResourceOptimizer:
                     if ml_decision == 'ALLOWED' and rule_decision == 'CONDITIONAL' and ml_confidence > 0.8:
                         decision['energy_saver'] = 'ALLOWED'
                         decision['action'] = 'POWER_DOWN'
-                        decision['reason'] = f'ML OVERRIDE: {decision["reason"]} + ML={ml_decision} (conf={ml_confidence:.0%})'
+                        decision['reason'] = f'ML OVERRIDE: {decision["reason"]} + ML={ml_decision} (conf={ml_confidence:.0%}, fonte={ml_source})'
                         decision['confidence'] = ml_confidence
                         decision['ml_influenced'] = True
                         print(f"\033[1;32m[rApp ML] OVERRIDE: CONDITIONAL → ALLOWED (ML conf={ml_confidence:.0%})\033[0m")
@@ -685,7 +707,7 @@ class RappResourceOptimizer:
                     elif ml_decision == 'BLOCKED' and rule_decision == 'ALLOWED' and ml_confidence > 0.8:
                         decision['energy_saver'] = 'CONDITIONAL'
                         decision['action'] = 'MONITOR'
-                        decision['reason'] = f'ML CAUTION: {decision["reason"]} + ML={ml_decision} (conf={ml_confidence:.0%})'
+                        decision['reason'] = f'ML CAUTION: {decision["reason"]} + ML={ml_decision} (conf={ml_confidence:.0%}, fonte={ml_source})'
                         decision['confidence'] = ml_confidence
                         decision['ml_influenced'] = True
                         print(f"\033[1;33m[rApp ML] CAUTION: ALLOWED → CONDITIONAL (ML conf={ml_confidence:.0%})\033[0m")
@@ -933,6 +955,7 @@ class RappResourceOptimizer:
 
         # Structured logging to JSONL file
         try:
+            ml_prediction = decision.get('ml_rf_prediction', {})
             log_entry = {
                 'timestamp': decision.get('timestamp', int(time.time())),
                 'datetime': datetime.now().isoformat(),
@@ -945,6 +968,9 @@ class RappResourceOptimizer:
                 'slope_ms_per_sec': decision.get('trend_analysis', {}).get('slope_ms_per_sec', 0),
                 'pattern': decision.get('pattern', 'unknown'),
                 'ml_influenced': decision.get('ml_influenced', False),
+                'ml_source': ml_prediction.get('source', 'unknown'),
+                'ml_confidence': ml_prediction.get('confidence', 0),
+                'ml_predicted_cvar_ms': ml_prediction.get('predicted_cvar_ms', 0),
                 'preventive_block': decision.get('preventive_block', False),
                 'eco_mode': decision.get('eco_mode', False),
                 'slicer_state': decision.get('slicer_state', 'UNKNOWN')
@@ -1065,9 +1091,58 @@ class RappResourceOptimizer:
             
             if decision['agent_override']:
                 print(f"\033[1;35m  >>> AGENT-AL OVERRIDE: {decision['agent_policy']}\033[0m")
-            
+
             print("=" * 70)
-    
+
+    def check_ml_retrain(self):
+        """Verifica se é hora de retreinar o ML."""
+        now = time.time()
+        elapsed = now - self.ml_last_retrain
+
+        if elapsed >= self.ml_retrain_interval:
+            print(f"\033[1;35m[rApp ML] Retreinamento automático (a cada 12h)...\033[0m")
+            self.retrain_ml()
+            self.ml_last_retrain = now
+            self.ml_retrain_count += 1
+
+    def retrain_ml(self):
+        """Retreina o modelo ML com dados do banco."""
+        try:
+            import subprocess
+            import sys
+
+            script_path = os.path.join(os.path.dirname(__file__), 'train_ml_model.py')
+            result = subprocess.run(
+                [sys.executable, script_path, '--output', './models'],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=os.path.dirname(__file__)
+            )
+
+            if result.returncode == 0:
+                print(f"\033[1;32m[rApp ML] Retreinamento concluído (#{self.ml_retrain_count + 1})\033[0m")
+
+                # Recarregar modelos
+                self.ml_predictor._load_models()
+
+                # Mostrar accuracy do novo modelo
+                report_path = os.path.join(os.path.dirname(__file__), 'models', 'training_report.json')
+                if os.path.exists(report_path):
+                    import json
+                    with open(report_path, 'r') as f:
+                        report = json.load(f)
+                        accuracy = report.get('classifier', {}).get('random_forest_accuracy', 0)
+                        classes = report.get('classifier', {}).get('classes', [])
+                        print(f"\033[1;32m[rApp ML] Nova accuracy: {accuracy:.2%}, Classes: {classes}\033[0m")
+            else:
+                print(f"\033[1;31m[rApp ML] Erro no retreinamento: {result.stderr[:200]}\033[0m")
+
+        except subprocess.TimeoutExpired:
+            print(f"\033[1;31m[rApp ML] Timeout no retreinamento\033[0m")
+        except Exception as e:
+            print(f"\033[1;31m[rApp ML] Erro no retreinamento: {e}\033[0m")
+
     def print_final_stats(self):
         """Imprime estatísticas finais."""
         total = self.stats['total_cycles']
@@ -1145,8 +1220,11 @@ class RappResourceOptimizer:
             
             # 8. Imprime status
             self.print_status(decision, xapp_status)
-            
-            # 9. Espera próximo ciclo
+
+            # 9. Verifica se é hora de retreinar ML
+            self.check_ml_retrain()
+
+            # 10. Espera próximo ciclo
             time.sleep(self.interval)
         
         # Shutdown

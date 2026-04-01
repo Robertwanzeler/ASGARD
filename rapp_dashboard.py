@@ -356,6 +356,15 @@ def ml_page():
             'ues': 0.08
         }
 
+    # Get retrain info
+    retrain_count = 0
+    next_retrain = "N/A"
+    try:
+        # Try to read from orchestrator stats (if available)
+        pass
+    except Exception:
+        pass
+
     return render_template(
         'ml.html',
         ml_status=ml_status,
@@ -363,6 +372,8 @@ def ml_page():
         prediction_history=prediction_history,
         concordance_pct=concordance_pct,
         feature_importance=feature_importance,
+        retrain_count=retrain_count,
+        next_retrain=next_retrain,
         now=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
 
