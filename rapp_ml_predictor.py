@@ -5,7 +5,7 @@ GreenRAN ML Predictor (Tempo Real)
 ML predictor com acesso em tempo real ao banco de dados.
 
 Características:
-  - Consulta banco de dados a cada predição (últimos 10 min)
+  - Consulta banco de dados a cada predição (últimos 2 min)
   - Override por banco quando BLOCKED ≥ 60%
   - Retreinamento automático 2x por dia
   - Sempre ativo e atualizado
@@ -27,7 +27,7 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
 # Thresholds
 DB_OVERRIDE_THRESHOLD = 0.60  # 60% para override
 DB_BOOST_THRESHOLD = 0.60     # 60% para boost de confiança
-WINDOW_MINUTES = 10           # Janela de consulta ao banco
+WINDOW_MINUTES = 2            # Janela de consulta ao banco
 
 
 class MLPredictor:
@@ -227,7 +227,7 @@ class MLPredictor:
 
         Fluxo:
         1. Predição do modelo ML
-        2. Consulta banco (últimos 10 min)
+        2. Consulta banco (últimos 2 min)
         3. Se BLOCKED ≥ 60% no banco → OVERRIDE
         4. Se ALLOWED ≥ 60% no banco → OVERRIDE
         5. Caso contrário → usa predição ML
