@@ -40,6 +40,7 @@ import argparse
 import signal
 import json
 from datetime import datetime
+from collections import deque
 
 sys.path.insert(0, '/home/robert/orange_nuclear')
 
@@ -57,6 +58,7 @@ SLICER_INTENT_PATH = "/tmp/xapp_intents/slicer.txt"
 ENERGY_INTENT_PATH = "/tmp/xapp_intents/energy_saver.txt"
 RAPP_DECISION_PATH = "/tmp/xapp_intents/rapp_decision.txt"
 EXTENDED_METRICS_PATH = "/tmp/xapp_metrics/extended_metrics.json"
+XAPP_HEALTH_FILE = "/tmp/xapp_health.json"
 
 DEFAULT_INTERVAL = 1  # Non-RT RIC: ≥1 segundo (O-RAN spec) - 1s para máxima responsividade
 
@@ -99,6 +101,10 @@ class RappResourceOptimizer:
             'ack_pending': 0,
             'ack_timeout': 0
         }
+        
+        # Histórico de predições ML para exibição
+        self.ml_history = deque(maxlen=50)  # Mantém últimas 50 predições
+        self.history_display_interval = 1  # Exibir a cada ciclo (mais frequente)
         
         # Inicializa componentes
         print("[rApp] Inicializando componentes...")
@@ -240,9 +246,38 @@ class RappResourceOptimizer:
         }
     
     def get_xapp_status(self):
-        """Retorna status dos xApps."""
-        status = self.xapp_manager.get_status()
-        status['energy_decision'] = self._energy_active
+        """Retorna status dos xApps e salva em arquivo."""
+        status = {}
+        
+        # Status do SLICER
+        slicer_pid = self.xapp_manager.get_pid('slicer')
+        slicer_running = self.xapp_manager.is_running('slicer')
+        status['SLICER'] = {
+            'status': 'RUNNING' if slicer_running else 'STOPPED',
+            'pid': slicer_pid,
+            'last_cycle': getattr(self, 'cycle', 0),
+            'total_restarts': 0,
+            'last_heartbeat': datetime.now().isoformat()
+        }
+        
+        # Status do ENERGY SAVER
+        energy_pid = self.xapp_manager.get_pid('energy_saver')
+        energy_running = self.xapp_manager.is_running('energy_saver')
+        status['ENERGY'] = {
+            'status': 'RUNNING' if energy_running else 'STOPPED',
+            'pid': energy_pid,
+            'last_cycle': getattr(self, 'cycle', 0),
+            'total_restarts': 0,
+            'last_heartbeat': datetime.now().isoformat()
+        }
+        
+        # Salvar em arquivo para dashboard
+        try:
+            with open(XAPP_HEALTH_FILE, 'w') as f:
+                json.dump(status, f, indent=2)
+        except Exception as e:
+            pass
+        
         return status
     
     def read_slicer_intent(self):
@@ -651,16 +686,60 @@ class RappResourceOptimizer:
         # ========================================
 
         if self.ml_predictor.is_loaded() and not decision['preventive_block']:
+            # Buscar últimos dados do Data Lake para novas features
+            latest_extended = None
+            if self.data_lake:
+                latest_extended = self.data_lake.get_latest_extended_metrics(limit=1)
+            
+            # Extrair novas features
+            throughput_kbps = 0
+            packet_loss_rate = 0
+            jitter_ms = 0
+            tx_bytes = 0
+            rx_bytes = 0
+            
+            if latest_extended and len(latest_extended) > 0:
+                row = latest_extended[0]
+                throughput_kbps = float(row.get('throughput_kbps', 0) or 0)
+                packet_loss_rate = float(row.get('global_packet_loss_rate', 0) or 0)
+                jitter_ms = float(row.get('global_jitter_us', 0) or 0) / 1000.0
+                tx_bytes = int(row.get('total_tx_bytes', 0) or 0)
+                rx_bytes = int(row.get('total_rx_bytes', 0) or 0)
+            
+            # Calcular tx_rx_ratio
+            tx_rx_ratio = tx_bytes / max(rx_bytes, 1) if rx_bytes > 0 else 0
+            
+            # Buscar histórico de decisões
+            energy_history = 0
+            if self.data_lake:
+                recent_decisions = self.data_lake.get_recent_decisions(minutes=5, limit=10)
+                if recent_decisions:
+                    blocked_count = sum(1 for d in recent_decisions if d.get('decision') == 'BLOCKED')
+                    energy_history = blocked_count / len(recent_decisions)
+            
+            # P95 = pior 5% dos UEs (é o valor crítico que as regras usam)
+            p95_value = network_health.get('p95_us', 0) if network_health else 0
+            
             ml_metrics = {
                 'cvar_per_ue_us': cvar_us if cvar_us else 0,
-                'latency_p95_per_ue_us': network_health.get('p95_us', 0) if network_health else 0,
-                'global_avg_latency_us': network_health.get('median_us', 0) if network_health else 0,
+                'cvar_p95_us': p95_value,
+                'latency_p95_per_ue_us': p95_value,
+                'global_avg_latency_us': float(row.get('global_avg_latency_us', 0) or 0) if latest_extended else 0,
                 'variance_per_ue_us2': variance_us2 if variance_us2 else 0,
                 'total_active_cameras': slicer_intent.get('ACTIVE_CAMERAS', 0) if slicer_intent else 0,
                 'total_active_ues': slicer_intent.get('ACTIVE_UES', 20) if slicer_intent else 20,
                 'total_critical_ues': slicer_intent.get('CRITICAL_UES', 0) if slicer_intent else 0,
-                'sim_time_s': 0,
+                'sim_time_s': float(row.get('sim_time_s', 0) or 0) if latest_extended else 0,
+                # Novas features
+                'throughput_kbps': throughput_kbps,
+                'packet_loss_rate': packet_loss_rate,
+                'jitter_ms': jitter_ms,
+                'tx_rx_ratio': tx_rx_ratio,
+                'energy_history': energy_history,
             }
+            
+            # DEBUG: Log do P95 que está sendo enviado para ML
+            print(f"[rApp DEBUG] ML cvar_p95 = {p95_value}us = {p95_value/1000:.1f}ms")
 
             # Usar predição com contexto do banco de dados
             ml_result = self.ml_predictor.predict_with_db_context(ml_metrics)
@@ -671,6 +750,9 @@ class RappResourceOptimizer:
             ml_confidence = ml_result.get('confidence', 0)
             ml_source = ml_result.get('source', 'unknown')
             ml_cvar_prev = ml_result.get('predicted_cvar_ms', 0)
+            ml_cvar_trend = ml_result.get('cvar_trend', 0)
+            ml_warning = ml_result.get('warning', None)
+            ml_trend_info = ml_result.get('trend_info', '')
             db_dist = ml_result.get('db_distribution', {})
             db_total = ml_result.get('db_total', 0)
 
@@ -682,23 +764,54 @@ class RappResourceOptimizer:
                 }.get(ml_source, '\033[0m')
 
                 print(f"{source_color}[rApp ML] {ml_decision} (conf={ml_confidence:.2f}, "
-                      f"CVaR={ml_cvar_prev}ms, fonte={ml_source}, "
+                      f"CVaR={ml_cvar_prev}ms, trend={ml_cvar_trend:.1f}ms, fonte={ml_source}, "
                       f"banco={db_total}regs)\033[0m")
+
+                # D) Exibir avisos de detecção de cenários críticos
+                if ml_warning:
+                    warning_colors = {
+                        'RAPID_DETERIORATION': '\033[1;33m',  # Amarelo
+                        'NEAR_CRITICAL_ZONE': '\033[1;33m',  # Amarelo
+                        'ACCUMULATING_RISK': '\033[1;31m',   # Vermelho
+                    }
+                    color = warning_colors.get(ml_warning, '\033[0m')
+                    print(f"{color}[rApp ML] ⚠️ {ml_warning}: {ml_trend_info}\033[0m")
 
                 if db_dist:
                     dist_str = ', '.join(f"{k}:{v}%" for k, v in db_dist.items())
                     print(f"\033[0;90m[rApp ML] Distribuição banco: {dist_str}\033[0m")
 
             # ML influences decision based on confidence
-            if ml_decision and ml_confidence > 0.7:
+            ml_prediction_valid = True
+            if ml_decision and ml_confidence > 0.45:
+                
+                # Validar predição ML contra CVaR real
+                # Se ML prevê muito baixo mas CVaR real é alto, desconsiderar
+                cvar_ms = cvar_us / 1000.0 if cvar_us else 0
+                if ml_cvar_prev > 0 and cvar_ms > 0:
+                    # Se ML prevê < 15ms mas real > 60ms, subestimou muito
+                    if ml_cvar_prev < 15 and cvar_ms > 60:
+                        print(f"\033[1;33m[rApp] AVISO: ML subestimou muito ({ml_cvar_prev:.1f}ms vs {cvar_ms:.1f}ms real)\033[0m")
+                        ml_prediction_valid = False
+                    # Se ML prevê ≤70ms mas real > 70ms, subestimou CRÍTICO (apenas se diff > 20ms)
+                    elif ml_cvar_prev <= 70 and cvar_ms > 70 and (cvar_ms - ml_cvar_prev) > 20:
+                        print(f"\033[1;31m[rApp] AVISO: ML subestimou CRÍTICO ({ml_cvar_prev:.1f}ms vs {cvar_ms:.1f}ms real)\033[0m")
+                        ml_prediction_valid = False
+                    # Se ML prevê > 80ms mas real < 20ms, superestimou muito
+                    elif ml_cvar_prev > 80 and cvar_ms < 20:
+                        print(f"\033[1;33m[rApp] AVISO: ML superestimou ({ml_cvar_prev:.1f}ms vs {cvar_ms:.1f}ms real)\033[0m")
+                        ml_prediction_valid = False
+                
                 decision['ml_influenced'] = False
 
-                # Only influence if NOT a safety block (R1, R2, R3)
-                if not decision['preventive_block'] and decision['energy_saver'] != 'BLOCKED':
+                # Só influencia se predição for válida
+                if not ml_prediction_valid:
+                    print(f"\033[1;33m[rApp] ML ignorada - predição inválida\033[0m")
+                elif not decision['preventive_block'] and decision['energy_saver'] != 'BLOCKED':
                     rule_decision = decision['energy_saver']
 
-                    # ML says ALLOWED + Rules say CONDITIONAL + conf > 80% → ALLOWED
-                    if ml_decision == 'ALLOWED' and rule_decision == 'CONDITIONAL' and ml_confidence > 0.8:
+                    # ML says ALLOWED + Rules say CONDITIONAL + conf > 45% → ALLOWED
+                    if ml_prediction_valid and ml_decision == 'ALLOWED' and rule_decision == 'CONDITIONAL' and ml_confidence > 0.45:
                         decision['energy_saver'] = 'ALLOWED'
                         decision['action'] = 'POWER_DOWN'
                         decision['reason'] = f'ML OVERRIDE: {decision["reason"]} + ML={ml_decision} (conf={ml_confidence:.0%}, fonte={ml_source})'
@@ -706,20 +819,35 @@ class RappResourceOptimizer:
                         decision['ml_influenced'] = True
                         print(f"\033[1;32m[rApp ML] OVERRIDE: CONDITIONAL → ALLOWED (ML conf={ml_confidence:.0%})\033[0m")
 
-                    # ML says BLOCKED + Rules say ALLOWED + conf > 80% → CONDITIONAL
-                    elif ml_decision == 'BLOCKED' and rule_decision == 'ALLOWED' and ml_confidence > 0.8:
+                    # ML says BLOCKED + Rules say ALLOWED + conf > 45% → CONDITIONAL
+                    elif ml_prediction_valid and ml_decision == 'BLOCKED' and rule_decision == 'ALLOWED' and ml_confidence > 0.45:
                         decision['energy_saver'] = 'CONDITIONAL'
                         decision['action'] = 'MONITOR'
                         decision['reason'] = f'ML CAUTION: {decision["reason"]} + ML={ml_decision} (conf={ml_confidence:.0%}, fonte={ml_source})'
                         decision['confidence'] = ml_confidence
                         decision['ml_influenced'] = True
                         print(f"\033[1;33m[rApp ML] CAUTION: ALLOWED → CONDITIONAL (ML conf={ml_confidence:.0%})\033[0m")
+                    
+                    # D) B) ML com aviso de cenários críticos mesmo com confiança menor
+                    elif ml_warning and ml_warning in ['ACCUMULATING_RISK', 'RAPID_DETERIORATION', 'NEAR_CRITICAL_ZONE']:
+                        # Mesmo com confiança baixa, se ML detectou cenário crítico, tomar precaução
+                        if rule_decision == 'ALLOWED':
+                            decision['energy_saver'] = 'CONDITIONAL'
+                            decision['action'] = 'MONITOR'
+                            decision['reason'] = f'ML CRITICAL WARNING: {decision["reason"]} + {ml_warning}: {ml_trend_info}'
+                            decision['confidence'] = max(ml_confidence, 0.75)
+                            decision['ml_influenced'] = True
+                            print(f"\033[1;31m[rApp ML] CRITICAL WARNING: ALLOWED → CONDITIONAL ({ml_warning})\033[0m")
 
-                # Log concordance
-                if ml_decision == decision['energy_saver']:
-                    print(f"\033[0;32m[rApp ML] ✓ Concordância ML={ml_decision} == Regras={decision['energy_saver']}\033[0m")
-                else:
-                    print(f"\033[0;33m[rApp ML] ✗ Discordância ML={ml_decision} != Regras={decision['energy_saver']}\033[0m")
+                # Log concordance (only if ML was considered)
+                if ml_decision and ml_confidence > 0.45:
+                    if ml_prediction_valid:
+                        if ml_decision == decision['energy_saver']:
+                            print(f"\033[0;32m[rApp ML] ✓ Concordância ML={ml_decision} == Regras={decision['energy_saver']}\033[0m")
+                        else:
+                            print(f"\033[0;33m[rApp ML] ✗ Discordância ML={ml_decision} != Regras={decision['energy_saver']}\033[0m")
+                    else:
+                        print(f"\033[0;33m[rApp ML] ✗ ML desconsiderada - predição inválida\033[0m")
 
         # ========================================
         # ETAPA 3: AGENT-AL OVERRIDE
@@ -1009,6 +1137,17 @@ class RappResourceOptimizer:
             print("                    rApp-ResourceOptimizer")
             print("=" * 70)
             print(f"  Ciclo: {self.cycle}  |  Tempo: {datetime.now().strftime('%H:%M:%S')}")
+            
+            # Status da conexão de dados
+            if hasattr(self, 'data_fresh'):
+                if self.data_fresh:
+                    status_icon = "🟢"
+                    status_text = "ONLINE"
+                else:
+                    status_icon = "🔴"
+                    status_text = "OFFLINE"
+                last_data = getattr(self, 'last_sim_time', 0)
+                print(f"  Status: {status_icon} {status_text} | sim_time: {last_data}s")
             print("")
             
             # xAPPS STATUS
@@ -1109,17 +1248,17 @@ class RappResourceOptimizer:
             self.ml_retrain_count += 1
 
     def retrain_ml(self):
-        """Retreina o modelo ML com dados do banco."""
+        """Retreina o modelo ML com dados recentes do banco."""
         try:
             import subprocess
             import sys
 
             script_path = os.path.join(os.path.dirname(__file__), 'train_ml_model.py')
             result = subprocess.run(
-                [sys.executable, script_path, '--output', './models'],
+                [sys.executable, script_path, '--retrain', '--hours', '24', '--output', './models'],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=300,
                 cwd=os.path.dirname(__file__)
             )
 
@@ -1138,13 +1277,97 @@ class RappResourceOptimizer:
                         accuracy = report.get('classifier', {}).get('random_forest_accuracy', 0)
                         classes = report.get('classifier', {}).get('classes', [])
                         print(f"\033[1;32m[rApp ML] Nova accuracy: {accuracy:.2%}, Classes: {classes}\033[0m")
+                
+                # Log do stdout para debug (últimas 500 chars)
+                if result.stdout:
+                    print(f"\033[1;34m[rApp ML] Log do treino: {result.stdout[-500:]}\033[0m")
             else:
-                print(f"\033[1;31m[rApp ML] Erro no retreinamento: {result.stderr[:200]}\033[0m")
+                print(f"\033[1;31m[rApp ML] Erro no retreinamento (código {result.returncode}):\033[0m")
+                print(f"\033[1;31m[rApp ML] STDERR: {result.stderr[-500:]}\033[0m")
+                if result.stdout:
+                    print(f"\033[1;31m[rApp ML] STDOUT: {result.stdout[-500:]}\033[0m")
 
         except subprocess.TimeoutExpired:
-            print(f"\033[1;31m[rApp ML] Timeout no retreinamento\033[0m")
+            print(f"\033[1;31m[rApp ML] Timeout no retreinamento (>5min)\033[0m")
         except Exception as e:
             print(f"\033[1;31m[rApp ML] Erro no retreinamento: {e}\033[0m")
+
+    def _record_ml_history(self, decision):
+        """Record ML prediction for history display."""
+        try:
+            # Extract ML prediction info
+            ml_result = decision.get('ml_rf_prediction', {})
+            ml_decision = ml_result.get('decision', 'NONE')
+            ml_confidence = ml_result.get('confidence', 0.0)
+            predicted_cvar = ml_result.get('predicted_cvar_ms', 0.0)
+            ml_influenced = decision.get('ml_influenced', False)
+            
+            # Extract source and reason
+            ml_source = ml_result.get('source', 'unknown')
+            ml_reason = ml_result.get('reason', '')
+            
+            # D) Extract warning and trend info for critical scenario detection
+            ml_warning = ml_result.get('warning', '')
+            ml_trend = ml_result.get('cvar_trend', 0.0)
+            ml_trend_info = ml_result.get('trend_info', '')
+            
+            # Get final decision (after rules applied)
+            rule_decision = decision.get('energy_saver', 'UNKNOWN')
+            
+            # Calculate concordance
+            concordance = (ml_decision == rule_decision) if ml_decision != 'NONE' else False
+            
+            # Create history entry
+            history_entry = {
+                'timestamp': datetime.fromtimestamp(decision['timestamp']).strftime('%Y-%m-%d %H:%M:%S'),
+                'ml_decision': ml_decision,
+                'rule_decision': rule_decision,
+                'ml_confidence': ml_confidence,
+                'predicted_cvar': predicted_cvar,
+                'ml_influenced': ml_influenced,
+                'concordance': concordance,
+                'source': ml_source,
+                'reason': ml_reason,
+                'ml_warning': ml_warning,
+                'ml_trend': ml_trend,
+                'ml_trend_info': ml_trend_info
+            }
+            
+            # Add to history deque (automatically removes oldest when maxlen reached)
+            self.ml_history.append(history_entry)
+            
+        except Exception as e:
+            # Don't let history recording break the main loop
+            pass  # Silently fail to avoid disrupting operation
+
+    def _display_ml_history(self):
+        """Display formatted ML prediction history."""
+        if not self.ml_history:
+            return
+        
+        # Only display if we have enough entries to make it worthwhile
+        if len(self.ml_history) < 2:
+            return
+        
+        print("\n" + "=" * 130)
+        print("                           HISTÓRICO DE PREDIÇÕES ML")
+        print("=" * 130)
+        print(f"{'Timestamp':<20} {'Decisão ML':<12} {'Decisão Regras':<15} {'Conf. ML':<8} {'CVaR Previsto':<12} {'ML Inf.':<8} {'Concordância':<12} {'Fonte':<20} {'Reason'}")
+        print("-" * 130)
+        
+        # Show last 10 entries or all if less than 10
+        display_entries = list(self.ml_history)[-10:] if len(self.ml_history) > 10 else list(self.ml_history)
+        
+        for entry in display_entries:
+            ml_influenced_str = "Sim" if entry['ml_influenced'] else "Não"
+            concordance_str = "✓" if entry['concordance'] else "✗"
+            # Truncate reason if too long
+            reason_display = entry['reason'][:35] + "..." if len(entry['reason']) > 35 else entry['reason']
+            
+            print(f"{entry['timestamp']:<20} {entry['ml_decision']:<12} {entry['rule_decision']:<15} "
+                  f"{entry['ml_confidence']*100:>6.0f}%    {entry['predicted_cvar']:>8.1f} ms    "
+                  f"{ml_influenced_str:<8} {concordance_str:<12} {entry['source']:<20} {reason_display}")
+        print("=" * 130)
 
     def print_final_stats(self):
         """Imprime estatísticas finais."""
@@ -1187,8 +1410,78 @@ class RappResourceOptimizer:
         print(f"  A1 Policies: /tmp/rapp_policies/")
         print("=" * 70)
         
+        # Timeout para detectar quando dados param ( watchdog )
+        # Usar SIM_TIME (tempo de simulação) ao invés de timestamp do sistema
+        SIM_TIMEOUT_SECONDS = 5  # Se sim_time não avanza por 5 ciclos, parar de decidir
+        
+        # Status da conexão (para exibir no dashboard)
+        self.data_fresh = True
+        self.last_sim_time = 0
+        
+        # Para detecção de transição de simulação
+        self.last_sim_time_for_reset = None
+        
         while self.running:
             self.cycle += 1
+            
+            # ========================================
+            # 0. WATCHDOG: Verificar se dados estão chegando
+            # Usa sim_time (tempo de simulação) ao invés de timestamp do sistema
+            # Se sim_time não avanza, a simulação parou
+            # ========================================
+            
+            # Buscar último sim_time no DB (fonte confiável)
+            # ULTIMO dado por TIMESTAMP (não MAX sim_time, que pode ser de simulação antiga)
+            new_sim_time = 0
+            try:
+                cursor = self.data_lake.conn.cursor()
+                cursor.execute("SELECT sim_time_s FROM extended_metrics ORDER BY timestamp DESC LIMIT 1")
+                result = cursor.fetchone()
+                if result and result[0]:
+                    new_sim_time = result[0]
+            except:
+                pass
+            
+            # Verificar watchdog usando SIM_TIME do DB (não timestamp do sistema)
+            # Comparar sim_time atual com sim_time do ciclo anterior
+            if self.last_sim_time > 0 and new_sim_time > 0:
+                # PRIMEIRO: verificar se é nova simulação (sim_time resetou)
+                # Isso DEVE ser verificado antes do diff, porque diff negativo significa reset
+                if new_sim_time < 10:
+                    # Nova simulação começou (sim_time resetou para ~0)
+                    if not self.data_fresh:
+                        print(f"\n✅  [rApp] Nova simulação detectada! sim_time={new_sim_time}s")
+                        self.data_fresh = True
+                    self.ml_predictor.reset_history()
+                    print(f"    → Histórico ML resetado para nova simulação")
+                else:
+                    sim_time_diff = new_sim_time - self.last_sim_time
+                    
+                    # Se diff é NEGATIVO, significa nova simulação (reset)
+                    if sim_time_diff < 0:
+                        if not self.data_fresh:
+                            print(f"\n✅  [rApp] Nova simulação detectada! sim_time={new_sim_time}s (reset)")
+                            self.data_fresh = True
+                        self.ml_predictor.reset_history()
+                        print(f"    → Histórico ML resetado")
+                    # Se sim_time não avançou (diff ~= 0), simulação terminou
+                    elif sim_time_diff <= 0.1:
+                        if self.data_fresh:
+                            print(f"\n⚠️  [rApp] SIMULAÇÃO PARADA! sim_time={new_sim_time}s (último: {self.last_sim_time}s)")
+                            print(f"    → Entrando em modo OFFLINE - aguardando novos dados...")
+                            self.data_fresh = False
+                        
+                        time.sleep(self.interval)
+                        self.last_sim_time = new_sim_time
+                        continue
+                    else:
+                        if not self.data_fresh:
+                            print(f"\n✅  [rApp] Simulação ativa! sim_time={new_sim_time}s")
+                            self.data_fresh = True
+            
+            # Update last_sim_time
+            if new_sim_time > 0:
+                self.last_sim_time = new_sim_time
             
             # 1. Lê intenções dos xApps
             slicer_intent = self.read_slicer_intent()
@@ -1223,9 +1516,19 @@ class RappResourceOptimizer:
             
             # 8. Imprime status
             self.print_status(decision, xapp_status)
-
+            
+            # 8.5. Armazena predição ML para histórico
+            self._record_ml_history(decision)
+            
+            # 8.6. Exibe histórico de predições ML periodicamente
+            if self.cycle % self.history_display_interval == 0 and len(self.ml_history) > 0:
+                self._display_ml_history()
+            
             # 9. Verifica se é hora de retreinar ML
             self.check_ml_retrain()
+            
+            # 10. Salva status dos xApps para dashboard
+            self.get_xapp_status()
 
             # 10. Espera próximo ciclo
             time.sleep(self.interval)

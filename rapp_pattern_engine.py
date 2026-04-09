@@ -643,7 +643,7 @@ class PatternRecognition:
                        global_worst_latency_us, global_avg_latency_us,
                        global_min_latency_us, global_max_latency_us,
                        global_jitter_us, global_packet_loss_rate,
-                       total_active_ues, total_tx_bytes, total_rx_bytes,
+                       total_active_ues, total_critical_ues, total_tx_bytes, total_rx_bytes,
                        throughput_kbps
                 FROM extended_metrics
                 WHERE timestamp >= ?
@@ -712,6 +712,7 @@ class PatternRecognition:
         packet_losses = [h['global_packet_loss_rate'] for h in history if h['global_packet_loss_rate'] is not None]
         throughputs = [h['throughput_kbps'] for h in history if h['throughput_kbps']]
         ues_counts = [h['total_active_ues'] for h in history if h['total_active_ues'] is not None]
+        critical_ues_list = [h.get('total_critical_ues', 0) for h in history if h.get('total_critical_ues', 0) is not None]
         
         # Métricas robustas dos percentis
         latency_p5_list = [h.get('latency_p5_us', 0) for h in history if h.get('latency_p5_us', 0) > 0]
@@ -778,6 +779,7 @@ class PatternRecognition:
                 'avg_throughput_kbps': avg_throughput,
                 'avg_packet_loss_rate': avg_packet_loss,
                 'avg_active_ues': avg(ues_counts),
+                'critical_ues': avg(critical_ues_list) if critical_ues_list else 0,
             },
             'trends': {
                 'latency': trend_list(latencies),
