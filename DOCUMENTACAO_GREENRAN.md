@@ -163,6 +163,7 @@ Reduzir o consumo de energia da rede O-RAN enquanto mantém a qualidade de servi
 | **Função** | Cérebro estratégico do Non-RT RIC |
 | **Ciclo** | 1 segundo (mínimo O-RAN) |
 | **Porta Dashboard** | 5000 |
+| **Porta Grafana** | 3001 |
 
 **Cadeia de Inicialização:**
 
@@ -405,7 +406,8 @@ def cleanup_old_data(self, days=7):
 | **Framework** | Flask |
 | **Porta** | 5000 |
 | **Host** | 0.0.0.0 |
-| **Templates** | 7 arquivos HTML |
+| **Templates** | 8 arquivos HTML |
+| **ML Config** | config/ml_thresholds.json |
 
 **Rotas:**
 
@@ -434,11 +436,12 @@ def cleanup_old_data(self, days=7):
 |----------|-----------|
 | `base.html` | Layout base |
 | `dashboard.html` | Dashboard principal |
-| `metrics.html` | Visão detalhada de métricas |
+| `metrics.html` | Visão detalhada de métricas (com valores) |
 | `decisions.html` | Histórico de decisões |
 | `pattern.html` | Análise de padrões |
-| `xapps.html` | Status dos xApps |
+| `xapps.html` | Status dos xApps + Políticas A1 |
 | `ml.html` | Dashboard de ML |
+| ` efficiencies.html` | Eficiência energética |
 
 ---
 
@@ -580,7 +583,19 @@ if ml_result['decision'] in distribution:
 - Histórico de predições
 - Feature importance
 
-### Dashboard Grafana (localhost:3000)
+### Dashboard Grafana (localhost:3001)
+
+**Nota**: A porta padrão do Grafana no docker-compose é 3001 (não 3000). O banco de dados InfluxDB deve ser criado manualmente se não existir.
+
+**Configuração do InfluxDB:**
+```bash
+# Criar banco de dados
+docker exec gui_influxdb_1 influx -execute "CREATE DATABASE influx"
+
+# Iniciar push de métricas
+cd /home/robert/orange_nuclear
+python3 ./push_stats_to_influx.py --interval 5 &
+```
 
 **Painéis:**
 
