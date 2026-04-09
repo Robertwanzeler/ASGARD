@@ -82,10 +82,13 @@ def load_data(db_path, hours=None):
             m.global_avg_latency_us,
             m.global_worst_latency_us,
             m.global_jitter_us,
+            m.global_packet_loss_rate,
             m.throughput_kbps,
             m.total_active_ues,
             m.total_active_cameras,
             m.total_critical_ues,
+            m.total_tx_bytes,
+            m.total_rx_bytes,
             m.cvar_per_ue_us,
             m.variance_per_ue_us2,
             m.latency_p95_per_ue_us,
@@ -147,6 +150,63 @@ def engineer_features(df):
 
     # Throughput in Mbps
     df['throughput_mbps'] = df['throughput_kbps'] / 1000.0
+    
+    # Packet loss rate (já existe no banco como decimal, converter para %)
+    if 'global_packet_loss_rate' in df.columns:
+        df['packet_loss_rate'] = df['global_packet_loss_rate'] * 100
+    else:
+        df['packet_loss_rate'] = 0.0
+    
+    # Jitter in ms (já está em us no banco)
+    if 'global_jitter_us' in df.columns:
+        df['jitter_ms'] = df['global_jitter_us'] / 1000.0
+    else:
+        df['jitter_ms'] = 0.0
+    
+    # TX/RX ratio (proporção de tráfego uplink vs downlink)
+    if 'total_tx_bytes' in df.columns and 'total_rx_bytes' in df.columns:
+        df['tx_rx_ratio'] = df['total_tx_bytes'] / df['total_rx_bytes'].clip(lower=1)
+    else:
+        df['tx_rx_ratio'] = 0.0
+    
+    # Energy history (proporção de decisões BLOCKED nos últimos registros)
+    # Usar decisão anterior como proxy para energy_history
+    df['energy_history'] = (df['decision'] == 'BLOCKED').astype(float)
+    df['energy_history'] = df['energy_history'].rolling(window=5, min_periods=1).mean()
+    
+    # Features de TREND (3) - NOVAS para ML PREDITIVA
+    # cvar_trend: diferença entre CVaR atual e 5 ciclos atrás
+    df['cvar_trend'] = df['cvar_ms'].diff(5).fillna(0)
+    
+    # throughput_trend: diferença de throughput (positivo = aumentando)
+    if 'throughput_mbps' in df.columns:
+        df['throughput_trend'] = df['throughput_mbps'].diff().fillna(0)
+    else:
+        df['throughput_trend'] = 0
+    
+    # packet_loss_trend: diferença de packet loss (positivo = piorando)
+    df['packet_loss_trend'] = df['packet_loss_rate'].diff().fillna(0)
+
+    # ============================================================
+    # LAG FEATURES - NOVAS para ML PREDITIVA (predizer próximo ciclo)
+    # ============================================================
+    # Lag features - últimos 5 ciclos (t-1, t-2, ..., t-5)
+    for lag in range(1, 6):
+        df[f'cvar_lag_{lag}'] = df['cvar_ms'].shift(lag)
+        df[f'throughput_lag_{lag}'] = df['throughput_mbps'].shift(lag) if 'throughput_mbps' in df.columns else 0
+        df[f'packet_loss_lag_{lag}'] = df['packet_loss_rate'].shift(lag)
+        df[f'latency_lag_{lag}'] = df['avg_latency_ms'].shift(lag)
+    
+    # Rolling features (média dos últimos N ciclos)
+    df['cvar_rolling_3'] = df['cvar_ms'].rolling(3, min_periods=1).mean()
+    df['cvar_rolling_10'] = df['cvar_ms'].rolling(10, min_periods=1).mean()
+    df['cvar_rolling_std_3'] = df['cvar_ms'].rolling(3, min_periods=1).std().fillna(0)
+    
+    # Aceleração (derivada segunda - indica se tendência está acelerando)
+    df['cvar_acceleration'] = df['cvar_diff'].diff().fillna(0)
+    
+    # Velocidade de mudança (diferença da diferença)
+    df['latency_acceleration'] = df['latency_diff'].diff().fillna(0)
 
     # CVaR zones
     df['cvar_zone'] = pd.cut(
@@ -156,6 +216,7 @@ def engineer_features(df):
     ).astype(int)
 
     feature_cols = [
+        # Features originais (17)
         'cvar_ms',
         'cvar_diff',
         'cvar_rolling_mean',
@@ -173,6 +234,24 @@ def engineer_features(df):
         'is_weekend',
         'cvar_zone',
         'sim_time_s',
+        # Features de rede (5)
+        'throughput_mbps',
+        'packet_loss_rate',
+        'jitter_ms',
+        'tx_rx_ratio',
+        'energy_history',
+        # Features de TREND (3) - NOVAS
+        'cvar_trend',
+        'throughput_trend',
+        'packet_loss_trend',
+        # LAG FEATURES - NOVAS para ML PREDITIVA (15 features)
+        'cvar_lag_1', 'cvar_lag_2', 'cvar_lag_3', 'cvar_lag_4', 'cvar_lag_5',
+        'throughput_lag_1', 'throughput_lag_2', 'throughput_lag_3',
+        'packet_loss_lag_1', 'packet_loss_lag_2', 'packet_loss_lag_3',
+        'latency_lag_1', 'latency_lag_2',
+        # Rolling e Acceleration (5)
+        'cvar_rolling_3', 'cvar_rolling_10', 'cvar_rolling_std_3',
+        'cvar_acceleration', 'latency_acceleration',
     ]
 
     print(f"    → {len(feature_cols)} features criadas")
@@ -180,12 +259,13 @@ def engineer_features(df):
 
 
 def train_classifier(df, feature_cols, output_dir):
-    """Train decision classifier."""
-    print("[3/6] Treinando classificador de decisões...")
+    """Train decision classifier - VERSÃO PREDITIVA (target = próximo ciclo)."""
+    print("[3/6] Treinando classificador de decisões PREDITIVO...")
+    print("       → Target: decision_next (predizer próximo ciclo)")
 
-    # Prepare data
+    # Prepare data - USAR decision_next (target preditivo)
     X = df[feature_cols].values
-    y = df['decision'].values
+    y = df['decision_next'].values  # <-- PREDITIVO: próximo ciclo
 
     # Encode labels
     le = LabelEncoder()
@@ -262,12 +342,13 @@ def train_classifier(df, feature_cols, output_dir):
 
 
 def train_regressor(df, feature_cols, output_dir):
-    """Train CVaR regressor."""
-    print("[4/6] Treinando regressor de CVaR...")
+    """Train CVaR regressor - VERSÃO PREDITIVA (target = próximo ciclo)."""
+    print("[4/6] Treinando regressor de CVaR PREDITIVO...")
+    print("       → Target: cvar_next (predizer CVaR do próximo ciclo)")
 
-    # Prepare data
+    # Prepare data - USAR cvar_next (target preditivo)
     X = df[feature_cols].values
-    y = df['cvar_ms'].values
+    y = df['cvar_next'].values  # <-- PREDITIVO: próximo ciclo
 
     # Split
     X_train, X_test, y_train, y_test = train_test_split(
@@ -443,8 +524,23 @@ def main():
     for cls, count in df['decision'].value_counts().items():
         print(f"      {cls}: {count} ({count/len(df)*100:.1f}%)")
 
-    # Feature engineering
+    # Feature engineering (cria cvar_ms e outras features)
     df, feature_cols = engineer_features(df)
+    
+    # ============================================================
+    # TARGET PREDITIVO - Criar target deslocado (t+1)
+    # PARA ML preditiva, queremos predizer o próximo ciclo
+    # DEVE ser feito DEPOIS de engineer_features (que cria cvar_ms)
+    # ============================================================
+    # decision_next = decisão do ciclo seguinte
+    df['decision_next'] = df['decision'].shift(-1)
+    df['cvar_next'] = df['cvar_ms'].shift(-1)  # CVaR do próximo ciclo (para regressor)
+    
+    # Remover últimas linhas sem target (shift(-1) cria NaN no final)
+    df = df.dropna(subset=['decision_next'])
+    
+    print(f"\n    → Target preditivo: decision_next (predizer próximo ciclo)")
+    print(f"    → Registros após shift: {len(df)}")
 
     # Train classifier
     clf_results, rf_clf, clf_scaler, le = train_classifier(df, feature_cols, args.output)

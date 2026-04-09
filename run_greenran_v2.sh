@@ -140,7 +140,7 @@ done
 
 echo -e "${BLUE}=== [8/9] Iniciando Monitoramento (Grafana + InfluxDB) ===${NC}"
 # Verificar se Docker está disponível
-if command -v docker-compose &> /dev/null; then
+if command -v docker-compose &> /dev/null || docker compose version &> /dev/null; then
     # Verificar acesso ao Docker
     # Verificar Docker Compose (V1 usa "docker-compose", V2 usa "docker compose")
     if docker-compose --version &>/dev/null; then
@@ -160,13 +160,14 @@ if command -v docker-compose &> /dev/null; then
     echo -e "${BLUE}    diretório: $(pwd)${NC}"
     
     # Parar serviços existentes
-    echo -e "${BLUE}    Parando serviços existentes...${NC}"
-    $DOCKER_CMD down 2>/dev/null || true
+    echo -e "${BLUE}    Parando serviços existentes e limpando volumes...${NC}"
+    $DOCKER_CMD down -v 2>/dev/null || true
+    sudo $DOCKER_CMD down -v 2>/dev/null || true
     
     # Iniciar serviços
     echo -e "${BLUE}    Iniciando serviços Docker...${NC}"
     if $DOCKER_CMD up -d; then
-        echo -e "${GREEN}    ✓ Grafana iniciado em http://localhost:3000${NC}"
+        echo -e "${GREEN}    ✓ Grafana iniciado em http://localhost:3001${NC}"
         echo -e "${GREEN}    ✓ InfluxDB iniciado em http://localhost:8086${NC}"
         echo -e "${GREEN}    ✓ GUI iniciado em http://localhost:8000${NC}"
     else
@@ -174,9 +175,9 @@ if command -v docker-compose &> /dev/null; then
         echo -e "${YELLOW}    Saída do erro:${NC}"
         $DOCKER_CMD up -d 2>&1 | head -20
         echo -e "${RED}    Tentando com sudo...${NC}"
-        sudo docker-compose down 2>/dev/null || true
-        if sudo docker-compose up -d; then
-            echo -e "${GREEN}    ✓ Grafana iniciado com sudo${NC}"
+        sudo $DOCKER_CMD down 2>/dev/null || true
+        if sudo $DOCKER_CMD up -d; then
+            echo -e "${GREEN}    ✓ Grafana iniciado com sudo em http://localhost:3001${NC}"
             echo -e "${GREEN}    ✓ InfluxDB iniciado com sudo${NC}"
             echo -e "${GREEN}    ✓ GUI iniciado com sudo${NC}"
         else
@@ -209,7 +210,7 @@ echo -e "\n${GREEN}==========================================${NC}"
 echo -e "${GREEN}  SISTEMA GREENRAN INICIADO!${NC}"
 echo -e "${GREEN}==========================================${NC}"
 echo -e "Monitoramento:"
-echo -e "  - Grafana:   http://localhost:3000 (admin/admin)"
+echo -e "  - Grafana:   http://localhost:3001 (admin/admin)"
 echo -e "  - Dashboard: http://localhost:5000"
 echo -e "  - GUI:       http://localhost:8000"
 echo -e ""
