@@ -1180,7 +1180,7 @@ class DataLake:
     def get_database_stats(self):
         """
         Retorna estatísticas do banco de dados.
-        
+
         Returns:
             Dict com estatísticas.
         """
@@ -1204,6 +1204,73 @@ class DataLake:
             'last_record': row[1],
             'db_size_bytes': os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
         }
+    
+    def get_latest_extended_metrics(self, limit=1):
+        """
+        Retorna as últimas métricas estendidas (para novas features ML).
+        
+        Args:
+            limit: Número de registros a retornar
+            
+        Returns:
+            List de dicts com métricas
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT datetime, throughput_kbps, global_packet_loss_rate, 
+                   global_jitter_us, total_tx_bytes, total_rx_bytes,
+                   cvar_per_ue_us, variance_per_ue_us2
+            FROM extended_metrics
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                'datetime': row[0],
+                'throughput_kbps': row[1],
+                'global_packet_loss_rate': row[2],
+                'global_jitter_us': row[3],
+                'total_tx_bytes': row[4],
+                'total_rx_bytes': row[5],
+                'cvar_per_ue_us': row[6],
+                'variance_per_ue_us2': row[7],
+            })
+        return results
+    
+    def get_recent_decisions(self, minutes=5, limit=10):
+        """
+        Retorna decisões recentes (para energy_history).
+        
+        Args:
+            minutes: Minutos para buscar
+            limit: Número máximo de registros
+            
+        Returns:
+            List de dicts com decisões
+        """
+        import time
+        cursor = self.conn.cursor()
+        cutoff_time = int(time.time()) - (minutes * 60)
+        
+        cursor.execute("""
+            SELECT datetime, decision, energy_state, confidence
+            FROM decisions_history
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (cutoff_time, limit))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                'datetime': row[0],
+                'decision': row[1],
+                'energy_state': row[2],
+                'confidence': row[3],
+            })
+        return results
     
     def calculate_slope(self, window_minutes=5):
         """
