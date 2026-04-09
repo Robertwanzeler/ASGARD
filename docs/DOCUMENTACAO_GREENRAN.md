@@ -1126,7 +1126,134 @@ Todos os componentes estão integrados e funcionando corretamente. O sistema é 
 
 ---
 
-**Documento criado em**: 02 de Abril de 2026
+## 17. Estrutura de Pastas
+
+### Visão Geral
+
+O projeto está organizado em pastas para melhor manutenção:
+
+```
+/home/robert/orange_nuclear/
+├── src/                    # Código principal do sistema
+│   ├── rapp_orchestrator.py     # Orquestrador principal
+│   ├── rapp_dashboard.py       # Dashboard web
+│   ├── rapp_data_lake.py       # Persistência de dados
+│   ├── rapp_ml_predictor.py   # Predições ML
+│   ├── rapp_pattern_engine.py  # Análise de padrões
+│   ├── rapp_trend_analysis.py  # Análise de tendências
+│   ├── csv_to_metrics.py      # Coleta de métricas
+│   └── *.py                  # Outros módulos
+│
+├── scripts/                # Scripts de execução
+│   ├── run_greenran.sh         # Iniciar sistema
+│   ├── run_greenran_v2.sh    # Versão 2
+│   ├── start_monitoring.sh    # Iniciar monitoramento
+│   └── *.sh                  # Outros scripts
+│
+├── training/              # Treinamento ML
+│   ├── train_ml_model.py    # Treinar modelo
+│   ├── cleanup_dataset.py  # Limpar dados
+│   └── generate_charts.py  # Gerar gráficos
+│
+├── monitoring/            # Monitoramento
+│   ├── monitor_data_collection.sh  # Monitor coleta
+│   └── watchdog_xapps.py    # Watchdog xApps
+│
+├── push/                  # Envio para InfluxDB
+│   ├── push_stats_to_influx.py
+│   └── push_cvar_to_influx.py
+│
+├── utils/                  # Utilitários
+│   └── plot_results.py
+│
+├── config/                 # Configurações
+│   └── ml_thresholds.json   # Thresholds ML
+│
+├── models/                # Modelos ML (.gitignore)
+│   └── *.joblib
+│
+├── docs/                  # Documentação
+│   ├── DOCUMENTACAO_GREENRAN.md
+│   └── *.md
+│
+├── templates/              # Templates HTML Dashboard
+│   └── *.html
+│
+└── flexric/              # Submódulo E2AP
+└── ns-O-RAN-flexric/    # Submódulo ns-3
+```
+
+---
+
+## 18. Como Executar o Sistema
+
+### Pré-requisitos
+
+1. Python 3.8+
+2. SQLite3
+3. Docker + Docker Compose
+4. Bibliotecas: `numpy`, `pandas`, `scikit-learn`, `xgboost`, `influxdb`, `flask`
+
+### Instalação
+
+```bash
+# Clone o repositório
+git clone https://github.com/Robertwanzeler/-greenran-oran-.git
+cd orange_nuclear
+
+# Execute o sistema
+./scripts/run_greenran.sh
+```
+
+### Dashboard
+
+- **Web Dashboard**: http://localhost:5000
+- **Grafana**: http://localhost:3001
+- **InfluxDB**: localhost:8086
+
+### Monitoramento
+
+```bash
+# Monitor de coleta
+./monitoring/monitor_data_collection.sh
+
+# Watchdog xApps
+python3 monitoring/watchdog_xapps.py
+```
+
+---
+
+## 19. Glossário de Termos
+
+| Termo | Significado |
+|-------|-------------|
+| **CVaR** | Conditional Value at Risk - Latência no percentil 95% |
+| **rApp** | Aplicação Non-RT RIC - Inteligência estratégica |
+| **xApp** | Aplicação Near-RT RIC - Controle em tempo real |
+| **O-RAN** | Open Radio Access Network - Rede de acesso aberto |
+| **RIC** | Radio Intelligent Controller - Controlador de rádio |
+| **ML** | Machine Learning - Aprendizado de máquina |
+| **ALLOWED** | Decisão: Economia habilitada |
+| **BLOCKED** | Decisão: Economia desabilitada |
+| **CONDITIONAL** | Decisão: Economia parcial |
+| **SLA** | Service Level Agreement - Acordo de nível de serviço |
+| **Regressor** | Modelo ML que prediz valores contínuos |
+| **Classifier** | Modelo ML que prediz categorias |
+
+---
+
+## 20. Referências
+
+- [O-RAN Documentation](https://www.o-ran.org)
+- [ns-3 Documentation](https://www.nsnam.org)
+- [FlexRIC](https://github.com/netsys/flexric)
+- [XGBoost](https://xgboost.readthedocs.io/)
+- [Scikit-learn](https://scikit-learn.org/)
+
+---
+
+**Documento criado em**: 09 de Abril de 2026
+**Última Atualização**: 09 de Abril de 2026
 **Autor**: Assistente IA
 **Projeto**: GreenRAN O-RAN
 **Repositório**: [github.com/Robertwanzeler/-greenran-oran-.git](https://github.com/Robertwanzeler/-greenran-oran-.git)
