@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-04-02T15:42:35.410738",
-  "dataset_size": 1775,
+  "timestamp": "2026-04-04T18:05:26.238997",
+  "dataset_size": 5001,
   "features": [
     "cvar_ms",
     "cvar_diff",
@@ -21,24 +21,24 @@
     "sim_time_s"
   ],
   "classifier": {
-    "random_forest_accuracy": 0.8929577464788733,
-    "cross_validation_mean": 0.9112676056338028,
-    "cross_validation_std": 0.022314055658809673,
+    "random_forest_accuracy": 0.9340659340659341,
+    "cross_validation_mean": 0.93675,
+    "cross_validation_std": 0.0062549980015983875,
     "confusion_matrix": [
       [
-        129,
-        5,
-        4
+        342,
+        2,
+        28
       ],
       [
-        6,
-        164,
-        6
+        22,
+        555,
+        9
       ],
       [
-        12,
         5,
-        24
+        0,
+        38
       ]
     ],
     "classes": [
@@ -46,30 +46,30 @@
       "BLOCKED",
       "CONDITIONAL"
     ],
-    "xgboost_accuracy": 0.9014084507042254
+    "xgboost_accuracy": 0.9270729270729271
   },
   "regressor": {
-    "mae_ms": 0.031959555521819845,
-    "rmse_ms": 0.2301221297412532,
-    "r2": 0.9999513027437517
+    "mae_ms": 0.002662947135848809,
+    "rmse_ms": 0.02175530518562881,
+    "r2": 0.9999995934048855
   },
   "feature_importance": {
-    "cvar_ms": 0.09311023989094873,
-    "cvar_diff": 0.010205876154219784,
-    "cvar_rolling_mean": 0.17923670414424514,
-    "cvar_rolling_std": 0.02254610106789988,
-    "latency_p95_ms": 0.01950142196607955,
-    "avg_latency_ms": 0.02407860562261512,
-    "variance_ms2": 0.022401100472383174,
-    "total_active_cameras": 0.00013994945972474894,
+    "cvar_ms": 0.13249380684206866,
+    "cvar_diff": 0.004903826138797797,
+    "cvar_rolling_mean": 0.16206828974792187,
+    "cvar_rolling_std": 0.0189883835520512,
+    "latency_p95_ms": 0.016504084816515042,
+    "avg_latency_ms": 0.025954535338049322,
+    "variance_ms2": 0.020431327540494242,
+    "total_active_cameras": 0.00012166380584914591,
     "total_active_ues": 0.0,
-    "camera_ratio": 0.00010897589286975516,
-    "total_critical_ues": 0.06183145016284558,
-    "hour_sin": 0.13062598924232413,
-    "hour_cos": 0.1569602493181244,
-    "is_night": 0.01265712229838518,
-    "is_weekend": 0.0,
-    "cvar_zone": 0.05883353857989873,
-    "sim_time_s": 0.20776267572743598
+    "camera_ratio": 7.777114718118317e-05,
+    "total_critical_ues": 0.059832218666731524,
+    "hour_sin": 0.12907795931540283,
+    "hour_cos": 0.1293453125737995,
+    "is_night": 0.008410533393145373,
+    "is_weekend": 0.028746441058811686,
+    "cvar_zone": 0.052970988467579354,
+    "sim_time_s": 0.2100728575956014
   }
 }

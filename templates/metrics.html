@@ -16,7 +16,7 @@
                     <tr><td>Throughput</td><td>{{ "%.0f"|format(metrics.global_metrics.throughput_kbps) }} kbps</td></tr>
                     <tr><td>UEs Ativas</td><td>{{ metrics.global_metrics.total_active_ues }}</td></tr>
                     <tr><td>Câmeras Ativas</td><td>{{ metrics.active_cameras }}</td></tr>
-                    <tr><td>Críticas</td><td class="{% if metrics.critical_cameras > 0 %}text-danger{% endif %}">{{ metrics.critical_cameras }}</td></tr>
+                    <tr><td>UEs Críticos (>80ms)</td><td class="{% if metrics.critical_cameras > 0 or extended.global_metrics.critical_ues > 0 %}text-danger{% endif %}">{{ metrics.critical_cameras + (extended.global_metrics.critical_ues|int) }}</td></tr>
                 </table>
                 {% else %}
                 <p class="text-muted">Sem dados disponíveis</p>
@@ -31,9 +31,9 @@
                 {% if extended and extended.status == 'analyzed' %}
                 <table class="table">
                     <tr><td>Quality Score</td><td class="{% if extended.quality_score >= 80 %}text-success{% elif extended.quality_score >= 60 %}text-warning{% else %}text-danger{% endif %}">{{ "%.0f"|format(extended.quality_score) }}/100 ({{ extended.quality_grade }})</td></tr>
-                    <tr><td>Status Latência</td><td>{{ extended.latency_status }}</td></tr>
-                    <tr><td>Status Jitter</td><td>{{ extended.jitter_status }}</td></tr>
-                    <tr><td>Status Throughput</td><td>{{ extended.throughput_status }}</td></tr>
+                    <tr><td>Latência</td><td>{{ "%.2f"|format(extended.global_metrics.avg_latency_us / 1000) }} ms ({{ extended.latency_status }})</td></tr>
+                    <tr><td>Jitter</td><td>{{ "%.2f"|format(extended.global_metrics.avg_jitter_us / 1000) }} ms ({{ extended.jitter_status }})</td></tr>
+                    <tr><td>Throughput</td><td>{{ "%.1f"|format(extended.global_metrics.avg_throughput_kbps / 1000) }} Mbps ({{ extended.throughput_status }})</td></tr>
                     <tr><td>Packet Loss</td><td>{{ "%.2f"|format(extended.global_metrics.avg_packet_loss_rate * 100) }}%</td></tr>
                     <tr><td>Amostras</td><td>{{ extended.sample_count }}</td></tr>
                 </table>

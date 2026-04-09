@@ -123,20 +123,22 @@
             </div>
             <div class="card-body">
                 <table class="table table-sm">
-                    {% for name, data in xapp_status.items() %}
+                    {% for name in ['SLICER', 'ENERGY'] %}
+                    {% if xapp_status[name] %}
                     <tr>
                         <td><strong>{{ name }}</strong></td>
                         <td>
-                            {% if data.status == 'RUNNING' %}
+                            {% if xapp_status[name].status == 'RUNNING' %}
                                 <span class="badge badge-ok">RODANDO</span>
-                            {% elif data.status == 'UNRESPONSIVE' %}
+                            {% elif xapp_status[name].status == 'UNRESPONSIVE' %}
                                 <span class="badge badge-warning">UNRESPONSIVE</span>
                             {% else %}
-                                <span class="badge badge-critical">{{ data.status }}</span>
+                                <span class="badge badge-critical">{{ xapp_status[name].status }}</span>
                             {% endif %}
                         </td>
-                        <td>PID: {{ data.pid or 'N/A' }}</td>
+                        <td>PID: {{ xapp_status[name].pid or 'N/A' }}</td>
                     </tr>
+                    {% endif %}
                     {% endfor %}
                 </table>
             </div>

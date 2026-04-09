@@ -388,8 +388,11 @@ class RappResourceOptimizer:
             decision['slicer_state'] = slicer_state
         
         if energy_intent:
-            energy_state = energy_intent.get('INTENT', 'UNKNOWN')
+            # energy_saver.txt usa ACTION=POWER_DOWN, não INTENT
+            energy_state = energy_intent.get('ACTION', 'UNKNOWN')
             decision['energy_state'] = energy_state
+            # Também capturar o power level
+            decision['energy_power_level'] = energy_intent.get('POWER_LEVEL', 'UNKNOWN')
         
         # ========================================
         # ETAPA 0: TREND ANALYSIS (SLOPE) - PREDITIVA

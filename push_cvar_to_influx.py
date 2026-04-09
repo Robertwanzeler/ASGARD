@@ -20,7 +20,7 @@ import time
 import sqlite3
 import requests
 
-DEFAULT_INFLUX_HOST = "172.18.0.2"
+DEFAULT_INFLUX_HOST = "localhost"
 DEFAULT_INFLUX_PORT = 8086
 DEFAULT_INFLUX_DB = "influx"
 DEFAULT_INFLUX_USER = "admin"

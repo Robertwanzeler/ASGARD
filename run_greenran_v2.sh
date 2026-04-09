@@ -142,34 +142,47 @@ echo -e "${BLUE}=== [8/9] Iniciando Monitoramento (Grafana + InfluxDB) ===${NC}"
 # Verificar se Docker está disponível
 if command -v docker-compose &> /dev/null; then
     # Verificar acesso ao Docker
-    if docker info &>/dev/null; then
+    # Verificar Docker Compose (V1 usa "docker-compose", V2 usa "docker compose")
+    if docker-compose --version &>/dev/null; then
         DOCKER_CMD="docker-compose"
-        echo -e "${GREEN}    Acesso Docker OK${NC}"
+        echo -e "${GREEN}    Docker Compose V1 detectado${NC}"
+    elif docker compose version &>/dev/null; then
+        DOCKER_CMD="docker compose"
+        echo -e "${GREEN}    Docker Compose V2 detectado${NC}"
     else
-        DOCKER_CMD="sudo docker-compose"
-        echo -e "${YELLOW}    Sem acesso Docker, usando sudo${NC}"
+        echo -e "${RED}    Docker Compose não encontrado!${NC}"
+        echo -e "${YELLOW}    Instale com: sudo apt install docker-compose${NC}"
+        exit 1
     fi
     
     cd $BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/GUI
     
+    echo -e "${BLUE}    diretório: $(pwd)${NC}"
+    
     # Parar serviços existentes
+    echo -e "${BLUE}    Parando serviços existentes...${NC}"
     $DOCKER_CMD down 2>/dev/null || true
     
     # Iniciar serviços
-    if $DOCKER_CMD up -d 2>/dev/null; then
-        echo -e "${GREEN}    Grafana iniciado em http://localhost:3000${NC}"
-        echo -e "${GREEN}    InfluxDB iniciado em http://localhost:8086${NC}"
-        echo -e "${GREEN}    GUI iniciado em http://localhost:8000${NC}"
+    echo -e "${BLUE}    Iniciando serviços Docker...${NC}"
+    if $DOCKER_CMD up -d; then
+        echo -e "${GREEN}    ✓ Grafana iniciado em http://localhost:3000${NC}"
+        echo -e "${GREEN}    ✓ InfluxDB iniciado em http://localhost:8086${NC}"
+        echo -e "${GREEN}    ✓ GUI iniciado em http://localhost:8000${NC}"
     else
         echo -e "${RED}    ERRO ao iniciar Docker services${NC}"
+        echo -e "${YELLOW}    Saída do erro:${NC}"
+        $DOCKER_CMD up -d 2>&1 | head -20
         echo -e "${RED}    Tentando com sudo...${NC}"
         sudo docker-compose down 2>/dev/null || true
-        if sudo docker-compose up -d 2>/dev/null; then
-            echo -e "${GREEN}    Grafana iniciado em http://localhost:3000${NC}"
-            echo -e "${GREEN}    InfluxDB iniciado em http://localhost:8086${NC}"
-            echo -e "${GREEN}    GUI iniciado em http://localhost:8000${NC}"
+        if sudo docker-compose up -d; then
+            echo -e "${GREEN}    ✓ Grafana iniciado com sudo${NC}"
+            echo -e "${GREEN}    ✓ InfluxDB iniciado com sudo${NC}"
+            echo -e "${GREEN}    ✓ GUI iniciado com sudo${NC}"
         else
             echo -e "${RED}    ERRO: Não foi possível iniciar Docker services${NC}"
+            echo -e "${YELLOW}    Verifique se o Docker daemon está rodando:${NC}"
+            echo -e "${YELLOW}    systemctl status docker${NC}"
         fi
     fi
     

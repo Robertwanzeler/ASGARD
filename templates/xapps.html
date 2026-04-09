@@ -7,22 +7,24 @@
             <div class="card-header"><h5>Status dos xApps</h5></div>
             <div class="card-body">
                 <table class="table">
-                    {% for name, data in xapp_status.items() %}
+                    {% for name in ['SLICER', 'ENERGY'] %}
+                    {% if xapp_status[name] %}
                     <tr>
                         <td><strong>{{ name }}</strong></td>
                         <td>
-                            {% if data.status == 'RUNNING' %}
+                            {% if xapp_status[name].status == 'RUNNING' %}
                                 <span class="badge bg-success">RODANDO</span>
-                            {% elif data.status == 'UNRESPONSIVE' %}
+                            {% elif xapp_status[name].status == 'UNRESPONSIVE' %}
                                 <span class="badge bg-warning">UNRESPONSIVE</span>
                             {% else %}
-                                <span class="badge bg-danger">{{ data.status }}</span>
+                                <span class="badge bg-danger">{{ xapp_status[name].status }}</span>
                             {% endif %}
                         </td>
                     </tr>
-                    <tr><td>PID</td><td>{{ data.pid or 'N/A' }}</td></tr>
-                    <tr><td>Último Cycle</td><td>{{ data.last_cycle or 'N/A' }}</td></tr>
-                    <tr><td>Total Restarts</td><td>{{ data.total_restarts or 0 }}</td></tr>
+                    <tr><td>PID</td><td>{{ xapp_status[name].pid or 'N/A' }}</td></tr>
+                    <tr><td>Último Cycle</td><td>{{ xapp_status[name].last_cycle or 'N/A' }}</td></tr>
+                    <tr><td>Total Restarts</td><td>{{ xapp_status[name].total_restarts or 0 }}</td></tr>
+                    {% endif %}
                     {% endfor %}
                 </table>
             </div>
@@ -34,7 +36,34 @@
             <div class="card-body">
                 <p><strong>Pendentes:</strong> {{ policy_status.pending|length if policy_status.pending else 0 }}</p>
                 {% if policy_status.pending %}
-                <pre>{{ policy_status.pending|tojson(indent=2) }}</pre>
+                <table class="table table-sm table-bordered">
+                    <thead>
+                        <tr>
+                            <th>Política</th>
+                            <th>Status</th>
+                            <th>Policy ID</th>
+                            <th>Enviada em</th>
+                            <th>Tentativas</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for pol_name, pol_data in policy_status.pending.items() %}
+                        <tr>
+                            <td><strong>{{ pol_name|upper }}</strong></td>
+                            <td><span class="badge bg-warning">PENDENTE</span></td>
+                            <td>{{ pol_data.policy_id }}</td>
+                            <td>{{ pol_data.last_sent }}</td>
+                            <td>{{ pol_data.attempts }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                <details>
+                    <summary>JSON Completo</summary>
+                    <pre>{{ policy_status.pending|tojson(indent=2) }}</pre>
+                </details>
+                {% else %}
+                <p><span class="badge bg-success">Nenhuma política pendente</span></p>
                 {% endif %}
             </div>
         </div>

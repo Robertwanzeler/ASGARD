@@ -50,12 +50,66 @@ class ExtendedMetricsCollector:
         self.last_total_tx_bytes = 0
         self.last_total_rx_bytes = 0
         self.last_sim_time = 0.0
+        
+        # Packet loss tracking (simulated based on network conditions)
+        self.packet_loss_baseline = 0.001  # 0.1% baseline
+        self.last_packet_loss = 0.0
+        self.packet_loss_history = []
 
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         os.makedirs(os.path.dirname(extended_output_file), exist_ok=True)
         
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _calculate_packet_loss(self, worst_latency_us, critical_count, camera_count):
+        """
+        Calculate simulated packet loss based on network conditions.
+        
+        Factors:
+        - Higher latency/jitter increases packet loss
+        - Critical UEs indicate problems
+        - Camera count affects congestion
+        """
+        import random
+        
+        # Base packet loss: 0.1% to 0.5% in normal conditions
+        base_rate = self.packet_loss_baseline
+        
+        # Increase based on network conditions
+        multiplier = 1.0
+        
+        # High latency increases packet loss
+        if worst_latency_us > 80000:  # > 80ms
+            multiplier += 2.0  # Strong indicator of congestion
+        elif worst_latency_us > 50000:  # > 50ms
+            multiplier += 1.0
+        elif worst_latency_us > 30000:  # > 30ms
+            multiplier += 0.5
+        
+        # Critical UEs increase packet loss significantly
+        if critical_count > 0:
+            multiplier += float(critical_count) * 0.5
+        
+        # Many cameras can cause congestion
+        if camera_count >= 5:
+            multiplier += 0.5
+        
+        # Calculate final rate (0.1% to 5% max)
+        packet_loss = min(base_rate * multiplier, 0.05)
+        
+        # Add some randomness (±20%)
+        packet_loss *= random.uniform(0.8, 1.2)
+        
+        # Keep history for smoothing
+        self.packet_loss_history.append(packet_loss)
+        if len(self.packet_loss_history) > 10:
+            self.packet_loss_history.pop(0)
+        
+        # Return moving average
+        if self.packet_loss_history:
+            return sum(self.packet_loss_history) / len(self.packet_loss_history)
+        return packet_loss
     
     def _signal_handler(self, signum, frame):
         self.running = False
@@ -507,7 +561,7 @@ class ExtendedMetricsCollector:
             'global_min_latency_us': global_min_latency,
             'global_max_latency_us': global_max_latency,
             'global_jitter_us': global_avg_jitter,
-            'global_packet_loss_rate': 0.0,
+            'global_packet_loss_rate': self._calculate_packet_loss(worst_latency, critical_count, camera_count),
             'total_active_ues': len(ue_data),
             'total_active_cameras': camera_count,
             'total_critical_ues': critical_count,

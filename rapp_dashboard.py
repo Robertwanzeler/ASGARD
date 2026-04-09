@@ -299,32 +299,40 @@ def ml_page():
     prediction_history = []
     try:
         cursor = PATTERN_ENGINE.dl.conn.execute(
-            """SELECT datetime, ml_decision, decision, ml_confidence,
+            """SELECT timestamp, ml_decision, decision, ml_confidence,
                       ml_predicted_cvar_ms, ml_influenced
                FROM decisions_history
+               WHERE ml_decision IS NOT NULL AND ml_decision != ''
                ORDER BY timestamp DESC LIMIT 20"""
         )
         for row in cursor.fetchall():
+            ts = row[0] or 0
+            # Convert Unix timestamp to readable format
+            try:
+                dt_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                dt_str = str(ts)
+            
             ml_dec = row[1] or 'N/A'
-            rule_dec = row[2]
+            rule_dec = row[2] or 'UNKNOWN'
             ml_conf = row[3] or 0
             ml_cvar = row[4] or 0
             influenced = row[5] or 0
 
             # Calculate concordance
-            concordance = (ml_dec == rule_dec) if ml_dec != 'N/A' else False
+            concordance = (ml_dec == rule_dec) if ml_dec not in ('N/A', 'NONE', '') else False
 
             prediction_history.append({
-                'timestamp': row[0],
+                'timestamp': dt_str,
                 'ml_decision': ml_dec,
                 'rule_decision': rule_dec,
                 'confidence': ml_conf,
                 'predicted_cvar_ms': ml_cvar,
-                'ml_influenced': influenced,
+                'ml_influenced': bool(influenced),
                 'concordance': concordance
             })
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Erro ao buscar histórico ML: {e}")
 
     # Calculate concordance percentage
     concordance_pct = 85.0  # Default

@@ -2,30 +2,30 @@
   GreenRAN ML Training Report
 ============================================================
 
-Data: 2026-04-02 15:42:35
+Data: 2026-04-04 18:05:26
 
 CLASSIFIER (Decisão rApp)
 ----------------------------------------
-  Random Forest Accuracy: 0.8930
-  XGBoost Accuracy: 0.9014
-  Cross-validation: 0.9113 ± 0.0223
+  Random Forest Accuracy: 0.9341
+  XGBoost Accuracy: 0.9271
+  Cross-validation: 0.9367 ± 0.0063
   Classes: ['ALLOWED', 'BLOCKED', 'CONDITIONAL']
 
 REGRESSOR (CVaR prediction)
 ----------------------------------------
-  MAE: 0.03 ms
-  RMSE: 0.23 ms
+  MAE: 0.00 ms
+  RMSE: 0.02 ms
   R²: 1.0000
 
 TOP 10 FEATURES (by importance)
 ----------------------------------------
-  sim_time_s: 0.2078
-  cvar_rolling_mean: 0.1792
-  hour_cos: 0.1570
-  hour_sin: 0.1306
-  cvar_ms: 0.0931
-  total_critical_ues: 0.0618
-  cvar_zone: 0.0588
-  avg_latency_ms: 0.0241
-  cvar_rolling_std: 0.0225
-  variance_ms2: 0.0224
+  sim_time_s: 0.2101
+  cvar_rolling_mean: 0.1621
+  cvar_ms: 0.1325
+  hour_cos: 0.1293
+  hour_sin: 0.1291
+  total_critical_ues: 0.0598
+  cvar_zone: 0.0530
+  is_weekend: 0.0287
+  avg_latency_ms: 0.0260
+  variance_ms2: 0.0204
