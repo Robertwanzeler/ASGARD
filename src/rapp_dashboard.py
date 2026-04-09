@@ -30,7 +30,7 @@ from rapp_data_lake import DataLake
 from rapp_pattern_engine import PatternRecognition
 from rapp_alerts import AlertManager
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='../templates')
 
 DATA_LAKE = DataLake()
 PATTERN_ENGINE = PatternRecognition(DATA_LAKE)
