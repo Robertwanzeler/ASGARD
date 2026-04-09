@@ -26,18 +26,17 @@ MAX_VALID_LATENCY_US=500000  # 500ms em microsegundos (filtra bug, mantém viola
 
 # Função para query SQLite via Python
 query_sqlite() {
-    python3 -c "
+    python3 << EOF
 import sqlite3
-import sys
 try:
     conn = sqlite3.connect('$DB_PATH')
-    c = conn.execute('''$1''')
+    c = conn.execute("""$1""")
     r = c.fetchone()
     print(r[0] if r and r[0] is not None else '0')
     conn.close()
-except Exception as e:
+except:
     print('0')
-" 2>/dev/null || echo "0"
+EOF
 }
 
 # Contadores
@@ -238,10 +237,10 @@ echo ""
 echo -e "${CYAN}${BOLD}[6] DECISÕES DO RAPP${NC}"
 echo -e "${CYAN}----------------------------------------${NC}"
 
-BLOCKED=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision = 'BLOCKED'" | grep -E '^[0-9]+$' || echo "0")
-ALLOWED=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision = 'ALLOWED'" | grep -E '^[0-9]+$' || echo "0")
-CONDITIONAL=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision = 'CONDITIONAL'" | grep -E '^[0-9]+$' || echo "0")
-UNKNOWN=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision NOT IN ('BLOCKED', 'ALLOWED', 'CONDITIONAL')" | grep -E '^[0-9]+$' || echo "0")
+BLOCKED=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision='BLOCKED'")
+ALLOWED=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision='ALLOWED'")
+CONDITIONAL=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision='CONDITIONAL'")
+UNKNOWN=$(query_sqlite "SELECT COUNT(*) FROM decisions_history WHERE decision NOT IN ('BLOCKED','ALLOWED','CONDITIONAL')")
 TOTAL_DEC=$((BLOCKED + ALLOWED + CONDITIONAL + UNKNOWN))
 
 echo -e "  BLOQUEADO (BLOCKED):     ${RED}${BOLD}$BLOCKED${NC}"
@@ -392,13 +391,15 @@ if [ ! -z "$ENERGY_STATS" ] && [ "$ENERGY_STATS" != "null" ]; then
         FP_COUNT=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['commands'].get('FULL_POWER',{}).get('count',0))" 2>/dev/null)
         FP_PCT=$(python3 -c "print(round($FP_COUNT/$TOTAL_CMDS*100,1))" 2>/dev/null || echo "0")
         echo -n "    FULL_POWER:         $FP_COUNT ($FP_PCT%)"
-        if [ "$FP_PCT" -gt 50 ]; then echo " ⚠️ ALTA POTÊNCIA"; else echo ""; fi
+        if [ "${FP_PCT%.*}" -gt 50 ]; then echo " ⚠️ ALTA POTÊNCIA"; else echo ""; fi
         
         # CONDITIONAL_REDUCE (70%)
         CR_COUNT=$(echo "$ENERGY_STATS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['commands'].get('CONDITIONAL_REDUCE',{}).get('count',0))" 2>/dev/null)
         if [ ! -z "$CR_COUNT" ] && [ "$CR_COUNT" -gt 0 ]; then
             CR_PCT=$(python3 -c "print(round($CR_COUNT/$TOTAL_CMDS*100,1))" 2>/dev/null || echo "0")
             echo -e "    CONDITIONAL:        $CR_COUNT ($CR_PCT%) - 70% potência"
+        else
+            echo ""
         fi
         
         # POWER_DOWN (50%)
@@ -406,6 +407,8 @@ if [ ! -z "$ENERGY_STATS" ] && [ "$ENERGY_STATS" != "null" ]; then
         if [ ! -z "$PD_COUNT" ] && [ "$PD_COUNT" -gt 0 ]; then
             PD_PCT=$(python3 -c "print(round($PD_COUNT/$TOTAL_CMDS*100,1))" 2>/dev/null || echo "0")
             echo -e "    POWER_DOWN:         $PD_COUNT ($PD_PCT%) - 50% potência"
+        else
+            echo ""
         fi
         
         # POWER_DOWN_ECO (25%)
