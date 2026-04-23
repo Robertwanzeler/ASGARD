@@ -39,28 +39,108 @@ import time
 import argparse
 import signal
 import json
+import re
 from datetime import datetime
 from collections import deque
+from greenran_paths import (
+    DRL_VENV_SITE_PACKAGES,
+    STATE_DIR,
+    SLICER_INTENT_PATH,
+    ENERGY_INTENT_PATH,
+    RAPP_DECISION_PATH,
+    EXTENDED_METRICS_JSON_PATH,
+    XAPP_HEALTH_PATH,
+    XAPP_INTENTS_DIR,
+    ensure_runtime_dirs,
+    as_str,
+)
+from greenran_runtime import load_runtime_config
 
-sys.path.insert(0, '/home/robert/orange_nuclear')
+# Add drlexp venv to path for DRL imports
+DRL_VENV_PATH = as_str(DRL_VENV_SITE_PACKAGES)
+if os.path.exists(DRL_VENV_PATH) and DRL_VENV_PATH not in sys.path:
+    sys.path.insert(0, DRL_VENV_PATH)
 
 from rapp_data_lake import DataLake
 from rapp_pattern_engine import PatternRecognition
 from rapp_agent_openran import AgentOpenRAN
 from rapp_a1_interface import A1PolicyInterface
 from rapp_ml_predictor import MLPredictor
+
+# DRL Modules (SBiLSTM + A3C)
+try:
+    from rapp_drl_predictor import DRLPredictor
+    HAS_DRL = True
+except ImportError as e:
+    HAS_DRL = False
+    print(f"[rApp] DRL import error: {e} - using RF only")
+
 # from rapp_synthetic_generator import SyntheticDataGenerator  # Removed - not available
 from rapp_xapp_manager import XAppManager
 from rapp_trend_analysis import TrendAnalysis
 from energy_command_protocol import EnergyCommand
 
-SLICER_INTENT_PATH = "/tmp/xapp_intents/slicer.txt"
-ENERGY_INTENT_PATH = "/tmp/xapp_intents/energy_saver.txt"
-RAPP_DECISION_PATH = "/tmp/xapp_intents/rapp_decision.txt"
-EXTENDED_METRICS_PATH = "/tmp/xapp_metrics/extended_metrics.json"
-XAPP_HEALTH_FILE = "/tmp/xapp_health.json"
+SLICER_INTENT_PATH = as_str(SLICER_INTENT_PATH)
+ENERGY_INTENT_PATH = as_str(ENERGY_INTENT_PATH)
+RAPP_DECISION_PATH = as_str(RAPP_DECISION_PATH)
+EXTENDED_METRICS_PATH = as_str(EXTENDED_METRICS_JSON_PATH)
+XAPP_HEALTH_FILE = as_str(XAPP_HEALTH_PATH)
+APP2_MONITORING_PATH = as_str(STATE_DIR / "app2_monitoramento" / "monitoring_snapshot.json")
+ARTICLE00_SCENARIO_CONTROL_PATH = as_str(STATE_DIR / "article00_scenario_control.json")
 
-DEFAULT_INTERVAL = 1  # Non-RT RIC: ≥1 segundo (O-RAN spec) - 1s para máxima responsividade
+RUNTIME_CONFIG = load_runtime_config()
+DEFAULT_INTERVAL = max(1, float(RUNTIME_CONFIG["orchestrator"]["interval_seconds"]))
+
+_INT_RE = re.compile(r"^[+-]?\d+$")
+_FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _safe_read_json_file(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_app1_camera_override():
+    control = _safe_read_json_file(ARTICLE00_SCENARIO_CONTROL_PATH)
+    override = control.get("app1_camera_override", {}) or {}
+    if not override.get("enabled", False):
+        return {}
+    return override
+
+
+def _coerce_intent_value(raw_value):
+    """Converte valores escalares do intent para tipos numéricos quando possível."""
+    value = raw_value.strip()
+    if not value:
+        return value
+
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+
+    if value.endswith("%"):
+        return value
+
+    if _INT_RE.match(value):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+
+    if _FLOAT_RE.match(value):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+    return value
 
 
 class RappResourceOptimizer:
@@ -105,6 +185,7 @@ class RappResourceOptimizer:
         # Histórico de predições ML para exibição
         self.ml_history = deque(maxlen=50)  # Mantém últimas 50 predições
         self.history_display_interval = 1  # Exibir a cada ciclo (mais frequente)
+        self.app2_connectivity_history = deque(maxlen=3)
         
         # Inicializa componentes
         print("[rApp] Inicializando componentes...")
@@ -130,6 +211,18 @@ class RappResourceOptimizer:
         # ML Predictor (Random Forest / XGBoost) com acesso ao banco
         self.ml_predictor = MLPredictor(data_lake=self.data_lake)
 
+        # DRL Predictor (SBiLSTM + A3C)
+        if HAS_DRL:
+            try:
+                self.drl_predictor = DRLPredictor()
+                self.drl_predictor.load_models()
+                print("[rApp] DRL Predictor loaded (SBiLSTM + A3C)")
+            except Exception as e:
+                print(f"[rApp] DRL load failed: {e}")
+                self.drl_predictor = None
+        else:
+            self.drl_predictor = None
+
         # Retreinamento automático do ML (2x por dia = a cada 12h)
         self.ml_retrain_interval = 12 * 3600  # 12 horas em segundos
         self.ml_last_retrain = time.time()
@@ -150,7 +243,8 @@ class RappResourceOptimizer:
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         # Cria diretórios
-        os.makedirs("/tmp/xapp_intents", exist_ok=True)
+        ensure_runtime_dirs()
+        os.makedirs(as_str(XAPP_INTENTS_DIR), exist_ok=True)
         
         # INICIA xApps CONTROLADOS PELO RAPP
         # Slicer SEMPRE inicia com rApp (prioridade)
@@ -291,7 +385,7 @@ class RappResourceOptimizer:
                 for line in f:
                     if '=' in line:
                         key, value = line.strip().split('=', 1)
-                        intent[key.strip()] = value.strip()
+                        intent[key.strip()] = _coerce_intent_value(value)
             return intent
         except Exception as e:
             print(f"[rApp] ERRO ao ler SLICER: {e}")
@@ -308,7 +402,7 @@ class RappResourceOptimizer:
                 for line in f:
                     if '=' in line:
                         key, value = line.strip().split('=', 1)
-                        intent[key.strip()] = value.strip()
+                        intent[key.strip()] = _coerce_intent_value(value)
             return intent
         except Exception as e:
             print(f"[rApp] ERRO ao ler ENERGY: {e}")
@@ -316,14 +410,259 @@ class RappResourceOptimizer:
     
     def read_extended_metrics(self):
         """Lê métricas estendidas do JSON."""
-        try:
-            if not os.path.exists(EXTENDED_METRICS_PATH):
-                return None
-            
-            with open(EXTENDED_METRICS_PATH, 'r') as f:
-                return json.load(f)
-        except Exception as e:
+        if not os.path.exists(EXTENDED_METRICS_PATH):
             return None
+
+        for attempt in range(3):
+            try:
+                with open(EXTENDED_METRICS_PATH, 'r') as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                if attempt < 2:
+                    time.sleep(0.05)
+                    continue
+                return None
+            except Exception:
+                return None
+
+        return None
+
+    def _get_latest_sim_time(self):
+        """Obtém o sim_time mais recente sem deixar DB antigo bloquear novo run."""
+        db_sim_time = 0
+        db_timestamp = 0
+
+        try:
+            cursor = self.data_lake.conn.cursor()
+            cursor.execute("SELECT timestamp, sim_time_s FROM extended_metrics ORDER BY timestamp DESC LIMIT 1")
+            result = cursor.fetchone()
+            if result:
+                db_timestamp = int(result[0] or 0)
+                db_sim_time = float(result[1] or 0)
+        except Exception:
+            pass
+
+        live_sim_time = 0
+        live_timestamp = 0
+        extended_metrics = self.read_extended_metrics()
+        if extended_metrics:
+            try:
+                live_sim_time = float(
+                    (extended_metrics.get('sim_time_range', {}) or {}).get('end', 0) or 0
+                )
+                live_timestamp = int((extended_metrics.get('timestamp') or 0) / 1000)
+            except (TypeError, ValueError):
+                live_sim_time = 0
+
+        if live_sim_time > 0:
+            if db_sim_time <= 0:
+                return live_sim_time
+
+            # Novo run: JSON vivo resetou o sim_time, mas o DB ainda tem 600s do run anterior.
+            if live_timestamp >= db_timestamp and live_sim_time + 10 < db_sim_time:
+                return live_sim_time
+
+            # DB ficou para trás ou perdeu ciclos; use o JSON corrente.
+            if live_timestamp > db_timestamp + max(2, int(self.interval)):
+                return live_sim_time
+
+        return db_sim_time if db_sim_time > 0 else live_sim_time
+
+    def _get_camera_sla_metrics(self, slicer_intent=None):
+        """
+        Extrai métricas reais de SLA das câmeras.
+
+        Prioriza o snapshot de métricas estendidas por UE e cai para o
+        intent do slicer apenas como fallback quando necessário.
+        """
+        metrics = {
+            'latency_ms': 0.0,
+            'throughput_mbps': 0.0,
+            'active_cameras': 0,
+            'critical_cameras': 0,
+            'observed_cameras': 0,
+            'throughput_ready': False,
+            'throughput_source': 'unavailable',
+            'sim_time_s': 0.0,
+        }
+
+        extended_metrics = self.read_extended_metrics()
+        if extended_metrics:
+            try:
+                metrics['sim_time_s'] = float(
+                    (extended_metrics.get('sim_time_range', {}) or {}).get('end', 0) or 0
+                )
+            except (TypeError, ValueError):
+                metrics['sim_time_s'] = 0.0
+
+            override = _load_app1_camera_override()
+            if override:
+                metrics.update({
+                    'latency_ms': float(override.get('latency_ms', 0.0) or 0.0),
+                    'throughput_mbps': float(override.get('throughput_mbps', 0.0) or 0.0),
+                    'active_cameras': int(override.get('active_cameras', 0) or 0),
+                    'critical_cameras': int(override.get('critical_cameras', 0) or 0),
+                    'observed_cameras': int(
+                        override.get('observed_cameras', override.get('active_cameras', 0)) or 0
+                    ),
+                    'throughput_ready': bool(override.get('throughput_ready', True)),
+                    'throughput_source': str(
+                        override.get('throughput_source', 'article00_control') or 'article00_control'
+                    ),
+                })
+                return metrics
+
+            ue_metrics = extended_metrics.get('ue_metrics', {}) or {}
+            camera_entries = [
+                ue_data for ue_data in ue_metrics.values()
+                if ue_data.get('device_type') == 'camera'
+            ]
+
+            if camera_entries:
+                worst_latency_us = max(float(entry.get('latency_us', 0) or 0) for entry in camera_entries)
+                min_throughput_kbps = min(
+                    float(entry.get('rx_throughput_kbps', entry.get('throughput_kbps', 0)) or 0)
+                    for entry in camera_entries
+                )
+                critical_cameras = sum(
+                    1 for entry in camera_entries
+                    if float(entry.get('latency_us', 0) or 0) >= 100000
+                )
+                observed_cameras = sum(
+                    1 for entry in camera_entries
+                    if (
+                        bool(entry.get('has_latency_samples'))
+                        or int(entry.get('packet_count', 0) or 0) > 0
+                        or float(entry.get('rx_bytes', 0) or 0) > 0
+                        or float(entry.get('tx_bytes', 0) or 0) > 0
+                        or float(entry.get('rx_throughput_kbps', entry.get('throughput_kbps', 0)) or 0) > 0
+                    )
+                )
+                throughput_sources = {
+                    str(entry.get('throughput_source', '') or '').strip()
+                    for entry in camera_entries
+                    if str(entry.get('throughput_source', '') or '').strip()
+                }
+
+                metrics.update({
+                    'latency_ms': worst_latency_us / 1000.0,
+                    'throughput_mbps': min_throughput_kbps / 1000.0,
+                    'active_cameras': len(camera_entries),
+                    'critical_cameras': critical_cameras,
+                    'observed_cameras': observed_cameras,
+                    'throughput_ready': observed_cameras == len(camera_entries),
+                    'throughput_source': ','.join(sorted(throughput_sources)) or 'pdcp_rx_window',
+                })
+                return metrics
+
+            global_metrics = extended_metrics.get('global_metrics', {}) or {}
+            metrics.update({
+                'latency_ms': float(global_metrics.get('global_worst_camera_latency_us', 0) or 0) / 1000.0,
+                'active_cameras': int(extended_metrics.get('active_cameras', 0) or 0),
+                'critical_cameras': int(extended_metrics.get('critical_cameras', 0) or 0),
+            })
+
+        if slicer_intent:
+            p95_latency_us = float(slicer_intent.get('P95_LATENCY_US', 0) or 0)
+            metrics['latency_ms'] = max(metrics['latency_ms'], p95_latency_us / 1000.0)
+            metrics['active_cameras'] = max(metrics['active_cameras'], int(slicer_intent.get('ACTIVE_CAMERAS', 0) or 0))
+            metrics['critical_cameras'] = max(metrics['critical_cameras'], int(slicer_intent.get('CRITICAL_CAMERAS', 0) or 0))
+            metrics['throughput_ready'] = (
+                metrics['active_cameras'] > 0
+                and metrics['observed_cameras'] >= metrics['active_cameras']
+            )
+
+        return metrics
+
+    def _get_app2_gateway_metrics(self):
+        """
+        Lê o snapshot vivo do App2 e resume a saúde dos sensores/gateways.
+
+        App2 representa a camada mMTC/monitoramento ambiental. Os sensores não
+        são UEs individuais; a decisão usa conectividade agregada por gateway.
+        """
+        metrics = {
+            'available': False,
+            'stale': False,
+            'age_seconds': None,
+            'total_sensors': 0,
+            'active_sensors': 0,
+            'connected_sensors': 0,
+            'error_sensors': 0,
+            'low_battery_sensors': 0,
+            'connected_ratio': 1.0,
+            'error_ratio': 0.0,
+            'packet_loss_percent': 0.0,
+            'delivery_success_percent': 100.0,
+            'avg_latency_ms': 0.0,
+            'avg_battery_percent': 100.0,
+            'avg_rssi_dbm': 0.0,
+            'network_utilization_percent': 0.0,
+            'gateways': 0,
+            'connectivity_modes': 0,
+        }
+
+        try:
+            if not os.path.exists(APP2_MONITORING_PATH):
+                return metrics
+
+            with open(APP2_MONITORING_PATH, 'r') as f:
+                snapshot = json.load(f)
+
+            sensors = snapshot.get('sensors', {}) or {}
+            readings = snapshot.get('readings', {}) or {}
+            network = snapshot.get('network', {}) or {}
+
+            total_sensors = int(sensors.get('total', 0) or 0)
+            connected_sensors = int(sensors.get('connected', 0) or 0)
+            error_sensors = int(sensors.get('error', 0) or 0)
+            low_battery_sensors = int(sensors.get('low_battery', 0) or 0)
+            connected_ratio = connected_sensors / max(total_sensors, 1)
+            error_ratio = error_sensors / max(total_sensors, 1)
+
+            timestamp_text = snapshot.get('timestamp')
+            age_seconds = None
+            if timestamp_text:
+                try:
+                    ts = datetime.fromisoformat(str(timestamp_text).replace('Z', '+00:00'))
+                    if ts.tzinfo is not None:
+                        age_seconds = max(0.0, time.time() - ts.timestamp())
+                    else:
+                        age_seconds = max(0.0, time.time() - ts.timestamp())
+                except (TypeError, ValueError, OSError):
+                    age_seconds = None
+
+            if age_seconds is None:
+                try:
+                    age_seconds = max(0.0, time.time() - os.path.getmtime(APP2_MONITORING_PATH))
+                except OSError:
+                    age_seconds = None
+
+            metrics.update({
+                'available': True,
+                'stale': bool(age_seconds is not None and age_seconds > 45),
+                'age_seconds': age_seconds,
+                'total_sensors': total_sensors,
+                'active_sensors': int(sensors.get('active', 0) or 0),
+                'connected_sensors': connected_sensors,
+                'error_sensors': error_sensors,
+                'low_battery_sensors': low_battery_sensors,
+                'connected_ratio': connected_ratio,
+                'error_ratio': error_ratio,
+                'packet_loss_percent': float(network.get('packet_loss_percent', 0) or 0),
+                'delivery_success_percent': float(network.get('delivery_success_percent', 100) or 100),
+                'avg_latency_ms': float(network.get('avg_latency_ms', 0) or 0),
+                'avg_battery_percent': float(readings.get('avg_battery_percent', 100) or 100),
+                'avg_rssi_dbm': float(network.get('avg_rssi_dbm', 0) or 0),
+                'network_utilization_percent': float(network.get('network_utilization_percent', 0) or 0),
+                'gateways': len(sensors.get('gateways', []) or []),
+                'connectivity_modes': len(sensors.get('connectivity_modes', []) or []),
+            })
+        except Exception as e:
+            metrics['error'] = str(e)
+            print(f"[rApp] Erro ao ler App2 monitoring: {e}")
+
+        return metrics
     
     def record_current_metrics(self, slicer_intent, energy_intent):
         """Registra métricas atuais no Data Lake."""
@@ -412,7 +751,15 @@ class RappResourceOptimizer:
             'pattern_analysis': None,
             'ml_decision': None,
             'trend_analysis': None,
-            'preventive_block': False
+            'preventive_block': False,
+            'camera_metrics': None,
+            'app2_metrics': None,
+            'drl_prediction': {},
+            'drl_influenced': False,
+            'drl_rejected_reason': '',
+            'drl_policy_action': '',
+            'drl_policy_applied': False,
+            'ml_risk_cap_applied': False
         }
         
         slicer_state = 'UNKNOWN'
@@ -430,6 +777,197 @@ class RappResourceOptimizer:
             decision['energy_power_level'] = energy_intent.get('POWER_LEVEL', 'UNKNOWN')
         
         # ========================================
+        # REGRA DE PRIORIDADE DA PROPOSTA
+        # 1) Câmeras/eMBB: 25 Mbps mínimos por câmera e latência protegida.
+        # 2) App2/mMTC: saúde agregada de sensores/gateways.
+        # ========================================
+        
+        if slicer_intent:
+            camera_metrics = self._get_camera_sla_metrics(slicer_intent)
+            camera_latency_ms = camera_metrics['latency_ms']
+            camera_throughput_mbps = camera_metrics['throughput_mbps']
+            active_cameras = camera_metrics['active_cameras']
+            critical_cameras = camera_metrics['critical_cameras']
+            observed_cameras = int(camera_metrics.get('observed_cameras', 0) or 0)
+            throughput_ready = bool(camera_metrics.get('throughput_ready', False))
+            sim_time_s = float(camera_metrics.get('sim_time_s', 0) or 0)
+
+            decision['camera_metrics'] = {
+                'latency_ms': camera_latency_ms,
+                'throughput_mbps': camera_throughput_mbps,
+                'active_cameras': active_cameras,
+                'critical_cameras': critical_cameras,
+                'observed_cameras': observed_cameras,
+                'throughput_ready': throughput_ready,
+                'throughput_source': camera_metrics.get('throughput_source', 'unavailable'),
+                'sim_time_s': sim_time_s,
+            }
+            
+            CAMERA_THROUGHPUT_WARNING_MBPS = 30.0
+            CAMERA_THROUGHPUT_MIN_MBPS = 25.0
+
+            # Se a telemetria por câmera ainda não apareceu, manter guarda total
+            # sem gerar falso bloqueio de throughput=0 no warm-up.
+            if active_cameras > 0 and not throughput_ready:
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = 'FULL_POWER_GUARD'
+                decision['reason'] = (
+                    f'CÂMERA: aguardando amostras de throughput '
+                    f'({observed_cameras}/{active_cameras} câmeras observadas, sim_time={sim_time_s:.1f}s)'
+                )
+                decision['confidence'] = 0.6
+                decision['priority_violation'] = 'THROUGHPUT_WARMUP'
+                print(
+                    f"\033[1;33m[rApp] CÂMERA: aguardando amostras de throughput "
+                    f"({observed_cameras}/{active_cameras}, sim_time={sim_time_s:.1f}s) - FULL_POWER_GUARD\033[0m"
+                )
+
+            # REGRA: Throughput < 25Mbps → BLOCKED (SLA mínimo violado)
+            elif active_cameras > 0 and camera_throughput_mbps < CAMERA_THROUGHPUT_MIN_MBPS:
+                decision['energy_saver'] = 'BLOCKED'
+                decision['action'] = 'FULL_POWER'
+                decision['reason'] = (
+                    f'CÂMERA SLA: Throughput {camera_throughput_mbps:.1f}Mbps '
+                    f'< {CAMERA_THROUGHPUT_MIN_MBPS:.0f}Mbps (mínimo)'
+                )
+                decision['confidence'] = 1.0
+                decision['priority_violation'] = 'THROUGHPUT'
+                self.stats['sla_violations'] += 1
+                print(
+                    f"\033[1;31m[rApp] CÂMERA SLA: Throughput {camera_throughput_mbps:.1f}Mbps "
+                    f"< {CAMERA_THROUGHPUT_MIN_MBPS:.0f}Mbps - BLOCKED\033[0m"
+                )
+                
+            # REGRA: Latência ≥ 80ms → BLOCKED
+            elif active_cameras > 0 and camera_latency_ms >= 80:
+                decision['energy_saver'] = 'BLOCKED'
+                decision['action'] = 'FULL_POWER'
+                decision['reason'] = f'CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= 80ms'
+                decision['confidence'] = 1.0
+                decision['priority_violation'] = 'LATENCY'
+                self.stats['sla_violations'] += 1
+                print(f"\033[1;31m[rApp] CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= 80ms - BLOCKED\033[0m")
+            
+            # REGRA: Throughput na faixa 25-30Mbps → CONDITIONAL (faixa de cautela)
+            elif active_cameras > 0 and camera_throughput_mbps < CAMERA_THROUGHPUT_WARNING_MBPS:
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = 'FULL_POWER_GUARD'
+                decision['reason'] = (
+                    f'CÂMERA: Throughput {camera_throughput_mbps:.1f}Mbps em '
+                    f'[{CAMERA_THROUGHPUT_MIN_MBPS:.0f}-{CAMERA_THROUGHPUT_WARNING_MBPS:.0f}Mbps] - margem protegida'
+                )
+                decision['confidence'] = 0.85
+                decision['priority_violation'] = 'THROUGHPUT_WARNING'
+                print(
+                    f"\033[1;33m[rApp] CÂMERA: Throughput {camera_throughput_mbps:.1f}Mbps em "
+                    f"[{CAMERA_THROUGHPUT_MIN_MBPS:.0f}-{CAMERA_THROUGHPUT_WARNING_MBPS:.0f}Mbps] - CONDITIONAL\033[0m"
+                )
+
+            # REGRA: Latência 60-80ms → CONDITIONAL
+            elif active_cameras > 0 and camera_latency_ms >= 60:
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = 'FULL_POWER_GUARD'
+                decision['reason'] = f'CÂMERA: Latência {camera_latency_ms:.1f}ms em [60-80ms] - margem protegida'
+                decision['confidence'] = 0.7
+                decision['priority_violation'] = 'LATENCY_WARNING'
+                print(f"\033[1;33m[rApp] CÂMERA: Latência {camera_latency_ms:.1f}ms em [60-80ms] - CONDITIONAL\033[0m")
+        
+        # Câmera tem prioridade máxima. BLOCKED é violação direta; CONDITIONAL é
+        # faixa de guarda e também não pode ser relaxada por CVaR/ML/DRL.
+        camera_sla_violated = (
+            decision.get('energy_saver') in ['BLOCKED']
+            and decision.get('priority_violation') in ['THROUGHPUT', 'LATENCY']
+        )
+        camera_guard_active = (
+            decision.get('energy_saver') == 'CONDITIONAL'
+            and decision.get('priority_violation') in ['THROUGHPUT_WARNING', 'LATENCY_WARNING', 'THROUGHPUT_WARMUP']
+        )
+        camera_priority_active = camera_sla_violated or camera_guard_active
+
+        app2_metrics = self._get_app2_gateway_metrics()
+        decision['app2_metrics'] = app2_metrics
+
+        app2_sla_violated = False
+        app2_guard_active = False
+
+        if not camera_priority_active and app2_metrics.get('available'):
+            connected_ratio = float(app2_metrics.get('connected_ratio', 1.0) or 0)
+            packet_loss = float(app2_metrics.get('packet_loss_percent', 0) or 0)
+            delivery_success = float(app2_metrics.get('delivery_success_percent', 100) or 0)
+            app2_latency_ms = float(app2_metrics.get('avg_latency_ms', 0) or 0)
+            avg_battery = float(app2_metrics.get('avg_battery_percent', 100) or 0)
+            error_ratio = float(app2_metrics.get('error_ratio', 0) or 0)
+            low_battery = int(app2_metrics.get('low_battery_sensors', 0) or 0)
+            error_sensors = int(app2_metrics.get('error_sensors', 0) or 0)
+
+            critical_reasons = []
+            warning_reasons = []
+
+            self.app2_connectivity_history.append(connected_ratio)
+            app2_low_connectivity_samples = sum(
+                1 for ratio in self.app2_connectivity_history if ratio < 0.95
+            )
+
+            if app2_metrics.get('stale'):
+                age = app2_metrics.get('age_seconds')
+                warning_reasons.append(f"snapshot antigo ({age:.0f}s)" if age is not None else "snapshot antigo")
+            if connected_ratio < 0.85:
+                critical_reasons.append(f"sensores conectados {connected_ratio:.0%} < 85%")
+            elif connected_ratio < 0.90:
+                warning_reasons.append(f"sensores conectados {connected_ratio:.0%} < 90%")
+            elif connected_ratio < 0.95 and app2_low_connectivity_samples >= 2:
+                warning_reasons.append(
+                    f"sensores conectados {connected_ratio:.0%} < 95% persistente "
+                    f"({app2_low_connectivity_samples}/{len(self.app2_connectivity_history)} amostras)"
+                )
+            if packet_loss >= 10:
+                critical_reasons.append(f"packet loss {packet_loss:.1f}% >= 10%")
+            elif packet_loss >= 5:
+                warning_reasons.append(f"packet loss {packet_loss:.1f}% >= 5%")
+            if delivery_success < 90:
+                critical_reasons.append(f"entrega {delivery_success:.1f}% < 90%")
+            elif delivery_success < 95:
+                warning_reasons.append(f"entrega {delivery_success:.1f}% < 95%")
+            if app2_latency_ms >= 1000:
+                critical_reasons.append(f"latência média {app2_latency_ms:.0f}ms >= 1000ms")
+            elif app2_latency_ms >= 500:
+                warning_reasons.append(f"latência média {app2_latency_ms:.0f}ms >= 500ms")
+            if avg_battery < 15:
+                critical_reasons.append(f"bateria média {avg_battery:.1f}% < 15%")
+            elif avg_battery < 25 or low_battery > 0:
+                warning_reasons.append(f"bateria média {avg_battery:.1f}% / baixa={low_battery}")
+            if error_ratio >= 0.20:
+                critical_reasons.append(f"sensores em erro {error_ratio:.0%} >= 20%")
+            elif error_sensors >= 2:
+                warning_reasons.append(f"sensores em erro={error_sensors}")
+            elif error_sensors == 1 and app2_low_connectivity_samples >= 2:
+                warning_reasons.append(
+                    f"sensores em erro=1 persistente "
+                    f"({app2_low_connectivity_samples}/{len(self.app2_connectivity_history)} amostras)"
+                )
+
+            if critical_reasons:
+                decision['energy_saver'] = 'BLOCKED'
+                decision['action'] = 'FULL_POWER'
+                decision['reason'] = f"APP2 mMTC SLA: {critical_reasons[0]}"
+                decision['confidence'] = 0.9
+                decision['priority_violation'] = 'APP2_MTC_CRITICAL'
+                app2_sla_violated = True
+                self.stats['sla_violations'] += 1
+                print(f"\033[1;31m[rApp] APP2 mMTC SLA: {critical_reasons[0]} - BLOCKED\033[0m")
+            elif warning_reasons:
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = 'FULL_POWER_GUARD'
+                decision['reason'] = f"APP2 mMTC: {warning_reasons[0]} - margem protegida"
+                decision['confidence'] = 0.7
+                decision['priority_violation'] = 'APP2_MTC_WARNING'
+                app2_guard_active = True
+                print(f"\033[1;33m[rApp] APP2 mMTC: {warning_reasons[0]} - CONDITIONAL\033[0m")
+
+        app2_priority_active = app2_sla_violated or app2_guard_active
+        service_priority_active = camera_priority_active or app2_priority_active
+        
+        # ========================================
         # ETAPA 0: TREND ANALYSIS (SLOPE) - PREDITIVA
         # O rApp detecta se latência está SUBINDO antes de bater crítico
         # ========================================
@@ -444,7 +982,8 @@ class RappResourceOptimizer:
         }
         
         # Decisão preventiva baseada em tendência
-        if trend_decision['preventive']:
+        # Se serviço prioritário já violou/entrou em guarda, não aplicar tendência.
+        if not service_priority_active and trend_decision['preventive']:
             decision['energy_saver'] = 'BLOCKED'
             decision['action'] = 'PREVENTIVE_BLOCK'
             decision['reason'] = f"TREND: {trend_decision['reason']}"
@@ -456,14 +995,25 @@ class RappResourceOptimizer:
         # ========================================
         # ETAPA 1: PATTERN ENGINE (ML) - fonte única
         # ========================================
+        
+        # Se serviço prioritário violou SLA, pular decisões preditivas que relaxam energia.
+        if camera_sla_violated:
+            print(f"\033[1;31m[rApp] PULANDO ML - Câmera violou SLA primeiro\033[0m")
+        elif camera_guard_active:
+            print(f"\033[1;33m[rApp] PULANDO ML - Câmera em faixa de guarda\033[0m")
+        elif app2_sla_violated:
+            print(f"\033[1;31m[rApp] PULANDO ML - App2 mMTC violou SLA\033[0m")
+        elif app2_guard_active:
+            print(f"\033[1;33m[rApp] PULANDO ML - App2 mMTC em faixa de guarda\033[0m")
+        
         pattern_analysis = self.pattern_engine.analyze_current()
         decision['pattern_analysis'] = pattern_analysis
         
         ml_decision = self.pattern_engine.should_allow_energy_saving()
         decision['ml_decision'] = ml_decision
         
-        # Só aplica se não houve bloco preventivo por tendência
-        if not decision['preventive_block']:
+        # Só aplica se não houve bloco preventivo por tendência e serviços prioritários OK.
+        if not decision['preventive_block'] and not service_priority_active:
             if ml_decision['recommendation'] == 'ALLOW':
                 decision['energy_saver'] = 'ALLOWED'
                 decision['action'] = 'ACTIVATE_ENERGY_SAVING'
@@ -492,34 +1042,39 @@ class RappResourceOptimizer:
         # rApp: Usar métricas avançadas (CVaR, Variância)
         network_health = self.data_lake.get_network_health(window_minutes=5)
         
-        # Thresholds com faixa de prevenção de 20ms
-        CVAR_NORMAL_US = 60000       # 60ms - Faixa normal
-        CVAR_CRITICAL_US = 80000     # 80ms - Faixa crítica (SLA)
+        # Thresholds recalibrados para o novo CVaR do coletor
+        CVAR_ECO_US = 40000          # 40ms - rede muito saudável
+        CVAR_NORMAL_US = 120000      # 120ms - faixa normal do novo CVaR de cauda
+        CVAR_CRITICAL_US = 250000    # 250ms - cauda crítica real
+        P95_WARNING_US = 60000       # 60ms - alerta de degradação distribuída
+        P95_CRITICAL_US = 120000     # 120ms - degradação distribuída severa
         SLOPE_PREVENTION = 2.0       # 2ms/s - Prevenção
         STABILITY_THRESHOLD = 50     # Score mínimo de estabilidade
         
         if network_health:
-            cvar_us = network_health['cvar_us']
-            variance_us2 = network_health['variance_us2']
-            median_us = network_health['median_us']
-            p95_us = network_health['p95_us']
-            stability_score = network_health['stability_score']
+            cvar_us = float(network_health.get('cvar_us', 0) or 0)
+            variance_us2 = float(network_health.get('variance_us2', 0) or 0)
+            median_us = float(network_health.get('median_us', 0) or 0)
+            p95_us = float(network_health.get('p95_us', 0) or 0)
+            stability_score = network_health.get('stability_score', 100)
+            latest_cvar_us = float(network_health.get('latest_cvar_us', cvar_us) or cvar_us)
             
             # DEBUG: Log do CVaR calculado
-            print(f"[rApp DEBUG] network_health.cvar_us = {cvar_us}us = {cvar_us/1000:.1f}ms")
+            print(f"[rApp DEBUG] network_health.cvar_us = {cvar_us}us = {cvar_us/1000:.1f}ms | latest={latest_cvar_us/1000:.1f}ms | p95={p95_us/1000:.1f}ms")
             
             # Armazenar no decision para debugging
             decision['network_health'] = {
                 'median_us': median_us,
                 'p95_us': p95_us,
                 'cvar_us': cvar_us,
+                'latest_cvar_us': latest_cvar_us,
                 'variance_us2': variance_us2,
                 'stability_score': stability_score
             }
         else:
             # Fallback para mediana se network_health não disponível
-            cvar_us = self.calculate_median_latency(minutes=5) or 0
-            variance_us2 = 0
+            cvar_us = float(self.calculate_median_latency(minutes=5) or 0)
+            variance_us2 = 0.0
             stability_score = 100
             decision['network_health'] = {'fallback': True, 'cvar_us': cvar_us}
             if cvar_us > 0:
@@ -527,8 +1082,9 @@ class RappResourceOptimizer:
             else:
                 print(f"[rApp DEBUG] Sem dados de CVaR disponíveis")
         
-        # Só aplica CVaR se não houve bloco preventivo e temos dados
-        if not decision['preventive_block'] and cvar_us is not None and cvar_us > 0:
+        # Só aplica CVaR se não houve bloco preventivo, não houve violação/guarda
+        # prioritária e temos dados. Caso contrário, a decisão prioritária prevalece.
+        if not decision['preventive_block'] and not service_priority_active and cvar_us is not None and cvar_us > 0:
             
             # Obter slope para decisões de prevenção
             slope = trend_info.get('slope_ms_per_sec', 0) if trend_info.get('valid') else 0
@@ -536,15 +1092,15 @@ class RappResourceOptimizer:
             # ===== LÓGICA DE COORDENAÇÃO rApp-xApps =====
             # REGRAS (refinadas com slope negativo vs zero):
             # 1. CÂMERAS SÃO PRIORIDADE MÁXIMA (se Slicer CRITICAL → BLOCKED)
-            # 2. CVaR/UE ≥ 80ms → BLOCKED
+            # 2. CVaR/UE ≥ 250ms ou P95/UE ≥ 120ms → BLOCKED
             # 3. Slope > 2ms/s → BLOCKED (prevenção)
-            # 4a. CVaR < 20ms + slope ≤ 0 → ECO (25% potência)
-            # 4b. CVaR < 60ms + slope < -0.01 → ALLOWED (50%) - melhorando
-            # 4c. CVaR < 60ms + abs(slope) < 0.01 → ALLOWED (60%) - estável
-            # 4d. 60-80ms + slope < -0.01 → ALLOWED (70%) - melhorando
-            # 4e. 60-80ms + abs(slope) < 0.01 → ALLOWED (80%) - estável
-            # 5. CVaR < 60ms + slope > 0.01 → CONDITIONAL (70%) - piorando
-            # 6. 60-80ms + slope > 0.01 → CONDITIONAL (90%) - piorando
+            # 4a. CVaR < 40ms + slope ≤ 0 → ECO (25% potência)
+            # 4b. CVaR < 120ms + slope < -0.01 → ALLOWED (50%) - melhorando
+            # 4c. CVaR < 120ms + abs(slope) < 0.01 → ALLOWED (60%) - estável
+            # 4d. 120-250ms + slope < -0.01 → ALLOWED (70%) - melhorando
+            # 4e. 120-250ms + abs(slope) < 0.01 → ALLOWED (80%) - estável
+            # 5. CVaR < 120ms + slope > 0.01 → CONDITIONAL (70%) - piorando
+            # 6. 120-250ms + slope > 0.01 → CONDITIONAL (90%) - piorando
             
             # Classificar estado do slope
             SLOPE_TOLERANCE = 0.01  # ms/s
@@ -565,14 +1121,17 @@ class RappResourceOptimizer:
                 self.stats['sla_violations'] += 1
                 print(f"\033[1;31m[rApp] REGRA 1: Slicer CRITICAL - BLOCKED\033[0m")
             
-            # REGRA 2: CVaR/UE ≥ 80ms → SLA em risco
-            elif cvar_us >= CVAR_CRITICAL_US:
+            # REGRA 2: cauda crítica ou degradação distribuída
+            elif cvar_us >= CVAR_CRITICAL_US or p95_us >= P95_CRITICAL_US:
                 decision['energy_saver'] = 'BLOCKED'
                 decision['action'] = 'FULL_POWER'
-                decision['reason'] = f'CRÍTICO: CVaR={cvar_us/1000:.1f}ms ≥ 80ms - SLA em risco!'
+                if p95_us >= P95_CRITICAL_US and cvar_us < CVAR_CRITICAL_US:
+                    decision['reason'] = f'CRÍTICO: P95/UE={p95_us/1000:.1f}ms ≥ 120ms - degradação distribuída'
+                else:
+                    decision['reason'] = f'CRÍTICO: CVaR={cvar_us/1000:.1f}ms ≥ 250ms - SLA em risco!'
                 decision['confidence'] = 1.0
                 self.stats['sla_violations'] += 1
-                print(f"\033[1;31m[rApp] REGRA 2: CVaR ≥ 80ms - BLOCKED\033[0m")
+                print(f"\033[1;31m[rApp] REGRA 2: cauda crítica - BLOCKED\033[0m")
             
             # REGRA 3: Slope > 2ms/s → PREVENÇÃO
             elif slope > SLOPE_PREVENTION:
@@ -584,62 +1143,62 @@ class RappResourceOptimizer:
                 self.stats['preventive_blocks'] = self.stats.get('preventive_blocks', 0) + 1
                 print(f"\033[1;33m[rApp] REGRA 3: Slope > 2ms/s - BLOCKED\033[0m")
             
-            # REGRA 4a: CVaR < 20ms + slope ≤ 0 → ECO MODE (25% potência)
-            elif cvar_us < 20000 and slope <= 0:
+            # REGRA 4a: CVaR < 40ms + slope estável/melhorando → ECO MODE (25% potência)
+            elif cvar_us < CVAR_ECO_US and p95_us < P95_WARNING_US and slope <= SLOPE_TOLERANCE:
                 decision['energy_saver'] = 'ALLOWED'
                 decision['action'] = 'POWER_DOWN_ECO'
                 decision['eco_mode'] = True
-                decision['reason'] = f'ECO MODE: CVaR={cvar_us/1000:.1f}ms < 20ms + slope={slope:.2f}ms/s ({slope_state}) → Economia extrema (25%)'
+                decision['reason'] = f'ECO MODE: CVaR={cvar_us/1000:.1f}ms em zona saudável + P95={p95_us/1000:.1f}ms + slope={slope:.2f}ms/s ({slope_state}) → Economia extrema (25%)'
                 decision['confidence'] = 0.95
-                print(f"\033[1;32m[rApp] REGRA 4a: CVaR < 20ms + Slope ≤ 0 - ECO MODE\033[0m")
+                print(f"\033[1;32m[rApp] REGRA 4a: CVaR em zona saudável + Slope estável/melhorando - ECO MODE\033[0m")
             
             # REGRA 4b: CVaR < 60ms + slope < -0.01 → ALLOWED (50%) - melhorando
             elif cvar_us < CVAR_NORMAL_US and slope < -SLOPE_TOLERANCE:
                 decision['energy_saver'] = 'ALLOWED'
                 decision['action'] = 'POWER_DOWN'
-                decision['reason'] = f'MELHORANDO: CVaR={cvar_us/1000:.1f}ms < 60ms + slope={slope:.2f}ms/s (descendo) → Economia (50%)'
+                decision['reason'] = f'MELHORANDO: CVaR={cvar_us/1000:.1f}ms em zona normal + slope={slope:.2f}ms/s (descendo) → Economia (50%)'
                 decision['confidence'] = 0.9
-                print(f"\033[1;32m[rApp] REGRA 4b: CVaR < 60ms + Slope < 0 - ALLOWED 50%\033[0m")
+                print(f"\033[1;32m[rApp] REGRA 4b: CVaR em zona normal + Slope < 0 - ALLOWED 50%\033[0m")
             
             # REGRA 4c: CVaR < 60ms + slope ≈ 0 → ALLOWED (60%) - estável
             elif cvar_us < CVAR_NORMAL_US and abs(slope) < SLOPE_TOLERANCE:
                 decision['energy_saver'] = 'ALLOWED'
                 decision['action'] = 'POWER_DOWN'
-                decision['reason'] = f'ESTÁVEL: CVaR={cvar_us/1000:.1f}ms < 60ms + slope={slope:.2f}ms/s (zero) → Economia moderada (60%)'
+                decision['reason'] = f'ESTÁVEL: CVaR={cvar_us/1000:.1f}ms em zona normal + slope={slope:.2f}ms/s (zero) → Economia moderada (60%)'
                 decision['confidence'] = 0.85
-                print(f"\033[1;32m[rApp] REGRA 4c: CVaR < 60ms + Slope ≈ 0 - ALLOWED 60%\033[0m")
+                print(f"\033[1;32m[rApp] REGRA 4c: CVaR em zona normal + Slope ≈ 0 - ALLOWED 60%\033[0m")
             
             # REGRA 4d: 60-80ms + slope < -0.01 → ALLOWED (70%) - melhorando
             elif cvar_us < CVAR_CRITICAL_US and slope < -SLOPE_TOLERANCE:
                 decision['energy_saver'] = 'ALLOWED'
                 decision['action'] = 'POWER_DOWN'
-                decision['reason'] = f'MELHORANDO: CVaR={cvar_us/1000:.1f}ms (60-80ms) + slope={slope:.2f}ms/s (descendo) → Economia (70%)'
+                decision['reason'] = f'MELHORANDO: CVaR={cvar_us/1000:.1f}ms (120-250ms) + slope={slope:.2f}ms/s (descendo) → Economia (70%)'
                 decision['confidence'] = 0.8
-                print(f"\033[1;33m[rApp] REGRA 4d: 60ms ≤ CVaR < 80ms + Slope < 0 - ALLOWED 70%\033[0m")
+                print(f"\033[1;33m[rApp] REGRA 4d: 120ms ≤ CVaR < 250ms + Slope < 0 - ALLOWED 70%\033[0m")
             
             # REGRA 4e: 60-80ms + slope ≈ 0 → ALLOWED (80%) - estável
             elif cvar_us < CVAR_CRITICAL_US and abs(slope) < SLOPE_TOLERANCE:
                 decision['energy_saver'] = 'ALLOWED'
                 decision['action'] = 'POWER_DOWN'
-                decision['reason'] = f'ESTÁVEL: CVaR={cvar_us/1000:.1f}ms (60-80ms) + slope={slope:.2f}ms/s (zero) → Economia moderada (80%)'
+                decision['reason'] = f'ESTÁVEL: CVaR={cvar_us/1000:.1f}ms (120-250ms) + slope={slope:.2f}ms/s (zero) → Economia moderada (80%)'
                 decision['confidence'] = 0.75
-                print(f"\033[1;33m[rApp] REGRA 4e: 60ms ≤ CVaR < 80ms + Slope ≈ 0 - ALLOWED 80%\033[0m")
+                print(f"\033[1;33m[rApp] REGRA 4e: 120ms ≤ CVaR < 250ms + Slope ≈ 0 - ALLOWED 80%\033[0m")
             
             # REGRA 5: CVaR < 60ms + slope > 0.01 → CONDITIONAL (70%) - piorando
             elif cvar_us < CVAR_NORMAL_US and slope > SLOPE_TOLERANCE:
                 decision['energy_saver'] = 'CONDITIONAL'
                 decision['action'] = 'MONITOR'
-                decision['reason'] = f'PIORANDO: CVaR={cvar_us/1000:.1f}ms < 60ms + slope=+{slope:.2f}ms/s (subindo) → Monitorar (70%)'
+                decision['reason'] = f'PIORANDO: CVaR={cvar_us/1000:.1f}ms em zona normal + slope=+{slope:.2f}ms/s (subindo) → Monitorar (70%)'
                 decision['confidence'] = 0.6
-                print(f"\033[1;36m[rApp] REGRA 5: CVaR < 60ms + Slope > 0 - CONDITIONAL 70%\033[0m")
+                print(f"\033[1;36m[rApp] REGRA 5: CVaR em zona normal + Slope > 0 - CONDITIONAL 70%\033[0m")
             
             # REGRA 6: 60-80ms + slope > 0.01 → CONDITIONAL (90%) - piorando
             elif cvar_us < CVAR_CRITICAL_US and slope > SLOPE_TOLERANCE:
                 decision['energy_saver'] = 'CONDITIONAL'
                 decision['action'] = 'MONITOR'
-                decision['reason'] = f'PIORANDO: CVaR={cvar_us/1000:.1f}ms (60-80ms) + slope=+{slope:.2f}ms/s (subindo) → Monitorar (90%)'
+                decision['reason'] = f'PIORANDO: CVaR={cvar_us/1000:.1f}ms (120-250ms) + slope=+{slope:.2f}ms/s (subindo) → Monitorar (90%)'
                 decision['confidence'] = 0.4
-                print(f"\033[1;31m[rApp] REGRA 6: 60ms ≤ CVaR < 80ms + Slope > 0 - CONDITIONAL 90%\033[0m")
+                print(f"\033[1;31m[rApp] REGRA 6: 120ms ≤ CVaR < 250ms + Slope > 0 - CONDITIONAL 90%\033[0m")
             
             # REGRA 7: Outros casos → CONDITIONAL
             else:
@@ -653,7 +1212,7 @@ class RappResourceOptimizer:
         # Ajusta decisão baseada no padrão detectado
         # ========================================
 
-        if pattern_analysis and not decision['preventive_block']:
+        if pattern_analysis and not decision['preventive_block'] and not service_priority_active:
             pattern = pattern_analysis.get('pattern', 'unknown')
             activity_level = pattern_analysis.get('activity_level', 'normal')
 
@@ -685,41 +1244,35 @@ class RappResourceOptimizer:
         # Predição baseada em modelo treinado
         # ========================================
 
-        if self.ml_predictor.is_loaded() and not decision['preventive_block']:
-            # Buscar últimos dados do Data Lake para novas features
-            latest_extended = None
-            if self.data_lake:
-                latest_extended = self.data_lake.get_latest_extended_metrics(limit=1)
-            
-            # Extrair novas features
-            throughput_kbps = 0
-            packet_loss_rate = 0
-            jitter_ms = 0
-            tx_bytes = 0
-            rx_bytes = 0
-            
-            if latest_extended and len(latest_extended) > 0:
+        # Features compartilhadas por ML e DRL. Elas ficam fora do bloco de ML
+        # para a DRL continuar segura mesmo se o modelo RF não estiver carregado.
+        latest_extended = None
+        row = {}
+        if self.data_lake:
+            latest_extended = self.data_lake.get_latest_extended_metrics(limit=1)
+            if latest_extended:
                 row = latest_extended[0]
-                throughput_kbps = float(row.get('throughput_kbps', 0) or 0)
-                packet_loss_rate = float(row.get('global_packet_loss_rate', 0) or 0)
-                jitter_ms = float(row.get('global_jitter_us', 0) or 0) / 1000.0
-                tx_bytes = int(row.get('total_tx_bytes', 0) or 0)
-                rx_bytes = int(row.get('total_rx_bytes', 0) or 0)
-            
-            # Calcular tx_rx_ratio
-            tx_rx_ratio = tx_bytes / max(rx_bytes, 1) if rx_bytes > 0 else 0
-            
-            # Buscar histórico de decisões
-            energy_history = 0
-            if self.data_lake:
-                recent_decisions = self.data_lake.get_recent_decisions(minutes=5, limit=10)
-                if recent_decisions:
-                    blocked_count = sum(1 for d in recent_decisions if d.get('decision') == 'BLOCKED')
-                    energy_history = blocked_count / len(recent_decisions)
-            
-            # P95 = pior 5% dos UEs (é o valor crítico que as regras usam)
-            p95_value = network_health.get('p95_us', 0) if network_health else 0
-            
+
+        throughput_kbps = float(row.get('throughput_kbps', 0) or 0)
+        packet_loss_rate = float(row.get('global_packet_loss_rate', 0) or 0)
+        jitter_ms = float(row.get('global_jitter_us', 0) or 0) / 1000.0
+        tx_bytes = int(row.get('total_tx_bytes', 0) or 0)
+        rx_bytes = int(row.get('total_rx_bytes', 0) or 0)
+        tx_rx_ratio = tx_bytes / max(rx_bytes, 1) if rx_bytes > 0 else 0
+
+        energy_history = 0
+        if self.data_lake:
+            recent_decisions = self.data_lake.get_recent_decisions(minutes=5, limit=10)
+            if recent_decisions:
+                blocked_count = sum(1 for d in recent_decisions if d.get('decision') == 'BLOCKED')
+                energy_history = blocked_count / len(recent_decisions)
+
+        # P95 = pior 5% dos UEs (é o valor crítico que as regras usam).
+        p95_value = network_health.get('p95_us', 0) if network_health else 0
+
+        print(f"[rApp DEBUG] ML Predictor loaded: {self.ml_predictor.is_loaded()}, preventive_block: {decision['preventive_block']}")
+        
+        if self.ml_predictor.is_loaded() and not decision['preventive_block'] and not service_priority_active:
             ml_metrics = {
                 'cvar_per_ue_us': cvar_us if cvar_us else 0,
                 'cvar_p95_us': p95_value,
@@ -744,6 +1297,9 @@ class RappResourceOptimizer:
             # Usar predição com contexto do banco de dados
             ml_result = self.ml_predictor.predict_with_db_context(ml_metrics)
             decision['ml_rf_prediction'] = ml_result
+            
+            # DEBUG: Log do resultado ML
+            print(f"[rApp DEBUG] ml_result = {ml_result}")
 
             # Log da predição com fonte
             ml_decision = ml_result.get('decision')
@@ -850,6 +1406,168 @@ class RappResourceOptimizer:
                         print(f"\033[0;33m[rApp ML] ✗ ML desconsiderada - predição inválida\033[0m")
 
         # ========================================
+        # ETAPA 2B: DRL PREDICTOR (SBiLSTM + A3C)
+        # ========================================
+        
+        prev_cvar_for_drl = getattr(self, '_prev_cvar_us', 0) or 0
+        if self.drl_predictor is not None and not decision.get('preventive_block', False) and not service_priority_active:
+            try:
+                # Safe float conversion
+                cvar_val = float(cvar_us) if cvar_us else 50.0
+                prev_val = prev_cvar_for_drl
+                drl_cvar_trend = (cvar_val - prev_val) / 1000.0
+                
+                drl_state = {
+                    'cvar_ms': cvar_val / 1000.0,
+                    'cvar_trend': drl_cvar_trend,
+                    'cvar_acceleration': 0,
+                    'latency_p95_ms': float(p95_value) / 1000.0 if p95_value else 60,
+                    'jitter_ms': float(jitter_ms) if jitter_ms else 2,
+                    'packet_loss_pct': float(packet_loss_rate) * 100 if packet_loss_rate else 0.1,
+                    'throughput_mbps': float(throughput_kbps) / 1000.0 if throughput_kbps else 100,
+                    'active_ues': int(slicer_intent.get('ACTIVE_UES', 20)) if slicer_intent else 20,
+                    'active_cameras': int(slicer_intent.get('ACTIVE_CAMERAS', 3)) if slicer_intent else 3,
+                    'critical_ues': int(slicer_intent.get('CRITICAL_UES', 0)) if slicer_intent else 0,
+                    'camera_ratio': float(slicer_intent.get('ACTIVE_CAMERAS', 3)) / max(float(slicer_intent.get('ACTIVE_UES', 20)), 1) if slicer_intent else 0.15,
+                    'critical_ue_ratio': float(slicer_intent.get('CRITICAL_UES', 0)) / max(float(slicer_intent.get('ACTIVE_UES', 20)), 1) if slicer_intent else 0,
+                    'allocated_rbs': int(slicer_intent.get('ACTIVE_UES', 20)) * 10 if slicer_intent else 200,
+                    'current_power': 20,
+                    'power_budget': 30,
+                    'hour_sin': 0,
+                    'hour_cos': 1,
+                    'variance_ms2': float(variance_us2) / 1_000_000.0 if variance_us2 else 10
+                }
+                
+                drl_result = self.drl_predictor.predict(drl_state)
+                decision['drl_prediction'] = drl_result
+                
+                drl_cvar = drl_result.get('predicted_cvar_ms', 0)
+                drl_raw_cvar = drl_result.get('raw_predicted_cvar_ms', drl_cvar)
+                drl_decision = drl_result.get('final_decision', 'UNKNOWN')
+                drl_confidence = drl_result.get('confidence', 0)
+                
+                calibration_note = ''
+                if drl_result.get('calibrated'):
+                    calibration_note = f", raw={drl_raw_cvar:.2f}ms, calib={drl_result.get('calibration_reason', '')}"
+                print(
+                    f"[rApp DRL] CVaR predicted: {drl_cvar:.2f}ms, Decision: {drl_decision}, "
+                    f"Power: {drl_result.get('power', 'N/A')}, "
+                    f"Policy: {drl_result.get('policy_action', 'N/A')}, "
+                    f"seq={drl_result.get('state_sequence_len', 0)}"
+                    f"{calibration_note}"
+                )
+
+                real_cvar_ms = cvar_val / 1000.0 if cvar_val else 0
+                real_p95_ms = float(p95_value) / 1000.0 if p95_value else 0
+                drl_prediction_valid = True
+                if (
+                    drl_decision == 'BLOCKED'
+                    and real_cvar_ms < 40
+                    and real_p95_ms < 60
+                    and drl_cvar > 60
+                ):
+                    drl_prediction_valid = False
+                    decision['drl_rejected_reason'] = 'DRL_SUPERESTIMATED_HEALTHY_NETWORK'
+                    print(
+                        "\033[1;33m[rApp DRL] Ignorada: previu BLOCKED/CVaR="
+                        f"{drl_cvar:.1f}ms, mas rede real está saudável "
+                        f"(CVaR={real_cvar_ms:.1f}ms, P95={real_p95_ms:.1f}ms)\033[0m"
+                    )
+                
+                if drl_prediction_valid and drl_decision != 'UNKNOWN' and decision['energy_saver'] == 'ALLOWED':
+                    ml_risk = decision.get('ml_rf_prediction') or {}
+                    ml_risk_ok = ml_risk.get('decision') in (None, 'ALLOWED')
+                    ml_predicted_cvar = float(ml_risk.get('predicted_cvar_ms', 0) or 0)
+                    if ml_predicted_cvar and ml_predicted_cvar >= 55:
+                        ml_risk_ok = False
+
+                    drl_policy_action = drl_result.get('policy_action')
+                    if ml_risk_ok and drl_confidence >= 0.40 and drl_policy_action in {
+                        'POWER_DOWN_ECO', 'POWER_DOWN', 'CONDITIONAL_REDUCE'
+                    }:
+                        decision['action'] = drl_policy_action
+                        decision['eco_mode'] = drl_policy_action == 'POWER_DOWN_ECO'
+                        decision['drl_policy_action'] = drl_policy_action
+                        decision['drl_policy_applied'] = True
+                        decision['drl_influenced'] = True
+                        decision['reason'] = (
+                            f"DRL_POLICY: {drl_result.get('power', 'N/A')} -> {drl_policy_action}; "
+                            f"CVaR_real={real_cvar_ms:.1f}ms, CVaR_pred={drl_cvar:.1f}ms, "
+                            f"conf={drl_confidence:.0%}"
+                        )
+                        print(
+                            f"\033[1;36m[rApp DRL] POLICY: {drl_result.get('power', 'N/A')} "
+                            f"→ {drl_policy_action} (CVaR={drl_cvar:.1f}ms, conf={drl_confidence:.0%})\033[0m"
+                        )
+
+                # DRL só altera a decisão de alto nível em caso conservador forte.
+                if drl_prediction_valid and drl_confidence > 0.6 and drl_decision != 'UNKNOWN':
+                    # Se DRL BLOCKED mas ML/RF Allow → seguir DRL (mais seguro)
+                    if drl_decision == 'BLOCKED' and decision['energy_saver'] in ['ALLOWED', 'CONDITIONAL']:
+                        decision['energy_saver'] = 'BLOCKED'
+                        decision['action'] = 'FULL_POWER'
+                        reason = decision.get('reason', '')
+                        decision['reason'] = f'DRL OVERRIDE: {reason} + DRL={drl_decision} (CVaR={drl_cvar:.1f}ms)'
+                        decision['confidence'] = max(decision.get('confidence', 0), drl_confidence)
+                        decision['drl_influenced'] = True
+                        print(f"\033[1;31m[rApp DRL] OVERRIDE: BLOCKED (conf={drl_confidence:.0%})\033[0m")
+                    
+                    # Se DRL Allow mas ML Blocked → manter ML (mais seguro)
+                    elif drl_decision == 'ALLOWED' and decision['energy_saver'] == 'BLOCKED':
+                        print(f"\033[0;33m[rApp DRL] DRL Allow but ML Blocked - keeping ML\033[0m")
+                
+            except Exception as e:
+                print(f"\033[0;90m[rApp DRL] Error: {e}\033[0m")
+
+        # Se a DRL não teve confiança suficiente para escolher a potência, a ML
+        # ainda atua como freio de segurança para evitar ECO agressivo com CVaR
+        # intermediário. App1/App2 e bloqueios preventivos continuam soberanos.
+        if (
+            not service_priority_active
+            and not decision.get('preventive_block', False)
+            and decision.get('energy_saver') == 'ALLOWED'
+            and not decision.get('drl_policy_applied', False)
+        ):
+            ml_risk = decision.get('ml_rf_prediction') or {}
+            try:
+                ml_predicted_cvar_ms = float(ml_risk.get('predicted_cvar_ms', 0) or 0)
+            except (TypeError, ValueError):
+                ml_predicted_cvar_ms = 0.0
+
+            real_cvar_ms = float(cvar_us) / 1000.0 if cvar_us else 0.0
+            risk_cvar_ms = max(real_cvar_ms, ml_predicted_cvar_ms)
+
+            if risk_cvar_ms >= 45 and decision.get('action') in ['POWER_DOWN_ECO', 'POWER_DOWN']:
+                decision['action'] = 'CONDITIONAL_REDUCE'
+                decision['eco_mode'] = False
+                decision['ml_risk_cap_applied'] = True
+                decision['reason'] = (
+                    f"ML_RISK_CAP: CVaR_risco={risk_cvar_ms:.1f}ms "
+                    f"(real={real_cvar_ms:.1f}ms, ML={ml_predicted_cvar_ms:.1f}ms); "
+                    "DRL sem política aplicada -> CONDITIONAL_REDUCE"
+                )
+                print(
+                    f"\033[1;33m[rApp ML] RISK CAP: CVaR risco={risk_cvar_ms:.1f}ms "
+                    "→ CONDITIONAL_REDUCE\033[0m"
+                )
+            elif risk_cvar_ms >= 30 and decision.get('action') == 'POWER_DOWN_ECO':
+                decision['action'] = 'POWER_DOWN'
+                decision['eco_mode'] = False
+                decision['ml_risk_cap_applied'] = True
+                decision['reason'] = (
+                    f"ML_RISK_CAP: CVaR_risco={risk_cvar_ms:.1f}ms "
+                    f"(real={real_cvar_ms:.1f}ms, ML={ml_predicted_cvar_ms:.1f}ms); "
+                    "DRL sem política aplicada -> POWER_DOWN"
+                )
+                print(
+                    f"\033[1;33m[rApp ML] RISK CAP: CVaR risco={risk_cvar_ms:.1f}ms "
+                    "→ POWER_DOWN\033[0m"
+                )
+
+        # Armazenar CVaR para o próximo ciclo somente depois da DRL usar o anterior.
+        self._prev_cvar_us = float(cvar_us) if cvar_us else 0
+        
+        # ========================================
         # ETAPA 3: AGENT-AL OVERRIDE
         # ========================================
         agent_intent = self.agent.read_intent()
@@ -868,7 +1586,7 @@ class RappResourceOptimizer:
         # ========================================
         
         # Se tendência diz SUBINDO muito rápido (>5ms/s) → SEMPRE bloquear
-        if trend_info.get('valid') and trend_info['slope_ms_per_sec'] > 5 and trend_info['current_latency_ms'] > 50:
+        if not service_priority_active and trend_info.get('valid') and trend_info['slope_ms_per_sec'] > 5 and trend_info['current_latency_ms'] > 50:
             decision['energy_saver'] = 'BLOCKED'
             decision['action'] = 'PREVENTIVE_BLOCK'
             decision['reason'] = f"ARBITER_TREND: Slope +{trend_info['slope_ms_per_sec']:.1f}ms/s > 5ms/s - Prevenção total"
@@ -942,6 +1660,17 @@ class RappResourceOptimizer:
                         f.write(f"|  ⚠  Em {time_crit:.0f}s atinge 150ms!{' '*29}|\n")
                     if decision.get('preventive_block'):
                         f.write(f"|  [PREVENTIVE BLOCK ATIVO]{' '*29}|\n")
+                    f.write("+----------------------------------------------------+\n")
+                    f.write("\n")
+
+                if decision.get('app2_metrics') and decision['app2_metrics'].get('available'):
+                    app2 = decision['app2_metrics']
+                    f.write("+---------------- APP2 MTC HEALTH --------------------+\n")
+                    f.write(f"|  Sensores: {app2.get('connected_sensors', 0)}/{app2.get('total_sensors', 0)} conectados{' '*22}|\n")
+                    f.write(f"|  Packet loss: {app2.get('packet_loss_percent', 0):.1f}%{' '*39}|\n")
+                    f.write(f"|  Entrega: {app2.get('delivery_success_percent', 0):.1f}%{' '*43}|\n")
+                    f.write(f"|  Latencia media: {app2.get('avg_latency_ms', 0):.0f}ms{' '*35}|\n")
+                    f.write(f"|  Bateria media: {app2.get('avg_battery_percent', 0):.1f}%{' '*35}|\n")
                     f.write("+----------------------------------------------------+\n")
                     f.write("\n")
                 
@@ -1047,10 +1776,16 @@ class RappResourceOptimizer:
             self.energy_cmd.send_full_power(reason=f"BLOCKED: {reason}")
             
         elif energy_state == 'ALLOWED':
-            # Verificar se é MODO ECO (CVaR < 20ms)
-            if decision.get('eco_mode'):
+            action = decision.get('action', '')
+            # Quando a hierarquia liberou a economia, a DRL pode escolher o
+            # nível de redução. A ML permanece como validação de risco.
+            if action == 'POWER_DOWN_ECO' or decision.get('eco_mode'):
                 # ECO MODE → POWER_DOWN_ECO (10% potência)
                 self.energy_cmd.send_power_down_eco(reason=f"ALLOWED (ECO): {reason}")
+            elif action == 'POWER_DOWN':
+                self.energy_cmd.send_power_down(reason=f"ALLOWED: {reason}")
+            elif action in ['CONDITIONAL_REDUCE', 'REDUCE_POWER']:
+                self.energy_cmd.send_conditional_reduce(reason=f"ALLOWED (DRL cautela): {reason}")
             else:
                 # Permitido → POWER_DOWN (economizar)
                 # Verificar nível de confiança para escolher nível
@@ -1061,8 +1796,13 @@ class RappResourceOptimizer:
                     self.energy_cmd.send_reduce_power(reason=f"ALLOWED (cautela): {reason}")
                 
         elif energy_state == 'CONDITIONAL':
-            # Condicional → CONDITIONAL_REDUCE (economia moderada ativa)
-            self.energy_cmd.send_conditional_reduce(reason=f"CONDITIONAL: {reason}")
+            if decision.get('priority_violation') in ['THROUGHPUT_WARNING', 'LATENCY_WARNING', 'APP2_MTC_WARNING']:
+                # Faixa de guarda prioritária: manter potência para não cruzar o SLA mínimo.
+                guard_prefix = 'APP2_GUARD' if decision.get('priority_violation') == 'APP2_MTC_WARNING' else 'CAMERA_GUARD'
+                self.energy_cmd.send_full_power(reason=f"{guard_prefix}: {reason}")
+            else:
+                # Condicional genérico → economia moderada ativa
+                self.energy_cmd.send_conditional_reduce(reason=f"CONDITIONAL: {reason}")
             
         else:
             # Estado desconhecido → MAINTAIN
@@ -1087,6 +1827,7 @@ class RappResourceOptimizer:
         # Structured logging to JSONL file
         try:
             ml_prediction = decision.get('ml_rf_prediction', {})
+            drl_prediction = decision.get('drl_prediction', {})
             log_entry = {
                 'timestamp': decision.get('timestamp', int(time.time())),
                 'datetime': datetime.now().isoformat(),
@@ -1102,9 +1843,25 @@ class RappResourceOptimizer:
                 'ml_source': ml_prediction.get('source', 'unknown'),
                 'ml_confidence': ml_prediction.get('confidence', 0),
                 'ml_predicted_cvar_ms': ml_prediction.get('predicted_cvar_ms', 0),
+                'drl_decision': drl_prediction.get('final_decision', 'UNKNOWN'),
+                'drl_confidence': drl_prediction.get('confidence', 0),
+                'drl_predicted_cvar_ms': drl_prediction.get('predicted_cvar_ms', 0),
+                'drl_raw_predicted_cvar_ms': drl_prediction.get('raw_predicted_cvar_ms', drl_prediction.get('predicted_cvar_ms', 0)),
+                'drl_policy_action': decision.get('drl_policy_action') or drl_prediction.get('policy_action', ''),
+                'drl_policy_applied': decision.get('drl_policy_applied', False),
+                'drl_calibrated': drl_prediction.get('calibrated', False),
+                'drl_calibration_reason': drl_prediction.get('calibration_reason', ''),
+                'drl_influenced': decision.get('drl_influenced', False),
+                'drl_rejected_reason': decision.get('drl_rejected_reason', ''),
+                'ml_risk_cap_applied': decision.get('ml_risk_cap_applied', False),
                 'preventive_block': decision.get('preventive_block', False),
                 'eco_mode': decision.get('eco_mode', False),
-                'slicer_state': decision.get('slicer_state', 'UNKNOWN')
+                'slicer_state': decision.get('slicer_state', 'UNKNOWN'),
+                'priority_violation': decision.get('priority_violation', ''),
+                'app2_connected_ratio': (decision.get('app2_metrics') or {}).get('connected_ratio'),
+                'app2_packet_loss_percent': (decision.get('app2_metrics') or {}).get('packet_loss_percent'),
+                'app2_delivery_success_percent': (decision.get('app2_metrics') or {}).get('delivery_success_percent'),
+                'app2_avg_latency_ms': (decision.get('app2_metrics') or {}).get('avg_latency_ms')
             }
 
             with open('/tmp/rapp_decisions.jsonl', 'a') as f:
@@ -1406,17 +2163,20 @@ class RappResourceOptimizer:
         print("         rApp-ResourceOptimizer - Non-RT RIC")
         print("=" * 70)
         print(f"  Intervalo: {self.interval}s (Non-RT: >=1s)")
-        print(f"  Data Lake: /tmp/rapp_data_lake.db")
-        print(f"  A1 Policies: /tmp/rapp_policies/")
+        from greenran_paths import RAPP_DB_PATH, RAPP_POLICIES_DIR
+        print(f"  Data Lake: {RAPP_DB_PATH}")
+        print(f"  A1 Policies: {RAPP_POLICIES_DIR}/")
         print("=" * 70)
         
-        # Timeout para detectar quando dados param ( watchdog )
-        # Usar SIM_TIME (tempo de simulação) ao invés de timestamp do sistema
-        SIM_TIMEOUT_SECONDS = 5  # Se sim_time não avanza por 5 ciclos, parar de decidir
+        # Timeout para detectar quando dados param (watchdog).
+        # Um ciclo sem avanço é comum enquanto o coletor espera novos CSVs; só
+        # considerar offline após ciclos consecutivos sem avanço do sim_time.
+        SIM_STALE_CYCLES = 3
         
         # Status da conexão (para exibir no dashboard)
         self.data_fresh = True
         self.last_sim_time = 0
+        self.stale_sim_cycles = 0
         
         # Para detecção de transição de simulação
         self.last_sim_time_for_reset = None
@@ -1430,51 +2190,39 @@ class RappResourceOptimizer:
             # Se sim_time não avanza, a simulação parou
             # ========================================
             
-            # Buscar último sim_time no DB (fonte confiável)
-            # ULTIMO dado por TIMESTAMP (não MAX sim_time, que pode ser de simulação antiga)
-            new_sim_time = 0
-            try:
-                cursor = self.data_lake.conn.cursor()
-                cursor.execute("SELECT sim_time_s FROM extended_metrics ORDER BY timestamp DESC LIMIT 1")
-                result = cursor.fetchone()
-                if result and result[0]:
-                    new_sim_time = result[0]
-            except:
-                pass
+            # Buscar sim_time mais recente.
+            # Preferimos o DB, mas recuperamos via JSON vivo se o DB perder um ciclo.
+            new_sim_time = self._get_latest_sim_time()
             
             # Verificar watchdog usando SIM_TIME do DB (não timestamp do sistema)
             # Comparar sim_time atual com sim_time do ciclo anterior
             if self.last_sim_time > 0 and new_sim_time > 0:
-                # PRIMEIRO: verificar se é nova simulação (sim_time resetou)
-                # Isso DEVE ser verificado antes do diff, porque diff negativo significa reset
-                if new_sim_time < 10:
-                    # Nova simulação começou (sim_time resetou para ~0)
+                sim_time_diff = new_sim_time - self.last_sim_time
+
+                # Diff negativo significa que a simulação resetou para um novo run.
+                if sim_time_diff < -1.0:
                     if not self.data_fresh:
-                        print(f"\n✅  [rApp] Nova simulação detectada! sim_time={new_sim_time}s")
+                        print(f"\n✅  [rApp] Nova simulação detectada! sim_time={new_sim_time}s (reset)")
                         self.data_fresh = True
+                    self.stale_sim_cycles = 0
                     self.ml_predictor.reset_history()
-                    print(f"    → Histórico ML resetado para nova simulação")
+                    if self.drl_predictor is not None and hasattr(self.drl_predictor, 'reset_history'):
+                        self.drl_predictor.reset_history()
+                    print(f"    → Histórico ML/DRL resetado")
                 else:
-                    sim_time_diff = new_sim_time - self.last_sim_time
-                    
-                    # Se diff é NEGATIVO, significa nova simulação (reset)
-                    if sim_time_diff < 0:
-                        if not self.data_fresh:
-                            print(f"\n✅  [rApp] Nova simulação detectada! sim_time={new_sim_time}s (reset)")
-                            self.data_fresh = True
-                        self.ml_predictor.reset_history()
-                        print(f"    → Histórico ML resetado")
                     # Se sim_time não avançou (diff ~= 0), simulação terminou
-                    elif sim_time_diff <= 0.1:
-                        if self.data_fresh:
+                    if sim_time_diff <= 0.1:
+                        self.stale_sim_cycles += 1
+                        if self.data_fresh and self.stale_sim_cycles >= SIM_STALE_CYCLES:
                             print(f"\n⚠️  [rApp] SIMULAÇÃO PARADA! sim_time={new_sim_time}s (último: {self.last_sim_time}s)")
                             print(f"    → Entrando em modo OFFLINE - aguardando novos dados...")
                             self.data_fresh = False
-                        
-                        time.sleep(self.interval)
-                        self.last_sim_time = new_sim_time
-                        continue
+                        if not self.data_fresh:
+                            time.sleep(self.interval)
+                            self.last_sim_time = new_sim_time
+                            continue
                     else:
+                        self.stale_sim_cycles = 0
                         if not self.data_fresh:
                             print(f"\n✅  [rApp] Simulação ativa! sim_time={new_sim_time}s")
                             self.data_fresh = True
@@ -1566,7 +2314,7 @@ def main():
     parser.add_argument(
         '--synthetic', '-s',
         type=int,
-        default=0,
+        default=int(RUNTIME_CONFIG["orchestrator"]["synthetic_days"]),
         help='Dias de dados sintéticos a gerar para ML (default: 0)'
     )
     parser.add_argument(

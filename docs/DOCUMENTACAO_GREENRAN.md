@@ -4,6 +4,19 @@
 **Última Atualização**: 02 de Abril de 2026
 **Status**: Operacional
 
+## Leitura Inicial Recomendada
+
+Antes desta documentacao completa, vale abrir:
+
+- `docs/ARTICLE00_EXPERIMENTOS.md`
+  - protocolo experimental alinhado ao artigo00;
+  - uso de `scripts/run_article00_experiments.py`;
+  - coleta com `--auto` e `--auto-switch`.
+- `docs/CONFLICT_DATASET_PIPELINE.md`
+  - dataset de conflitos, grafo operacional e matriz aprendida.
+- `docs/ESTUDO_ARTIGOS_BASE.md`
+  - justificativa tecnica dos conflitos e da hierarquia do rApp.
+
 ---
 
 ## Índice

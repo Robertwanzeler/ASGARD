@@ -4,6 +4,20 @@
 
 Data: 2026-03-20
 
+## Documentos Prioritarios
+
+Para o estado atual do GreenRAN, estes documentos sao a referencia principal:
+
+- `docs/ARTICLE00_EXPERIMENTOS.md`
+  - protocolo de coleta alinhado ao artigo00;
+  - execucao automatica de cenarios com `--auto-switch`.
+- `docs/CONFLICT_DATASET_PIPELINE.md`
+  - pipeline de exportacao do dataset de conflitos e grafo operacional.
+- `docs/ESTUDO_ARTIGOS_BASE.md`
+  - relacao entre artigo00, artigo01 e a hierarquia do rApp.
+- `docs/DOCUMENTACAO_GREENRAN.md`
+  - visao geral completa do projeto.
+
 ---
 
 ## Resumo das Alterações Recentes

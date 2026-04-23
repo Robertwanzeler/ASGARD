@@ -1,5 +1,23 @@
 # GreenRAN O-RAN - Coordenação rApp-xApps
 
+## Leitura Recomendada Atual
+
+Para o estado atual do projeto, estes documentos devem ser lidos primeiro:
+
+- `docs/ARTICLE00_EXPERIMENTOS.md`
+  - protocolo experimental alinhado ao artigo00;
+  - coleta automatica com `--auto` e `--auto-switch`;
+  - estrutura de saida por rodada e por cenario.
+- `docs/CONFLICT_DATASET_PIPELINE.md`
+  - exportacao do dataset de conflitos;
+  - aprendizado da matriz operacional;
+  - comparacao entre grafo operacional e grafo aprendido.
+- `docs/ESTUDO_ARTIGOS_BASE.md`
+  - encaixe conceitual dos artigos base com o GreenRAN;
+  - limites atuais da implementacao frente ao `GraphSAGE`.
+- `docs/DOCUMENTACAO_GREENRAN.md`
+  - documentacao ampla do sistema.
+
 ## Visão Geral
 
 O projeto GreenRAN implementa um sistema de coordenação entre rApps (Non-RT RIC) e xApps (Near-RT RIC) para gerenciamento de energia em redes O-RAN, garantindo que câmeras de vigilância 4K nunca sofram latência alta.
