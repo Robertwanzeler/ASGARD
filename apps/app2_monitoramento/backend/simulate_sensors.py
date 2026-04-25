@@ -36,6 +36,11 @@ CONNECTIVITY_PROFILES = {
     "ntn_gateway": {"latency": (500, 1400), "rssi": (-125, -95), "loss": (2.0, 12.0), "power": (80, 180)},
 }
 
+CONNECTIVITY_BASE_SCALE = 0.72
+CONNECTED_STICKINESS = 0.55
+DISCONNECTED_STICKINESS = 1.18
+DISCONNECTED_RECOVERY_PENALTY = 0.04
+
 def ensure_dirs():
     APP2_STATE_DIR.mkdir(parents=True, exist_ok=True)
     (APP2_STATE_DIR / "sensors").mkdir(exist_ok=True)
@@ -58,20 +63,45 @@ def _load_sensor_override():
         return {}
     return override
 
+
+def _load_previous_sensor_states():
+    sensors_file = APP2_STATE_DIR / "sensors" / "latest.json"
+    previous = _safe_read_json(sensors_file, [])
+    return {
+        int(sensor.get("sensor_id")): sensor
+        for sensor in previous
+        if isinstance(sensor, dict) and sensor.get("sensor_id") is not None
+    }
+
 def simulate_sensor_data(num_sensors=17):
     sensors = []
     base_profiles = SENSOR_PROFILES * (num_sensors // len(SENSOR_PROFILES) + 1)
+    previous_states = _load_previous_sensor_states()
 
     for i in range(num_sensors):
         sensor_type, unit, min_value, max_value, connectivity, gateway_id, domain = base_profiles[i]
         profile = CONNECTIVITY_PROFILES[connectivity]
         packet_loss = random.uniform(*profile["loss"])
         battery_percent = max(3, min(100, random.gauss(78, 14) - (i % 5) * 3))
-        connected = random.random() > min(0.35, packet_loss / 100.0 + (0.08 if battery_percent < 15 else 0))
+        sensor_id = i + 1
+        previous_sensor = previous_states.get(sensor_id, {})
+        previous_connected = previous_sensor.get("status", "ok") == "ok"
+        disconnect_probability = min(
+            0.28,
+            (packet_loss / 100.0 + (0.08 if battery_percent < 15 else 0)) * CONNECTIVITY_BASE_SCALE,
+        )
+        if previous_connected:
+            disconnect_probability *= CONNECTED_STICKINESS
+        else:
+            disconnect_probability = min(
+                0.40,
+                disconnect_probability * DISCONNECTED_STICKINESS + DISCONNECTED_RECOVERY_PENALTY,
+            )
+        connected = random.random() > disconnect_probability
         value = random.uniform(min_value, max_value)
 
         sensors.append({
-            'sensor_id': i + 1,
+            'sensor_id': sensor_id,
             'type': sensor_type,
             'value': round(value, 2),
             'unit': unit,

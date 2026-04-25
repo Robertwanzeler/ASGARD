@@ -15,6 +15,10 @@ Para o estado atual do projeto, estes documentos devem ser lidos primeiro:
   - os 6 graficos finais e o que eles significam para o cenario.
 - `docs/DOCUMENTACAO_GREENRAN.md`
   - documentacao ampla do sistema.
+- `docs/DRL_RUNTIME_MELHORIAS.md`
+  - melhorias no predictor DRL em runtime;
+  - trace, warmup, estabilidade e leitura correta do dashboard;
+  - ajuste de oscilacao do simulador do App2 sem mexer na politica do `rApp`.
 
 ## Visão Geral
 
