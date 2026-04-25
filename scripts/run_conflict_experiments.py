@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Interactive experiment runner aligned with artigo00 collection protocol.
+Interactive experiment runner aligned with conflitos collection protocol.
 
 What it does:
 - guides 7 GreenRAN scenarios with 20 rounds each by default;
 - records exact start/end timestamps for every round;
 - exports a conflict dataset/graph for each round without mixing windows;
 - learns the conflict matrix for each round using threshold 0.5;
-- exports scenario-wide datasets and article-style subsets (50/150/450 rows).
+- exports scenario-wide datasets and comparison subsets (50/150/450 rows).
 
 What it does not do yet:
 - GraphSAGE training with epochs. The current learner is heuristic/statistical,
-  so we only align dataset sizes and threshold from artigo00. Epoch-based GNN
+  so we only align dataset sizes and threshold from conflitos. Epoch-based GNN
   training remains a later phase.
 """
 
@@ -33,8 +33,8 @@ from typing import Callable, Iterable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPORT_SCRIPT = PROJECT_ROOT / "scripts" / "export_conflict_dataset.py"
 LEARN_SCRIPT = PROJECT_ROOT / "scripts" / "learn_conflict_matrix.py"
-DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "runs" / "article00_experiments"
-SCENARIO_CONTROL_PATH = Path("/tmp/article00_scenario_control.json")
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "runs" / "experimentos_conflitos"
+SCENARIO_CONTROL_PATH = Path("/tmp/scenario_control.json")
 
 DEFAULT_SUBSET_SIZES = (50, 150, 450)
 DEFAULT_THRESHOLD = 0.5
@@ -44,13 +44,14 @@ DEFAULT_DURATION = 600
 DEFAULT_PROGRESS_STEP = 60
 DEFAULT_ROUND_GAP = 0
 DEFAULT_SCENARIO_GAP = 0
+TARGET_ROWS_EXEMPT_SCENARIOS = {"baseline_saude"}
 
 SNAPSHOT_FILES = {
     "app1_monitoring_snapshot": Path("/tmp/app1_vigilancia/monitoring_snapshot.json"),
     "app2_monitoring_snapshot": Path("/tmp/app2_monitoramento/monitoring_snapshot.json"),
     "extended_metrics": Path("/tmp/xapp_metrics/extended_metrics.json"),
     "rapp_decisions": Path("/tmp/rapp_decisions.jsonl"),
-    "article00_scenario_control": SCENARIO_CONTROL_PATH,
+    "scenario_control": SCENARIO_CONTROL_PATH,
 }
 
 
@@ -138,7 +139,7 @@ SCENARIOS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run artigo00-aligned GreenRAN conflict collection in guided rounds."
+        description="Run conflict-aligned GreenRAN conflict collection in guided rounds."
     )
     parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS, help="rounds per scenario")
     parser.add_argument("--duration", type=int, default=DEFAULT_DURATION, help="seconds per round")
@@ -163,13 +164,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--subset-sizes",
         default="50,150,450",
-        help="comma-separated article-style dataset sizes",
+        help="comma-separated comparison dataset sizes",
     )
     parser.add_argument(
         "--threshold",
         type=float,
         default=DEFAULT_THRESHOLD,
-        help="learner threshold aligned to artigo00",
+        help="learner threshold aligned to the conflict protocol",
     )
     parser.add_argument(
         "--min-count",
@@ -198,6 +199,18 @@ def parse_args() -> argparse.Namespace:
         "--auto-switch",
         action="store_true",
         help="apply automatic App1/App2 control profiles so scenario labels also change the live conditions",
+    )
+    parser.add_argument(
+        "--target-rows-per-scenario",
+        type=int,
+        default=0,
+        help="keep collecting until this number of conflict rows is reached for each scenario (except baseline_saude)",
+    )
+    parser.add_argument(
+        "--max-rounds-per-scenario",
+        type=int,
+        default=0,
+        help="hard cap for rounds per scenario when --target-rows-per-scenario is enabled; 0 means auto-derive",
     )
     return parser.parse_args()
 
@@ -360,7 +373,7 @@ def build_round_control_profile(scenario: Scenario, round_index: int, duration: 
         "throughput_mbps": 32.0,
         "avg_throughput_mbps": 34.0,
         "latency_ms": 18.0,
-        "throughput_source": "article00_control",
+        "throughput_source": "scenario_control",
     }
     app2_healthy = {
         "enabled": True,
@@ -501,7 +514,7 @@ def apply_control_stage(
     stage: dict,
 ) -> None:
     payload = {
-        "schema": "greenran.article00_scenario_control.v1",
+        "schema": "greenran.scenario_control.v1",
         "generated_at": int(time.time()),
         "generated_at_iso": datetime.now().isoformat(timespec="seconds"),
         "scenario": scenario.slug,
@@ -523,6 +536,10 @@ def scenario_manifest(scenario: Scenario) -> dict:
     }
 
 
+def scenario_uses_target_rows(scenario: Scenario, target_rows: int) -> bool:
+    return target_rows > 0 and scenario.slug not in TARGET_ROWS_EXEMPT_SCENARIOS
+
+
 def run_round(
     scenario: Scenario,
     round_index: int,
@@ -534,6 +551,7 @@ def run_round(
     min_count: int,
     auto_mode: bool,
     auto_switch: bool,
+    cumulative_rows_before: int,
 ) -> dict | None:
     round_label = f"round_{round_index:02d}"
     round_dir = scenario_dir / "rounds" / round_label
@@ -602,7 +620,7 @@ def run_round(
             str(EXPORT_SCRIPT),
             "--since-ts",
             str(start_ts),
-            "--until-ts",
+            "--until-exclusive-ts",
             str(end_ts),
             "--dataset",
             str(dataset_path),
@@ -651,6 +669,7 @@ def run_round(
         "graph_path": str(graph_path),
         "adjacency_path": str(adjacency_path),
         "report_path": str(report_path),
+        "cumulative_rows": cumulative_rows_before + int(export_result.get("rows", 0)),
     }
     write_json(round_dir / "round_summary.json", summary)
     print(
@@ -662,6 +681,40 @@ def run_round(
     return summary
 
 
+def combine_round_datasets(round_summaries: list[dict], destination_csv: Path) -> int:
+    destination_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = None
+    combined_rows = []
+    for summary in round_summaries:
+        dataset_path = Path(summary["dataset_path"])
+        with dataset_path.open() as src:
+            reader = csv.DictReader(src)
+            if fieldnames is None:
+                fieldnames = reader.fieldnames or []
+            combined_rows.extend(reader)
+
+    with destination_csv.open("w", newline="") as dst:
+        writer = csv.DictWriter(dst, fieldnames=fieldnames or [])
+        writer.writeheader()
+        writer.writerows(combined_rows)
+
+    return len(combined_rows)
+
+
+def rebuild_graph_from_dataset(dataset_path: Path, graph_path: Path) -> dict:
+    return run_json_command(
+        [
+            sys.executable,
+            str(EXPORT_SCRIPT),
+            "--dataset-input",
+            str(dataset_path),
+            "--graph",
+            str(graph_path),
+        ]
+    )
+
+
 def build_scenario_exports(
     scenario: Scenario,
     scenario_dir: Path,
@@ -670,6 +723,7 @@ def build_scenario_exports(
     threshold: float,
     min_count: int,
     subset_sizes: tuple[int, ...],
+    round_summaries: list[dict],
 ) -> dict:
     exports_dir = scenario_dir / "scenario_exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
@@ -679,20 +733,8 @@ def build_scenario_exports(
     full_adjacency = exports_dir / "conflict_adjacency_full.json"
     full_report = exports_dir / "conflict_report_full.json"
 
-    export_result = run_json_command(
-        [
-            sys.executable,
-            str(EXPORT_SCRIPT),
-            "--since-ts",
-            str(scenario_start_ts),
-            "--until-ts",
-            str(scenario_end_ts),
-            "--dataset",
-            str(full_dataset),
-            "--graph",
-            str(full_graph),
-        ]
-    )
+    combined_rows = combine_round_datasets(round_summaries, full_dataset)
+    export_result = rebuild_graph_from_dataset(full_dataset, full_graph)
     run_json_command(
         [
             sys.executable,
@@ -761,20 +803,20 @@ def build_scenario_exports(
         "start_iso": iso_from_ts(scenario_start_ts),
         "end_iso": iso_from_ts(scenario_end_ts),
         "full_export": {
-            "rows": int(export_result.get("rows", 0)),
+            "rows": combined_rows,
             "dataset_path": str(full_dataset),
             "graph_path": str(full_graph),
             "adjacency_path": str(full_adjacency),
             "report_path": str(full_report),
             "summary": read_json(full_report).get("summary", {}),
         },
-        "article00_alignment": {
+        "conflict_alignment": {
             "dataset_sizes": list(subset_sizes),
             "threshold": threshold,
             "recommended_gnn_epochs": 600,
             "epochs_applied_in_current_runner": None,
             "note": (
-                "dataset sizes and threshold are aligned with artigo00; "
+                "dataset sizes and threshold are aligned with conflitos; "
                 "GraphSAGE epoch training is not implemented in the current heuristic learner"
             ),
         },
@@ -790,15 +832,17 @@ def main() -> int:
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_dir = Path(args.output_root) / f"{timestamp}_artigo00_protocol"
+    experiment_dir = Path(args.output_root) / f"{timestamp}_conflict_protocol"
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = {
-        "schema": "greenran.artigo00_protocol.v1",
+        "schema": "greenran.conflict_protocol.v1",
         "generated_at": int(time.time()),
         "generated_at_iso": datetime.now().isoformat(timespec="seconds"),
         "config": {
             "rounds_per_scenario": args.rounds,
+            "target_rows_per_scenario": args.target_rows_per_scenario,
+            "max_rounds_per_scenario": args.max_rounds_per_scenario,
             "round_duration_s": args.duration,
             "progress_step_s": args.progress_step,
             "auto_mode": args.auto,
@@ -814,12 +858,16 @@ def main() -> int:
     write_json(experiment_dir / "experiment_manifest.json", manifest)
 
     print(f"Saída do experimento: {experiment_dir}")
-    print("Protocolo artigo00:")
+    print("Protocolo de conflitos:")
     print(f"- threshold: {args.threshold}")
     print(f"- subsets: {', '.join(str(size) for size in subset_sizes)}")
-    print("- epochs GNN recomendados no artigo: 600 (não aplicados neste runner atual)")
+    print("- epochs GNN de referência: 600 (não aplicados neste runner atual)")
     print(f"- modo automático: {'sim' if args.auto else 'não'}")
     print(f"- troca automática de cenário: {'sim' if args.auto_switch else 'não'}")
+    if args.target_rows_per_scenario > 0:
+        print(f"- meta de linhas por cenário: {args.target_rows_per_scenario}")
+        if args.max_rounds_per_scenario > 0:
+            print(f"- limite máximo de rodadas por cenário: {args.max_rounds_per_scenario}")
     if args.auto:
         print(f"- intervalo automático entre rodadas: {args.round_gap}s")
         print(f"- intervalo automático entre cenários: {args.scenario_gap}s")
@@ -842,7 +890,7 @@ def main() -> int:
             if args.auto:
                 print(
                     f"Iniciando cenário '{scenario.slug}' automaticamente "
-                    f"com {args.rounds} rodadas."
+                    f"com mínimo de {args.rounds} rodadas."
                 )
             else:
                 scenario_action = prompt_action(
@@ -855,12 +903,18 @@ def main() -> int:
             round_summaries = []
             scenario_start_ts = 0
             scenario_end_ts = 0
+            cumulative_rows = 0
+            round_index = 1
+            target_enabled = scenario_uses_target_rows(scenario, args.target_rows_per_scenario)
+            max_rounds = args.max_rounds_per_scenario
+            if max_rounds <= 0:
+                max_rounds = max(args.rounds, args.rounds * 3 if target_enabled else args.rounds)
 
-            for round_index in range(1, args.rounds + 1):
+            while True:
                 summary = run_round(
                     scenario=scenario,
                     round_index=round_index,
-                    total_rounds=args.rounds,
+                    total_rounds=max_rounds if target_enabled else args.rounds,
                     scenario_dir=scenario_dir,
                     duration=args.duration,
                     progress_step=args.progress_step,
@@ -868,22 +922,51 @@ def main() -> int:
                     min_count=args.min_count,
                     auto_mode=args.auto,
                     auto_switch=args.auto_switch,
+                    cumulative_rows_before=cumulative_rows,
                 )
                 if summary is None:
+                    round_index += 1
+                    if not target_enabled and round_index > args.rounds:
+                        break
+                    if target_enabled and round_index > max_rounds:
+                        break
                     continue
 
                 if scenario_start_ts == 0:
                     scenario_start_ts = summary["start_ts"]
                 scenario_end_ts = summary["end_ts"]
+                cumulative_rows += int(summary["rows"])
+                summary["cumulative_rows"] = cumulative_rows
                 round_summaries.append(summary)
                 experiment_summary_rows.append(summary)
 
-                if args.auto and args.round_gap > 0 and round_index < args.rounds:
+                if target_enabled:
+                    print(
+                        f"  progresso {scenario.slug}: {cumulative_rows}/{args.target_rows_per_scenario} linhas"
+                    )
+
+                minimum_rounds_done = round_index >= args.rounds
+                target_reached = cumulative_rows >= args.target_rows_per_scenario if target_enabled else True
+                reached_round_cap = round_index >= max_rounds
+
+                if minimum_rounds_done and target_reached:
+                    break
+                if not target_enabled and round_index >= args.rounds:
+                    break
+                if target_enabled and reached_round_cap:
+                    print(
+                        f"  meta de {args.target_rows_per_scenario} linhas não atingida em {scenario.slug}; "
+                        f"parando no limite de {max_rounds} rodadas com {cumulative_rows} linhas"
+                    )
+                    break
+
+                if args.auto and args.round_gap > 0:
                     auto_wait(
                         f"intervalo antes da próxima rodada de {scenario.slug}",
                         args.round_gap,
                         args.progress_step,
                     )
+                round_index += 1
 
             write_csv(
                 scenario_dir / "round_summary.csv",
@@ -903,6 +986,7 @@ def main() -> int:
                     "weak_or_low_support",
                     "spurious_in_baseline",
                     "emergent_from_data",
+                    "cumulative_rows",
                     "dataset_path",
                     "graph_path",
                     "adjacency_path",
@@ -919,6 +1003,7 @@ def main() -> int:
                     threshold=args.threshold,
                     min_count=args.min_count,
                     subset_sizes=subset_sizes,
+                    round_summaries=round_summaries,
                 )
                 write_json(scenario_dir / "scenario_report.json", scenario_report)
                 scenario_reports.append(scenario_report)
@@ -927,6 +1012,11 @@ def main() -> int:
                     f"{scenario_report['full_export']['rows']} | "
                     f"confirmed={scenario_report['full_export']['summary'].get('confirmed_by_data', 0)}"
                 )
+                if target_enabled:
+                    print(
+                        f"  fechamento {scenario.slug}: {scenario_report['full_export']['rows']}/"
+                        f"{args.target_rows_per_scenario} linhas"
+                    )
 
             if args.auto and args.scenario_gap > 0:
                 if args.auto_switch:
@@ -962,6 +1052,7 @@ def main() -> int:
             "weak_or_low_support",
             "spurious_in_baseline",
             "emergent_from_data",
+            "cumulative_rows",
             "dataset_path",
             "graph_path",
             "adjacency_path",

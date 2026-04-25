@@ -2,11 +2,12 @@
 
 Este pipeline transforma as decisoes do rApp em um dataset de conflitos e em
 um grafo operacional. Ele e o passo intermediario entre regras explicitas de
-arbitragem e um futuro grafo aprendido.
+arbitragem e o treino do grafo aprendido com GraphSAGE.
 
-Para o protocolo experimental alinhado ao `artigo00`, ver tambem:
+Para o fluxo final de treino, multiseed e interpretacao dos graficos, ver
+tambem:
 
-- `docs/ARTICLE00_EXPERIMENTOS.md`
+- `docs/ANALISE_CONFLITOS_GNN.md`
 
 ## Objetivo
 
@@ -86,10 +87,10 @@ Este pipeline permite:
 - auditar se a hierarquia App1 > App2 > CVaR > ML > DRL esta sendo respeitada;
 - medir quais KPIs geram mais conflitos;
 - alimentar a visualizacao de conflitos;
-- preparar os dados para uma futura matriz de adjacencia aprendida.
+- preparar os dados para a matriz de adjacencia aprendida.
 
-O proximo passo tecnico e construir uma matriz `parameter -> KPI` a partir do
-CSV e comparar correlacoes simples contra os eventos rotulados pelo rApp.
+O proximo passo tecnico e treinar o reconstrutor GraphSAGE sobre os datasets e
+avaliar reconstrucao, conflito implicito e conflito indireto.
 
 ## Aprendizado da matriz
 
@@ -117,12 +118,12 @@ Com isso, o projeto passa a ter duas camadas:
 1. grafo operacional definido pelas decisoes do rApp;
 2. grafo aprendido a partir dos eventos exportados.
 
-## Protocolo experimental do artigo00
+## Protocolo experimental por cenarios
 
 O fluxo completo de coleta por cenarios e rodadas fica em:
 
 ```bash
-python3 scripts/run_article00_experiments.py
+python3 scripts/run_conflict_experiments.py
 ```
 
 Esse runner:
@@ -138,17 +139,17 @@ Esse runner:
 Para rodar sem prompts:
 
 ```bash
-python3 scripts/run_article00_experiments.py --rounds 10 --duration 120 --auto
+python3 scripts/run_conflict_experiments.py --rounds 10 --duration 120 --auto
 ```
 
 Para rodar sem prompts e com troca automatica de cenario:
 
 ```bash
-python3 scripts/run_article00_experiments.py --rounds 10 --duration 120 --auto --auto-switch
+python3 scripts/run_conflict_experiments.py --rounds 10 --duration 120 --auto --auto-switch
 ```
 
-Com `--auto-switch`, o runner escreve `/tmp/article00_scenario_control.json`
-e aplica perfis logicos nos componentes abaixo:
+Com `--auto-switch`, o runner escreve um arquivo de controle em `/tmp/` e aplica
+perfis logicos nos componentes abaixo:
 
 - `src/rapp_orchestrator.py`
 - `apps/app1_vigilancia/backend/services.py`
@@ -157,16 +158,45 @@ e aplica perfis logicos nos componentes abaixo:
 Isso garante que os cenarios do protocolo nao sejam apenas rotulos, mas
 condicoes operacionais controladas dentro do experimento.
 
-### Importante
+## Treino GraphSAGE
 
-O pipeline atual ainda nao treina `GraphSAGE/GNN` por epocas. Hoje ele esta
-alinhado ao artigo em:
+Depois da coleta, o treino pode ser executado com:
 
-- tamanhos de dataset `50`, `150`, `450`;
-- `threshold=0.5`;
-- protocolo de coleta por rodadas.
+```bash
+./drlexp/.venv/bin/python training/train_graphsage_conflicts.py \
+  --experiment-dir runs/experimentos_conflitos/experimento_principal \
+  --epochs 50,100,200,400,600,800,1000 \
+  --subset-sizes 50,150,450
+```
 
-Ainda nao esta alinhado em:
+O script grava artefatos em:
 
-- treino por `600 epochs`;
-- metricas finais de reconstrucao da GNN.
+- subdiretorios de treino por seed e por cenario.
+
+Por caso treinado:
+
+- `training_summary.json`
+- `history.csv`
+- checkpoints `epoch_*.pt`
+
+Relatorio agregado:
+
+- `aggregate_report.json`
+
+## Estado atual
+
+Hoje o pipeline ja cobre:
+
+- coleta por rodadas;
+- export por cenario;
+- subsets `50`, `150`, `450`;
+- treino GraphSAGE por epocas;
+- avaliacao multiseed;
+- graficos finais para:
+  - reconstrucao;
+  - conflito implicito;
+  - conflito indireto.
+
+Os detalhes finais de leitura dos cenarios e dos 6 graficos principais ficam em:
+
+- `docs/ANALISE_CONFLITOS_GNN.md`

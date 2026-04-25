@@ -4,17 +4,15 @@
 
 Para o estado atual do projeto, estes documentos devem ser lidos primeiro:
 
-- `docs/ARTICLE00_EXPERIMENTOS.md`
-  - protocolo experimental alinhado ao artigo00;
-  - coleta automatica com `--auto` e `--auto-switch`;
-  - estrutura de saida por rodada e por cenario.
 - `docs/CONFLICT_DATASET_PIPELINE.md`
   - exportacao do dataset de conflitos;
   - aprendizado da matriz operacional;
-  - comparacao entre grafo operacional e grafo aprendido.
-- `docs/ESTUDO_ARTIGOS_BASE.md`
-  - encaixe conceitual dos artigos base com o GreenRAN;
-  - limites atuais da implementacao frente ao `GraphSAGE`.
+  - treino GraphSAGE por epocas;
+  - estrutura da coleta por cenarios.
+- `docs/ANALISE_CONFLITOS_GNN.md`
+  - resumo do treino multiseed;
+  - splits usados em `conflito_implicito` e `recuperacao`;
+  - os 6 graficos finais e o que eles significam para o cenario.
 - `docs/DOCUMENTACAO_GREENRAN.md`
   - documentacao ampla do sistema.
 
