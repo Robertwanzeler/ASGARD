@@ -21,10 +21,12 @@ import time
 import numpy as np
 import joblib
 import json
-from datetime import datetime
 
-MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
-CONFIG_DIR = os.path.join(os.path.dirname(__file__), 'config')
+# Corrigir caminho dos modelos - estão em /home/robert/orange_nuclear/models/, não em src/models/
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+MODEL_DIR = os.path.join(PROJECT_DIR, 'models')
+CONFIG_DIR = os.path.join(PROJECT_DIR, 'config')
 
 # Thresholds - ML PREDITIVA (defaults, will be overridden by config)
 DB_OVERRIDE_THRESHOLD = 0.85  # 85% para override (só sobrescreve se maioria forte)
@@ -62,7 +64,7 @@ class MLPredictor:
         self._critical_zone_count = 0  # Contador de vezes na zona de cautela
         
         self.feature_cols = [
-            # Features originais (17)
+            # Features originais
             'cvar_ms',
             'cvar_diff',
             'cvar_rolling_mean',
@@ -71,38 +73,52 @@ class MLPredictor:
             'avg_latency_ms',
             'variance_ms2',
             'total_active_cameras',
-            'total_active_ues',
             'camera_ratio',
             'total_critical_ues',
-            'hour_sin',
-            'hour_cos',
-            'is_night',
-            'is_weekend',
             'cvar_zone',
-            'sim_time_s',
-            # Features de rede (5)
-            'throughput_kbps',
+            # Features de rede
+            'throughput_mbps',
             'packet_loss_rate',
             'jitter_ms',
             'tx_rx_ratio',
-            'energy_history',
-            # Features de TREND (3) - NOVAS
+            # Features de trend (3)
             'cvar_trend',
             'throughput_trend',
             'packet_loss_trend',
-            # LAG FEATURES (15) - PREDITIVAS
-            'cvar_lag_1', 'cvar_lag_2', 'cvar_lag_3', 'cvar_lag_4', 'cvar_lag_5',
-            'throughput_lag_1', 'throughput_lag_2', 'throughput_lag_3',
-            'packet_loss_lag_1', 'packet_loss_lag_2', 'packet_loss_lag_3',
-            'latency_lag_1', 'latency_lag_2',
-            # Rolling e Acceleration (5)
-            'cvar_rolling_3', 'cvar_rolling_10', 'cvar_rolling_std_3',
-            'cvar_acceleration', 'latency_acceleration',
+            # Lag features (13)
+            'cvar_lag_1',
+            'cvar_lag_2',
+            'cvar_lag_3',
+            'cvar_lag_4',
+            'cvar_lag_5',
+            'throughput_lag_1',
+            'throughput_lag_2',
+            'throughput_lag_3',
+            'packet_loss_lag_1',
+            'packet_loss_lag_2',
+            'packet_loss_lag_3',
+            'latency_lag_1',
+            'latency_lag_2',
+            # Rolling e aceleração (5)
+            'cvar_rolling_3',
+            'cvar_rolling_10',
+            'cvar_rolling_std_3',
+            'cvar_acceleration',
+            'latency_acceleration',
+            # Features preditivas finais (3)
+            'jitter_trend',
+            'cvar_momentum',
+            'critical_ue_ratio',
         ]
+        
         # Histórico para cálculo de trend e lag features (PREDITIVO)
         self._cvar_history = []
         self._prev_throughput = 0
         self._prev_packet_loss = 0
+        self._prev_jitter = 0
+        self._prev_latency = 0
+        self._prev_latency_diff = 0
+        self._prev_cvar_diff = 0
         # Histórico adicional para lag features
         self._throughput_history = []
         self._packet_loss_history = []
@@ -144,6 +160,10 @@ class MLPredictor:
         self._latency_history = []
         self._prev_throughput = 0
         self._prev_packet_loss = 0
+        self._prev_jitter = 0
+        self._prev_latency = 0
+        self._prev_latency_diff = 0
+        self._prev_cvar_diff = 0
         # D) Reset dos históricos de detecção de cenários críticos
         self._cvar_trend_history = []
         self._consecutive_increase_count = 0
@@ -223,8 +243,6 @@ class MLPredictor:
 
     def _prepare_features(self, metrics):
         """Prepare feature vector from metrics dict."""
-        now = datetime.now()
-
         cvar_ms = float(metrics.get('cvar_per_ue_us', 0)) / 1000.0
         cvar_p95_ms = float(metrics.get('cvar_p95_us', 0)) / 1000.0  # P95 = pior 5% dos UEs
         latency_p95_ms = float(metrics.get('latency_p95_per_ue_us', 0)) / 1000.0
@@ -238,22 +256,12 @@ class MLPredictor:
         # P95 representa o pior caso - mais importante para decisões
         effective_cvar = cvar_p95_ms if cvar_p95_ms > cvar_ms else cvar_ms
 
-        self._cvar_history.append(effective_cvar)
-        if len(self._cvar_history) > 10:
-            self._cvar_history = self._cvar_history[-10:]
-
-        cvar_diff = self._cvar_history[-1] - self._cvar_history[-2] if len(self._cvar_history) >= 2 else 0
-        cvar_rolling_mean = np.mean(self._cvar_history) if self._cvar_history else effective_cvar
-        cvar_rolling_std = np.std(self._cvar_history) if len(self._cvar_history) >= 2 else 0
+        cvar_history_preview = (self._cvar_history + [effective_cvar])[-10:]
+        cvar_diff = cvar_history_preview[-1] - cvar_history_preview[-2] if len(cvar_history_preview) >= 2 else 0
+        cvar_rolling_mean = np.mean(cvar_history_preview) if cvar_history_preview else effective_cvar
+        cvar_rolling_std = np.std(cvar_history_preview) if len(cvar_history_preview) >= 2 else 0
 
         camera_ratio = total_cameras / max(total_ues, 1)
-
-        hour = now.hour
-        day_of_week = now.weekday()
-        hour_sin = np.sin(2 * np.pi * hour / 24)
-        hour_cos = np.cos(2 * np.pi * hour / 24)
-        is_night = 1 if (hour >= 22 or hour < 6) else 0
-        is_weekend = 1 if day_of_week >= 5 else 0
 
         if cvar_ms < 60:
             cvar_zone = 0
@@ -262,82 +270,112 @@ class MLPredictor:
         else:
             cvar_zone = 2
 
-        sim_time_s = float(metrics.get('sim_time_s', 0))
-        
         # Features de rede (5)
         throughput_kbps = float(metrics.get('throughput_kbps', 0)) / 1000.0  # Converter para Mbps
         packet_loss_rate = float(metrics.get('packet_loss_rate', 0)) * 100   # Porcentagem
         jitter_ms = float(metrics.get('jitter_ms', 0))
         tx_rx_ratio = float(metrics.get('tx_rx_ratio', 0))
-        energy_history = float(metrics.get('energy_history', 0))  # 0-1 (proporção BLOCKED)
+        prev_cvar_diff = self._prev_cvar_diff
+
+        # Usar o histórico ANTERIOR ao ciclo atual para manter alinhamento causal
+        # com o pipeline de treino.
+        cvar_history_prev = self._cvar_history[-10:]
+        throughput_history_prev = self._throughput_history[-10:]
+        packet_loss_history_prev = self._packet_loss_history[-10:]
+        latency_history_prev = self._latency_history[-10:]
+
+        cvar_history_preview = (cvar_history_prev + [effective_cvar])[-10:]
+        cvar_diff = effective_cvar - cvar_history_prev[-1] if cvar_history_prev else 0
+        cvar_rolling_mean = np.mean(cvar_history_preview)
+        cvar_rolling_std = np.std(cvar_history_preview) if len(cvar_history_preview) >= 2 else 0
+
+        cvar_lag_1 = cvar_history_prev[-1] if len(cvar_history_prev) >= 1 else effective_cvar
+        cvar_lag_2 = cvar_history_prev[-2] if len(cvar_history_prev) >= 2 else cvar_lag_1
+        cvar_lag_3 = cvar_history_prev[-3] if len(cvar_history_prev) >= 3 else cvar_lag_2
+        cvar_lag_4 = cvar_history_prev[-4] if len(cvar_history_prev) >= 4 else cvar_lag_3
+        cvar_lag_5 = cvar_history_prev[-5] if len(cvar_history_prev) >= 5 else cvar_lag_4
+
+        throughput_lag_1 = throughput_history_prev[-1] if len(throughput_history_prev) >= 1 else throughput_kbps
+        throughput_lag_2 = throughput_history_prev[-2] if len(throughput_history_prev) >= 2 else throughput_lag_1
+        throughput_lag_3 = throughput_history_prev[-3] if len(throughput_history_prev) >= 3 else throughput_lag_2
+
+        packet_loss_lag_1 = packet_loss_history_prev[-1] if len(packet_loss_history_prev) >= 1 else packet_loss_rate
+        packet_loss_lag_2 = packet_loss_history_prev[-2] if len(packet_loss_history_prev) >= 2 else packet_loss_lag_1
+        packet_loss_lag_3 = packet_loss_history_prev[-3] if len(packet_loss_history_prev) >= 3 else packet_loss_lag_2
+
+        latency_lag_1 = latency_history_prev[-1] if len(latency_history_prev) >= 1 else avg_latency_ms
+        latency_lag_2 = latency_history_prev[-2] if len(latency_history_prev) >= 2 else latency_lag_1
+
+        cvar_rolling_3 = np.mean(cvar_history_preview[-3:]) if len(cvar_history_preview) >= 3 else effective_cvar
+        cvar_rolling_10 = np.mean(cvar_history_preview)
+        cvar_rolling_std_3 = np.std(cvar_history_preview[-3:]) if len(cvar_history_preview) >= 3 else 0
+
+        cvar_acceleration = cvar_diff - prev_cvar_diff if cvar_history_prev else 0
         
-        # Features de TREND (3) - NOVAS para ML PREDITIVA
-        # cvar_trend: diferença entre CVaR atual e 5 ciclos atrás (positivo = subindo)
+        # NOVAS FEATURES PREDITIVAS (adicionais):
+        # 1. jitter_trend - tendência do jitter
+        jitter_trend = jitter_ms - (self._prev_jitter if hasattr(self, '_prev_jitter') else jitter_ms)
+        self._prev_jitter = jitter_ms
+        
+        # 2. latency_acceleration - aceleração da latência
+        latency_diff = avg_latency_ms - (self._prev_latency if hasattr(self, '_prev_latency') else avg_latency_ms)
+        latency_acceleration = latency_diff - (self._prev_latency_diff if hasattr(self, '_prev_latency_diff') else 0)
+        self._prev_latency = avg_latency_ms
+        self._prev_latency_diff = latency_diff
+        
+        # 3. cvar_momentum - momento do CVaR (força da mudança)
+        cvar_momentum = cvar_diff * cvar_acceleration if cvar_diff != 0 else 0
+        
+        # 4. critical_ue_ratio - proporção de UEs críticos
+        critical_ue_ratio = total_critical / max(total_ues, 1)
+        
+        # ============================================================
+        # COMPLETAR TODAS AS FEATURES exatamente como no treino.
+        # ============================================================
+        # Features de rede
+        throughput_mbps = throughput_kbps
+        packet_loss_rate_pct = packet_loss_rate
+        jitter_ms_val = jitter_ms
+        tx_rx_ratio_val = tx_rx_ratio
+        
+        # Features de TREND (3)
         cvar_trend = 0
-        if len(self._cvar_history) >= 5:
-            cvar_trend = cvar_ms - self._cvar_history[-5]
+        if len(cvar_history_prev) >= 5:
+            cvar_trend = effective_cvar - cvar_history_prev[-5]
         
-        # throughput_trend: diferença de throughput (positivo = aumentando carga)
         throughput_trend = throughput_kbps - self._prev_throughput
         self._prev_throughput = throughput_kbps
         
-        # packet_loss_trend: diferença de packet loss (positivo = piorando)
         packet_loss_trend = packet_loss_rate - self._prev_packet_loss
         self._prev_packet_loss = packet_loss_rate
         
-        # ============================================================
-        # LAG FEATURES - PREDITIVAS (basadas no histórico)
-        # ============================================================
-        # Atualizar históricos
+        # Acceleration (2)
+        cvar_acceleration = cvar_diff - prev_cvar_diff if cvar_history_prev else 0
+        self._prev_cvar_diff = cvar_diff
+
+        # Atualizar históricos APÓS construir as features do ciclo atual.
         self._cvar_history.append(effective_cvar)
         self._throughput_history.append(throughput_kbps)
         self._packet_loss_history.append(packet_loss_rate)
         self._latency_history.append(avg_latency_ms)
-        
-        # Manter apenas últimos 10 valores
+
         if len(self._cvar_history) > 10:
             self._cvar_history = self._cvar_history[-10:]
             self._throughput_history = self._throughput_history[-10:]
             self._packet_loss_history = self._packet_loss_history[-10:]
             self._latency_history = self._latency_history[-10:]
         
-        # Lag features (1-5)
-        cvar_lag_1 = self._cvar_history[-1] if len(self._cvar_history) >= 1 else effective_cvar
-        cvar_lag_2 = self._cvar_history[-2] if len(self._cvar_history) >= 2 else cvar_lag_1
-        cvar_lag_3 = self._cvar_history[-3] if len(self._cvar_history) >= 3 else cvar_lag_2
-        cvar_lag_4 = self._cvar_history[-4] if len(self._cvar_history) >= 4 else cvar_lag_3
-        cvar_lag_5 = self._cvar_history[-5] if len(self._cvar_history) >= 5 else cvar_lag_4
-        
-        throughput_lag_1 = self._throughput_history[-1] if len(self._throughput_history) >= 1 else throughput_kbps
-        throughput_lag_2 = self._throughput_history[-2] if len(self._throughput_history) >= 2 else throughput_lag_1
-        throughput_lag_3 = self._throughput_history[-3] if len(self._throughput_history) >= 3 else throughput_lag_2
-        
-        packet_loss_lag_1 = self._packet_loss_history[-1] if len(self._packet_loss_history) >= 1 else packet_loss_rate
-        packet_loss_lag_2 = self._packet_loss_history[-2] if len(self._packet_loss_history) >= 2 else packet_loss_lag_1
-        packet_loss_lag_3 = self._packet_loss_history[-3] if len(self._packet_loss_history) >= 3 else packet_loss_lag_2
-        
-        latency_lag_1 = self._latency_history[-1] if len(self._latency_history) >= 1 else avg_latency_ms
-        latency_lag_2 = self._latency_history[-2] if len(self._latency_history) >= 2 else latency_lag_1
-        
-        # Rolling features
-        cvar_rolling_3 = np.mean(self._cvar_history[-3:]) if len(self._cvar_history) >= 3 else effective_cvar
-        cvar_rolling_10 = np.mean(self._cvar_history) if len(self._cvar_history) >= 10 else cvar_rolling_3
-        cvar_rolling_std_3 = np.std(self._cvar_history[-3:]) if len(self._cvar_history) >= 3 else 0
-        
-        # Acceleration (derivada segunda)
-        cvar_acceleration = cvar_diff - (self._cvar_history[-1] - self._cvar_history[-2]) if len(self._cvar_history) >= 2 else 0
-        latency_acceleration = 0  # Simplificado
-        
+        # RETURN: features causais alinhadas com o pipeline de treino.
         features = np.array([[
+            # Features originais
             cvar_ms, cvar_diff, cvar_rolling_mean, cvar_rolling_std,
             latency_p95_ms, avg_latency_ms, variance_ms2,
-            total_cameras, total_ues, camera_ratio, total_critical,
-            hour_sin, hour_cos, is_night, is_weekend, cvar_zone, sim_time_s,
-            # Features de rede (5)
-            throughput_kbps, packet_loss_rate, jitter_ms, tx_rx_ratio, energy_history,
+            total_cameras, camera_ratio, total_critical, cvar_zone,
+            # Features de rede
+            throughput_mbps, packet_loss_rate_pct, jitter_ms_val, tx_rx_ratio_val,
             # Features de TREND (3)
             cvar_trend, throughput_trend, packet_loss_trend,
-            # LAG FEATURES (15) - PREDITIVAS
+            # LAG FEATURES (13)
             cvar_lag_1, cvar_lag_2, cvar_lag_3, cvar_lag_4, cvar_lag_5,
             throughput_lag_1, throughput_lag_2, throughput_lag_3,
             packet_loss_lag_1, packet_loss_lag_2, packet_loss_lag_3,
@@ -345,8 +383,10 @@ class MLPredictor:
             # Rolling e Acceleration (5)
             cvar_rolling_3, cvar_rolling_10, cvar_rolling_std_3,
             cvar_acceleration, latency_acceleration,
+            # Novas features PREDITIVAS (3)
+            jitter_trend, cvar_momentum, critical_ue_ratio,
         ]])
-
+        
         return features
 
     def predict(self, metrics):
@@ -371,13 +411,15 @@ class MLPredictor:
         reg_features_scaled = self.reg_scaler.transform(features)
         predicted_cvar = float(self.regressor.predict(reg_features_scaled)[0])
 
-        importances = self.classifier.feature_importances_
         top_features = {}
-        for feat, imp in sorted(zip(self.feature_cols, importances), key=lambda x: x[1], reverse=True)[:5]:
-            top_features[feat] = round(float(imp), 4)
+        importances = getattr(self.classifier, 'feature_importances_', None)
+        if importances is not None:
+            for feat, imp in sorted(zip(self.feature_cols, importances), key=lambda x: x[1], reverse=True)[:5]:
+                top_features[feat] = round(float(imp), 4)
 
         return {
             'decision': decision,
+            'classifier_decision': decision,
             'confidence': confidence,
             'predicted_cvar_ms': round(predicted_cvar, 2),
             'feature_importance': top_features,
@@ -409,37 +451,15 @@ class MLPredictor:
         
         predicted_cvar = ml_result.get('predicted_cvar_ms', 0)
         current_cvar = float(metrics.get('cvar_per_ue_us', 0)) / 1000.0
-        
-        # === FASE 1: SE REGRESSOR DIZ QUE VAI SER CRÍTICO ===
-        if predicted_cvar >= self.CVAR_CRITICAL_THRESHOLD:
-            ml_result['decision'] = 'BLOCKED'
-            ml_result['confidence'] = 0.95
-            ml_result['source'] = 'regressor_prediction'
-            ml_result['reason'] = f'CVaR previsto={predicted_cvar:.1f}ms ≥ {self.CVAR_CRITICAL_THRESHOLD}ms'
-            return ml_result
-        
-        # === FASE 2: SE REGRESSOR DIZ QUE VAI TER PROBLEMA ===
-        if predicted_cvar >= self.CVAR_WARNING_THRESHOLD:
-            ml_result['decision'] = 'CONDITIONAL'
-            ml_result['confidence'] = 0.85
-            ml_result['source'] = 'regressor_warning'
-            ml_result['reason'] = f'CVaR previsto={predicted_cvar:.1f}ms ≥ {self.CVAR_WARNING_THRESHOLD}ms'
-            return ml_result
-        
-        # === FASE 3: Se current CVaR (P95) já está crítico ===
+        classifier_decision = ml_result.get('classifier_decision', ml_result.get('decision'))
+
+        # === FASE 2: Se current CVaR (P95) já está crítico ===
         cvar_p95_ms = float(metrics.get('cvar_p95_us', 0)) / 1000.0
         current_cvar_p95 = max(cvar_p95_ms, current_cvar)  # Usar o pior
-        
-        if current_cvar_p95 >= self.CVAR_CRITICAL_THRESHOLD:
-            ml_result['decision'] = 'BLOCKED'
-            ml_result['confidence'] = 0.90
-            ml_result['source'] = 'current_cvar_critical'
-            ml_result['reason'] = f'CVaR P95={current_cvar_p95:.1f}ms ≥ {self.CVAR_CRITICAL_THRESHOLD}ms'
-            return ml_result
-        
+
         # === D) DETECÇÃO DE CENÁRIOS CRÍTICOS ===
-        # Analisar trend de CVaR para detecção precoce - SEMPRE executar, mesmo após early returns
-        # Precisamos calcular ANTES dos returns para detectar deterioração mesmo quando decisão já foi tomada
+        # Analisar trend de CVaR para detecção precoce e anexar ao resultado
+        # antes de qualquer decisão de retorno precoce.
         cvar_trend = 0
         if len(self._cvar_history) >= 5:
             cvar_trend = self._cvar_history[-1] - self._cvar_history[-5]
@@ -491,6 +511,43 @@ class MLPredictor:
             ml_result['source'] = 'regressor_prediction'
             ml_result['reason'] = f'CVaR previsto={predicted_cvar:.1f}ms ≥ {self.CVAR_CRITICAL_THRESHOLD}ms'
             return ml_result
+
+        # === FASE 2: SE REGRESSOR DIZ QUE VAI TER PROBLEMA ===
+        if predicted_cvar >= self.CVAR_WARNING_THRESHOLD:
+            ml_result['decision'] = 'CONDITIONAL'
+            ml_result['confidence'] = 0.85
+            ml_result['source'] = 'regressor_warning'
+            ml_result['reason'] = f'CVaR previsto={predicted_cvar:.1f}ms ≥ {self.CVAR_WARNING_THRESHOLD}ms'
+            return ml_result
+
+        # === FASE 3: Se current CVaR (P95) já está crítico ===
+        if current_cvar_p95 >= self.CVAR_CRITICAL_THRESHOLD:
+            ml_result['decision'] = 'BLOCKED'
+            ml_result['confidence'] = 0.90
+            ml_result['source'] = 'current_cvar_critical'
+            ml_result['reason'] = f'CVaR P95={current_cvar_p95:.1f}ms ≥ {self.CVAR_CRITICAL_THRESHOLD}ms'
+            return ml_result
+
+        # Regime saudável: o regressor manda mais que o classificador.
+        healthy_limit = min(self.CVAR_WARNING_THRESHOLD * 0.55, 35.0)
+        if predicted_cvar < healthy_limit and current_cvar_p95 < healthy_limit:
+            if ml_result.get('warning') in {'RAPID_DETERIORATION', 'ACCUMULATING_RISK'}:
+                ml_result['decision'] = 'CONDITIONAL'
+                ml_result['confidence'] = max(float(ml_result.get('confidence', 0.0)), 0.55)
+                ml_result['source'] = 'regressor_healthy_trend_guard'
+                ml_result['reason'] = (
+                    f'CVaR saudável ({predicted_cvar:.1f}ms), mas trend={ml_result["warning"]}'
+                )
+                return ml_result
+
+            if classifier_decision != 'ALLOWED':
+                ml_result['decision'] = 'ALLOWED'
+                ml_result['confidence'] = max(float(ml_result.get('confidence', 0.0)) * 0.75, 0.55)
+                ml_result['source'] = 'regressor_healthy_override'
+                ml_result['reason'] = (
+                    f'Regressor saudável ({predicted_cvar:.1f}ms) override classifier={classifier_decision}'
+                )
+                return ml_result
         
         # 4. Consulta banco (apenas para validação, não override)
         db_stats = self.query_database_stats()

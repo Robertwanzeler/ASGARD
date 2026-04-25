@@ -19,6 +19,11 @@ Para o estado atual do projeto, estes documentos devem ser lidos primeiro:
   - melhorias no predictor DRL em runtime;
   - trace, warmup, estabilidade e leitura correta do dashboard;
   - ajuste de oscilacao do simulador do App2 sem mexer na politica do `rApp`.
+- `docs/ML_RUNTIME_MELHORIAS.md`
+  - correcoes causais no predictor de ML;
+  - retreino com split temporal;
+  - poda de features enviesadas;
+  - validacao em runtime saudavel sem bloqueio espurio.
 
 ## Visão Geral
 

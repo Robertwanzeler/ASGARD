@@ -31,7 +31,7 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (
@@ -50,6 +50,52 @@ except ImportError:
 
 DEFAULT_DB = "/tmp/rapp_data_lake.db"
 DEFAULT_OUTPUT = "./models"
+TEMPORAL_TEST_FRACTION = 0.2
+
+
+def temporal_train_test_split(X, y, test_fraction=TEMPORAL_TEST_FRACTION):
+    """Temporal holdout split preserving chronology."""
+    n_samples = len(X)
+    if n_samples < 10:
+        raise ValueError(f"Dataset muito pequeno para split temporal: {n_samples}")
+
+    split_idx = max(int(n_samples * (1 - test_fraction)), 1)
+    split_idx = min(split_idx, n_samples - 1)
+
+    return (
+        X[:split_idx],
+        X[split_idx:],
+        y[:split_idx],
+        y[split_idx:],
+    )
+
+
+def temporal_cv_accuracy(X_train, y_train, n_splits=5):
+    """Time-series cross-validation with per-fold scaling."""
+    if len(X_train) < 20:
+        return float("nan"), float("nan")
+
+    splitter = TimeSeriesSplit(n_splits=min(n_splits, max(2, len(X_train) // 20)))
+    scores = []
+
+    for train_idx, val_idx in splitter.split(X_train):
+        scaler = StandardScaler()
+        X_fold_train = scaler.fit_transform(X_train[train_idx])
+        X_fold_val = scaler.transform(X_train[val_idx])
+
+        model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=10,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=-1
+        )
+        model.fit(X_fold_train, y_train[train_idx])
+        scores.append(accuracy_score(y_train[val_idx], model.predict(X_fold_val)))
+
+    return float(np.mean(scores)), float(np.std(scores))
 
 
 def load_data(db_path, hours=None):
@@ -121,11 +167,10 @@ def engineer_features(df):
     df['hour'] = df['datetime'].dt.hour
     df['day_of_week'] = df['datetime'].dt.dayofweek
 
-    # Cyclical encoding for hour
+    # Time features remain available for analysis, but are not fed to the model
+    # to avoid clock-driven bias.
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-
-    # Time-based features
     df['is_night'] = ((df['hour'] >= 22) | (df['hour'] < 6)).astype(int)
     df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
 
@@ -169,11 +214,6 @@ def engineer_features(df):
     else:
         df['tx_rx_ratio'] = 0.0
     
-    # Energy history (proporção de decisões BLOCKED nos últimos registros)
-    # Usar decisão anterior como proxy para energy_history
-    df['energy_history'] = (df['decision'] == 'BLOCKED').astype(float)
-    df['energy_history'] = df['energy_history'].rolling(window=5, min_periods=1).mean()
-    
     # Features de TREND (3) - NOVAS para ML PREDITIVA
     # cvar_trend: diferença entre CVaR atual e 5 ciclos atrás
     df['cvar_trend'] = df['cvar_ms'].diff(5).fillna(0)
@@ -191,11 +231,22 @@ def engineer_features(df):
     # LAG FEATURES - NOVAS para ML PREDITIVA (predizer próximo ciclo)
     # ============================================================
     # Lag features - últimos 5 ciclos (t-1, t-2, ..., t-5)
-    for lag in range(1, 6):
-        df[f'cvar_lag_{lag}'] = df['cvar_ms'].shift(lag)
-        df[f'throughput_lag_{lag}'] = df['throughput_mbps'].shift(lag) if 'throughput_mbps' in df.columns else 0
-        df[f'packet_loss_lag_{lag}'] = df['packet_loss_rate'].shift(lag)
-        df[f'latency_lag_{lag}'] = df['avg_latency_ms'].shift(lag)
+    df['cvar_lag_1'] = df['cvar_ms'].shift(1).fillna(df['cvar_ms'])
+    df['cvar_lag_2'] = df['cvar_ms'].shift(2).fillna(df['cvar_lag_1'])
+    df['cvar_lag_3'] = df['cvar_ms'].shift(3).fillna(df['cvar_lag_2'])
+    df['cvar_lag_4'] = df['cvar_ms'].shift(4).fillna(df['cvar_lag_3'])
+    df['cvar_lag_5'] = df['cvar_ms'].shift(5).fillna(df['cvar_lag_4'])
+
+    df['throughput_lag_1'] = df['throughput_mbps'].shift(1).fillna(df['throughput_mbps'])
+    df['throughput_lag_2'] = df['throughput_mbps'].shift(2).fillna(df['throughput_lag_1'])
+    df['throughput_lag_3'] = df['throughput_mbps'].shift(3).fillna(df['throughput_lag_2'])
+
+    df['packet_loss_lag_1'] = df['packet_loss_rate'].shift(1).fillna(df['packet_loss_rate'])
+    df['packet_loss_lag_2'] = df['packet_loss_rate'].shift(2).fillna(df['packet_loss_lag_1'])
+    df['packet_loss_lag_3'] = df['packet_loss_rate'].shift(3).fillna(df['packet_loss_lag_2'])
+
+    df['latency_lag_1'] = df['avg_latency_ms'].shift(1).fillna(df['avg_latency_ms'])
+    df['latency_lag_2'] = df['avg_latency_ms'].shift(2).fillna(df['latency_lag_1'])
     
     # Rolling features (média dos últimos N ciclos)
     df['cvar_rolling_3'] = df['cvar_ms'].rolling(3, min_periods=1).mean()
@@ -207,6 +258,16 @@ def engineer_features(df):
     
     # Velocidade de mudança (diferença da diferença)
     df['latency_acceleration'] = df['latency_diff'].diff().fillna(0)
+    
+    # NOVAS FEATURES PREDITIVAS (do rapp_ml_predictor.py)
+    # jitter_trend: tendência do jitter (piorando ou melhorando)
+    df['jitter_trend'] = df['jitter_ms'].diff().fillna(0)
+    
+    # cvar_momentum: aceleração da aceleração (momento de mudança)
+    df['cvar_momentum'] = df['cvar_acceleration'].diff().fillna(0)
+    
+    # critical_ue_ratio: proporção de UEs críticos (indica carga crítica)
+    df['critical_ue_ratio'] = df['total_critical_ues'] / df['total_active_ues'].clip(lower=1)
 
     # CVaR zones
     df['cvar_zone'] = pd.cut(
@@ -216,7 +277,7 @@ def engineer_features(df):
     ).astype(int)
 
     feature_cols = [
-        # Features originais (17)
+        # Features originais (16) - REMOVIDO sim_time_s (não é causal!)
         'cvar_ms',
         'cvar_diff',
         'cvar_rolling_mean',
@@ -225,22 +286,15 @@ def engineer_features(df):
         'avg_latency_ms',
         'variance_ms2',
         'total_active_cameras',
-        'total_active_ues',
         'camera_ratio',
         'total_critical_ues',
-        'hour_sin',
-        'hour_cos',
-        'is_night',
-        'is_weekend',
         'cvar_zone',
-        'sim_time_s',
         # Features de rede (5)
         'throughput_mbps',
         'packet_loss_rate',
         'jitter_ms',
         'tx_rx_ratio',
-        'energy_history',
-        # Features de TREND (3) - NOVAS
+        # Features de TREND (3) - CAUSAIS
         'cvar_trend',
         'throughput_trend',
         'packet_loss_trend',
@@ -249,9 +303,11 @@ def engineer_features(df):
         'throughput_lag_1', 'throughput_lag_2', 'throughput_lag_3',
         'packet_loss_lag_1', 'packet_loss_lag_2', 'packet_loss_lag_3',
         'latency_lag_1', 'latency_lag_2',
-        # Rolling e Acceleration (5)
+        # Rolling e Acceleration (8) - CAUSAIS
         'cvar_rolling_3', 'cvar_rolling_10', 'cvar_rolling_std_3',
         'cvar_acceleration', 'latency_acceleration',
+        # NOVAS FEATURES PREDITIVAS (3) - CAUSAIS
+        'jitter_trend', 'cvar_momentum', 'critical_ue_ratio',
     ]
 
     print(f"    → {len(feature_cols)} features criadas")
@@ -271,10 +327,8 @@ def train_classifier(df, feature_cols, output_dir):
     le = LabelEncoder()
     y_encoded = le.fit_transform(y)
 
-    # Split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
-    )
+    # Temporal split
+    X_train, X_test, y_train, y_test = temporal_train_test_split(X, y_encoded)
 
     # Scale features
     scaler = StandardScaler()
@@ -301,9 +355,9 @@ def train_classifier(df, feature_cols, output_dir):
     print(f"    Classification Report:")
     print(classification_report(y_test, y_pred_rf, target_names=le.classes_))
 
-    # Cross-validation
-    cv_scores = cross_val_score(rf, X_train_scaled, y_train, cv=5, scoring='accuracy')
-    print(f"    Cross-validation: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+    # Time-series cross-validation
+    cv_mean, cv_std = temporal_cv_accuracy(X_train, y_train, n_splits=5)
+    print(f"    Cross-validation temporal: {cv_mean:.4f} ± {cv_std:.4f}")
 
     # Save
     joblib.dump(rf, os.path.join(output_dir, 'rf_classifier.joblib'))
@@ -312,11 +366,12 @@ def train_classifier(df, feature_cols, output_dir):
 
     results = {
         'rf_accuracy': rf_accuracy,
-        'cv_mean': cv_scores.mean(),
-        'cv_std': cv_scores.std(),
+        'cv_mean': cv_mean,
+        'cv_std': cv_std,
         'feature_importance': dict(zip(feature_cols, rf.feature_importances_.tolist())),
         'confusion_matrix': confusion_matrix(y_test, y_pred_rf).tolist(),
-        'classes': le.classes_.tolist()
+        'classes': le.classes_.tolist(),
+        'split_mode': 'temporal_holdout'
     }
 
     # XGBoost if available
@@ -350,10 +405,8 @@ def train_regressor(df, feature_cols, output_dir):
     X = df[feature_cols].values
     y = df['cvar_next'].values  # <-- PREDITIVO: próximo ciclo
 
-    # Split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+    # Temporal split
+    X_train, X_test, y_train, y_test = temporal_train_test_split(X, y)
 
     # Scale
     scaler = StandardScaler()
