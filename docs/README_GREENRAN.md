@@ -6,11 +6,30 @@ Data: 2026-03-20
 
 ## Documentos Prioritarios
 
-Para o estado atual do GreenRAN, estes documentos sao a referencia principal:
+Para a trilha `article00`, os documentos principais agora foram consolidados em:
 
+- `docs/ARTICLE00_RESUMO_FINAL.md`
+  - resumo executivo;
+  - melhor cenario geral;
+  - melhor cenario estrito em `threshold 0.5`;
+  - comparacao final com o artigo;
+  - localizacao dos graficos e artefatos.
+- `docs/ARTICLE00_METODO_E_EXPERIMENTOS.md`
+  - pipeline tecnico;
+  - principais mudancas do metodo;
+  - protocolo experimental consolidado;
+  - organizacao das pastas de graficos;
+  - limites e status experimental.
+
+Documentacao historica/complementar:
+
+- `docs/ARTICLE00_AUDITORIA_RESULTADOS.md`
+- `docs/ARTICLE00_DATASET_AUDITORIA.md`
+- `docs/ARTICLE00_VEREDITO_CONFORMIDADE.md`
+- `docs/ARTICLE00_PROTOCOLO_EXPERIMENTAL.md`
+- `docs/ARTICLE00_DESENHO_TECNICO.md`
+- `docs/ARTICLE00_COMPARISON_FIGURES.md`
 - `docs/ARTICLE00_EXPERIMENTOS.md`
-  - protocolo de coleta alinhado ao artigo00;
-  - execucao automatica de cenarios com `--auto-switch`.
 - `docs/CONFLICT_DATASET_PIPELINE.md`
   - pipeline de exportacao do dataset de conflitos e grafo operacional.
 - `docs/ESTUDO_ARTIGOS_BASE.md`
