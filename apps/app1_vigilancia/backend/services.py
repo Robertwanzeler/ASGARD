@@ -96,6 +96,9 @@ def _extract_camera_network_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
 class VigilanceEventStore:
     """Persistência simples de eventos da App1."""
 
+    MAX_EVENTS = 5000
+    PRUNE_TO_EVENTS = 4000
+
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
         self.app_state_dir = self.state_dir / "app1_vigilancia"
@@ -103,6 +106,8 @@ class VigilanceEventStore:
         self.app_state_dir.mkdir(parents=True, exist_ok=True)
         if not self.events_file.exists():
             self._write_events([])
+        else:
+            self._prune_if_needed()
 
     def _read_events(self) -> List[Dict[str, Any]]:
         return _safe_read_json(self.events_file, [])
@@ -110,6 +115,19 @@ class VigilanceEventStore:
     def _write_events(self, events: List[Dict[str, Any]]) -> None:
         with open(self.events_file, "w", encoding="utf-8") as f:
             json.dump(events, f, indent=2)
+
+    def _prune_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if len(events) <= self.MAX_EVENTS:
+            return events
+        events_sorted = sorted(events, key=lambda item: item.get("timestamp", 0), reverse=True)
+        pruned = events_sorted[:self.PRUNE_TO_EVENTS]
+        return sorted(pruned, key=lambda item: item.get("timestamp", 0))
+
+    def _prune_if_needed(self) -> None:
+        events = self._read_events()
+        pruned = self._prune_events(events)
+        if len(pruned) != len(events):
+            self._write_events(pruned)
 
     def list_events(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         events = sorted(self._read_events(), key=lambda item: item.get("timestamp", 0), reverse=True)
@@ -138,7 +156,7 @@ class VigilanceEventStore:
             "network_context": network_context,
         }
         events.append(event)
-        self._write_events(events)
+        self._write_events(self._prune_events(events))
         return event
 
     def reveal_face(self, event_id: str, reason: str = "security_validation") -> Optional[Dict[str, Any]]:
@@ -156,7 +174,7 @@ class VigilanceEventStore:
             break
 
         if updated is not None:
-            self._write_events(events)
+            self._write_events(self._prune_events(events))
         return updated
 
 
