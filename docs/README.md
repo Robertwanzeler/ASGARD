@@ -4,6 +4,14 @@
 
 Para o estado atual do projeto, estes documentos devem ser lidos primeiro:
 
+- `docs/NS3_ARTICLE00_TEMPORAL_PIPELINE.md`
+  - fluxo oficial para rodar a metodologia temporal do `article00` sobre dados coletados do `ns-3`;
+  - wrapper unico de simulacao + coleta + conversao + treino temporal;
+  - artefatos finais em `runs/ns3_article00/<scenario>/`.
+- `docs/APP1_APP2_ANALISE.md`
+  - comparacao objetiva entre `App1-Vigilancia` e `App2-Monitoramento`;
+  - grau de maturidade de cada app;
+  - integracao com GreenRAN e papel atual no `rApp`.
 - `docs/CONFLICT_DATASET_PIPELINE.md`
   - exportacao do dataset de conflitos;
   - aprendizado da matriz operacional;

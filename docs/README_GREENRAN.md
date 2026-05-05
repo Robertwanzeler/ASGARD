@@ -21,6 +21,21 @@ Para a trilha `article00`, os documentos principais agora foram consolidados em:
   - organizacao das pastas de graficos;
   - limites e status experimental.
 
+Para a trilha temporal equivalente sobre `ns-3`, o documento principal agora e:
+
+- `docs/NS3_ARTICLE00_TEMPORAL_PIPELINE.md`
+  - fluxo oficial para reproduzir a metodologia temporal do `article00` em dados coletados do runtime GreenRAN;
+  - wrapper unico para subida do runtime, coleta, conversao e treino;
+  - localizacao dos artefatos em `runs/ns3_article00/`.
+
+Para a comparacao funcional dos aplicativos principais, o documento principal agora e:
+
+- `docs/APP1_APP2_ANALISE.md`
+  - papel do `App1-Vigilancia` e do `App2-Monitoramento`;
+  - diferencas de maturidade;
+  - integracao com GreenRAN e `ns-3`;
+  - limites e proximos passos.
+
 Documentacao historica/complementar:
 
 - `docs/ARTICLE00_AUDITORIA_RESULTADOS.md`
