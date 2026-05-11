@@ -39,7 +39,9 @@ htmlcov/
 
 # Runtime state and generated outputs
 /results/
+!/runs/.gitkeep
 /runs/**
+/runs/**/state_snapshot/
 /charts/*.csv
 /charts/*.png
 /models/*.joblib
