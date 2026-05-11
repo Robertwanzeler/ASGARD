@@ -58,3 +58,6 @@ htmlcov/
 !requirements-dev.txt
 !README*.txt
 !models/*.txt
+carla/
+.venv-graphsage/
+.venv/
