@@ -1,0 +1,22 @@
+{
+  "schema": "greenran.article00_figure_manifest.v1",
+  "generated_at": "2026-05-04T14:09:21.546741+00:00",
+  "training_root": "runs/article00_threshold_09/f/training",
+  "training_summaries": [
+    "runs/article00_threshold_09/f/training/seed_42/training_summary.json",
+    "runs/article00_threshold_09/f/training/seed_43/training_summary.json",
+    "runs/article00_threshold_09/f/training/seed_44/training_summary.json",
+    "runs/article00_threshold_09/f/training/seed_45/training_summary.json",
+    "runs/article00_threshold_09/f/training/seed_46/training_summary.json",
+    "runs/article00_threshold_09/f/training/seed_47/training_summary.json"
+  ],
+  "expected_figures": [
+    "reconstruction_f1_vs_epochs.png",
+    "reconstruction_f1_vs_threshold.png",
+    "implicit_f1_vs_epochs.png",
+    "implicit_f1_vs_threshold.png",
+    "indirect_f1_vs_epochs.png",
+    "indirect_f1_vs_threshold.png"
+  ],
+  "status": "experimental_temporal_graphsage"
+}

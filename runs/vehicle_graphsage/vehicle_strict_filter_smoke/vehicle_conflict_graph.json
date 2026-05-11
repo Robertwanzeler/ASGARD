@@ -1,0 +1,14 @@
+{
+  "schema": "greenran.conflict_graph.v1",
+  "generated_at": 1778447989,
+  "window_events": 0,
+  "stats": {
+    "total_events": 0,
+    "by_conflict_type": {},
+    "by_service": {},
+    "by_kpi": {},
+    "by_mitigation": {}
+  },
+  "nodes": [],
+  "edges": []
+}

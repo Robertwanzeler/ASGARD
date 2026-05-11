@@ -1,0 +1,14 @@
+{
+  "schema": "greenran.article00_armd_comparison_figures.v1",
+  "reference_json": "/home/robert/orange_nuclear/config/article00_reference_fixed.json",
+  "armd_json": "config/armd_greenran_series.seed43_unified.json",
+  "generated": {
+    "reconstruction_threshold_0_5": "runs/article00/comparison_figures_seed43_unified/comparison_reconstruction_threshold_0_5.png",
+    "reconstruction_dataset_450_thresholds": "runs/article00/comparison_figures_seed43_unified/comparison_reconstruction_dataset_450_thresholds.png",
+    "indirect_threshold_0_5": "runs/article00/comparison_figures_seed43_unified/comparison_indirect_threshold_0_5.png",
+    "indirect_dataset_450_thresholds": "runs/article00/comparison_figures_seed43_unified/comparison_indirect_dataset_450_thresholds.png",
+    "implicit_threshold_0_5": "runs/article00/comparison_figures_seed43_unified/comparison_implicit_threshold_0_5.png",
+    "implicit_dataset_450_thresholds": "runs/article00/comparison_figures_seed43_unified/comparison_implicit_dataset_450_thresholds.png"
+  },
+  "note": "Reference curves are frozen in article00_reference_fixed.json; update only armd_greenran_series.json."
+}

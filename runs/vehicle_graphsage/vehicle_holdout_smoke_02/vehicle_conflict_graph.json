@@ -1,0 +1,265 @@
+{
+  "schema": "greenran.conflict_graph.v1",
+  "generated_at": 1778447416,
+  "window_events": 1403,
+  "stats": {
+    "total_events": 1403,
+    "by_conflict_type": {
+      "implicit": 924,
+      "indirect": 479
+    },
+    "by_service": {
+      "App1-Vigilancia": 1403
+    },
+    "by_kpi": {
+      "camera_throughput_mbps": 924,
+      "camera_latency_ms": 479
+    },
+    "by_mitigation": {
+      "FULL_POWER": 554,
+      "FULL_POWER_GUARD": 849
+    }
+  },
+  "nodes": [
+    {
+      "id": "rApp-CVaR/ML-Arbiter",
+      "label": "rApp-CVaR/ML-Arbiter",
+      "type": "agent",
+      "event_count": 924
+    },
+    {
+      "id": "xApp1-RANSlicer",
+      "label": "xApp1-RANSlicer",
+      "type": "agent",
+      "event_count": 1403
+    },
+    {
+      "id": "xApp2-EnergySaver",
+      "label": "xApp2-EnergySaver",
+      "type": "agent",
+      "event_count": 479
+    },
+    {
+      "id": "rApp-ResourceOptimizer",
+      "label": "rApp-ResourceOptimizer",
+      "type": "arbiter",
+      "event_count": 1403
+    },
+    {
+      "id": "camera_latency_ms",
+      "label": "camera_latency_ms",
+      "type": "kpi",
+      "event_count": 479
+    },
+    {
+      "id": "camera_throughput_mbps",
+      "label": "camera_throughput_mbps",
+      "type": "kpi",
+      "event_count": 924
+    },
+    {
+      "id": "FULL_POWER",
+      "label": "FULL_POWER",
+      "type": "mitigation",
+      "event_count": 554
+    },
+    {
+      "id": "FULL_POWER_GUARD",
+      "label": "FULL_POWER_GUARD",
+      "type": "mitigation",
+      "event_count": 849
+    },
+    {
+      "id": "energy_policy",
+      "label": "energy_policy",
+      "type": "parameter",
+      "event_count": 479
+    },
+    {
+      "id": "global_health_policy",
+      "label": "global_health_policy",
+      "type": "parameter",
+      "event_count": 924
+    },
+    {
+      "id": "App1-Vigilancia",
+      "label": "App1-Vigilancia",
+      "type": "service",
+      "event_count": 1403
+    }
+  ],
+  "edges": [
+    {
+      "source": "FULL_POWER",
+      "target": "App1-Vigilancia",
+      "relation": "protects",
+      "weight": 554,
+      "conflict_types": {
+        "implicit": 75,
+        "indirect": 479
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 75,
+        "camera_latency_ms": 479
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "App1-Vigilancia",
+      "relation": "protects",
+      "weight": 849,
+      "conflict_types": {
+        "implicit": 849
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 849
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "App1-Vigilancia",
+      "relation": "belongs_to",
+      "weight": 479,
+      "conflict_types": {
+        "indirect": 479
+      },
+      "affected_kpis": {
+        "camera_latency_ms": 479
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 479,
+      "conflict_types": {
+        "indirect": 479
+      },
+      "affected_kpis": {
+        "camera_latency_ms": 479
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "App1-Vigilancia",
+      "relation": "belongs_to",
+      "weight": 924,
+      "conflict_types": {
+        "implicit": 924
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 924
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 924,
+      "conflict_types": {
+        "implicit": 924
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 924
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "energy_policy",
+      "target": "camera_latency_ms",
+      "relation": "affects",
+      "weight": 479,
+      "conflict_types": {
+        "indirect": 479
+      },
+      "affected_kpis": {
+        "camera_latency_ms": 479
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "global_health_policy",
+      "target": "camera_throughput_mbps",
+      "relation": "affects",
+      "weight": 924,
+      "conflict_types": {
+        "implicit": 924
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 924
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "rApp-CVaR/ML-Arbiter",
+      "target": "global_health_policy",
+      "relation": "controls",
+      "weight": 924,
+      "conflict_types": {
+        "implicit": 924
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 924
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER",
+      "relation": "mitigates",
+      "weight": 554,
+      "conflict_types": {
+        "implicit": 75,
+        "indirect": 479
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 75,
+        "camera_latency_ms": 479
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER_GUARD",
+      "relation": "mitigates",
+      "weight": 849,
+      "conflict_types": {
+        "implicit": 849
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 849
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "energy_policy",
+      "relation": "controls",
+      "weight": 479,
+      "conflict_types": {
+        "indirect": 479
+      },
+      "affected_kpis": {
+        "camera_latency_ms": 479
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    }
+  ]
+}

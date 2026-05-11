@@ -1,0 +1,12 @@
+GreenRAN ML + DRL Training
+Started: 2026-05-09T00:48:16-03:00
+DB: /tmp/rapp_data_lake.db
+ML hours: 24
+SBiLSTM epochs: 600
+SBiLSTM prediction window: 100
+A3C episodes: 10000
+A3C workers: 8
+
+[1/4] Training ML...
+  ML done -> /home/robert/orange_nuclear/runs/training/20260509_004816_ml_drl/ml_train.log
+[2/4] Training SBiLSTM...

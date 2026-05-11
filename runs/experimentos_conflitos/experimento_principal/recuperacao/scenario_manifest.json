@@ -1,0 +1,10 @@
+{
+  "slug": "recuperacao",
+  "title": "Recuperação e histerese",
+  "goal": "observar retorno gradual do sistema após estado ruim",
+  "instructions": [
+    "comece a rodada com App1 ou App2 degradado",
+    "depois recupere para estado saudável durante a janela",
+    "isso ajuda a medir persistência, guarda e estabilização"
+  ]
+}

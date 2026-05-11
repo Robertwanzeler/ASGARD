@@ -1,0 +1,61 @@
+============================================================
+  GreenRAN ML Training Pipeline
+  Mode: RETRAIN (last 24h)
+============================================================
+
+[1/6] Carregando dados de /tmp/rapp_data_lake.db...
+    → Filtrando últimas 24 horas
+    → 7350 registros carregados
+
+    Distribuição de classes:
+      ALLOWED: 4806 (65.4%)
+      BLOCKED: 1401 (19.1%)
+      CONDITIONAL: 1143 (15.6%)
+[2/6] Feature Engineering...
+    → 39 features criadas
+
+    → Target preditivo: decision_next (predizer próximo ciclo)
+    → Registros após shift: 7349
+[3/6] Treinando classificador de decisões PREDITIVO...
+       → Target: decision_next (predizer próximo ciclo)
+    Random Forest Accuracy: 0.9769
+    Classification Report:
+              precision    recall  f1-score   support
+
+     ALLOWED       0.99      1.00      1.00       950
+     BLOCKED       0.96      0.97      0.96       377
+ CONDITIONAL       0.91      0.85      0.88       143
+
+    accuracy                           0.98      1470
+   macro avg       0.95      0.94      0.95      1470
+weighted avg       0.98      0.98      0.98      1470
+
+    Cross-validation temporal: 0.8396 ± 0.1968
+    Treinando XGBoost...
+    XGBoost Accuracy: 0.9741
+[4/6] Treinando regressor de CVaR PREDITIVO...
+       → Target: cvar_next (predizer CVaR do próximo ciclo)
+    MAE: 1.20 ms
+    RMSE: 11.31 ms
+    R²: 0.9890
+[5/6] Salvando relatório...
+    → Relatório salvo em /home/robert/orange_nuclear/models/training_report.txt
+[6/6] Gerando gráfico de feature importance...
+    → Gráfico salvo
+
+============================================================
+  TREINAMENTO CONCLUÍDO
+============================================================
+  Modelos salvos em: /home/robert/orange_nuclear/models/
+
+  Arquivos gerados:
+    feature_importance.png (148.2 KB)
+    label_encoder.joblib (0.5 KB)
+    reg_scaler.joblib (1.5 KB)
+    rf_classifier.joblib (1548.1 KB)
+    rf_regressor.joblib (1395.8 KB)
+    rf_scaler.joblib (1.5 KB)
+    training_report.json (3.2 KB)
+    training_report.txt (0.8 KB)
+    xgb_classifier.joblib (578.8 KB)
+

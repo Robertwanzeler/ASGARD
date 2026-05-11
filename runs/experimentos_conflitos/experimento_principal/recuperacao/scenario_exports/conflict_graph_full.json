@@ -1,0 +1,287 @@
+{
+  "schema": "greenran.conflict_graph.v1",
+  "generated_at": 1777013099,
+  "window_events": 455,
+  "stats": {
+    "total_events": 455,
+    "by_conflict_type": {
+      "implicit": 372,
+      "indirect": 83
+    },
+    "by_service": {
+      "App1-Vigilancia": 452,
+      "App2-Monitoramento": 3
+    },
+    "by_kpi": {
+      "camera_throughput_mbps": 452,
+      "app2_connected_ratio": 3
+    },
+    "by_mitigation": {
+      "FULL_POWER": 452,
+      "FULL_POWER_GUARD": 3
+    }
+  },
+  "nodes": [
+    {
+      "id": "App2-Monitoramento",
+      "label": "App2-Monitoramento",
+      "type": "agent",
+      "event_count": 6
+    },
+    {
+      "id": "rApp-CVaR/ML-Arbiter",
+      "label": "rApp-CVaR/ML-Arbiter",
+      "type": "agent",
+      "event_count": 372
+    },
+    {
+      "id": "xApp1-RANSlicer",
+      "label": "xApp1-RANSlicer",
+      "type": "agent",
+      "event_count": 452
+    },
+    {
+      "id": "xApp2-EnergySaver",
+      "label": "xApp2-EnergySaver",
+      "type": "agent",
+      "event_count": 83
+    },
+    {
+      "id": "rApp-ResourceOptimizer",
+      "label": "rApp-ResourceOptimizer",
+      "type": "arbiter",
+      "event_count": 455
+    },
+    {
+      "id": "app2_connected_ratio",
+      "label": "app2_connected_ratio",
+      "type": "kpi",
+      "event_count": 3
+    },
+    {
+      "id": "camera_throughput_mbps",
+      "label": "camera_throughput_mbps",
+      "type": "kpi",
+      "event_count": 452
+    },
+    {
+      "id": "FULL_POWER",
+      "label": "FULL_POWER",
+      "type": "mitigation",
+      "event_count": 452
+    },
+    {
+      "id": "FULL_POWER_GUARD",
+      "label": "FULL_POWER_GUARD",
+      "type": "mitigation",
+      "event_count": 3
+    },
+    {
+      "id": "energy_policy",
+      "label": "energy_policy",
+      "type": "parameter",
+      "event_count": 83
+    },
+    {
+      "id": "global_health_policy",
+      "label": "global_health_policy",
+      "type": "parameter",
+      "event_count": 372
+    },
+    {
+      "id": "App1-Vigilancia",
+      "label": "App1-Vigilancia",
+      "type": "service",
+      "event_count": 452
+    }
+  ],
+  "edges": [
+    {
+      "source": "FULL_POWER",
+      "target": "App1-Vigilancia",
+      "relation": "protects",
+      "weight": 452,
+      "conflict_types": {
+        "implicit": 372,
+        "indirect": 80
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 452
+      },
+      "latest_timestamp": "1777013038",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "App2-Monitoramento",
+      "relation": "protects",
+      "weight": 3,
+      "conflict_types": {
+        "indirect": 3
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 3
+      },
+      "latest_timestamp": "1777012922",
+      "latest_reason": "APP2 mMTC: sensores conectados 88% < 90% - margem protegida"
+    },
+    {
+      "source": "app2_connected_ratio",
+      "target": "App2-Monitoramento",
+      "relation": "belongs_to",
+      "weight": 3,
+      "conflict_types": {
+        "indirect": 3
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 3
+      },
+      "latest_timestamp": "1777012922",
+      "latest_reason": "APP2 mMTC: sensores conectados 88% < 90% - margem protegida"
+    },
+    {
+      "source": "app2_connected_ratio",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 3,
+      "conflict_types": {
+        "indirect": 3
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 3
+      },
+      "latest_timestamp": "1777012922",
+      "latest_reason": "APP2 mMTC: sensores conectados 88% < 90% - margem protegida"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "App1-Vigilancia",
+      "relation": "belongs_to",
+      "weight": 452,
+      "conflict_types": {
+        "implicit": 372,
+        "indirect": 80
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 452
+      },
+      "latest_timestamp": "1777013038",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 452,
+      "conflict_types": {
+        "implicit": 372,
+        "indirect": 80
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 452
+      },
+      "latest_timestamp": "1777013038",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "energy_policy",
+      "target": "app2_connected_ratio",
+      "relation": "affects",
+      "weight": 3,
+      "conflict_types": {
+        "indirect": 3
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 3
+      },
+      "latest_timestamp": "1777012922",
+      "latest_reason": "APP2 mMTC: sensores conectados 88% < 90% - margem protegida"
+    },
+    {
+      "source": "energy_policy",
+      "target": "camera_throughput_mbps",
+      "relation": "affects",
+      "weight": 80,
+      "conflict_types": {
+        "indirect": 80
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 80
+      },
+      "latest_timestamp": "1777013038",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "global_health_policy",
+      "target": "camera_throughput_mbps",
+      "relation": "affects",
+      "weight": 372,
+      "conflict_types": {
+        "implicit": 372
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 372
+      },
+      "latest_timestamp": "1777012194",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "rApp-CVaR/ML-Arbiter",
+      "target": "global_health_policy",
+      "relation": "controls",
+      "weight": 372,
+      "conflict_types": {
+        "implicit": 372
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 372
+      },
+      "latest_timestamp": "1777012194",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER",
+      "relation": "mitigates",
+      "weight": 452,
+      "conflict_types": {
+        "implicit": 372,
+        "indirect": 80
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 452
+      },
+      "latest_timestamp": "1777013038",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER_GUARD",
+      "relation": "mitigates",
+      "weight": 3,
+      "conflict_types": {
+        "indirect": 3
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 3
+      },
+      "latest_timestamp": "1777012922",
+      "latest_reason": "APP2 mMTC: sensores conectados 88% < 90% - margem protegida"
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "energy_policy",
+      "relation": "controls",
+      "weight": 83,
+      "conflict_types": {
+        "indirect": 83
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 80,
+        "app2_connected_ratio": 3
+      },
+      "latest_timestamp": "1777013038",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    }
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "schema": "greenran.article00_dataset_metadata.v1",
+  "generated_at": "2026-04-30T00:54:49.205439+00:00",
+  "seed": 42,
+  "samples": 450,
+  "smoothing": 0.82,
+  "feature_order": [
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+    "P5",
+    "P6",
+    "P7",
+    "K1",
+    "K2",
+    "K3",
+    "K4"
+  ],
+  "parameter_ranges": {
+    "P1": [
+      0.0,
+      300.0
+    ],
+    "P2": [
+      0.0,
+      300.0
+    ],
+    "P3": [
+      0.0,
+      3.0
+    ],
+    "P4": [
+      0.0,
+      3.0
+    ],
+    "P5": [
+      0.0,
+      3.0
+    ],
+    "P6": [
+      0.0,
+      3.0
+    ],
+    "P7": [
+      0.0,
+      3.0
+    ]
+  },
+  "known_app_parameter_edges": {
+    "A1": [
+      "P1",
+      "P2"
+    ],
+    "A2": [
+      "P2",
+      "P3"
+    ],
+    "A3": [
+      "P4",
+      "P5"
+    ],
+    "A4": [
+      "P6",
+      "P7"
+    ]
+  },
+  "known_app_kpi_edges": {
+    "A1": [
+      "K1"
+    ],
+    "A2": [
+      "K1",
+      "K2"
+    ],
+    "A3": [
+      "K2",
+      "K3"
+    ],
+    "A4": [
+      "K3",
+      "K4"
+    ]
+  },
+  "parameter_kpi_edges": [
+    [
+      "P1",
+      "K1"
+    ],
+    [
+      "P2",
+      "K1"
+    ],
+    [
+      "P1",
+      "K2"
+    ],
+    [
+      "P3",
+      "K2"
+    ],
+    [
+      "P4",
+      "K3"
+    ],
+    [
+      "P5",
+      "K3"
+    ],
+    [
+      "P6",
+      "K4"
+    ],
+    [
+      "P7",
+      "K4"
+    ]
+  ],
+  "timeseries_path": "runs/article00_sweeps/expd_capacity/c1/datasets/seed_42/timeseries.csv",
+  "graph_reference_path": "runs/article00_sweeps/expd_capacity/c1/datasets/seed_42/article00_graph_reference.json",
+  "temporal_graph_path": "runs/article00_sweeps/expd_capacity/c1/datasets/seed_42/article00_temporal_graph.json",
+  "notes": [
+    "Synthetic article00 experimental dataset.",
+    "Temporal graph is exported separately for the isolated article00 trainer."
+  ]
+}

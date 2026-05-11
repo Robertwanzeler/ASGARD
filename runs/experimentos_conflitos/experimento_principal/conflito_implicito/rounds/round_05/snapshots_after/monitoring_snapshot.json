@@ -1,0 +1,40 @@
+{
+  "timestamp": "2026-04-24T02:00:53.247634",
+  "sensors": {
+    "total": 17,
+    "active": 17,
+    "connected": 17,
+    "error": 0,
+    "low_battery": 0,
+    "connectivity_modes": [
+      "5g_native",
+      "5g_redcap",
+      "lora_fwa",
+      "ntn_gateway"
+    ],
+    "gateways": [
+      "GW-5G-01",
+      "GW-5G-02",
+      "GW-LORA-01",
+      "GW-NTN-01"
+    ]
+  },
+  "readings": {
+    "avg_temperature_c": 22.34,
+    "avg_humidity_percent": 71.86,
+    "avg_soil_conductivity": 1.83,
+    "avg_battery_percent": 75.84,
+    "avg_power_mw": 183.79
+  },
+  "network": {
+    "packet_loss_percent": 3.28,
+    "tx_packets": 203,
+    "rx_packets": 203,
+    "lost_packets": 0,
+    "avg_latency_ms": 184.05,
+    "avg_rssi_dbm": -88.98,
+    "network_utilization_percent": 39.8,
+    "delivery_success_percent": 100.0
+  },
+  "alerts": []
+}

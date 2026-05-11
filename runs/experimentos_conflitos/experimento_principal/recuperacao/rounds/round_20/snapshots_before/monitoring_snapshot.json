@@ -1,0 +1,45 @@
+{
+  "timestamp": "2026-04-24T03:06:53.912101",
+  "sensors": {
+    "total": 17,
+    "active": 17,
+    "connected": 17,
+    "error": 0,
+    "low_battery": 0,
+    "connectivity_modes": [
+      "5g_native",
+      "5g_redcap",
+      "lora_fwa",
+      "ntn_gateway"
+    ],
+    "gateways": [
+      "GW-5G-01",
+      "GW-5G-02",
+      "GW-LORA-01",
+      "GW-NTN-01"
+    ]
+  },
+  "readings": {
+    "avg_temperature_c": 32.94,
+    "avg_humidity_percent": 65.11,
+    "avg_soil_conductivity": 0.63,
+    "avg_battery_percent": 76.23,
+    "avg_power_mw": 185.0
+  },
+  "network": {
+    "packet_loss_percent": 3.17,
+    "tx_packets": 198,
+    "rx_packets": 198,
+    "lost_packets": 0,
+    "avg_latency_ms": 182.59,
+    "avg_rssi_dbm": -88.85,
+    "network_utilization_percent": 38.82,
+    "delivery_success_percent": 100.0
+  },
+  "alerts": [
+    {
+      "level": "warning",
+      "message": "Temperatura alta: 32.9°C"
+    }
+  ]
+}
