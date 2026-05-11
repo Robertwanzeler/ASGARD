@@ -47,3 +47,8 @@ O runner prefere `drlexp/.venv/bin/python` para o treino quando essa virtualenv 
 - `runs/`, `charts/`, parte de `models/` e snapshots locais devem ser tratados como artefatos gerados, não como código-fonte principal.
 - relatórios finais que valem versionamento devem ir para `reports/`, não para `runs/`.
 - a documentação operacional mais atual está em `docs/`, não na raiz.
+
+# Submodules (pushed as branches)
+flexric -> branches/flexric
+ns-O-RAN-flexric -> branches/ns-O-RAN-flexric
+
