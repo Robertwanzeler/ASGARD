@@ -29,7 +29,7 @@ DEFAULT_DATASET_PATH = Path("/tmp/greenran_conflict_dataset.csv")
 DEFAULT_GRAPH_PATH = Path("/tmp/greenran_conflict_graph.json")
 
 
-CONFLICT_QUERY = """
+BASE_CONFLICT_QUERY = """
 SELECT
     ce.timestamp,
     ce.datetime,
@@ -116,7 +116,8 @@ SELECT
         WHERE em.timestamp <= ce.timestamp
         ORDER BY em.timestamp DESC
         LIMIT 1
-    ) AS total_active_ues
+    ) AS total_active_ues,
+    {vehicle_selects}
 FROM conflict_events ce
 LEFT JOIN decisions_history dh ON dh.timestamp = ce.timestamp
 WHERE ce.timestamp >= ?
@@ -145,6 +146,12 @@ def parse_args():
     parser.add_argument("--dataset", default=str(DEFAULT_DATASET_PATH), help="CSV output path")
     parser.add_argument("--graph", default=str(DEFAULT_GRAPH_PATH), help="graph JSON output path")
     parser.add_argument("--limit", type=int, default=0, help="optional max rows from the newest window")
+    parser.add_argument(
+        "--focus",
+        choices=("all", "vehicle"),
+        default="all",
+        help="optional dataset focus; 'vehicle' keeps only App3/vehicular conflict rows",
+    )
     return parser.parse_args()
 
 
@@ -154,9 +161,112 @@ def open_db(db_path):
     return conn
 
 
+def table_columns(conn, table_name):
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {row[1] for row in rows}
+
+
+def build_vehicle_selects(ue_columns):
+    if "device_type" not in ue_columns:
+        return """
+    0 AS total_active_vehicles,
+    0 AS ego_vehicle_count,
+    0 AS vehicle_high_risk_count,
+    0 AS vehicle_medium_risk_count,
+    0 AS vehicle_degraded_autonomy_count,
+    NULL AS vehicle_max_latency_us,
+    0 AS vehicle_max_packet_loss_percent,
+    0 AS vehicle_avg_speed_mps
+"""
+
+    latest_vehicle_ts = """
+        (
+            SELECT MAX(um2.timestamp)
+            FROM ue_metrics um2
+            WHERE um2.timestamp <= ce.timestamp
+        )
+"""
+    vehicle_filter = f"um.timestamp = {latest_vehicle_ts}\n        AND um.device_type = 'vehicle'"
+
+    ego_filter = "AND um.vehicle_role = 'ego'" if "vehicle_role" in ue_columns else "AND 1 = 0"
+    high_risk_filter = (
+        "AND lower(coalesce(um.risk_state, '')) IN ('high', 'critical')" if "risk_state" in ue_columns else "AND 1 = 0"
+    )
+    medium_risk_filter = (
+        "AND lower(coalesce(um.risk_state, '')) IN ('medium', 'warning')" if "risk_state" in ue_columns else "AND 1 = 0"
+    )
+    degraded_filter = (
+        "AND lower(coalesce(um.autonomy_state, '')) NOT IN ('', 'normal', 'unknown')"
+        if "autonomy_state" in ue_columns
+        else "AND 1 = 0"
+    )
+    packet_loss_expr = "coalesce(um.packet_loss_percent, 0)" if "packet_loss_percent" in ue_columns else "0"
+    speed_expr = "coalesce(um.speed_mps, 0)" if "speed_mps" in ue_columns else "0"
+    latency_expr = (
+        "coalesce(um.latency_avg_us, um.latency_us)"
+        if "latency_avg_us" in ue_columns
+        else ("um.latency_us" if "latency_us" in ue_columns else "NULL")
+    )
+
+    return f"""
+    (
+        SELECT COUNT(*)
+        FROM ue_metrics um
+        WHERE {vehicle_filter}
+    ) AS total_active_vehicles,
+    (
+        SELECT COUNT(*)
+        FROM ue_metrics um
+        WHERE {vehicle_filter}
+        {ego_filter}
+    ) AS ego_vehicle_count,
+    (
+        SELECT COUNT(*)
+        FROM ue_metrics um
+        WHERE {vehicle_filter}
+        {high_risk_filter}
+    ) AS vehicle_high_risk_count,
+    (
+        SELECT COUNT(*)
+        FROM ue_metrics um
+        WHERE {vehicle_filter}
+        {medium_risk_filter}
+    ) AS vehicle_medium_risk_count,
+    (
+        SELECT COUNT(*)
+        FROM ue_metrics um
+        WHERE {vehicle_filter}
+        {degraded_filter}
+    ) AS vehicle_degraded_autonomy_count,
+    (
+        SELECT MAX({latency_expr})
+        FROM ue_metrics um
+        WHERE {vehicle_filter}
+    ) AS vehicle_max_latency_us,
+    (
+        SELECT MAX({packet_loss_expr})
+        FROM ue_metrics um
+        WHERE {vehicle_filter}
+    ) AS vehicle_max_packet_loss_percent,
+    (
+        SELECT AVG({speed_expr})
+        FROM ue_metrics um
+        WHERE {vehicle_filter}
+    ) AS vehicle_avg_speed_mps
+"""
+
+
+def build_conflict_query(conn):
+    ue_columns = table_columns(conn, "ue_metrics")
+    return BASE_CONFLICT_QUERY.format(vehicle_selects=build_vehicle_selects(ue_columns))
+
+
 def load_rows(conn, hours, limit, since_ts=0, until_ts=0, until_exclusive_ts=0):
     lower_bound = int(since_ts or (time.time() - hours * 3600))
-    query = CONFLICT_QUERY
+    query = build_conflict_query(conn)
     params = [lower_bound]
 
     if until_exclusive_ts:
@@ -202,11 +312,41 @@ def enrich_rows(rows):
         row["p95_ms"] = _us_to_ms(row.get("latency_p95_per_ue_us"))
         row["throughput_mbps"] = _kbps_to_mbps(row.get("throughput_kbps"))
         row["global_packet_loss_percent"] = _safe_float(row.get("global_packet_loss_rate"), 0.0) * 100.0
+        row["vehicle_max_latency_ms"] = _us_to_ms(row.get("vehicle_max_latency_us"))
 
         if observed is not None:
             previous_by_kpi[kpi] = observed
 
     return rows
+
+
+def _contains_vehicle_signal(value):
+    text = (value or "").strip().lower()
+    if not text:
+        return False
+    return "vehicle" in text or "veicular" in text
+
+
+def is_vehicle_row(row):
+    if (row.get("affected_service") or "").strip() == "App3-Veicular":
+        return True
+    if _contains_vehicle_signal(row.get("affected_kpi")):
+        return True
+    if _contains_vehicle_signal(row.get("source_agent")):
+        return True
+    if _contains_vehicle_signal(row.get("target_agent")):
+        return True
+    if (row.get("parameter") or "").strip() == "vehicle_priority_policy":
+        return True
+    return False
+
+
+def filter_rows(rows, focus):
+    if focus == "all":
+        return rows
+    if focus == "vehicle":
+        return [row for row in rows if is_vehicle_row(row)]
+    raise ValueError(f"unsupported focus: {focus}")
 
 
 def write_dataset(rows, dataset_path):
@@ -245,6 +385,14 @@ def write_dataset(rows, dataset_path):
         "global_packet_loss_percent",
         "total_active_cameras",
         "total_active_ues",
+        "total_active_vehicles",
+        "ego_vehicle_count",
+        "vehicle_high_risk_count",
+        "vehicle_medium_risk_count",
+        "vehicle_degraded_autonomy_count",
+        "vehicle_max_latency_ms",
+        "vehicle_max_packet_loss_percent",
+        "vehicle_avg_speed_mps",
         "graph_path",
         "conflict_reason",
         "rapp_reason",
@@ -389,7 +537,7 @@ def main():
         raise SystemExit("--until-ts and --until-exclusive-ts are mutually exclusive")
 
     if args.dataset_input:
-        rows = load_dataset_rows(args.dataset_input)
+        rows = enrich_rows(load_dataset_rows(args.dataset_input))
         dataset_path = Path(args.dataset_input)
     else:
         conn = open_db(args.db)
@@ -406,7 +554,10 @@ def main():
             until_ts=args.until_ts,
             until_exclusive_ts=args.until_exclusive_ts,
         )
-        dataset_path = write_dataset(rows, args.dataset)
+        conn.close()
+
+    rows = filter_rows(rows, args.focus)
+    dataset_path = write_dataset(rows, args.dataset)
 
     graph = build_graph(rows)
     graph_path = write_graph(graph, args.graph)
@@ -414,6 +565,7 @@ def main():
     print(json.dumps({
         "rows": len(rows),
         "dataset_input": args.dataset_input or None,
+        "focus": args.focus,
         "since_ts": args.since_ts or None,
         "until_ts": args.until_ts or None,
         "until_exclusive_ts": args.until_exclusive_ts or None,

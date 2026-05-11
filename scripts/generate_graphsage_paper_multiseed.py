@@ -7,6 +7,8 @@ scenario/subset structure and produces:
 
 - reconstruction F1 vs epochs for threshold 0.5
 - reconstruction F1 vs epochs for dataset size 450 with threshold curves
+- direct F1 vs epochs for threshold 0.5
+- direct F1 vs epochs for dataset size 450 with threshold curves
 - indirect F1 vs epochs for threshold 0.5
 - indirect F1 vs epochs for dataset size 450 with threshold curves
 - implicit F1 vs epochs for threshold 0.5
@@ -80,6 +82,8 @@ THRESHOLD_CURVE_STYLES = {
 FIGSIZE = (4.35, 3.25)
 DEFAULT_RANDOM_BASELINE_TRIALS = 256
 DEFAULT_RANDOM_SEED = 42
+CONFLICT_TYPE_ORDER = ("direct", "indirect", "implicit")
+CONFLICT_TYPE_SEED_OFFSET = {"direct": 0, "indirect": 500, "implicit": 1000}
 
 
 def parse_args() -> argparse.Namespace:
@@ -246,6 +250,17 @@ def type_min_support(conflict_type: str) -> int:
     if conflict_type == "indirect":
         return INDIRECT_MIN_SUPPORT
     return 1
+
+
+def available_conflict_types(case_summaries: list[dict]) -> list[str]:
+    present = set()
+    for case_summary in case_summaries:
+        metric_graph = load_json(metric_graph_path(case_summary))
+        present.update((metric_graph.get("stats", {}).get("by_conflict_type", {}) or {}).keys())
+        if not present:
+            for edge in metric_graph.get("edges", []):
+                present.update((edge.get("conflict_types", {}) or {}).keys())
+    return [conflict_type for conflict_type in CONFLICT_TYPE_ORDER if conflict_type in present]
 
 
 def load_seed_cases(training_dir: Path, scenario: str) -> dict[int, dict]:
@@ -585,70 +600,44 @@ def main() -> int:
         legend_variant="threshold",
     )
 
-    if args.scenario == "recuperacao":
-        indirect_dataset_series = build_type_dataset_series(
+    for conflict_type in available_conflict_types(case450_summaries):
+        dataset_series = build_type_dataset_series(
             seed_cases_list,
-            "indirect",
+            conflict_type,
             trials=args.random_baseline_trials,
-            random_seed=args.random_seed + 500,
+            random_seed=args.random_seed + CONFLICT_TYPE_SEED_OFFSET.get(conflict_type, 0),
         )
-        figures[f"{args.scenario}_indirect_f1_vs_epochs"] = plot_errorbar_series(
-            indirect_dataset_series,
-            title="F1 Indirect vs. Epochs for Threshold=0.5",
-            caption="Indirect conflict labeling accuracy according to the number of epochs and fixed threshold of 0.5.",
+        figures[f"{args.scenario}_{conflict_type}_f1_vs_epochs"] = plot_errorbar_series(
+            dataset_series,
+            title=f"F1 {conflict_type.title()} vs. Epochs for Threshold=0.5",
+            caption=(
+                f"{conflict_type.title()} conflict labeling accuracy according to the number of epochs "
+                "and fixed threshold of 0.5."
+            ),
             output_dir=output_dir,
-            stem=f"{args.scenario}_indirect_f1_vs_epochs",
+            stem=f"{args.scenario}_{conflict_type}_f1_vs_epochs",
             styles=DATASET_CURVE_STYLES,
             legend_variant="dataset",
         )
 
-        indirect_threshold_series = build_threshold_series(
+        threshold_series = build_threshold_series(
             case450_summaries,
-            "indirect",
+            conflict_type,
             trials=args.random_baseline_trials,
-            random_seed=args.random_seed + 500,
+            random_seed=args.random_seed + CONFLICT_TYPE_SEED_OFFSET.get(conflict_type, 0),
         )
-        figures[f"{args.scenario}_indirect_f1_vs_threshold"] = plot_errorbar_series(
-            indirect_threshold_series,
-            title="F1 Indirect vs. Epochs for Dataset Size=450",
-            caption="Indirect conflict labeling accuracy according to the number of epochs and a fixed dataset size of 450.",
+        figures[f"{args.scenario}_{conflict_type}_f1_vs_threshold"] = plot_errorbar_series(
+            threshold_series,
+            title=f"F1 {conflict_type.title()} vs. Epochs for Dataset Size=450",
+            caption=(
+                f"{conflict_type.title()} conflict labeling accuracy according to the number of epochs "
+                "and a fixed dataset size of 450."
+            ),
             output_dir=output_dir,
-            stem=f"{args.scenario}_indirect_f1_vs_threshold",
+            stem=f"{args.scenario}_{conflict_type}_f1_vs_threshold",
             styles=THRESHOLD_CURVE_STYLES,
             legend_variant="threshold",
         )
-
-    implicit_dataset_series = build_type_dataset_series(
-        seed_cases_list,
-        "implicit",
-        trials=args.random_baseline_trials,
-        random_seed=args.random_seed + 1000,
-    )
-    figures[f"{args.scenario}_implicit_f1_vs_epochs"] = plot_errorbar_series(
-        implicit_dataset_series,
-        title="F1 Implicit vs. Epochs for Threshold=0.5",
-        caption="Implicit conflict labeling accuracy according to the number of epochs and fixed threshold of 0.5.",
-        output_dir=output_dir,
-        stem=f"{args.scenario}_implicit_f1_vs_epochs",
-        styles=DATASET_CURVE_STYLES,
-        legend_variant="dataset",
-    )
-
-    implicit_threshold_series = build_threshold_series(
-        case450_summaries,
-        "implicit",
-        trials=args.random_baseline_trials,
-        random_seed=args.random_seed + 1000,
-    )
-    figures[f"{args.scenario}_implicit_f1_vs_threshold"] = plot_errorbar_series(
-        implicit_threshold_series,
-        title="F1 Implicit vs. Epochs for Dataset Size=450",
-        caption="Implicit conflict labeling accuracy according to the number of epochs and a fixed dataset size of 450.",
-        output_dir=output_dir,
-        stem=f"{args.scenario}_implicit_f1_vs_threshold",
-        styles=THRESHOLD_CURVE_STYLES,
-        legend_variant="threshold",
-    )
 
     summary = {
         "experiment_dir": str(experiment_dir),

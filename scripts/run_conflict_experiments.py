@@ -31,10 +31,16 @@ from typing import Callable, Iterable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from greenran_paths import ARTICLE00_SCENARIO_CONTROL_PATH  # noqa: E402
+
 EXPORT_SCRIPT = PROJECT_ROOT / "scripts" / "export_conflict_dataset.py"
 LEARN_SCRIPT = PROJECT_ROOT / "scripts" / "learn_conflict_matrix.py"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "runs" / "experimentos_conflitos"
-SCENARIO_CONTROL_PATH = Path("/tmp/scenario_control.json")
+SCENARIO_CONTROL_PATH = ARTICLE00_SCENARIO_CONTROL_PATH
 
 DEFAULT_SUBSET_SIZES = (50, 150, 450)
 DEFAULT_THRESHOLD = 0.5
@@ -132,6 +138,46 @@ SCENARIOS = (
             "comece a rodada com App1 ou App2 degradado",
             "depois recupere para estado saudável durante a janela",
             "isso ajuda a medir persistência, guarda e estabilização",
+        ),
+    ),
+    Scenario(
+        slug="vehicle_warning",
+        title="Vehicle warning",
+        goal="forçar guarda veicular sem entrar em estado crítico total",
+        instructions=(
+            "mantenha App1 e App2 saudáveis",
+            "leve o ego vehicle para latência >= 50ms ou packet loss >= 2%",
+            "gere pelo menos 1 veículo em risco médio para treinar o estado de guarda",
+        ),
+    ),
+    Scenario(
+        slug="vehicle_critical",
+        title="Vehicle critical",
+        goal="forçar bloqueio por segurança veicular",
+        instructions=(
+            "mantenha App1 e App2 saudáveis",
+            "leve o ego vehicle para latência >= 100ms ou packet loss >= 5%",
+            "gere risco alto ou autonomia degradada no ego vehicle",
+        ),
+    ),
+    Scenario(
+        slug="vehicle_implicito",
+        title="Vehicle implícito",
+        goal="gerar conflito implícito com KPI global saudável e ego degradado",
+        instructions=(
+            "preserve CVaR/P95 global do sistema saudável",
+            "degrade apenas o ego vehicle localmente",
+            "o objetivo é ensinar conflito implícito específico do domínio veicular",
+        ),
+    ),
+    Scenario(
+        slug="vehicle_recovery",
+        title="Vehicle recovery",
+        goal="capturar recuperação do veículo após estado crítico",
+        instructions=(
+            "comece com ego vehicle crítico ou autonomia degradada",
+            "recupere para estado saudável no meio da rodada",
+            "use isso para treinar histerese e estabilização do domínio veicular",
         ),
     ),
 )
@@ -390,9 +436,22 @@ def build_round_control_profile(scenario: Scenario, round_index: int, duration: 
         "network_utilization_percent": 62.0,
         "mode": "healthy",
     }
+    vehicle_healthy = {
+        "enabled": True,
+        "total_vehicles": 5,
+        "high_risk_vehicles": 0,
+        "medium_risk_vehicles": 0,
+        "degraded_autonomy_vehicles": 0,
+        "ego_latency_ms": 18.0,
+        "traffic_latency_ms": 12.0,
+        "ego_packet_loss_percent": 0.2,
+        "traffic_packet_loss_percent": 0.1,
+        "max_speed_mps": 7.0,
+        "mode": "healthy",
+    }
 
     if scenario.slug == "baseline_saude":
-        return [{"offset_s": 0, "app1": app1_healthy, "app2": app2_healthy}]
+        return [{"offset_s": 0, "app1": app1_healthy, "app2": app2_healthy, "vehicle": vehicle_healthy}]
 
     if scenario.slug == "app1_throughput":
         target_tp = 24.0 if round_index % 2 else 27.5
@@ -406,6 +465,7 @@ def build_round_control_profile(scenario: Scenario, round_index: int, duration: 
                     "latency_ms": 22.0,
                 },
                 "app2": app2_healthy,
+                "vehicle": vehicle_healthy,
             }
         ]
 
@@ -423,6 +483,7 @@ def build_round_control_profile(scenario: Scenario, round_index: int, duration: 
                     "critical_cameras": critical,
                 },
                 "app2": app2_healthy,
+                "vehicle": vehicle_healthy,
             }
         ]
 
@@ -441,6 +502,7 @@ def build_round_control_profile(scenario: Scenario, round_index: int, duration: 
                     "avg_rssi_dbm": -94.0,
                     "mode": "degraded_light",
                 },
+                "vehicle": vehicle_healthy,
             }
         ]
 
@@ -461,6 +523,7 @@ def build_round_control_profile(scenario: Scenario, round_index: int, duration: 
                     "avg_battery_percent": 58.0,
                     "mode": "degraded_critical",
                 },
+                "vehicle": vehicle_healthy,
             }
         ]
 
@@ -475,6 +538,7 @@ def build_round_control_profile(scenario: Scenario, round_index: int, duration: 
                     "latency_ms": 24.0,
                 },
                 "app2": app2_healthy,
+                "vehicle": vehicle_healthy,
             }
         ]
 
@@ -499,11 +563,90 @@ def build_round_control_profile(scenario: Scenario, round_index: int, duration: 
                     "avg_latency_ms": 280.0,
                     "mode": "recovery_start",
                 },
+                "vehicle": vehicle_healthy,
             },
-            {"offset_s": midpoint, "app1": app1_healthy, "app2": app2_healthy},
+            {"offset_s": midpoint, "app1": app1_healthy, "app2": app2_healthy, "vehicle": vehicle_healthy},
         ]
 
-    return [{"offset_s": 0, "app1": app1_healthy, "app2": app2_healthy}]
+    if scenario.slug == "vehicle_warning":
+        return [
+            {
+                "offset_s": 0,
+                "app1": app1_healthy,
+                "app2": app2_healthy,
+                "vehicle": {
+                    **vehicle_healthy,
+                    "medium_risk_vehicles": 1,
+                    "ego_latency_ms": 58.0 if round_index % 2 else 52.0,
+                    "ego_packet_loss_percent": 2.6,
+                    "mode": "vehicle_warning",
+                },
+            }
+        ]
+
+    if scenario.slug == "vehicle_critical":
+        return [
+            {
+                "offset_s": 0,
+                "app1": app1_healthy,
+                "app2": app2_healthy,
+                "vehicle": {
+                    **vehicle_healthy,
+                    "high_risk_vehicles": 1,
+                    "degraded_autonomy_vehicles": 1,
+                    "ego_latency_ms": 126.0,
+                    "ego_packet_loss_percent": 5.8,
+                    "mode": "vehicle_critical",
+                },
+            }
+        ]
+
+    if scenario.slug == "vehicle_implicito":
+        return [
+            {
+                "offset_s": 0,
+                "app1": {
+                    **app1_healthy,
+                    "throughput_mbps": 32.0,
+                    "avg_throughput_mbps": 34.0,
+                    "latency_ms": 18.0,
+                },
+                "app2": app2_healthy,
+                "vehicle": {
+                    **vehicle_healthy,
+                    "medium_risk_vehicles": 1,
+                    "ego_latency_ms": 68.0,
+                    "ego_packet_loss_percent": 2.4,
+                    "mode": "vehicle_implicit",
+                },
+            }
+        ]
+
+    if scenario.slug == "vehicle_recovery":
+        midpoint = max(1, duration // 2)
+        return [
+            {
+                "offset_s": 0,
+                "app1": app1_healthy,
+                "app2": app2_healthy,
+                "vehicle": {
+                    **vehicle_healthy,
+                    "high_risk_vehicles": 1,
+                    "degraded_autonomy_vehicles": 1,
+                    "ego_latency_ms": 118.0,
+                    "ego_packet_loss_percent": 5.2,
+                    "mode": "vehicle_recovery_start",
+                },
+            },
+            {
+                "offset_s": midpoint,
+                "app1": app1_healthy,
+                "app2": app2_healthy,
+                "vehicle": vehicle_healthy,
+            },
+        ]
+
+    return [{"offset_s": 0, "app1": app1_healthy, "app2": app2_healthy, "vehicle": vehicle_healthy}]
 
 
 def apply_control_stage(
@@ -523,6 +666,7 @@ def apply_control_stage(
         "duration_s": duration,
         "app1_camera_override": stage.get("app1", {}),
         "app2_sensor_override": stage.get("app2", {}),
+        "vehicle_override": stage.get("vehicle", {}),
     }
     write_scenario_control(payload)
 

@@ -86,7 +86,9 @@ RAPP_DECISION_PATH = as_str(RAPP_DECISION_PATH)
 EXTENDED_METRICS_PATH = as_str(EXTENDED_METRICS_JSON_PATH)
 XAPP_HEALTH_FILE = as_str(XAPP_HEALTH_PATH)
 APP2_MONITORING_PATH = as_str(STATE_DIR / "app2_monitoramento" / "monitoring_snapshot.json")
+APP2_SENSORS_PATH = as_str(STATE_DIR / "app2_monitoramento" / "sensors" / "latest.json")
 ARTICLE00_SCENARIO_CONTROL_PATH = as_str(STATE_DIR / "article00_scenario_control.json")
+RAPP_DECISIONS_LOG_PATH = as_str(STATE_DIR / "rapp_decisions.jsonl")
 
 RUNTIME_CONFIG = load_runtime_config()
 DEFAULT_INTERVAL = max(1, float(RUNTIME_CONFIG["orchestrator"]["interval_seconds"]))
@@ -141,6 +143,87 @@ def _coerce_intent_value(raw_value):
             return value
 
     return value
+
+
+def evaluate_vehicle_policy(vehicle_metrics):
+    """Avalia risco veicular sem depender do runtime completo do rApp."""
+    metrics = vehicle_metrics or {}
+    if not metrics.get("available"):
+        return {
+            "available": False,
+            "severity": "none",
+            "violation": "",
+            "action": "",
+            "reason": "",
+            "confidence": 0.0,
+            "sla_violated": False,
+            "guard_active": False,
+        }
+
+    high_risk = int(metrics.get("high_risk_vehicles", 0) or 0)
+    medium_risk = int(metrics.get("medium_risk_vehicles", 0) or 0)
+    degraded_autonomy = int(metrics.get("degraded_autonomy_vehicles", 0) or 0)
+    vehicle_latency_ms = float(metrics.get("max_latency_ms", 0) or 0)
+    vehicle_packet_loss = float(metrics.get("max_packet_loss_percent", 0) or 0)
+    ego_present = bool(metrics.get("ego_present", False))
+
+    critical_reasons = []
+    warning_reasons = []
+
+    if metrics.get("stale"):
+        age = metrics.get("age_seconds")
+        warning_reasons.append(
+            f"snapshot de veículo antigo ({age:.0f}s)" if age is not None else "snapshot de veículo antigo"
+        )
+    if high_risk > 0:
+        critical_reasons.append(f"veículos em risco alto={high_risk}")
+    if degraded_autonomy > 0:
+        critical_reasons.append(f"autonomia degradada em {degraded_autonomy} veículo(s)")
+    if ego_present and vehicle_latency_ms >= 100:
+        critical_reasons.append(f"latência veicular {vehicle_latency_ms:.0f}ms >= 100ms")
+    elif ego_present and vehicle_latency_ms >= 50:
+        warning_reasons.append(f"latência veicular {vehicle_latency_ms:.0f}ms >= 50ms")
+    if vehicle_packet_loss >= 5:
+        critical_reasons.append(f"packet loss veicular {vehicle_packet_loss:.1f}% >= 5%")
+    elif vehicle_packet_loss >= 2:
+        warning_reasons.append(f"packet loss veicular {vehicle_packet_loss:.1f}% >= 2%")
+    if medium_risk > 0 and not critical_reasons:
+        warning_reasons.append(f"veículos em risco médio={medium_risk}")
+
+    if critical_reasons:
+        return {
+            "available": True,
+            "severity": "critical",
+            "violation": "VEHICLE_CRITICAL",
+            "action": "FULL_POWER",
+            "reason": critical_reasons[0],
+            "confidence": 0.95,
+            "sla_violated": True,
+            "guard_active": False,
+        }
+
+    if warning_reasons:
+        return {
+            "available": True,
+            "severity": "warning",
+            "violation": "VEHICLE_WARNING",
+            "action": "FULL_POWER_GUARD",
+            "reason": warning_reasons[0],
+            "confidence": 0.8,
+            "sla_violated": False,
+            "guard_active": True,
+        }
+
+    return {
+        "available": True,
+        "severity": "none",
+        "violation": "",
+        "action": "",
+        "reason": "",
+        "confidence": 0.0,
+        "sla_violated": False,
+        "guard_active": False,
+    }
 
 
 class RappResourceOptimizer:
@@ -210,6 +293,7 @@ class RappResourceOptimizer:
 
         # ML Predictor (Random Forest / XGBoost) com acesso ao banco
         self.ml_predictor = MLPredictor(data_lake=self.data_lake)
+        self.ml_invalid_streak = 0
 
         # DRL Predictor (SBiLSTM + A3C)
         if HAS_DRL:
@@ -663,6 +747,88 @@ class RappResourceOptimizer:
             print(f"[rApp] Erro ao ler App2 monitoring: {e}")
 
         return metrics
+
+    def _get_vehicle_metrics(self):
+        """
+        Resume a saúde operacional dos veículos conectados exportados pelo
+        coletor combinado ns-3 + CARLA.
+        """
+        metrics = {
+            'available': False,
+            'stale': False,
+            'age_seconds': None,
+            'total_vehicles': 0,
+            'ego_present': False,
+            'high_risk_vehicles': 0,
+            'medium_risk_vehicles': 0,
+            'degraded_autonomy_vehicles': 0,
+            'max_latency_ms': 0.0,
+            'max_packet_loss_percent': 0.0,
+            'max_speed_mps': 0.0,
+            'vehicles': [],
+        }
+
+        try:
+            if not os.path.exists(EXTENDED_METRICS_PATH):
+                return metrics
+
+            with open(EXTENDED_METRICS_PATH, 'r', encoding='utf-8') as f:
+                extended = json.load(f)
+
+            ue_metrics = (extended.get('ue_metrics', {}) or {})
+            vehicle_entries = []
+            for imsi, ue_data in ue_metrics.items():
+                if ue_data.get('device_type') != 'vehicle':
+                    continue
+                vehicle_entries.append({
+                    'imsi': imsi,
+                    'vehicle_id': ue_data.get('vehicle_id', f"veh-imsi-{imsi}"),
+                    'vehicle_role': ue_data.get('vehicle_role', 'traffic'),
+                    'autonomy_state': ue_data.get('autonomy_state', 'unknown'),
+                    'risk_state': ue_data.get('risk_state', 'unknown'),
+                    'latency_ms': float(ue_data.get('latency_avg_us', ue_data.get('latency_us', 0)) or 0) / 1000.0,
+                    'packet_loss_percent': float(
+                        ue_data.get(
+                            'packet_loss_percent',
+                            float(extended.get('global_metrics', {}).get('global_packet_loss_rate', 0) or 0) * 100.0,
+                        ) or 0
+                    ),
+                    'speed_mps': float(ue_data.get('speed_mps', 0.0) or 0.0),
+                    'lane_id': ue_data.get('lane_id'),
+                    'waypoint_id': ue_data.get('waypoint_id'),
+                })
+
+            if not vehicle_entries:
+                return metrics
+
+            age_seconds = None
+            try:
+                age_seconds = max(0.0, time.time() - os.path.getmtime(EXTENDED_METRICS_PATH))
+            except OSError:
+                age_seconds = None
+
+            metrics.update({
+                'available': True,
+                'stale': bool(age_seconds is not None and age_seconds > 20),
+                'age_seconds': age_seconds,
+                'total_vehicles': len(vehicle_entries),
+                'ego_present': any(v.get('vehicle_role') == 'ego' for v in vehicle_entries),
+                'high_risk_vehicles': sum(1 for v in vehicle_entries if str(v.get('risk_state', '')).lower() in {'high', 'critical'}),
+                'medium_risk_vehicles': sum(1 for v in vehicle_entries if str(v.get('risk_state', '')).lower() in {'medium', 'warning'}),
+                'degraded_autonomy_vehicles': sum(
+                    1 for v in vehicle_entries
+                    if str(v.get('autonomy_state', '')).lower() not in {'normal', 'unknown'}
+                ),
+                'max_latency_ms': max(float(v.get('latency_ms', 0) or 0) for v in vehicle_entries),
+                'max_packet_loss_percent': max(float(v.get('packet_loss_percent', 0) or 0) for v in vehicle_entries),
+                'max_speed_mps': max(float(v.get('speed_mps', 0) or 0) for v in vehicle_entries),
+                'vehicles': vehicle_entries,
+            })
+        except Exception as e:
+            metrics['error'] = str(e)
+            print(f"[rApp] Erro ao ler métricas de veículos: {e}")
+
+        return metrics
     
     def record_current_metrics(self, slicer_intent, energy_intent):
         """Registra métricas atuais no Data Lake."""
@@ -686,6 +852,14 @@ class RappResourceOptimizer:
             energy_state=energy_state,
             slicer_state=slicer_state
         )
+
+        app2_snapshot = _safe_read_json_file(APP2_MONITORING_PATH)
+        app2_sensors = _safe_read_json_file(APP2_SENSORS_PATH)
+        if isinstance(app2_snapshot, dict) and app2_snapshot:
+            self.data_lake.record_app2_snapshot(
+                snapshot=app2_snapshot,
+                sensors=app2_sensors if isinstance(app2_sensors, list) else [],
+            )
         
         extended_metrics = self.read_extended_metrics()
         if extended_metrics:
@@ -753,6 +927,7 @@ class RappResourceOptimizer:
             'trend_analysis': None,
             'preventive_block': False,
             'camera_metrics': None,
+            'vehicle_metrics': None,
             'app2_metrics': None,
             'drl_prediction': {},
             'drl_influenced': False,
@@ -884,13 +1059,41 @@ class RappResourceOptimizer:
         )
         camera_priority_active = camera_sla_violated or camera_guard_active
 
+        vehicle_metrics = self._get_vehicle_metrics()
+        decision['vehicle_metrics'] = vehicle_metrics
+
+        vehicle_sla_violated = False
+        vehicle_guard_active = False
+
+        if not camera_priority_active and vehicle_metrics.get('available'):
+            vehicle_policy = evaluate_vehicle_policy(vehicle_metrics)
+            if vehicle_policy['severity'] == 'critical':
+                decision['energy_saver'] = 'BLOCKED'
+                decision['action'] = vehicle_policy['action']
+                decision['reason'] = f"VEHICLE SAFETY: {vehicle_policy['reason']}"
+                decision['confidence'] = vehicle_policy['confidence']
+                decision['priority_violation'] = vehicle_policy['violation']
+                vehicle_sla_violated = True
+                self.stats['sla_violations'] += 1
+                print(f"\033[1;31m[rApp] VEHICLE SAFETY: {vehicle_policy['reason']} - BLOCKED\033[0m")
+            elif vehicle_policy['severity'] == 'warning':
+                decision['energy_saver'] = 'CONDITIONAL'
+                decision['action'] = vehicle_policy['action']
+                decision['reason'] = f"VEHICLE SAFETY: {vehicle_policy['reason']} - margem protegida"
+                decision['confidence'] = vehicle_policy['confidence']
+                decision['priority_violation'] = vehicle_policy['violation']
+                vehicle_guard_active = True
+                print(f"\033[1;33m[rApp] VEHICLE SAFETY: {vehicle_policy['reason']} - CONDITIONAL\033[0m")
+
+        vehicle_priority_active = vehicle_sla_violated or vehicle_guard_active
+
         app2_metrics = self._get_app2_gateway_metrics()
         decision['app2_metrics'] = app2_metrics
 
         app2_sla_violated = False
         app2_guard_active = False
 
-        if not camera_priority_active and app2_metrics.get('available'):
+        if not camera_priority_active and not vehicle_priority_active and app2_metrics.get('available'):
             connected_ratio = float(app2_metrics.get('connected_ratio', 1.0) or 0)
             packet_loss = float(app2_metrics.get('packet_loss_percent', 0) or 0)
             delivery_success = float(app2_metrics.get('delivery_success_percent', 100) or 0)
@@ -965,7 +1168,7 @@ class RappResourceOptimizer:
                 print(f"\033[1;33m[rApp] APP2 mMTC: {warning_reasons[0]} - CONDITIONAL\033[0m")
 
         app2_priority_active = app2_sla_violated or app2_guard_active
-        service_priority_active = camera_priority_active or app2_priority_active
+        service_priority_active = camera_priority_active or vehicle_priority_active or app2_priority_active
         
         # ========================================
         # ETAPA 0: TREND ANALYSIS (SLOPE) - PREDITIVA
@@ -1253,11 +1456,23 @@ class RappResourceOptimizer:
             if latest_extended:
                 row = latest_extended[0]
 
-        throughput_kbps = float(row.get('throughput_kbps', 0) or 0)
-        packet_loss_rate = float(row.get('global_packet_loss_rate', 0) or 0)
-        jitter_ms = float(row.get('global_jitter_us', 0) or 0) / 1000.0
-        tx_bytes = int(row.get('total_tx_bytes', 0) or 0)
-        rx_bytes = int(row.get('total_rx_bytes', 0) or 0)
+        live_extended = _safe_read_json_file(EXTENDED_METRICS_PATH)
+        live_global_metrics = live_extended.get('global_metrics', {}) or {}
+
+        throughput_kbps = float(
+            live_global_metrics.get(
+                'pdcp_delta_throughput_kbps',
+                live_global_metrics.get('throughput_kbps', row.get('throughput_kbps', 0)),
+            ) or 0
+        )
+        packet_loss_rate = float(
+            live_global_metrics.get('global_packet_loss_rate', row.get('global_packet_loss_rate', 0)) or 0
+        )
+        jitter_ms = float(
+            live_global_metrics.get('global_jitter_us', row.get('global_jitter_us', 0)) or 0
+        ) / 1000.0
+        tx_bytes = int(live_global_metrics.get('total_tx_bytes', row.get('total_tx_bytes', 0)) or 0)
+        rx_bytes = int(live_global_metrics.get('total_rx_bytes', row.get('total_rx_bytes', 0)) or 0)
         tx_rx_ratio = tx_bytes / max(rx_bytes, 1) if rx_bytes > 0 else 0
 
         energy_history = 0
@@ -1269,6 +1484,7 @@ class RappResourceOptimizer:
 
         # P95 = pior 5% dos UEs (é o valor crítico que as regras usam).
         p95_value = network_health.get('p95_us', 0) if network_health else 0
+        vehicle_metrics = decision.get('vehicle_metrics') or {}
 
         print(f"[rApp DEBUG] ML Predictor loaded: {self.ml_predictor.is_loaded()}, preventive_block: {decision['preventive_block']}")
         
@@ -1289,6 +1505,12 @@ class RappResourceOptimizer:
                 'jitter_ms': jitter_ms,
                 'tx_rx_ratio': tx_rx_ratio,
                 'energy_history': energy_history,
+                'total_active_vehicles': vehicle_metrics.get('total_vehicles', 0),
+                'vehicle_high_risk': vehicle_metrics.get('high_risk_vehicles', 0),
+                'vehicle_medium_risk': vehicle_metrics.get('medium_risk_vehicles', 0),
+                'vehicle_degraded_autonomy': vehicle_metrics.get('degraded_autonomy_vehicles', 0),
+                'vehicle_max_latency_ms': vehicle_metrics.get('max_latency_ms', 0.0),
+                'vehicle_max_packet_loss_percent': vehicle_metrics.get('max_packet_loss_percent', 0.0),
             }
             
             # DEBUG: Log do P95 que está sendo enviado para ML
@@ -1357,6 +1579,27 @@ class RappResourceOptimizer:
                     elif ml_cvar_prev > 80 and cvar_ms < 20:
                         print(f"\033[1;33m[rApp] AVISO: ML superestimou ({ml_cvar_prev:.1f}ms vs {cvar_ms:.1f}ms real)\033[0m")
                         ml_prediction_valid = False
+                    # Se a rede está claramente saudável, previsões na faixa 70-80ms
+                    # também são incoerentes e devem ser descartadas.
+                    elif ml_cvar_prev >= 70 and cvar_ms < 10 and (p95_value / 1000.0) < 10:
+                        print(
+                            f"\033[1;33m[rApp] AVISO: ML superestimou rede saudável "
+                            f"({ml_cvar_prev:.1f}ms vs real={cvar_ms:.1f}ms, P95={(p95_value / 1000.0):.1f}ms)\033[0m"
+                        )
+                        ml_prediction_valid = False
+
+                ml_result['valid'] = ml_prediction_valid
+                if ml_prediction_valid:
+                    self.ml_invalid_streak = 0
+                else:
+                    self.ml_invalid_streak += 1
+                    if self.ml_invalid_streak >= 3:
+                        print(
+                            f"\033[1;33m[rApp ML] Resetando histórico interno após "
+                            f"{self.ml_invalid_streak} predições inválidas consecutivas\033[0m"
+                        )
+                        self.ml_predictor.reset_history()
+                        self.ml_invalid_streak = 0
                 
                 decision['ml_influenced'] = False
 
@@ -1435,7 +1678,13 @@ class RappResourceOptimizer:
                     'power_budget': 30,
                     'hour_sin': 0,
                     'hour_cos': 1,
-                    'variance_ms2': float(variance_us2) / 1_000_000.0 if variance_us2 else 10
+                    'variance_ms2': float(variance_us2) / 1_000_000.0 if variance_us2 else 10,
+                    'active_vehicles': int(vehicle_metrics.get('total_vehicles', 0) or 0),
+                    'vehicle_high_risk': int(vehicle_metrics.get('high_risk_vehicles', 0) or 0),
+                    'vehicle_medium_risk': int(vehicle_metrics.get('medium_risk_vehicles', 0) or 0),
+                    'vehicle_degraded_autonomy': int(vehicle_metrics.get('degraded_autonomy_vehicles', 0) or 0),
+                    'vehicle_max_latency_ms': float(vehicle_metrics.get('max_latency_ms', 0.0) or 0.0),
+                    'vehicle_max_packet_loss_percent': float(vehicle_metrics.get('max_packet_loss_percent', 0.0) or 0.0),
                 }
                 
                 drl_result = self.drl_predictor.predict(drl_state)
@@ -1529,13 +1778,14 @@ class RappResourceOptimizer:
             and not decision.get('drl_policy_applied', False)
         ):
             ml_risk = decision.get('ml_rf_prediction') or {}
+            ml_risk_valid = bool(ml_risk.get('valid', True))
             try:
                 ml_predicted_cvar_ms = float(ml_risk.get('predicted_cvar_ms', 0) or 0)
             except (TypeError, ValueError):
                 ml_predicted_cvar_ms = 0.0
 
             real_cvar_ms = float(cvar_us) / 1000.0 if cvar_us else 0.0
-            risk_cvar_ms = max(real_cvar_ms, ml_predicted_cvar_ms)
+            risk_cvar_ms = max(real_cvar_ms, ml_predicted_cvar_ms) if ml_risk_valid else real_cvar_ms
 
             if risk_cvar_ms >= 45 and decision.get('action') in ['POWER_DOWN_ECO', 'POWER_DOWN']:
                 decision['action'] = 'CONDITIONAL_REDUCE'
@@ -1673,6 +1923,16 @@ class RappResourceOptimizer:
                     f.write(f"|  Bateria media: {app2.get('avg_battery_percent', 0):.1f}%{' '*35}|\n")
                     f.write("+----------------------------------------------------+\n")
                     f.write("\n")
+
+                if decision.get('vehicle_metrics') and decision['vehicle_metrics'].get('available'):
+                    veh = decision['vehicle_metrics']
+                    f.write("+--------------- VEHICLE SAFETY ----------------------+\n")
+                    f.write(f"|  Veiculos: {veh.get('total_vehicles', 0)} | Ego: {str(veh.get('ego_present', False)).lower():<5}{' '*31}|\n")
+                    f.write(f"|  Risco alto: {veh.get('high_risk_vehicles', 0)} | Risco medio: {veh.get('medium_risk_vehicles', 0)}{' '*20}|\n")
+                    f.write(f"|  Latencia max: {veh.get('max_latency_ms', 0):.0f}ms{' '*34}|\n")
+                    f.write(f"|  Packet loss: {veh.get('max_packet_loss_percent', 0):.1f}%{' '*37}|\n")
+                    f.write("+----------------------------------------------------+\n")
+                    f.write("\n")
                 
                 # Pattern Analysis
                 if decision['pattern_analysis']:
@@ -1796,9 +2056,14 @@ class RappResourceOptimizer:
                     self.energy_cmd.send_reduce_power(reason=f"ALLOWED (cautela): {reason}")
                 
         elif energy_state == 'CONDITIONAL':
-            if decision.get('priority_violation') in ['THROUGHPUT_WARNING', 'LATENCY_WARNING', 'APP2_MTC_WARNING']:
+            if decision.get('priority_violation') in ['THROUGHPUT_WARNING', 'LATENCY_WARNING', 'APP2_MTC_WARNING', 'VEHICLE_WARNING']:
                 # Faixa de guarda prioritária: manter potência para não cruzar o SLA mínimo.
-                guard_prefix = 'APP2_GUARD' if decision.get('priority_violation') == 'APP2_MTC_WARNING' else 'CAMERA_GUARD'
+                if decision.get('priority_violation') == 'APP2_MTC_WARNING':
+                    guard_prefix = 'APP2_GUARD'
+                elif decision.get('priority_violation') == 'VEHICLE_WARNING':
+                    guard_prefix = 'VEHICLE_GUARD'
+                else:
+                    guard_prefix = 'CAMERA_GUARD'
                 self.energy_cmd.send_full_power(reason=f"{guard_prefix}: {reason}")
             else:
                 # Condicional genérico → economia moderada ativa
@@ -1858,13 +2123,17 @@ class RappResourceOptimizer:
                 'eco_mode': decision.get('eco_mode', False),
                 'slicer_state': decision.get('slicer_state', 'UNKNOWN'),
                 'priority_violation': decision.get('priority_violation', ''),
+                'vehicle_total': (decision.get('vehicle_metrics') or {}).get('total_vehicles'),
+                'vehicle_high_risk': (decision.get('vehicle_metrics') or {}).get('high_risk_vehicles'),
+                'vehicle_medium_risk': (decision.get('vehicle_metrics') or {}).get('medium_risk_vehicles'),
+                'vehicle_max_latency_ms': (decision.get('vehicle_metrics') or {}).get('max_latency_ms'),
                 'app2_connected_ratio': (decision.get('app2_metrics') or {}).get('connected_ratio'),
                 'app2_packet_loss_percent': (decision.get('app2_metrics') or {}).get('packet_loss_percent'),
                 'app2_delivery_success_percent': (decision.get('app2_metrics') or {}).get('delivery_success_percent'),
                 'app2_avg_latency_ms': (decision.get('app2_metrics') or {}).get('avg_latency_ms')
             }
 
-            with open('/tmp/rapp_decisions.jsonl', 'a') as f:
+            with open(RAPP_DECISIONS_LOG_PATH, 'a') as f:
                 f.write(json.dumps(log_entry) + '\n')
         except Exception as e:
             print(f"[rApp] Erro ao gravar log estruturado: {e}")
@@ -2205,6 +2474,7 @@ class RappResourceOptimizer:
                         print(f"\n✅  [rApp] Nova simulação detectada! sim_time={new_sim_time}s (reset)")
                         self.data_fresh = True
                     self.stale_sim_cycles = 0
+                    self.ml_invalid_streak = 0
                     self.ml_predictor.reset_history()
                     if self.drl_predictor is not None and hasattr(self.drl_predictor, 'reset_history'):
                         self.drl_predictor.reset_history()

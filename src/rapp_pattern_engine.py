@@ -26,13 +26,11 @@ Uso:
     window = pe.calculate_energy_window()
 """
 
-import sys
 import time
 from datetime import datetime
 from collections import defaultdict
-
-sys.path.insert(0, '/home/robert/orange_nuclear')
 from rapp_data_lake import DataLake
+from greenran_paths import RAPP_DB_PATH
 
 DAY_NAMES = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom']
 DAY_NAMES_FULL = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
@@ -62,7 +60,7 @@ class PatternRecognition:
     - Packet Loss Rate, PDCP PDUs, MCS/TB Size
     """
     
-    def __init__(self, data_lake=None, db_path="/tmp/rapp_data_lake.db"):
+    def __init__(self, data_lake=None, db_path=str(RAPP_DB_PATH)):
         """
         Inicializa o Pattern Engine.
         

@@ -12,6 +12,18 @@ Para o estado atual do projeto, estes documentos devem ser lidos primeiro:
   - comparacao objetiva entre `App1-Vigilancia` e `App2-Monitoramento`;
   - grau de maturidade de cada app;
   - integracao com GreenRAN e papel atual no `rApp`.
+- `docs/CARLA_NS3_INTEGRACAO.md`
+  - plano tecnico para integrar `CARLA + ns-3 + GreenRAN`;
+  - separacao entre simulacao fisica, simulacao de rede e politica de decisao;
+  - primeira iteracao recomendada para veiculos conectados.
+- `docs/CARLA_2D_MODELO_VEICULAR.md`
+  - modelo 2D exato para a trilha veicular;
+  - estado minimo por veiculo;
+  - uso por `App3`, `xApp-VehicleSafety` e `rApp`.
+- `docs/APP3_VEICULAR_ARQUITETURA.md`
+  - arquitetura proposta para um novo `App3-Veicular`;
+  - separacao entre app, xApp e `rApp`;
+  - backend, snapshot e dados minimos por veiculo.
 - `docs/CONFLICT_DATASET_PIPELINE.md`
   - exportacao do dataset de conflitos;
   - aprendizado da matriz operacional;

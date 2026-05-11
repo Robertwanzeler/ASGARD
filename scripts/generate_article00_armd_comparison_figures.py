@@ -46,17 +46,17 @@ STYLES = {
     "graphsage_50": {"color": "#7d1fb2", "marker": "o", "linestyle": "-"},
     "graphsage_150": {"color": "#2ca02c", "marker": "o", "linestyle": "-"},
     "graphsage_450": {"color": "#1f77ff", "marker": "o", "linestyle": "-"},
-    "armd_50": {"color": "#7d1fb2", "marker": "s", "linestyle": "--", "markerfacecolor": "white"},
-    "armd_150": {"color": "#2ca02c", "marker": "s", "linestyle": "--", "markerfacecolor": "white"},
-    "armd_450": {"color": "#1f77ff", "marker": "s", "linestyle": "--", "markerfacecolor": "white"},
+    "armd_50": {"color": "#7d1fb2", "marker": "s", "linestyle": "--", "markerfacecolor": "#7d1fb2"},
+    "armd_150": {"color": "#2ca02c", "marker": "s", "linestyle": "--", "markerfacecolor": "#2ca02c"},
+    "armd_450": {"color": "#1f77ff", "marker": "s", "linestyle": "--", "markerfacecolor": "#1f77ff"},
     "graphsage_no_threshold": {"color": "#ff33cc", "marker": "o", "linestyle": "-"},
     "graphsage_threshold_02": {"color": "#ff8c1a", "marker": "o", "linestyle": "-"},
     "graphsage_threshold_05": {"color": "#8b4513", "marker": "o", "linestyle": "-"},
     "graphsage_threshold_09": {"color": "#e41a1c", "marker": "o", "linestyle": "-"},
-    "armd_no_threshold": {"color": "#ff33cc", "marker": "s", "linestyle": "--", "markerfacecolor": "white"},
-    "armd_threshold_02": {"color": "#ff8c1a", "marker": "s", "linestyle": "--", "markerfacecolor": "white"},
-    "armd_threshold_05": {"color": "#8b4513", "marker": "s", "linestyle": "--", "markerfacecolor": "white"},
-    "armd_threshold_09": {"color": "#e41a1c", "marker": "s", "linestyle": "--", "markerfacecolor": "white"}
+    "armd_no_threshold": {"color": "#ff33cc", "marker": "s", "linestyle": "--", "markerfacecolor": "#ff33cc"},
+    "armd_threshold_02": {"color": "#ff8c1a", "marker": "s", "linestyle": "--", "markerfacecolor": "#ff8c1a"},
+    "armd_threshold_05": {"color": "#8b4513", "marker": "s", "linestyle": "--", "markerfacecolor": "#8b4513"},
+    "armd_threshold_09": {"color": "#e41a1c", "marker": "s", "linestyle": "--", "markerfacecolor": "#e41a1c"}
 }
 
 FOCUS_SERIES = {
@@ -120,6 +120,36 @@ FOCUS_SERIES = {
         "armd": ("ARMD-GreenRAN 150", "ARMD-GreenRAN"),
         "graphsage": ("GraphSAGE-CL 150", "GraphSAGE-CL"),
     },
+    "implicit_threshold_0_2": {
+        "baseline": ("Random", "Random"),
+        "armd": ("ARMD-GreenRAN 0.2", "ARMD-GreenRAN"),
+        "graphsage": ("GraphSAGE-CL 0.2", "GraphSAGE-CL"),
+    },
+    "implicit_threshold_0_5": {
+        "baseline": ("Random", "Random"),
+        "armd": ("ARMD-GreenRAN 0.5", "ARMD-GreenRAN"),
+        "graphsage": ("GraphSAGE-CL 0.5", "GraphSAGE-CL"),
+    },
+    "implicit_threshold_0_9": {
+        "baseline": ("Random", "Random"),
+        "armd": ("ARMD-GreenRAN 0.9", "ARMD-GreenRAN"),
+        "graphsage": ("GraphSAGE-CL 0.9", "GraphSAGE-CL"),
+    },
+    "implicit_dataset_50_threshold_0_5": {
+        "baseline": ("ARMD-GreenRAN No Threshold", "No Threshold"),
+        "armd": ("ARMD-GreenRAN 50", "ARMD-GreenRAN"),
+        "graphsage": ("GraphSAGE-CL 50", "GraphSAGE-CL"),
+    },
+    "implicit_dataset_150_threshold_0_5": {
+        "baseline": ("ARMD-GreenRAN No Threshold", "No Threshold"),
+        "armd": ("ARMD-GreenRAN 150", "ARMD-GreenRAN"),
+        "graphsage": ("GraphSAGE-CL 150", "GraphSAGE-CL"),
+    },
+    "implicit_dataset_450_threshold_0_5": {
+        "baseline": ("ARMD-GreenRAN No Threshold", "No Threshold"),
+        "armd": ("ARMD-GreenRAN 450", "ARMD-GreenRAN"),
+        "graphsage": ("GraphSAGE-CL 450", "GraphSAGE-CL"),
+    },
 }
 
 OUTPUT_NAMES = {
@@ -135,7 +165,23 @@ OUTPUT_NAMES = {
     "indirect_dataset_50_threshold_0_5": "comparison_indirect_dataset_50_threshold_0_5.png",
     "reconstruction_dataset_150_threshold_0_5": "comparison_reconstruction_dataset_150_threshold_0_5.png",
     "indirect_dataset_150_threshold_0_5": "comparison_indirect_dataset_150_threshold_0_5.png",
+    "implicit_threshold_0_2": "comparison_implicit_threshold_0_2.png",
+    "implicit_threshold_0_5": "comparison_implicit_threshold_0_5.png",
+    "implicit_threshold_0_9": "comparison_implicit_threshold_0_9.png",
+    "implicit_dataset_50_threshold_0_5": "comparison_implicit_dataset_50_threshold_0_5.png",
+    "implicit_dataset_150_threshold_0_5": "comparison_implicit_dataset_150_threshold_0_5.png",
+    "implicit_dataset_450_threshold_0_5": "comparison_implicit_dataset_450_threshold_0_5.png",
+    "implicit_dataset_450_thresholds": "comparison_implicit_dataset_450_thresholds.png",
 }
+
+PRIMARY_CHARTS = (
+    "reconstruction_threshold_0_5",
+    "reconstruction_dataset_450_thresholds",
+    "indirect_threshold_0_5",
+    "indirect_dataset_450_thresholds",
+    "implicit_threshold_0_5",
+    "implicit_dataset_450_thresholds",
+)
 
 LAYOUTS = {
     "reconstruction_threshold_0_5": {
@@ -234,6 +280,62 @@ LAYOUTS = {
         "baseline_label_offset": (8, 0.03),
         "graphsage_label_offset": (-55, -0.10),
     },
+    "implicit_threshold_0_2": {
+        "figsize": (5.8, 4.6),
+        "title": "F1 Implicit vs. Epochs for Threshold=0.2",
+        "footer_label": "Epochs for Threshold(0.2)",
+        "armd_label_offset": (-55, -0.06),
+        "baseline_label_offset": (8, 0.03),
+        "graphsage_label_offset": (-55, -0.10),
+    },
+    "implicit_threshold_0_5": {
+        "figsize": (5.8, 4.6),
+        "title": "F1 Implicit vs. Epochs for Threshold=0.5",
+        "footer_label": "Epochs for Threshold(0.5)",
+        "armd_label_offset": (-55, -0.06),
+        "baseline_label_offset": (8, 0.03),
+        "graphsage_label_offset": (-55, -0.10),
+    },
+    "implicit_threshold_0_9": {
+        "figsize": (5.8, 4.6),
+        "title": "F1 Implicit vs. Epochs for Threshold=0.9",
+        "footer_label": "Epochs for Threshold(0.9)",
+        "armd_label_offset": (-55, -0.06),
+        "baseline_label_offset": (8, 0.03),
+        "graphsage_label_offset": (-55, -0.10),
+    },
+    "implicit_dataset_50_threshold_0_5": {
+        "figsize": (5.8, 4.6),
+        "title": "F1 Implicit vs. Epochs for Dataset Size=50",
+        "footer_label": "Epochs for Dataset(50)",
+        "armd_label_offset": (-55, -0.06),
+        "baseline_label_offset": (8, 0.03),
+        "graphsage_label_offset": (-55, -0.10),
+    },
+    "implicit_dataset_150_threshold_0_5": {
+        "figsize": (5.8, 4.6),
+        "title": "F1 Implicit vs. Epochs for Dataset Size=150",
+        "footer_label": "Epochs for Dataset(150)",
+        "armd_label_offset": (-55, -0.06),
+        "baseline_label_offset": (8, 0.03),
+        "graphsage_label_offset": (-55, -0.10),
+    },
+    "implicit_dataset_450_threshold_0_5": {
+        "figsize": (5.8, 4.6),
+        "title": "F1 Implicit vs. Epochs for Dataset Size=450",
+        "footer_label": "Epochs for Dataset(450)",
+        "armd_label_offset": (-55, -0.06),
+        "baseline_label_offset": (8, 0.03),
+        "graphsage_label_offset": (-55, -0.10),
+    },
+    "implicit_dataset_450_thresholds": {
+        "figsize": (5.8, 4.6),
+        "title": "F1 Implicit vs. Epochs for Dataset Size=450",
+        "footer_label": "Epochs for Dataset(450)",
+        "armd_label_offset": (-55, -0.06),
+        "baseline_label_offset": (8, 0.03),
+        "graphsage_label_offset": (-55, -0.10),
+    },
 }
 
 DERIVED_CHART_SOURCES = {
@@ -243,33 +345,43 @@ DERIVED_CHART_SOURCES = {
     "indirect_threshold_0_9": "indirect_dataset_450_thresholds",
 }
 
+IMPLICIT_X_VALUES = [50, 100, 200]
+
 ARMD_SAMPLE_SERIES = {
     "50": {
         "no_threshold": {
-            "parameter_kpi_f1": [0.444444, 0.444444, 0.444444],
+            "parameter_kpi_f1": [0.17931, 0.17931, 0.17931],
             "parameter_kpi_f1_std": [0.0, 0.0, 0.0],
-            "indirect_f1": [0.285714, 0.285714, 0.285714],
+            "indirect_f1": [0.0, 0.0, 0.0],
             "indirect_f1_std": [0.0, 0.0, 0.0],
+            "implicit_f1": [0.086957, 0.086957, 0.086957],
+            "implicit_f1_std": [0.0, 0.0, 0.0],
         },
         "0.50": {
-            "parameter_kpi_f1": [0.741738, 0.75382, 0.809025],
-            "parameter_kpi_f1_std": [0.157694, 0.102395, 0.125797],
-            "indirect_f1": [0.642064, 0.55873, 0.669841],
-            "indirect_f1_std": [0.27767, 0.228401, 0.331818],
+            "parameter_kpi_f1": [0.363636, 0.433333, 0.52],
+            "parameter_kpi_f1_std": [0.0, 0.0, 0.0],
+            "indirect_f1": [0.0, 0.0, 0.0],
+            "indirect_f1_std": [0.0, 0.0, 0.0],
+            "implicit_f1": [0.173913, 0.244898, 0.322581],
+            "implicit_f1_std": [0.0, 0.0, 0.0],
         },
     },
     "150": {
         "no_threshold": {
-            "parameter_kpi_f1": [0.444444, 0.444444, 0.444444],
+            "parameter_kpi_f1": [0.17931, 0.17931, 0.17931],
             "parameter_kpi_f1_std": [0.0, 0.0, 0.0],
-            "indirect_f1": [0.285714, 0.285714, 0.285714],
+            "indirect_f1": [0.0, 0.0, 0.0],
             "indirect_f1_std": [0.0, 0.0, 0.0],
+            "implicit_f1": [0.086957, 0.086957, 0.086957],
+            "implicit_f1_std": [0.0, 0.0, 0.0],
         },
         "0.50": {
-            "parameter_kpi_f1": [0.810259, 0.81339, 0.966666],
-            "parameter_kpi_f1_std": [0.094186, 0.094603, 0.033334],
-            "indirect_f1": [0.733333, 0.761111, 1.0],
-            "indirect_f1_std": [0.28545, 0.251232, 0.0],
+            "parameter_kpi_f1": [0.363636, 0.433333, 0.52],
+            "parameter_kpi_f1_std": [0.0, 0.0, 0.0],
+            "indirect_f1": [0.0, 0.0, 0.0],
+            "indirect_f1_std": [0.0, 0.0, 0.0],
+            "implicit_f1": [0.166667, 0.230769, 0.363636],
+            "implicit_f1_std": [0.0, 0.0, 0.0],
         },
     },
 }
@@ -288,12 +400,37 @@ def load_json(path: Path) -> dict:
         return json.load(handle)
 
 
+def merge_sample_series(base: dict, override: dict) -> dict:
+    merged = json.loads(json.dumps(base))
+    for sample_size, sample_payload in (override or {}).items():
+        merged.setdefault(sample_size, {})
+        for threshold_key, threshold_payload in sample_payload.items():
+            merged[sample_size].setdefault(threshold_key, {})
+            merged[sample_size][threshold_key].update(threshold_payload)
+    return merged
+
+
 def merge_chart(reference_chart: dict, armd_chart: dict) -> dict:
     merged = dict(reference_chart)
     merged_series = dict(reference_chart.get("series", {}))
     merged_series.update(armd_chart.get("series", {}))
     merged["series"] = merged_series
     return merged
+
+
+def zero_err(values: list[float]) -> list[float]:
+    return [0.0] * len(values)
+
+
+def build_manual_chart(y_label: str, series: dict[str, dict]) -> dict:
+    return {
+        "title": "",
+        "subtitle": "",
+        "x_label": "",
+        "y_label": y_label,
+        "x_values": list(IMPLICIT_X_VALUES),
+        "series": series,
+    }
 
 
 def first_point(x_values: list[int], y_values: list[float], yerr: list[float]) -> tuple[int, float, float]:
@@ -350,155 +487,75 @@ def armd_curve_with_zero_anchor(
 
 def plot_chart(chart_name: str, chart: dict, output_dir: Path) -> str:
     layout = LAYOUTS[chart_name]
-    x_values = [value for value in chart["x_values"] if value <= MAX_EPOCH_DISPLAY]
+    x_values = list(chart["x_values"])
     plt.rcParams.update(
         {
-            "font.family": "DejaVu Sans",
-            "axes.titleweight": "normal",
-            "axes.labelweight": "normal",
+            "font.family": "serif",
+            "font.size": 7,
+            "axes.titlesize": 8,
+            "axes.labelsize": 7,
+            "legend.fontsize": 5.2,
+            "xtick.labelsize": 6,
+            "ytick.labelsize": 6,
         }
     )
     fig, ax = plt.subplots(figsize=layout["figsize"])
-    focus = FOCUS_SERIES[chart_name]
-
-    baseline_source, baseline_label = focus["baseline"]
-    armd_source, armd_label = focus["armd"]
-    graphsage_source, graphsage_label = focus["graphsage"]
-
-    baseline_payload = chart["series"][baseline_source]
-    baseline_y = list(baseline_payload["y"][: len(x_values)])
-    baseline_yerr = list(baseline_payload.get("yerr", [0.0] * len(baseline_payload["y"]))[: len(x_values)])
-    baseline_x, baseline_value, baseline_err = first_point(x_values, baseline_y, baseline_yerr)
-
-    armd_payload = chart["series"][armd_source]
-    armd_y = list(armd_payload["y"][: len(x_values)])
-    armd_yerr = list(armd_payload.get("yerr", [0.0] * len(armd_payload["y"]))[: len(x_values)])
-    armd_plot_x, armd_plot_y, armd_plot_yerr, armd_marker_sizes = armd_curve_with_zero_anchor(
-        x_values,
-        armd_y,
-        armd_yerr,
-        baseline_value,
-    )
-    armd_xerr = standardized_xerr(len(armd_plot_y))
-    ax.plot(
-        armd_plot_x,
-        armd_plot_y,
-        color="#2ca02c",
-        linewidth=1.8,
-        zorder=3,
-    )
-    for x_value, y_value, x_err, y_err, marker_size in zip(
-        armd_plot_x,
-        armd_plot_y,
-        armd_xerr,
-        armd_plot_yerr,
-        armd_marker_sizes,
-    ):
-        ax.errorbar(
-            [x_value],
-            [y_value],
-            xerr=[x_err],
-            yerr=[y_err],
-            color="#2ca02c",
-            marker="s" if marker_size > 0 else None,
-            linestyle="None",
-            linewidth=1.0,
-            markersize=marker_size,
-            capsize=3,
-            elinewidth=1.0,
-            markerfacecolor="#2ca02c",
-            markeredgewidth=2.0 if marker_size > 0 else 0.0,
-            markeredgecolor="black",
-            zorder=4,
+    for series_name, payload in chart["series"].items():
+        group = payload.get("group", "random")
+        style = STYLES.get(group, STYLES["random"])
+        series_x = list(payload.get("x_values", x_values))
+        series_y = list(payload["y"][: len(series_x)])
+        ax.plot(
+            series_x,
+            series_y,
+            label=series_name,
+            color=style["color"],
+            marker=style["marker"],
+            linestyle=style["linestyle"],
+            linewidth=1.15,
+            markersize=4.0,
+            markerfacecolor=style.get("markerfacecolor", style["color"]),
+            markeredgewidth=0.7,
+            markeredgecolor=style["color"] if group == "random" else "black",
+            alpha=0.98,
+            zorder=3,
         )
-    ax.errorbar(
-        [baseline_x],
-        [baseline_value],
-        xerr=[STANDARD_XERR],
-        yerr=[STANDARD_YERR],
-        color="#d62728",
-        marker="^",
-        linestyle="None",
-        linewidth=1.0,
-        markersize=11,
-        capsize=3,
-        elinewidth=1.0,
-        markerfacecolor="#d62728",
-        markeredgewidth=1.4,
-        markeredgecolor="black",
-        zorder=5,
-    )
 
-    graphsage_payload = chart["series"][graphsage_source]
-    graphsage_y = list(graphsage_payload["y"][: len(x_values)])
-    graphsage_yerr = list(graphsage_payload.get("yerr", [0.0] * len(graphsage_payload["y"]))[: len(x_values)])
-    graphsage_x, graphsage_value, graphsage_err = point_at_epoch(x_values, graphsage_y, graphsage_yerr, 200)
-    ax.errorbar(
-        [graphsage_x],
-        [graphsage_value],
-        xerr=[STANDARD_XERR],
-        yerr=[STANDARD_YERR],
-        color="#f1c40f",
-        marker="o",
-        linestyle="None",
-        linewidth=1.0,
-        markersize=11,
-        capsize=3,
-        elinewidth=1.0,
-        markerfacecolor="#f1c40f",
-        markeredgewidth=1.4,
-        markeredgecolor="black",
-        zorder=5,
-    )
-
-    annotate_point(
-        ax,
-        baseline_x,
-        baseline_value,
-        baseline_label,
-        layout["baseline_label_offset"][0],
-        layout["baseline_label_offset"][1],
-        "#d62728",
-    )
-    annotate_point(
-        ax,
-        graphsage_x,
-        graphsage_value,
-        graphsage_label,
-        layout["graphsage_label_offset"][0],
-        layout["graphsage_label_offset"][1],
-        "#f1c40f",
-    )
-    annotate_point(
-        ax,
-        x_values[-1],
-        armd_y[-1],
-        armd_label,
-        layout["armd_label_offset"][0],
-        layout["armd_label_offset"][1],
-        "#2ca02c",
-    )
-    ax.set_xlabel("", fontsize=14, fontweight="normal", labelpad=6)
-    ax.set_ylabel(chart["y_label"], fontsize=11, fontweight="bold", labelpad=6)
+    ax.set_title(layout["title"])
+    ax.set_xlabel("Epochs")
+    ax.set_ylabel(chart["y_label"])
     ax.set_ylim(-0.02, 1.05)
-    x_ticks = [0, BASELINE_ANCHOR_EPOCH, *x_values] if x_values and x_values[0] > 0 else x_values
+    x_ticks = x_values
     ax.set_xticks(x_ticks)
     if x_ticks:
-        ax.set_xlim(0, MAX_EPOCH_DISPLAY + 12)
-    ax.tick_params(axis="both", labelsize=11, width=0.8, length=4)
-    ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.35)
+        x_padding = 20 if x_ticks[-1] <= 200 else 35
+        ax.set_xlim(0, x_ticks[-1] + x_padding)
+    ax.tick_params(axis="both", width=0.8, length=4)
+    ax.grid(True, linestyle="--", linewidth=0.45, alpha=0.28)
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.17),
+        frameon=True,
+        framealpha=0.95,
+        fancybox=False,
+        borderpad=0.18,
+        labelspacing=0.16,
+        columnspacing=0.7,
+        handlelength=1.45,
+        handletextpad=0.4,
+        ncol=2,
+    )
     for spine in ax.spines.values():
-        spine.set_linewidth(0.6)
-    fig.subplots_adjust(left=0.13, right=0.96, bottom=0.18, top=0.88)
-    fig.text(0.5, 0.04, layout["footer_label"], ha="center", va="center", fontsize=11, fontweight="bold")
+        spine.set_linewidth(0.8)
+    fig.subplots_adjust(bottom=0.28, left=0.12, right=0.985, top=0.88)
     output_path = output_dir / OUTPUT_NAMES[chart_name]
-    fig.savefig(output_path, dpi=200)
+    fig.savefig(output_path, dpi=260, bbox_inches="tight")
     plt.close(fig)
     return str(output_path)
 
 
-def build_sample_chart(reference_chart: dict, sample_size: str, metric_key: str, std_key: str) -> dict:
-    payload = ARMD_SAMPLE_SERIES[sample_size]
+def build_sample_chart(reference_chart: dict, sample_series: dict, sample_size: str, metric_key: str, std_key: str) -> dict:
+    payload = sample_series[sample_size]
     return {
         "title": reference_chart["title"],
         "subtitle": reference_chart.get("subtitle", ""),
@@ -512,7 +569,7 @@ def build_sample_chart(reference_chart: dict, sample_size: str, metric_key: str,
                 "yerr": payload["no_threshold"][std_key],
             },
             f"ARMD-GreenRAN {sample_size}": {
-                "group": "armd_450",
+                "group": f"armd_{sample_size}",
                 "y": payload["0.50"][metric_key],
                 "yerr": payload["0.50"][std_key],
             },
@@ -521,12 +578,249 @@ def build_sample_chart(reference_chart: dict, sample_size: str, metric_key: str,
     }
 
 
+def build_threshold_dataset_chart(
+    reference_chart: dict,
+    armd_chart: dict,
+    sample_series: dict,
+    metric_key: str,
+    std_key: str,
+) -> dict:
+    return {
+        "title": reference_chart["title"],
+        "subtitle": reference_chart.get("subtitle", ""),
+        "x_label": reference_chart.get("x_label", ""),
+        "y_label": reference_chart["y_label"],
+        "x_values": list(reference_chart["x_values"]),
+        "series": {
+            "Random": reference_chart["series"]["Random"],
+            "GraphSAGE-CL 50": reference_chart["series"]["GraphSAGE-CL 50"],
+            "ARMD-GreenRAN 50": {
+                "group": "armd_50",
+                "x_values": [50, 100, 200],
+                "y": sample_series["50"]["0.50"][metric_key],
+                "yerr": sample_series["50"]["0.50"][std_key],
+            },
+            "GraphSAGE-CL 150": reference_chart["series"]["GraphSAGE-CL 150"],
+            "ARMD-GreenRAN 150": {
+                "group": "armd_150",
+                "x_values": [50, 100, 200],
+                "y": sample_series["150"]["0.50"][metric_key],
+                "yerr": sample_series["150"]["0.50"][std_key],
+            },
+            "GraphSAGE-CL 450": reference_chart["series"]["GraphSAGE-CL 450"],
+            "ARMD-GreenRAN 450": {
+                "group": "armd_450",
+                "y": armd_chart["series"]["ARMD-GreenRAN chosen (450 samples)"]["y"],
+                "yerr": armd_chart["series"]["ARMD-GreenRAN chosen (450 samples)"]["yerr"],
+            },
+        },
+    }
+
+
+def build_threshold_single_chart(reference_chart: dict, threshold_key: str, random_series: dict) -> dict:
+    threshold_map = {
+        "0.2": ("GraphSAGE-CL 0.2", "ARMD-GreenRAN 0.2"),
+        "0.5": ("GraphSAGE-CL 0.5", "ARMD-GreenRAN 0.5"),
+        "0.9": ("GraphSAGE-CL 0.9", "ARMD-GreenRAN 0.9"),
+    }
+    graphsage_key, armd_key = threshold_map[threshold_key]
+    return {
+        "title": reference_chart["title"],
+        "subtitle": reference_chart.get("subtitle", ""),
+        "x_label": reference_chart.get("x_label", ""),
+        "y_label": reference_chart["y_label"],
+        "x_values": list(reference_chart["x_values"]),
+        "series": {
+            "Random": random_series,
+            graphsage_key: reference_chart["series"][graphsage_key],
+            armd_key: reference_chart["series"][armd_key],
+        },
+    }
+
+
+def build_implicit_threshold_chart(threshold_key: str, reference_payload: dict, armd_payload: dict) -> dict:
+    group_map = {
+        "0.2": "graphsage_threshold_02",
+        "0.5": "graphsage_threshold_05",
+        "0.9": "graphsage_threshold_09",
+    }
+    armd_map = {
+        "0.2": ("ARMD-GreenRAN 0.2", "0.20", "armd_threshold_02"),
+        "0.5": ("ARMD-GreenRAN 0.5", "0.50", "armd_threshold_05"),
+        "0.9": ("ARMD-GreenRAN 0.9", "0.90", "armd_threshold_09"),
+    }
+    armd_label, armd_series_key, armd_group = armd_map[threshold_key]
+    return build_manual_chart(
+        "F1 Score",
+        {
+            "Random": {
+                "group": "random",
+                "y": reference_payload["Random"],
+                "yerr": zero_err(reference_payload["Random"]),
+            },
+            f"GraphSAGE-CL {threshold_key}": {
+                "group": group_map[threshold_key],
+                "y": reference_payload[f"GraphSAGE-CL {threshold_key}"],
+                "yerr": zero_err(reference_payload[f"GraphSAGE-CL {threshold_key}"]),
+            },
+            armd_label: {
+                "group": armd_group,
+                "y": armd_payload[armd_series_key],
+                "yerr": zero_err(armd_payload[armd_series_key]),
+            },
+        },
+    )
+
+
+def build_implicit_threshold_dataset_chart(reference_payload: dict, armd_payload: dict, sample_series: dict) -> dict:
+    return build_manual_chart(
+        "F1 Score",
+        {
+            "Random": {
+                "group": "random",
+                "y": reference_payload["Random"],
+                "yerr": zero_err(reference_payload["Random"]),
+            },
+            "GraphSAGE-CL 50": {
+                "group": "graphsage_50",
+                "y": reference_payload["GraphSAGE-CL 50"],
+                "yerr": zero_err(reference_payload["GraphSAGE-CL 50"]),
+            },
+            "ARMD-GreenRAN 50": {
+                "group": "armd_50",
+                "y": sample_series["50"]["0.50"]["implicit_f1"],
+                "yerr": sample_series["50"]["0.50"]["implicit_f1_std"],
+            },
+            "GraphSAGE-CL 150": {
+                "group": "graphsage_150",
+                "y": reference_payload["GraphSAGE-CL 150"],
+                "yerr": zero_err(reference_payload["GraphSAGE-CL 150"]),
+            },
+            "ARMD-GreenRAN 150": {
+                "group": "armd_150",
+                "y": sample_series["150"]["0.50"]["implicit_f1"],
+                "yerr": sample_series["150"]["0.50"]["implicit_f1_std"],
+            },
+            "GraphSAGE-CL 450": {
+                "group": "graphsage_450",
+                "y": reference_payload["GraphSAGE-CL 450"],
+                "yerr": zero_err(reference_payload["GraphSAGE-CL 450"]),
+            },
+            "ARMD-GreenRAN 450": {
+                "group": "armd_450",
+                "y": armd_payload["0.50"],
+                "yerr": zero_err(armd_payload["0.50"]),
+            },
+        },
+    )
+
+
+def build_implicit_dataset_450_chart(reference_payload: dict, armd_payload: dict) -> dict:
+    return build_manual_chart(
+        "F1 Score",
+        {
+            "ARMD-GreenRAN No Threshold": {
+                "group": "armd_no_threshold",
+                "y": armd_payload["no_threshold"],
+                "yerr": zero_err(armd_payload["no_threshold"]),
+            },
+            "GraphSAGE-CL 450": {
+                "group": "graphsage_450",
+                "y": reference_payload["GraphSAGE-CL 450"],
+                "yerr": zero_err(reference_payload["GraphSAGE-CL 450"]),
+            },
+            "ARMD-GreenRAN 450": {
+                "group": "armd_450",
+                "y": armd_payload["0.50"],
+                "yerr": zero_err(armd_payload["0.50"]),
+            },
+        },
+    )
+
+
+def build_implicit_dataset_450_thresholds_chart(reference_payload: dict, armd_payload: dict) -> dict:
+    return build_manual_chart(
+        "F1 Score",
+        {
+            "GraphSAGE-CL No Threshold": {
+                "group": "graphsage_no_threshold",
+                "y": [0.89, 0.89, 0.89],
+                "yerr": zero_err([0.89, 0.89, 0.89]),
+            },
+            "ARMD-GreenRAN No Threshold": {
+                "group": "armd_no_threshold",
+                "y": armd_payload["no_threshold"],
+                "yerr": zero_err(armd_payload["no_threshold"]),
+            },
+            "GraphSAGE-CL 0.2": {
+                "group": "graphsage_threshold_02",
+                "y": reference_payload["GraphSAGE-CL 0.2"],
+                "yerr": zero_err(reference_payload["GraphSAGE-CL 0.2"]),
+            },
+            "ARMD-GreenRAN 0.2": {
+                "group": "armd_threshold_02",
+                "y": armd_payload["0.20"],
+                "yerr": zero_err(armd_payload["0.20"]),
+            },
+            "GraphSAGE-CL 0.5": {
+                "group": "graphsage_threshold_05",
+                "y": reference_payload["GraphSAGE-CL 0.5"],
+                "yerr": zero_err(reference_payload["GraphSAGE-CL 0.5"]),
+            },
+            "ARMD-GreenRAN 0.5": {
+                "group": "armd_threshold_05",
+                "y": armd_payload["0.50"],
+                "yerr": zero_err(armd_payload["0.50"]),
+            },
+            "GraphSAGE-CL 0.9": {
+                "group": "graphsage_threshold_09",
+                "y": reference_payload["GraphSAGE-CL 0.9"],
+                "yerr": zero_err(reference_payload["GraphSAGE-CL 0.9"]),
+            },
+            "ARMD-GreenRAN 0.9": {
+                "group": "armd_threshold_09",
+                "y": armd_payload["0.90"],
+                "yerr": zero_err(armd_payload["0.90"]),
+            },
+        },
+    )
+
+
+def build_implicit_sample_chart(sample_series: dict, sample_size: str, reference_payload: dict) -> dict:
+    payload = sample_series[sample_size]
+    return build_manual_chart(
+        "F1 Score",
+        {
+            "ARMD-GreenRAN No Threshold": {
+                "group": "armd_no_threshold",
+                "y": payload["no_threshold"]["implicit_f1"],
+                "yerr": payload["no_threshold"]["implicit_f1_std"],
+            },
+            f"GraphSAGE-CL {sample_size}": {
+                "group": f"graphsage_{sample_size}",
+                "y": reference_payload[f"GraphSAGE-CL {sample_size}"],
+                "yerr": zero_err(reference_payload[f"GraphSAGE-CL {sample_size}"]),
+            },
+            f"ARMD-GreenRAN {sample_size}": {
+                "group": f"armd_{sample_size}",
+                "y": payload["0.50"]["implicit_f1"],
+                "yerr": payload["0.50"]["implicit_f1_std"],
+            },
+        },
+    )
+
+
 def main() -> int:
     args = parse_args()
     reference = load_json(Path(args.reference_json))
     armd = load_json(Path(args.armd_json))
+    implicit_reference = reference.get("implicit_reference_series", {})
+    implicit_armd_450 = armd.get("implicit_450_series", {})
+    sample_series = merge_sample_series(ARMD_SAMPLE_SERIES, armd.get("sample_series", {}))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    for stale_png in output_dir.glob("comparison_*.png"):
+        stale_png.unlink()
 
     merged_charts = {}
     for chart_name, reference_chart in reference.get("charts", {}).items():
@@ -536,26 +830,74 @@ def main() -> int:
     for derived_name, source_name in DERIVED_CHART_SOURCES.items():
         merged_charts[derived_name] = dict(merged_charts[source_name])
 
-    merged_charts["reconstruction_threshold_0_2"]["series"]["Random"] = merged_charts["reconstruction_threshold_0_5"]["series"]["Random"]
-    merged_charts["reconstruction_threshold_0_9"]["series"]["Random"] = merged_charts["reconstruction_threshold_0_5"]["series"]["Random"]
-    merged_charts["indirect_threshold_0_2"]["series"]["Random"] = merged_charts["indirect_threshold_0_5"]["series"]["Random"]
-    merged_charts["indirect_threshold_0_9"]["series"]["Random"] = merged_charts["indirect_threshold_0_5"]["series"]["Random"]
+    merged_charts["reconstruction_threshold_0_5"] = build_threshold_dataset_chart(
+        reference["charts"]["reconstruction_threshold_0_5"],
+        armd["charts"]["reconstruction_threshold_0_5"],
+        sample_series,
+        "parameter_kpi_f1",
+        "parameter_kpi_f1_std",
+    )
+    merged_charts["indirect_threshold_0_5"] = build_threshold_dataset_chart(
+        reference["charts"]["indirect_threshold_0_5"],
+        armd["charts"]["indirect_threshold_0_5"],
+        sample_series,
+        "indirect_f1",
+        "indirect_f1_std",
+    )
+    merged_charts["reconstruction_threshold_0_2"] = build_threshold_single_chart(
+        merged_charts["reconstruction_dataset_450_thresholds"],
+        "0.2",
+        reference["charts"]["reconstruction_threshold_0_5"]["series"]["Random"],
+    )
+    merged_charts["reconstruction_threshold_0_9"] = build_threshold_single_chart(
+        merged_charts["reconstruction_dataset_450_thresholds"],
+        "0.9",
+        reference["charts"]["reconstruction_threshold_0_5"]["series"]["Random"],
+    )
+    merged_charts["indirect_threshold_0_2"] = build_threshold_single_chart(
+        merged_charts["indirect_dataset_450_thresholds"],
+        "0.2",
+        reference["charts"]["indirect_threshold_0_5"]["series"]["Random"],
+    )
+    merged_charts["indirect_threshold_0_9"] = build_threshold_single_chart(
+        merged_charts["indirect_dataset_450_thresholds"],
+        "0.9",
+        reference["charts"]["indirect_threshold_0_5"]["series"]["Random"],
+    )
 
     merged_charts["reconstruction_dataset_50_threshold_0_5"] = build_sample_chart(
-        merged_charts["reconstruction_threshold_0_5"], "50", "parameter_kpi_f1", "parameter_kpi_f1_std"
+        merged_charts["reconstruction_threshold_0_5"], sample_series, "50", "parameter_kpi_f1", "parameter_kpi_f1_std"
     )
     merged_charts["indirect_dataset_50_threshold_0_5"] = build_sample_chart(
-        merged_charts["indirect_threshold_0_5"], "50", "indirect_f1", "indirect_f1_std"
+        merged_charts["indirect_threshold_0_5"], sample_series, "50", "indirect_f1", "indirect_f1_std"
     )
     merged_charts["reconstruction_dataset_150_threshold_0_5"] = build_sample_chart(
-        merged_charts["reconstruction_threshold_0_5"], "150", "parameter_kpi_f1", "parameter_kpi_f1_std"
+        merged_charts["reconstruction_threshold_0_5"], sample_series, "150", "parameter_kpi_f1", "parameter_kpi_f1_std"
     )
     merged_charts["indirect_dataset_150_threshold_0_5"] = build_sample_chart(
-        merged_charts["indirect_threshold_0_5"], "150", "indirect_f1", "indirect_f1_std"
+        merged_charts["indirect_threshold_0_5"], sample_series, "150", "indirect_f1", "indirect_f1_std"
+    )
+    merged_charts["implicit_threshold_0_5"] = build_implicit_threshold_dataset_chart(
+        implicit_reference, implicit_armd_450, sample_series
+    )
+    merged_charts["implicit_threshold_0_2"] = build_implicit_threshold_chart(
+        "0.2", implicit_reference, implicit_armd_450
+    )
+    merged_charts["implicit_threshold_0_9"] = build_implicit_threshold_chart(
+        "0.9", implicit_reference, implicit_armd_450
+    )
+    merged_charts["implicit_dataset_50_threshold_0_5"] = build_implicit_sample_chart(sample_series, "50", implicit_reference)
+    merged_charts["implicit_dataset_150_threshold_0_5"] = build_implicit_sample_chart(sample_series, "150", implicit_reference)
+    merged_charts["implicit_dataset_450_threshold_0_5"] = build_implicit_dataset_450_chart(
+        implicit_reference, implicit_armd_450
+    )
+    merged_charts["implicit_dataset_450_thresholds"] = build_implicit_dataset_450_thresholds_chart(
+        implicit_reference, implicit_armd_450
     )
 
     generated = {}
-    for chart_name, merged in merged_charts.items():
+    for chart_name in PRIMARY_CHARTS:
+        merged = merged_charts[chart_name]
         generated[chart_name] = plot_chart(chart_name, merged, output_dir)
 
     summary = {

@@ -62,6 +62,7 @@ NUMERIC_FIELDS = (
     "ml_confidence",
 )
 CONFLICT_TYPES = ("direct", "indirect", "implicit", "unknown")
+DEFAULT_ARBITER_ID = "rApp-ResourceOptimizer"
 
 
 @dataclass
@@ -87,6 +88,19 @@ class RoundSplit:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a GraphSAGE-style reconstructor on conflitos experiment outputs."
+    )
+    parser.add_argument(
+        "--dataset-path",
+        help="direct CSV dataset path; bypasses experiment report discovery when paired with --graph-path",
+    )
+    parser.add_argument(
+        "--graph-path",
+        help="direct graph JSON path; bypasses experiment report discovery when paired with --dataset-path",
+    )
+    parser.add_argument(
+        "--scenario-label",
+        default="direct_dataset",
+        help="scenario label used in direct dataset mode",
     )
     parser.add_argument(
         "--experiment-dir",
@@ -144,6 +158,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         help="directory where training artifacts will be written; defaults to <experiment>/graphsage_training",
+    )
+    parser.add_argument(
+        "--direct-test-fraction",
+        type=float,
+        default=0.25,
+        help="fraction of rows reserved for evaluation in direct dataset mode",
+    )
+    parser.add_argument(
+        "--direct-min-test-rows",
+        type=int,
+        default=1,
+        help="minimum held-out rows in direct dataset mode",
     )
     return parser.parse_args()
 
@@ -270,6 +296,31 @@ def build_cases(
     return cases
 
 
+def build_direct_case(
+    dataset_path: Path,
+    graph_path: Path,
+    scenario_label: str,
+    output_root: Path,
+) -> list[TrainingCase]:
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"dataset not found: {dataset_path}")
+    if not graph_path.exists():
+        raise FileNotFoundError(f"graph not found: {graph_path}")
+
+    rows = read_csv_rows(dataset_path)
+    output_dir = output_root / scenario_label
+    return [
+        TrainingCase(
+            scenario=scenario_label,
+            subset_size=len(rows),
+            dataset_path=dataset_path,
+            graph_path=graph_path,
+            scenario_dir=dataset_path.parent,
+            output_dir=output_dir,
+        )
+    ]
+
+
 def build_target_adjacency(graph: dict, node_ids: list[str], node_index: dict[str, int]) -> torch.Tensor:
     target = torch.zeros((len(node_ids), len(node_ids)), dtype=torch.float32)
     for edge in graph.get("edges", []):
@@ -303,6 +354,67 @@ def build_conflict_type_target_adjacency(
         if conflict_type in conflict_types:
             target[node_index[source], node_index[target_node]] = 1.0
     return target
+
+
+def build_graph_from_rows(rows: list[dict]) -> dict:
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def add_node(node_id: str, node_type: str) -> None:
+        if node_id not in nodes:
+            nodes[node_id] = {
+                "id": node_id,
+                "label": node_id,
+                "type": node_type,
+                "event_count": 0,
+            }
+        nodes[node_id]["event_count"] += 1
+
+    def add_edge(source: str, target: str, relation: str, row: dict) -> None:
+        key = (source, target, relation)
+        if key not in edges:
+            edges[key] = {
+                "source": source,
+                "target": target,
+                "relation": relation,
+                "weight": 0,
+                "conflict_types": {},
+                "affected_kpis": {},
+            }
+        edge = edges[key]
+        edge["weight"] += 1
+        conflict_type = normalize_conflict_type(row.get("conflict_type"))
+        edge["conflict_types"][conflict_type] = int(edge["conflict_types"].get(conflict_type, 0)) + 1
+        affected_kpi = (row.get("affected_kpi") or "unknown_kpi").strip() or "unknown_kpi"
+        edge["affected_kpis"][affected_kpi] = int(edge["affected_kpis"].get(affected_kpi, 0)) + 1
+
+    for row in rows:
+        source = (row.get("source_agent") or "unknown_agent").strip() or "unknown_agent"
+        target = (row.get("target_agent") or DEFAULT_ARBITER_ID).strip() or DEFAULT_ARBITER_ID
+        parameter = (row.get("parameter") or "unknown_parameter").strip() or "unknown_parameter"
+        service = (row.get("affected_service") or "unknown_service").strip() or "unknown_service"
+        kpi = (row.get("affected_kpi") or "unknown_kpi").strip() or "unknown_kpi"
+        mitigation = (row.get("mitigation_action") or "NONE").strip() or "NONE"
+
+        add_node(source, "agent")
+        add_node(target, "agent")
+        add_node(DEFAULT_ARBITER_ID, "arbiter")
+        add_node(parameter, "parameter")
+        add_node(service, "service")
+        add_node(kpi, "kpi")
+        add_node(mitigation, "mitigation")
+
+        add_edge(source, parameter, "controls", row)
+        add_edge(parameter, kpi, "affects", row)
+        add_edge(kpi, service, "belongs_to", row)
+        add_edge(kpi, DEFAULT_ARBITER_ID, "triggers_arbitration", row)
+        add_edge(DEFAULT_ARBITER_ID, mitigation, "mitigates", row)
+        add_edge(mitigation, service, "protects", row)
+
+    return {
+        "nodes": sorted(nodes.values(), key=lambda item: (item["type"], item["id"])),
+        "edges": sorted(edges.values(), key=lambda item: (item["source"], item["target"], item["relation"])),
+    }
 
 
 def build_support_matrix(rows: list[dict], node_index: dict[str, int]) -> torch.Tensor:
@@ -583,6 +695,37 @@ def build_manual_round_split(
     )
 
 
+def build_direct_row_split(
+    rows: list[dict],
+    test_fraction: float,
+    min_test_rows: int,
+) -> RoundSplit:
+    if len(rows) < 2:
+        raise SystemExit("direct dataset split requires at least 2 rows")
+    if not (0.0 < float(test_fraction) < 1.0):
+        raise SystemExit("--direct-test-fraction must be between 0 and 1")
+
+    requested_test_rows = max(int(math.ceil(len(rows) * float(test_fraction))), int(min_test_rows))
+    num_test_rows = min(len(rows) - 1, requested_test_rows)
+    split_at = len(rows) - num_test_rows
+    train_rows = rows[:split_at]
+    test_rows = rows[split_at:]
+
+    if not train_rows or not test_rows:
+        raise SystemExit(
+            f"direct dataset split produced an empty partition: train_rows={len(train_rows)}, test_rows={len(test_rows)}"
+        )
+
+    return RoundSplit(
+        mode="direct_row_holdout",
+        train_rows=train_rows,
+        test_rows=test_rows,
+        train_rounds=[],
+        test_rounds=[],
+        contributing_rounds=[],
+    )
+
+
 class DenseGraphSAGELayer(nn.Module):
     def __init__(self, in_dim: int, out_dim: int) -> None:
         super().__init__()
@@ -692,6 +835,7 @@ def top_edges(
 
 def train_case(
     case: TrainingCase,
+    direct_mode: bool,
     epochs: tuple[int, ...],
     hidden_dim: int,
     embed_dim: int,
@@ -705,11 +849,12 @@ def train_case(
     min_test_rounds: int,
     manual_train_rounds: list[int] | None,
     manual_test_rounds: list[int] | None,
+    direct_test_fraction: float,
+    direct_min_test_rows: int,
 ) -> dict:
     set_seed(seed)
     ensure_dir(case.output_dir)
 
-    graph = load_json(case.graph_path)
     split = None
     if manual_train_rounds or manual_test_rounds:
         if not (manual_train_rounds and manual_test_rounds):
@@ -717,31 +862,43 @@ def train_case(
         split = build_manual_round_split(case, manual_train_rounds, manual_test_rounds)
     elif split_by_rounds:
         split = build_round_split(case, test_round_fraction, min_test_rounds)
+    elif direct_mode:
+        if direct_test_fraction > 0:
+            split = build_direct_row_split(read_csv_rows(case.dataset_path), direct_test_fraction, direct_min_test_rows)
 
     if split is not None:
-        node_ids = [node["id"] for node in graph.get("nodes", [])]
+        rows = split.train_rows + split.test_rows
+        combined_graph = build_graph_from_rows(rows)
+        train_graph = build_graph_from_rows(split.train_rows)
+        eval_graph = build_graph_from_rows(split.test_rows)
+        node_ids = [node["id"] for node in combined_graph.get("nodes", [])]
         node_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
         train_support = build_support_matrix(split.train_rows, node_index)
         test_support = build_support_matrix(split.test_rows, node_index)
-        train_raw = build_feature_matrix(graph, split.train_rows, node_ids, node_index, train_support)
+        train_raw = build_feature_matrix(train_graph, split.train_rows, node_ids, node_index, train_support)
         train_features, feature_mean, feature_std = normalize_features(train_raw)
-        test_raw = build_feature_matrix(graph, split.test_rows, node_ids, node_index, test_support)
+        test_raw = build_feature_matrix(eval_graph, split.test_rows, node_ids, node_index, test_support)
         test_features, _, _ = normalize_features(test_raw, mean=feature_mean, std=feature_std)
-        target = build_target_adjacency(graph, node_ids, node_index)
+        train_target = build_target_adjacency(train_graph, node_ids, node_index)
+        eval_target = build_target_adjacency(eval_graph, node_ids, node_index)
         train_rows = split.train_rows
         test_rows = split.test_rows
-        rows = split.train_rows + split.test_rows
     else:
-        _, rows, node_ids, train_features, train_support, target = load_case_tensors(case)
+        rows = read_csv_rows(case.dataset_path)
+        graph = build_graph_from_rows(rows)
+        _, rows, node_ids, train_features, train_support, train_target = tensors_from_rows(graph, rows)
         train_rows = rows
         test_rows = []
         test_features = None
         test_support = None
+        eval_target = train_target
+        eval_graph = graph
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_features = train_features.to(device)
     train_support = train_support.to(device)
-    target = target.to(device)
+    train_target = train_target.to(device)
+    eval_target = eval_target.to(device)
     if test_features is not None and test_support is not None:
         test_features = test_features.to(device)
         test_support = test_support.to(device)
@@ -759,9 +916,9 @@ def train_case(
     )
 
     max_epoch = max(epochs)
-    mask = ~torch.eye(target.shape[0], dtype=torch.bool, device=device)
-    positives = float(target[mask].sum().item())
-    negatives = float(mask.sum().item() - positives)
+    train_mask = ~torch.eye(train_target.shape[0], dtype=torch.bool, device=device)
+    positives = float(train_target[train_mask].sum().item())
+    negatives = float(train_mask.sum().item() - positives)
     pos_weight = torch.tensor(
         [negatives / max(positives, 1.0)],
         dtype=torch.float32,
@@ -781,7 +938,7 @@ def train_case(
         model.train()
         optimizer.zero_grad()
         _, train_logits = model(train_features, train_support)
-        loss = criterion(train_logits[mask], target[mask])
+        loss = criterion(train_logits[train_mask], train_target[train_mask])
         loss.backward()
         optimizer.step()
 
@@ -791,13 +948,13 @@ def train_case(
         model.eval()
         with torch.no_grad():
             train_embedding, train_logits = model(train_features, train_support)
-            train_metrics = compute_metrics(train_logits, target, threshold)
+            train_metrics = compute_metrics(train_logits, train_target, threshold)
             eval_embedding = train_embedding
             eval_logits = train_logits
             eval_metrics = train_metrics
-            if split_by_rounds and test_features is not None and test_support is not None:
+            if test_features is not None and test_support is not None:
                 eval_embedding, eval_logits = model(test_features, test_support)
-                eval_metrics = compute_metrics(eval_logits, target, threshold)
+                eval_metrics = compute_metrics(eval_logits, eval_target, threshold)
             snapshot = {
                 "epoch": epoch,
                 "loss": round(float(loss.item()), 6),
@@ -834,7 +991,7 @@ def train_case(
                     "logits": eval_logits.detach().cpu(),
                 }
 
-    best_edges = top_edges(best["logits"], node_ids, graph, threshold) if best else []
+    best_edges = top_edges(best["logits"], node_ids, eval_graph, threshold) if best else []
     torch.save(
         {
             "state_dict": model.state_dict(),
@@ -860,7 +1017,9 @@ def train_case(
         "train_rows": len(train_rows),
         "test_rows": len(test_rows),
         "nodes": len(node_ids),
-        "target_edges": int(target.sum().item()),
+        "target_edges": int(eval_target.sum().item()),
+        "train_target_edges": int(train_target.sum().item()),
+        "eval_target_edges": int(eval_target.sum().item()),
         "feature_dim": int(train_features.shape[1]),
         "epochs_requested": list(epochs),
         "elapsed_seconds": round(time.time() - started_at, 3),
@@ -908,18 +1067,32 @@ def train_case(
 
 def main() -> int:
     args = parse_args()
-    experiment_dir = Path(args.experiment_dir) if args.experiment_dir else latest_experiment_dir(DEFAULT_EXPERIMENT_ROOT)
-    output_root = Path(args.output_dir) if args.output_dir else experiment_dir / DEFAULT_OUTPUT_STEM
-    ensure_dir(output_root)
-
     epochs = parse_int_tuple(args.epochs)
     subset_sizes = parse_int_tuple(args.subset_sizes)
     manual_train_rounds = parse_round_list(args.train_rounds) if args.train_rounds else None
     manual_test_rounds = parse_round_list(args.test_rounds) if args.test_rounds else None
     if (manual_train_rounds is None) != (manual_test_rounds is None):
         raise SystemExit("use both --train-rounds and --test-rounds together")
-    reports = selected_reports(experiment_dir, args.scenarios)
-    cases = build_cases(experiment_dir, reports, subset_sizes, output_root)
+
+    direct_mode = bool(args.dataset_path or args.graph_path)
+    if direct_mode and not (args.dataset_path and args.graph_path):
+        raise SystemExit("use both --dataset-path and --graph-path together")
+    if direct_mode and (args.split_by_rounds or manual_train_rounds or manual_test_rounds):
+        raise SystemExit("round-based splits are not supported in direct dataset mode; use --direct-test-fraction")
+
+    if direct_mode:
+        dataset_path = Path(args.dataset_path)
+        graph_path = Path(args.graph_path)
+        output_root = Path(args.output_dir) if args.output_dir else dataset_path.parent / DEFAULT_OUTPUT_STEM
+        ensure_dir(output_root)
+        experiment_dir = dataset_path.parent
+        cases = build_direct_case(dataset_path, graph_path, args.scenario_label, output_root)
+    else:
+        experiment_dir = Path(args.experiment_dir) if args.experiment_dir else latest_experiment_dir(DEFAULT_EXPERIMENT_ROOT)
+        output_root = Path(args.output_dir) if args.output_dir else experiment_dir / DEFAULT_OUTPUT_STEM
+        ensure_dir(output_root)
+        reports = selected_reports(experiment_dir, args.scenarios)
+        cases = build_cases(experiment_dir, reports, subset_sizes, output_root)
 
     aggregate = {
         "generated_at": int(time.time()),
@@ -927,11 +1100,17 @@ def main() -> int:
         "experiment_dir": str(experiment_dir),
         "output_root": str(output_root),
         "epochs": list(epochs),
-        "subset_sizes": list(subset_sizes),
+        "subset_sizes": [] if direct_mode else list(subset_sizes),
         "threshold": args.threshold,
+        "direct_mode": direct_mode,
+        "dataset_path": args.dataset_path or "",
+        "graph_path": args.graph_path or "",
+        "scenario_label": args.scenario_label if direct_mode else "",
         "split_by_rounds": args.split_by_rounds,
         "test_round_fraction": args.test_round_fraction,
         "min_test_rounds": args.min_test_rounds,
+        "direct_test_fraction": args.direct_test_fraction,
+        "direct_min_test_rows": args.direct_min_test_rows,
         "train_rounds": manual_train_rounds or [],
         "test_rounds": manual_test_rounds or [],
         "cases": [],
@@ -940,9 +1119,15 @@ def main() -> int:
     print(f"Experimento de treino: {experiment_dir}")
     print(f"Saída do GraphSAGE: {output_root}")
     print(f"Epochs: {', '.join(str(value) for value in epochs)}")
-    print(f"Subsets: {', '.join(str(value) for value in subset_sizes)}")
+    if direct_mode:
+        print(f"Dataset direto: {args.dataset_path}")
+        print(f"Grafo direto: {args.graph_path}")
+    else:
+        print(f"Subsets: {', '.join(str(value) for value in subset_sizes)}")
     if manual_train_rounds and manual_test_rounds:
         print(f"Split manual de rodadas: treino={manual_train_rounds} | teste={manual_test_rounds}")
+    elif direct_mode:
+        print(f"Split direto temporal: {args.direct_test_fraction:.2f} para teste")
     else:
         print(f"Split por rodadas: {'sim' if args.split_by_rounds else 'não'}")
 
@@ -950,6 +1135,7 @@ def main() -> int:
         print(f"\n=== {case.scenario} | subset {case.subset_size} ===")
         summary = train_case(
             case=case,
+            direct_mode=direct_mode,
             epochs=epochs,
             hidden_dim=args.hidden_dim,
             embed_dim=args.embed_dim,
@@ -963,10 +1149,12 @@ def main() -> int:
             min_test_rounds=args.min_test_rounds,
             manual_train_rounds=manual_train_rounds,
             manual_test_rounds=manual_test_rounds,
+            direct_test_fraction=args.direct_test_fraction,
+            direct_min_test_rows=args.direct_min_test_rows,
         )
         aggregate["cases"].append(summary)
         best = summary.get("best_metrics", {})
-        if args.split_by_rounds or (manual_train_rounds and manual_test_rounds):
+        if summary.get("test_rows", 0) > 0:
             train_best = summary.get("train_metrics_at_best", {})
             print(
                 "best_epoch={best_epoch} | test_f1={test_f1:.4f} | test_precision={test_precision:.4f} | "

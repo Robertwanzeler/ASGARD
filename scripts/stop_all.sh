@@ -2,6 +2,9 @@
 # GreenRAN O-RAN - Script para Parar Todos os Processos
 # ===========================================
 
+. "$(dirname "$0")/core_runtime.sh"
+load_greenran_runtime
+
 echo "Parando todos os processos GreenRAN O-RAN..."
 
 # Parar rApp
@@ -24,6 +27,14 @@ pkill -9 -f "nearRT-RIC" 2>/dev/null && echo "nearRT-RIC parado" || true
 # Parar watchdog e dashboard
 pkill -9 -f "watchdog_xapps" 2>/dev/null && echo "Watchdog parado" || true
 pkill -9 -f "rapp_dashboard" 2>/dev/null && echo "Dashboard parado" || true
+pkill -9 -f "app1_vigilancia/backend/app.py" 2>/dev/null && echo "App1-Vigilancia parada" || true
+pkill -9 -f "app2_monitoramento/backend/app.py" 2>/dev/null && echo "App2-Monitoramento parada" || true
+pkill -9 -f "app3_veicular/backend/app.py" 2>/dev/null && echo "App3-Veicular parado" || true
+pkill -9 -f "simulate_sensors.py" 2>/dev/null && echo "Simulador App2 parado" || true
+pkill -9 -f "push_stats_to_influx.py" 2>/dev/null && echo "Push Stats parado" || true
+pkill -9 -f "push_cvar_to_influx.py" 2>/dev/null && echo "Push CVaR parado" || true
+pkill -9 -f "push_app1_to_influx.py" 2>/dev/null && echo "Push App1 parado" || true
+pkill -9 -f "push_app2_to_influx.py" 2>/dev/null && echo "Push App2 parado" || true
 
 # Limpar processos zumbis (defunct)
 echo "Limpando processos zumbis..."
@@ -35,15 +46,21 @@ fi
 
 # Limpar arquivos PID antigos
 echo "Limpando arquivos PID antigos..."
-rm -f /tmp/xapp_slicer.pid
-rm -f /tmp/xapp_energy_saver.pid
-rm -f /tmp/xapp_energy.pid
-rm -f /tmp/ns3.pid
-rm -f /tmp/ric.pid
-rm -f /tmp/csv_metrics.pid
-rm -f /tmp/rapp.pid
-rm -f /tmp/dashboard.pid
-rm -f /tmp/watchdog.pid
+rm -f "$GREENRAN_XAPP_SLICER_PID"
+rm -f "$STATE_DIR/xapp_energy_saver.pid"
+rm -f "$GREENRAN_XAPP_ENERGY_PID"
+rm -f "$GREENRAN_NS3_PID"
+rm -f "$GREENRAN_RIC_PID"
+rm -f "$GREENRAN_CSV_PID"
+rm -f "$GREENRAN_RAPP_PID"
+rm -f "$GREENRAN_DASHBOARD_PID"
+rm -f "$GREENRAN_WATCHDOG_PID"
+rm -f "$GREENRAN_APP1_PID"
+rm -f "$GREENRAN_PUSH_APP1_PID"
+rm -f "$GREENRAN_APP2_PID"
+rm -f "$GREENRAN_APP2_SIMULATOR_PID"
+rm -f "$GREENRAN_APP3_PID"
+rm -f "$GREENRAN_PUSH_APP2_PID"
 
 # Limpar sessões tmux se existirem
 tmux kill-session -t greenran 2>/dev/null || true
@@ -54,10 +71,10 @@ tmux kill-session -t energy 2>/dev/null || true
 sleep 2
 
 # Verificar se ainda há processos rodando
-REMAINING=$(ps aux | grep -E "nearRT-RIC|xapp|ns3.42|rapp|csv_to_metrics" | grep -v grep | wc -l)
+REMAINING=$(ps aux | grep -E "nearRT-RIC|xapp|ns3.42|rapp|csv_to_metrics|app1_vigilancia|app2_monitoramento|app3_veicular|simulate_sensors|push_stats_to_influx|push_cvar_to_influx|push_app1_to_influx|push_app2_to_influx" | grep -v grep | wc -l)
 if [ $REMAINING -gt 0 ]; then
     echo "AVISO: $REMAINING processos ainda rodando!"
-    ps aux | grep -E "nearRT-RIC|xapp|ns3.42|rapp|csv_to_metrics" | grep -v grep
+    ps aux | grep -E "nearRT-RIC|xapp|ns3.42|rapp|csv_to_metrics|app1_vigilancia|app2_monitoramento|app3_veicular|simulate_sensors|push_stats_to_influx|push_cvar_to_influx|push_app1_to_influx|push_app2_to_influx" | grep -v grep
 else
     echo "Todos os processos foram eliminados!"
 fi

@@ -98,6 +98,10 @@ O melhor cenario estrito em `0.5` apareceu com:
 - `threshold = 0.2`
 - `1.0 / 1.0 / 1.0`
 
+Referencia estavel:
+
+- [article00_final_reference_summary.json](/home/robert/orange_nuclear/runs/article00/reports/article00_final_reference_summary.json:1)
+
 ### Melhor cenario estrito em `0.5`
 
 - `450 samples`
@@ -113,6 +117,15 @@ O melhor cenario estrito em `0.5` apareceu com:
 - `hard_positive_focus_kpis = K2`
 - `0.988889 / 1.0 / 1.0`
 
+### Comparacao consolidada com o artigo
+
+| Metrica | Artigo base | ARMD-GreenRAN | Leitura |
+|---|---|---|---|
+| Reconstrucao geral | `1.0` com `450 samples`, `600 epochs`, `threshold 0.5` | `1.0` com `450 samples`, `200 epochs`, `threshold 0.2` | melhor cenario geral do metodo |
+| Reconstrucao estrita em `0.5` | `1.0` com `450 samples`, `600 epochs` | `0.988889` com `450 samples`, `200 epochs` | quase igual |
+| `Indirect` | `>= 600 epochs` para `1.0` | `1.0` com `450 samples`, `200 epochs` | melhor em eficiencia |
+| `Implicit` | `1.0` com `450 samples`, `200 epochs`, `threshold 0.5` | `1.0` com `450 samples`, `200 epochs` | igualado |
+
 ### Corridas adicionais de dataset
 
 Tambem foram rodadas variantes para:
@@ -122,6 +135,25 @@ Tambem foram rodadas variantes para:
 - `450 samples`
 
 Esses artefatos alimentam os comparativos por `Dataset`.
+
+### Exploracao adicional de `threshold = 0.9`
+
+Foi aberta uma trilha separada em `runs/article00_threshold_09/` para testar
+melhorias especificas de `threshold = 0.9`, sem sobrescrever a trilha principal
+de `article00`.
+
+O resultado final dessa exploracao foi:
+
+- melhora parcial em reconstrucao em alguns candidatos;
+- melhora parcial em `implicit` em alguns candidatos;
+- ausencia de ganho consistente no agregado completo;
+- nenhuma configuracao suficientemente forte para substituir os cenarios
+  principais em `0.2` ou `0.5`.
+
+Decisao final:
+
+- manter `0.9` apenas como referencia de sensibilidade mais rigida;
+- nao promover esses runs aos docs/graficos principais.
 
 ## Graficos Consolidados
 
@@ -133,7 +165,13 @@ Pasta organizada para consulta:
 
 - [graficos_selecionados_artigo](/home/robert/orange_nuclear/runs/article00/graficos_selecionados_artigo)
 
-Separacao usada:
+Separacao principal:
+
+- `reconstrucao`
+- `indirect`
+- `implicit`
+
+Dentro de cada metrica:
 
 - `threshold 0.2`
 - `threshold 0.5`
@@ -146,6 +184,14 @@ Regra dos pontos de referencia:
 
 - `Epochs for Threshold(...)` usa `Random`;
 - `Epochs for Dataset(...)` usa `No Threshold`.
+
+Observacao sobre relatorios:
+
+- [aggregate_report.json](/home/robert/orange_nuclear/runs/article00/reports/aggregate_report.json:1)
+  e [article00_run_multiseed.json](/home/robert/orange_nuclear/runs/article00/reports/article00_run_multiseed.json:1)
+  refletem a ultima corrida executada;
+- para citar o melhor cenario consolidado da trilha, usar
+  [article00_final_reference_summary.json](/home/robert/orange_nuclear/runs/article00/reports/article00_final_reference_summary.json:1).
 
 ## Limites
 

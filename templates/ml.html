@@ -2,6 +2,16 @@
 
 {% block title %}GreenRAN - Machine Learning{% endblock %}
 
+{% block extra_head %}
+<style>
+    /* Garantir cores visíveis na página ML */
+    .metric-value { color: #00ff88 !important; }
+    .table { color: #eeeeee !important; }
+    .card-body p { color: #eeeeee !important; margin-bottom: 8px; }
+    .card-body strong { color: #ffffff !important; }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="row mb-4">
     <div class="col-12">

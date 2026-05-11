@@ -40,6 +40,41 @@ PREDICTED_CVAR_BLOCKED = 80  # Se regressor prediz > 80ms = BLOCKED
 PREDICTED_CVAR_WARNING = 60  # Se regressor prediz > 60ms = CONDITIONAL
 
 
+def _compute_vehicle_pressure(metrics):
+    """Collapse vehicle state into pressure terms compatible with the legacy ML feature space."""
+    active_vehicles = int(metrics.get('total_active_vehicles', metrics.get('vehicle_total', 0)) or 0)
+    high_risk = int(metrics.get('vehicle_high_risk', 0) or 0)
+    medium_risk = int(metrics.get('vehicle_medium_risk', 0) or 0)
+    degraded = int(metrics.get('vehicle_degraded_autonomy', 0) or 0)
+    max_latency_ms = float(metrics.get('vehicle_max_latency_ms', 0.0) or 0.0)
+    max_packet_loss_percent = float(metrics.get('vehicle_max_packet_loss_percent', 0.0) or 0.0)
+
+    if active_vehicles <= 0:
+        return {
+            'active_vehicles': 0,
+            'virtual_critical_ues': 0,
+            'latency_ms': 0.0,
+            'packet_loss_percent': 0.0,
+        }
+
+    virtual_critical_ues = (high_risk * 3) + (degraded * 2) + medium_risk
+    if max_latency_ms >= 100.0:
+        virtual_critical_ues += 2
+    elif max_latency_ms >= 50.0:
+        virtual_critical_ues += 1
+    if max_packet_loss_percent >= 5.0:
+        virtual_critical_ues += 2
+    elif max_packet_loss_percent >= 2.0:
+        virtual_critical_ues += 1
+
+    return {
+        'active_vehicles': active_vehicles,
+        'virtual_critical_ues': virtual_critical_ues,
+        'latency_ms': max_latency_ms,
+        'packet_loss_percent': max_packet_loss_percent,
+    }
+
+
 class MLPredictor:
     """ML prediction module with real-time database access."""
 
@@ -174,14 +209,17 @@ class MLPredictor:
     def _load_models(self):
         """Load trained models from disk."""
         try:
-            self.classifier = joblib.load(os.path.join(self.model_dir, 'rf_classifier.joblib'))
+            best_classifier_path = os.path.join(self.model_dir, 'best_classifier.joblib')
+            legacy_classifier_path = os.path.join(self.model_dir, 'rf_classifier.joblib')
+            classifier_path = best_classifier_path if os.path.exists(best_classifier_path) else legacy_classifier_path
+            self.classifier = joblib.load(classifier_path)
             self.regressor = joblib.load(os.path.join(self.model_dir, 'rf_regressor.joblib'))
             self.clf_scaler = joblib.load(os.path.join(self.model_dir, 'rf_scaler.joblib'))
             self.reg_scaler = joblib.load(os.path.join(self.model_dir, 'reg_scaler.joblib'))
             self.label_encoder = joblib.load(os.path.join(self.model_dir, 'label_encoder.joblib'))
             self.loaded = True
             classes = list(self.label_encoder.classes_)
-            print(f"[ML] Modelos carregados - Classes: {classes}")
+            print(f"[ML] Modelos carregados - Classes: {classes} | classifier={os.path.basename(classifier_path)}")
         except FileNotFoundError as e:
             print(f"[ML] AVISO: Modelos não encontrados: {e}")
             print(f"[ML] Execute: python3 train_ml_model.py para treinar")
@@ -243,6 +281,7 @@ class MLPredictor:
 
     def _prepare_features(self, metrics):
         """Prepare feature vector from metrics dict."""
+        vehicle_pressure = _compute_vehicle_pressure(metrics)
         cvar_ms = float(metrics.get('cvar_per_ue_us', 0)) / 1000.0
         cvar_p95_ms = float(metrics.get('cvar_p95_us', 0)) / 1000.0  # P95 = pior 5% dos UEs
         latency_p95_ms = float(metrics.get('latency_p95_per_ue_us', 0)) / 1000.0
@@ -251,6 +290,11 @@ class MLPredictor:
         total_cameras = int(metrics.get('total_active_cameras', 0))
         total_ues = int(metrics.get('total_active_ues', 1))
         total_critical = int(metrics.get('total_critical_ues', 0))
+
+        if vehicle_pressure['active_vehicles'] > 0:
+            latency_p95_ms = max(latency_p95_ms, vehicle_pressure['latency_ms'])
+            avg_latency_ms = max(avg_latency_ms, vehicle_pressure['latency_ms'])
+            total_critical += vehicle_pressure['virtual_critical_ues']
 
         # Usar P95 (85.4ms) como cvar se disponível, senão usar cvar médio
         # P95 representa o pior caso - mais importante para decisões
@@ -273,6 +317,7 @@ class MLPredictor:
         # Features de rede (5)
         throughput_kbps = float(metrics.get('throughput_kbps', 0)) / 1000.0  # Converter para Mbps
         packet_loss_rate = float(metrics.get('packet_loss_rate', 0)) * 100   # Porcentagem
+        packet_loss_rate = max(packet_loss_rate, vehicle_pressure['packet_loss_percent'])
         jitter_ms = float(metrics.get('jitter_ms', 0))
         tx_rx_ratio = float(metrics.get('tx_rx_ratio', 0))
         prev_cvar_diff = self._prev_cvar_diff
@@ -420,8 +465,10 @@ class MLPredictor:
         return {
             'decision': decision,
             'classifier_decision': decision,
+            'raw_classifier_decision': decision,
             'confidence': confidence,
             'predicted_cvar_ms': round(predicted_cvar, 2),
+            'raw_predicted_cvar_ms': round(predicted_cvar, 2),
             'feature_importance': top_features,
             'all_probabilities': {
                 cls: round(float(p), 4)
@@ -449,17 +496,85 @@ class MLPredictor:
         # 1. Predição do regressor (PRÉ-DIZ O FUTURO!)
         ml_result = self.predict(metrics)
         
-        predicted_cvar = ml_result.get('predicted_cvar_ms', 0)
+        raw_predicted_cvar = float(ml_result.get('raw_predicted_cvar_ms', ml_result.get('predicted_cvar_ms', 0)) or 0)
+        predicted_cvar = raw_predicted_cvar
         current_cvar = float(metrics.get('cvar_per_ue_us', 0)) / 1000.0
-        classifier_decision = ml_result.get('classifier_decision', ml_result.get('decision'))
+        raw_classifier_decision = ml_result.get('raw_classifier_decision', ml_result.get('classifier_decision', ml_result.get('decision')))
+        classifier_decision = raw_classifier_decision
+        all_probabilities = ml_result.get('all_probabilities', {}) or {}
+        blocked_probability = float(all_probabilities.get('BLOCKED', 0.0) or 0.0)
+        conditional_probability = float(all_probabilities.get('CONDITIONAL', 0.0) or 0.0)
 
         # === FASE 2: Se current CVaR (P95) já está crítico ===
         cvar_p95_ms = float(metrics.get('cvar_p95_us', 0)) / 1000.0
         current_cvar_p95 = max(cvar_p95_ms, current_cvar)  # Usar o pior
 
+        # Correção explícita do classifier em rede claramente saudável.
+        # Mantém o valor bruto para observabilidade, mas evita que a trilha do
+        # classifier continue artificialmente conservadora quando o estado real
+        # e o regressor estão alinhados no regime saudável.
+        if (
+            raw_classifier_decision != 'ALLOWED'
+            and current_cvar_p95 < 10.0
+            and raw_predicted_cvar < 15.0
+            and blocked_probability < 0.30
+        ):
+            classifier_decision = 'ALLOWED'
+            ml_result['classifier_decision'] = 'ALLOWED'
+            ml_result['decision'] = 'ALLOWED'
+            ml_result['confidence'] = max(float(ml_result.get('confidence', 0.0) or 0.0), 0.55)
+            ml_result['source'] = 'classifier_healthy_correction'
+            ml_result['reason'] = (
+                f'Classifier bruto={raw_classifier_decision} corrigido para ALLOWED '
+                f'em rede saudável (CVaR/P95={current_cvar_p95:.1f}ms, regressor={raw_predicted_cvar:.1f}ms)'
+            )
+        else:
+            ml_result['classifier_decision'] = classifier_decision
+
         # === D) DETECÇÃO DE CENÁRIOS CRÍTICOS ===
         # Analisar trend de CVaR para detecção precoce e anexar ao resultado
         # antes de qualquer decisão de retorno precoce.
+        def _apply_warning_logic(cvar_for_warning):
+            ml_result.pop('warning', None)
+            ml_result.pop('trend_info', None)
+
+            if cvar_trend > 10:
+                ml_result['warning'] = 'RAPID_DETERIORATION'
+                ml_result['trend_info'] = f'CVaR subiu {cvar_trend:.1f}ms em 5 ciclos'
+                print(f"\033[1;33m[ML] ⚠️ ALERTA: Deterioração rápida! CVaR subiu {cvar_trend:.1f}ms\033[0m")
+
+            warning_threshold = self.CVAR_WARNING_THRESHOLD
+            critical_threshold = self.CVAR_CRITICAL_THRESHOLD
+            if warning_threshold <= cvar_for_warning < critical_threshold:
+                self._critical_zone_count += 1
+                if self._critical_zone_count >= 3:
+                    ml_result['warning'] = 'NEAR_CRITICAL_ZONE'
+                    ml_result['trend_info'] = (
+                        f'CVaR previsto {cvar_for_warning:.1f}ms está entre '
+                        f'{warning_threshold}ms e {critical_threshold}ms por {self._critical_zone_count} ciclos'
+                    )
+                    print(
+                        f"\033[1;33m[ML] ⚠️ ALERTA: Zona de cautela! "
+                        f'CVaR previsto={cvar_for_warning:.1f}ms próximo ao crítico\033[0m'
+                    )
+            else:
+                self._critical_zone_count = max(0, self._critical_zone_count - 1)
+
+            if cvar_trend > self._last_cvar_trend and self._last_cvar_trend > 0:
+                self._consecutive_increase_count += 1
+            else:
+                self._consecutive_increase_count = 0
+
+            self._last_cvar_trend = cvar_trend
+
+            if self._consecutive_increase_count >= 3:
+                ml_result['warning'] = 'ACCUMULATING_RISK'
+                ml_result['trend_info'] = f'{self._consecutive_increase_count} aumentos consecutivos de CVaR'
+                print(
+                    f"\033[1;31m[ML] 🔴 ALERTA: Risco acumulado! "
+                    f'{self._consecutive_increase_count} ciclos de aumento\033[0m'
+                )
+
         cvar_trend = 0
         if len(self._cvar_history) >= 5:
             cvar_trend = self._cvar_history[-1] - self._cvar_history[-5]
@@ -469,41 +584,62 @@ class MLPredictor:
         if len(self._cvar_trend_history) > 10:
             self._cvar_trend_history = self._cvar_trend_history[-10:]
         
-        # Detectar deterioração rápida (CVaR subiu > 10ms nos últimos 5 ciclos) - REDUZIDO de 15 para 10
-        if cvar_trend > 10:
-            ml_result['warning'] = 'RAPID_DETERIORATION'
-            ml_result['trend_info'] = f'CVaR subiu {cvar_trend:.1f}ms em 5 ciclos'
-            print(f"\033[1;33m[ML] ⚠️ ALERTA: Deterioração rápida! CVaR subiu {cvar_trend:.1f}ms\033[0m")
-        
-        # Detectar zona de cautela (entre warning e critical)
-        warning_threshold = self.CVAR_WARNING_THRESHOLD
-        critical_threshold = self.CVAR_CRITICAL_THRESHOLD
-        if warning_threshold <= predicted_cvar < critical_threshold:
-            self._critical_zone_count += 1
-            if self._critical_zone_count >= 3:
-                ml_result['warning'] = 'NEAR_CRITICAL_ZONE'
-                ml_result['trend_info'] = f'CVaR previsto {predicted_cvar:.1f}ms está entre {warning_threshold}ms e {critical_threshold}ms por {self._critical_zone_count} ciclos'
-                print(f"\033[1;33m[ML] ⚠️ ALERTA: Zona de cautela! CVaR previsto={predicted_cvar:.1f}ms próximo ao crítico\033[0m")
-        else:
-            self._critical_zone_count = max(0, self._critical_zone_count - 1)
-        
-        # Detectar acumulação de risco (aumentos consecutivos)
-        if cvar_trend > self._last_cvar_trend and self._last_cvar_trend > 0:
-            self._consecutive_increase_count += 1
-        else:
-            self._consecutive_increase_count = 0
-        
-        self._last_cvar_trend = cvar_trend
-        
-        if self._consecutive_increase_count >= 3:
-            ml_result['warning'] = 'ACCUMULATING_RISK'
-            ml_result['trend_info'] = f'{self._consecutive_increase_count} aumentos consecutivos de CVaR'
-            print(f"\033[1;31m[ML] 🔴 ALERTA: Risco acumulado! {self._consecutive_increase_count} ciclos de aumento\033[0m")
-        
         # Adicionar info de trend ao resultado (SEMPRE, mesmo após early returns)
         ml_result['cvar_trend'] = cvar_trend
         ml_result['trend_history'] = self._cvar_trend_history.copy()
-        
+        _apply_warning_logic(predicted_cvar)
+
+        # Guarda forte para rede claramente saudável: se o classificador está em
+        # ALLOWED com confiança razoável e o estado atual está muito saudável,
+        # não deixamos o regressor sozinho empurrar para BLOCKED/CONDITIONAL.
+        classifier_confidence = float(ml_result.get('confidence', 0.0) or 0.0)
+        if (
+            classifier_decision == 'ALLOWED'
+            and classifier_confidence >= 0.50
+            and current_cvar_p95 < 10.0
+            and raw_predicted_cvar >= self.CVAR_WARNING_THRESHOLD
+        ):
+            calibrated_cvar = max(current_cvar_p95 * 1.8, 12.0)
+            predicted_cvar = min(raw_predicted_cvar, calibrated_cvar)
+            ml_result['predicted_cvar_ms'] = round(predicted_cvar, 2)
+            ml_result['raw_classifier_decision'] = classifier_decision
+            ml_result['decision'] = 'ALLOWED'
+            ml_result['classifier_decision'] = 'ALLOWED'
+            ml_result['confidence'] = max(classifier_confidence * 0.9, 0.60)
+            ml_result['source'] = 'healthy_classifier_guard'
+            ml_result['reason'] = (
+                f'Classifier ALLOWED + rede saudável '
+                f'(CVaR/P95={current_cvar_p95:.1f}ms) calibra regressor bruto={raw_predicted_cvar:.1f}ms '
+                f'para {predicted_cvar:.1f}ms'
+            )
+            _apply_warning_logic(predicted_cvar)
+            return ml_result
+
+        # Se o classificador segue vendo rede saudável/normal e a probabilidade de
+        # BLOCKED é baixa, reduzimos o peso do regressor em regimes não críticos.
+        if (
+            classifier_decision == 'ALLOWED'
+            and classifier_confidence >= 0.50
+            and blocked_probability <= 0.18
+            and conditional_probability <= 0.40
+            and current_cvar_p95 < 20.0
+            and raw_predicted_cvar >= self.CVAR_WARNING_THRESHOLD
+        ):
+            calibrated_cvar = max(current_cvar_p95 * 2.2, 18.0)
+            predicted_cvar = min(raw_predicted_cvar, calibrated_cvar)
+            ml_result['predicted_cvar_ms'] = round(predicted_cvar, 2)
+            ml_result['raw_classifier_decision'] = classifier_decision
+            ml_result['decision'] = 'ALLOWED' if predicted_cvar < self.CVAR_WARNING_THRESHOLD else 'CONDITIONAL'
+            ml_result['classifier_decision'] = ml_result['decision']
+            ml_result['confidence'] = max(classifier_confidence * 0.85, 0.58)
+            ml_result['source'] = 'classifier_regressor_reconciliation'
+            ml_result['reason'] = (
+                f'Classifier saudável reconciliou regressor bruto={raw_predicted_cvar:.1f}ms '
+                f'para {predicted_cvar:.1f}ms'
+            )
+            _apply_warning_logic(predicted_cvar)
+            return ml_result
+
         # === FASE 1: SE REGRESSOR DIZ QUE VAI SER CRÍTICO ===
         if predicted_cvar >= self.CVAR_CRITICAL_THRESHOLD:
             ml_result['decision'] = 'BLOCKED'
@@ -541,7 +677,9 @@ class MLPredictor:
                 return ml_result
 
             if classifier_decision != 'ALLOWED':
+                ml_result['raw_classifier_decision'] = classifier_decision
                 ml_result['decision'] = 'ALLOWED'
+                ml_result['classifier_decision'] = 'ALLOWED'
                 ml_result['confidence'] = max(float(ml_result.get('confidence', 0.0)) * 0.75, 0.55)
                 ml_result['source'] = 'regressor_healthy_override'
                 ml_result['reason'] = (
@@ -553,7 +691,7 @@ class MLPredictor:
         db_stats = self.query_database_stats()
         
         if not db_stats or db_stats['total'] == 0:
-            ml_result['source'] = 'ml_predictive'
+            ml_result.setdefault('source', 'ml_predictive')
             ml_result['db_distribution'] = {}
             ml_result['db_total'] = 0
             return ml_result
@@ -576,7 +714,7 @@ class MLPredictor:
                     ml_result['source'] = 'db_override_cautious'
                     ml_result['reason'] = f'Banco mostra {distribution["BLOCKED"]}% BLOCKED recente'
         
-        ml_result['source'] = 'ml_predictive'
+        ml_result.setdefault('source', 'ml_predictive')
         return ml_result
 
     def is_loaded(self):

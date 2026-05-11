@@ -69,4 +69,117 @@
         </div>
     </div>
 </div>
+<div class="row">
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header"><h5>App1-Vigilância</h5></div>
+            <div class="card-body">
+                {% if app1_monitoring %}
+                <div class="row">
+                    <div class="col-md-3">
+                        <p><strong>Eventos</strong></p>
+                        <p>Total: {{ app1_monitoring.events.total }}</p>
+                        <p>Abertos: {{ app1_monitoring.events.open }}</p>
+                        <p>Validados: {{ app1_monitoring.events.validated }}</p>
+                    </div>
+                    <div class="col-md-3">
+                        <p><strong>Análises</strong></p>
+                        <p>Total: {{ app1_monitoring.analyses.total }}</p>
+                        <p>Críticas: {{ app1_monitoring.analyses.critical }}</p>
+                        <p>Risco visual: {{ "%.2f"|format(app1_monitoring.analyses.latest_visual_risk_score or 0) }}</p>
+                    </div>
+                    <div class="col-md-3">
+                        <p><strong>Vídeos</strong></p>
+                        <p>Uploads: {{ app1_monitoring.videos.uploaded }}</p>
+                        <p>Válidos: {{ app1_monitoring.videos.valid_videos }}</p>
+                        <p>Com artefatos: {{ app1_monitoring.videos.with_artifacts }}</p>
+                    </div>
+                    <div class="col-md-3">
+                        <p><strong>Observabilidade</strong></p>
+                        <p>Probe: {{ app1_monitoring.videos.latest_probe_status }}</p>
+                        <p>Artefatos: {{ app1_monitoring.videos.latest_artifact_status }}</p>
+                        <p><a href="{{ app1_url }}" target="_blank">Abrir App1</a></p>
+                        <p><a href="{{ grafana_url }}" target="_blank">Abrir Grafana</a></p>
+                    </div>
+                </div>
+                <details>
+                    <summary>Snapshot JSON</summary>
+                    <pre>{{ app1_monitoring|tojson(indent=2) }}</pre>
+                </details>
+                {% else %}
+                <p><span class="badge bg-warning">Sem snapshot</span> A App1 ainda não publicou monitoramento.</p>
+                <p><a href="{{ app1_url }}" target="_blank">Abrir App1</a></p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>App2-Sensores</h5></div>
+            <div class="card-body">
+                {% set app2_sla = app2_monitoring.app2_sla if app2_monitoring and app2_monitoring.app2_sla else {} %}
+                {% set app2_observed = app2_sla.observed if app2_sla and app2_sla.observed else {} %}
+                {% if app2_monitoring %}
+                <div class="row">
+                    <div class="col-md-6">
+                        <p><strong>Sensores</strong></p>
+                        <p>Total: {{ app2_observed.total_sensors or app2_monitoring.sensors.total or 0 }}</p>
+                        <p>Conectados: {{ app2_observed.connected_sensors or app2_monitoring.sensors.connected or 0 }}</p>
+                        <p>Erro: {{ app2_observed.error_sensors or app2_monitoring.sensors.error or 0 }}</p>
+                    </div>
+                    <div class="col-md-6">
+                        <p><strong>SLA</strong></p>
+                        <p>Status: <span class="badge {% if app2_sla.runtime_status == 'ok' %}bg-success{% elif app2_sla.runtime_status == 'warning' %}bg-warning{% else %}bg-danger{% endif %}">{{ app2_sla.status or 'INATIVA' }}</span></p>
+                        <p>Latência: {{ "%.1f"|format(app2_observed.avg_latency_ms or 0) }} ms</p>
+                        <p>Packet loss: {{ "%.1f"|format(app2_observed.packet_loss_percent or 0) }}%</p>
+                    </div>
+                </div>
+                <p><strong>Motivo:</strong> {{ app2_sla.reason or 'Sem dados' }}</p>
+                <details>
+                    <summary>Snapshot JSON</summary>
+                    <pre>{{ app2_monitoring|tojson(indent=2) }}</pre>
+                </details>
+                {% else %}
+                <p><span class="badge bg-warning">Sem snapshot</span> A App2 ainda não publicou monitoramento.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>App3-Veicular</h5></div>
+            <div class="card-body">
+                {% set app3_sla = app3_monitoring.vehicle_sla if app3_monitoring and app3_monitoring.vehicle_sla else {} %}
+                {% set app3_observed = app3_sla.observed if app3_sla and app3_sla.observed else {} %}
+                {% if app3_monitoring %}
+                <div class="row">
+                    <div class="col-md-6">
+                        <p><strong>Veículos</strong></p>
+                        <p>Total: {{ app3_observed.total_vehicles or app3_monitoring.vehicles.total_vehicles or 0 }}</p>
+                        <p>Risco alto: {{ app3_observed.high_risk_vehicles or app3_monitoring.vehicles.high_risk_vehicles or 0 }}</p>
+                        <p>Autonomia degradada: {{ app3_observed.degraded_autonomy_vehicles or app3_monitoring.vehicles.degraded_autonomy_vehicles or 0 }}</p>
+                    </div>
+                    <div class="col-md-6">
+                        <p><strong>SLA</strong></p>
+                        <p>Status: <span class="badge {% if app3_sla.runtime_status == 'ok' %}bg-success{% elif app3_sla.runtime_status == 'warning' %}bg-warning{% else %}bg-danger{% endif %}">{{ app3_sla.status or 'INATIVA' }}</span></p>
+                        <p>Latência máx: {{ "%.1f"|format(app3_observed.max_latency_ms or 0) }} ms</p>
+                        <p>Packet loss: {{ "%.1f"|format(app3_observed.max_packet_loss_percent or 0) }}%</p>
+                    </div>
+                </div>
+                <p><strong>Motivo:</strong> {{ app3_sla.reason or 'Sem dados' }}</p>
+                <p><a href="{{ app3_url }}" target="_blank">Abrir App3</a></p>
+                <details>
+                    <summary>Snapshot JSON</summary>
+                    <pre>{{ app3_monitoring|tojson(indent=2) }}</pre>
+                </details>
+                {% else %}
+                <p><span class="badge bg-warning">Sem snapshot</span> A App3 ainda não publicou monitoramento.</p>
+                <p><a href="{{ app3_url }}" target="_blank">Abrir App3</a></p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}

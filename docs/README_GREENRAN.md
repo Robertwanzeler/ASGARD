@@ -36,6 +36,22 @@ Para a comparacao funcional dos aplicativos principais, o documento principal ag
   - integracao com GreenRAN e `ns-3`;
   - limites e proximos passos.
 
+Para a trilha futura de veiculos conectados com simulacao fisica, o documento principal agora e:
+
+- `docs/CARLA_NS3_INTEGRACAO.md`
+  - arquitetura recomendada para `CARLA + ns-3 + GreenRAN`;
+  - bridge de estado veicular;
+  - integracao com `csv_to_metrics.py` e `rApp`;
+  - fases de implementacao.
+- `docs/CARLA_2D_MODELO_VEICULAR.md`
+  - modelo 2D logico usado para veiculos;
+  - entidades, estados e eventos da trilha veicular;
+  - justificativa tecnica para `2D` no contexto de rede.
+- `docs/APP3_VEICULAR_ARQUITETURA.md`
+  - arquitetura proposta do `App3-Veicular`;
+  - papel do `App3`, `xApp-VehicleSafety` e do `rApp`;
+  - fonte de dados e hierarquia de prioridade.
+
 Documentacao historica/complementar:
 
 - `docs/ARTICLE00_AUDITORIA_RESULTADOS.md`

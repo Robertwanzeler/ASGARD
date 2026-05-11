@@ -15,7 +15,7 @@ Arquitetura:
 
 Formato JSON:
     {
-        "action": "FULL_POWER|CONDITIONAL_REDUCE|POWER_DOWN|POWER_DOWN_ECO|MAINTAIN",
+        "action": "FULL_POWER|REDUCE_POWER|CONDITIONAL_REDUCE|POWER_DOWN|POWER_DOWN_ECO|MAINTAIN",
         "power_level": 0-100,
         "timestamp": unix_timestamp,
         "ttl_seconds": 5,
@@ -43,9 +43,11 @@ import json
 import time
 import os
 
+from greenran_paths import ENERGY_COMMAND_PATH, ENERGY_INTENT_PATH, as_str
+
 # Caminhos de comunicação
-ENERGY_COMMAND_PATH = "/tmp/xapp_intents/energy_command.json"
-ENERGY_INTENT_PATH = "/tmp/xapp_intents/energy_saver.txt"
+ENERGY_COMMAND_PATH = as_str(ENERGY_COMMAND_PATH)
+ENERGY_INTENT_PATH = as_str(ENERGY_INTENT_PATH)
 
 # Ações válidas
 # Cenário real: 1 RU (LTE) + 1 mmWave = 2 torres
@@ -63,6 +65,13 @@ ACTIONS = {
         'power_level': 70,  # 70% - economia moderada
         'ttl_seconds': 3,
         'description': 'Economia moderada - RU=1, mmWave=1, 70% potência'
+    },
+    'REDUCE_POWER': {
+        'ru_count': 1,
+        'mmwave_count': 1,
+        'power_level': 70,
+        'ttl_seconds': 3,
+        'description': 'Alias legado de CONDITIONAL_REDUCE'
     },
     'POWER_DOWN': {
         'ru_count': 1,
@@ -114,7 +123,7 @@ class EnergyCommand:
         Escreve comando de energia para o xApp.
         
         Args:
-            action: Ação desejada (FULL_POWER, REDUCE_POWER, POWER_DOWN, MAINTAIN)
+            action: Ação desejada (FULL_POWER, REDUCE_POWER, CONDITIONAL_REDUCE, POWER_DOWN, POWER_DOWN_ECO, MAINTAIN)
             power_level: Nível de potência 0-100 (opcional, usa default da ação)
             reason: String explicativa do motivo
             ttl: Timeout em segundos (padrão: 5s)
@@ -133,7 +142,7 @@ class EnergyCommand:
             power_level = action_info['power_level']
         
         if ttl is None:
-            ttl = DEFAULT_TTL
+            ttl = action_info.get('ttl_seconds', DEFAULT_TTL)
         
         command = {
             'action': action,
@@ -240,13 +249,12 @@ class EnergyCommand:
         return self.write_command('FULL_POWER', reason=reason)
     
     def send_reduce_power(self, reason=""):
-        """Envia comando POWER_DOWN - 50% potência."""
-        return self.write_command('POWER_DOWN', reason=reason)
+        """Envia comando CONDITIONAL_REDUCE - 70% potência."""
+        return self.write_command('CONDITIONAL_REDUCE', reason=reason)
     
     def send_conditional_reduce(self, reason=""):
         """Envia comando CONDITIONAL_REDUCE - 70% potência."""
-        action_info = ACTIONS['CONDITIONAL_REDUCE']
-        return self.write_command('CONDITIONAL_REDUCE', ttl=action_info.get('ttl_seconds', 3), reason=reason)
+        return self.write_command('CONDITIONAL_REDUCE', reason=reason)
     
     def send_power_down(self, reason=""):
         """Envia comando POWER_DOWN - 50% potência."""

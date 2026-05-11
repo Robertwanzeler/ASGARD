@@ -29,11 +29,23 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from greenran_paths import (
+    PROJECT_ROOT,
+    FLEXRIC_DIR,
+    FLEXRIC_LIB_DIR,
+    FLEXRIC_BUILD_DIR,
+    XAPP_SLICER_LOG_PATH,
+    XAPP_ENERGY_LOG_PATH,
+    XAPP_SLICER_PID_PATH,
+    XAPP_ENERGY_PID_PATH,
+    STATE_DIR,
+    as_str,
+)
 
-BASE_DIR = "/home/robert/orange_nuclear"
-FLEXRIC_DIR = f"{BASE_DIR}/flexric"
-FLEXRIC_LIB = f"{BASE_DIR}/flexric_lib"
-FLEXRIC_BUILD = f"{FLEXRIC_DIR}/build_e2ap_v1"
+BASE_DIR = as_str(PROJECT_ROOT)
+FLEXRIC_DIR = as_str(FLEXRIC_DIR)
+FLEXRIC_LIB = as_str(FLEXRIC_LIB_DIR)
+FLEXRIC_BUILD = as_str(FLEXRIC_BUILD_DIR)
 
 XAPP_PATHS = {
     "slicer": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_slicer",
@@ -41,13 +53,13 @@ XAPP_PATHS = {
 }
 
 XAPP_LOG_PATHS = {
-    "slicer": "/tmp/xapp_slicer.log",
-    "energy_saver": "/tmp/xapp_energy.log"
+    "slicer": as_str(XAPP_SLICER_LOG_PATH),
+    "energy_saver": as_str(XAPP_ENERGY_LOG_PATH)
 }
 
 XAPP_PID_PATHS = {
-    "slicer": "/tmp/xapp_slicer.pid",
-    "energy_saver": "/tmp/xapp_energy.pid"
+    "slicer": as_str(XAPP_SLICER_PID_PATH),
+    "energy_saver": as_str(XAPP_ENERGY_PID_PATH)
 }
 
 
@@ -79,7 +91,7 @@ class XAppManager:
         
         self.config_file = f"{base_dir}/flexric/flexric.conf"
         
-        os.makedirs("/tmp", exist_ok=True)
+        os.makedirs(as_str(STATE_DIR), exist_ok=True)
         
         print("[XAppManager] Inicializado")
     

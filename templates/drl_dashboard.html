@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+
+{% block title %}DRL - SBiLSTM + A3C | GreenRAN{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h2><span style="color: #ff6600;">DRL</span> - SBiLSTM + A3C</h2>
+        <p class="text-muted">Predição de latência e decisões de energia via Deep Reinforcement Learning</p>
+    </div>
+</div>
+
+{% if stats.runtime_status %}
+<div class="row mt-3">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-body">
+                {% if stats.runtime_status.paused_by_priority %}
+                <div class="alert alert-warning mb-0">
+                    <strong>DRL pausada por prioridade de serviço.</strong>
+                    Fonte: <code>{{ stats.runtime_status.priority_source }}</code>.
+                    Motivo: {{ stats.runtime_status.reason }}
+                </div>
+                {% elif stats.runtime_status.loaded and not stats.runtime_status.active %}
+                <div class="alert alert-info mb-0">
+                    <strong>DRL carregada, mas sem previsões registradas.</strong>
+                    {{ stats.runtime_status.reason }}
+                </div>
+                {% elif not stats.runtime_status.loaded %}
+                <div class="alert alert-danger mb-0">
+                    <strong>DRL não carregada.</strong>
+                    {{ stats.runtime_status.reason }}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- Estatísticas DRL -->
+<div class="row mt-4">
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">Total Previsões</div>
+            <div class="card-body text-center">
+                <div class="metric-value">{{ stats.total }}</div>
+                <div class="metric-label">ciclos processados</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">ALLOWED</div>
+            <div class="card-body text-center">
+                <div class="metric-value status-ok">{{ stats.allowed }} ({{ "%.1f"|format(stats.allowed_pct) }}%)</div>
+                <div class="metric-label">conexões permitidas</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">BLOCKED</div>
+            <div class="card-body text-center">
+                <div class="metric-value status-critical">{{ stats.blocked }} ({{ "%.1f"|format(stats.blocked_pct) }}%)</div>
+                <div class="metric-label">conexões bloqueadas</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">CVaR Médio</div>
+            <div class="card-body text-center">
+                <div class="metric-value">{{ "%.2f"|format(stats.avg_cvar) }}ms</div>
+                <div class="metric-label">latência prevista</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Histórico de Previsões -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">Últimas 30 Previsões</div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm table-striped">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>CVaR (SBiLSTM)</th>
+                                <th>Decisão (A3C)</th>
+                                <th>Potência</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for pred in predictions %}
+                            <tr>
+                                <td>{{ pred.timestamp }}</td>
+                                <td>{{ "%.2f"|format(pred.cvar) }}ms</td>
+                                <td>
+                                    {% if pred.decision == 'ALLOWED' %}
+                                    <span class="badge badge-ok">ALLOWED</span>
+                                    {% elif pred.decision == 'BLOCKED' %}
+                                    <span class="badge badge-critical">BLOCKED</span>
+                                    {% else %}
+                                    <span class="badge badge-warning">{{ pred.decision }}</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ pred.power }}</td>
+                            </tr>
+                            {% else %}
+                            <tr>
+                                <td colspan="4" class="text-center">Nenhuma previsão disponível</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Informações dos Modelos -->
+<div class="row mt-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">SBiLSTM (Predição de Latência)</div>
+            <div class="card-body">
+                <p><strong>Função:</strong> Predizer CVaR (Conditional Value at Risk)</p>
+                <p><strong>MAE:</strong> 0.84ms</p>
+                <p><strong>R²:</strong> 0.9662</p>
+                <p><strong>Prediction Window:</strong> 100</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">A3C (Decisão de Energia)</div>
+            <div class="card-body">
+                <p><strong>Função:</strong> Decidir ALLOWED/BLOCKED/CONDITIONAL</p>
+                <p><strong>Economia:</strong> 21.5%</p>
+                <p><strong>Proteção SLA:</strong> 100%</p>
+                <p><strong>Versão:</strong> V7</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Auto-refresh -->
+<div class="row mt-4">
+    <div class="col-12 text-center">
+        <button class="btn btn-primary" onclick="location.reload()">↻ Atualizar</button>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Auto-refresh a cada 5 segundos
+    setTimeout(function() { location.reload(); }, 5000);
+</script>
+{% endblock %}

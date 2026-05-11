@@ -112,6 +112,27 @@ O snapshot atual do App2 ja reflete um estado coerente de rede e disponibilidade
 
 ## Relacao com o rApp
 
+### Matriz de prioridade e SLA
+
+Hoje a hierarquia pratica do `rApp` e:
+
+1. `camera` (`App1`)
+2. `vehicle` (`App3` / trilha veicular)
+3. `sensors` (`App2`)
+4. economia geral
+
+| Dominio | Prioridade | Sinais principais | Critico | Guarda / Warning |
+|---|---|---|---|---|
+| `camera` | 1 | throughput + latencia | throughput `< 25 Mbps` ou latencia `>= 80 ms` | throughput em `25-30 Mbps` ou latencia em `60-80 ms` |
+| `vehicle` | 2 | risco + autonomia + latencia + perda | `risk_state=high`, `autonomy_state!=normal`, latencia `>= 100 ms`, perda `>= 5%` | `risk_state=medium`, latencia `>= 50 ms`, perda `>= 2%` |
+| `sensors` (`App2`) | 3 | conectividade + entrega + latencia + bateria | conectividade `< 85%`, perda `>= 10%`, entrega `< 90%`, latencia `>= 1000 ms`, bateria `< 15%` | conectividade `< 90%`, perda `>= 5%`, entrega `< 95%`, latencia `>= 500 ms`, bateria `< 25%` |
+
+Leitura pratica:
+
+- cameras continuam com prioridade maxima;
+- veiculos entram logo abaixo das cameras;
+- sensores do `App2` continuam relevantes, mas so decidem quando camera e vehicle estao saudaveis.
+
 ### App1
 
 O `App1` domina a decisao do `rApp` na maior parte dos cenarios atuais porque:
@@ -140,6 +161,14 @@ O `App2` ja influencia a decisao quando os sensores degradam. Em particular:
 - tecnicamente correto e integrado;
 - operacionalmente util;
 - ainda mais MVP do que produto final.
+
+## Resumo para apresentacao
+
+- O `App1-Vigilancia` e hoje o app mais maduro do projeto e o principal driver das decisoes do `rApp`, porque o cenario atual e centrado em cameras e SLA de video.
+- O `App2-Monitoramento` evoluiu de um mock para uma integracao real com sensores vindos do pipeline `ns-3`, com `17` sensores, tipos semanticos corretos e snapshot operacional coerente.
+- O `App1` esta mais proximo de um produto final; o `App2` esta tecnicamente correto e funcional, mas ainda mais proximo de um MVP operacional.
+- O `App2` ja consegue influenciar o `rApp` em estados de degradacao (`warning` e `blocked`), embora no cenario atual as cameras ainda dominem a logica de decisao.
+- A proxima evolucao natural e fortalecer a IA real no `App1` e aprofundar a analitica por sensor no `App2`.
 
 ## Proximos passos recomendados
 

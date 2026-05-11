@@ -27,16 +27,21 @@ Antes desta documentacao completa, vale abrir:
 4. [Regras de Decisão](#4-regras-de-decisão)
 5. [Sistema de Machine Learning](#5-sistema-de-machine-learning)
 6. [Dashboard e Monitoramento](#6-dashboard-e-monitoramento)
-7. [Scheduler e Automação](#7-scheduler-e-automação)
-8. [Data Lake](#8-data-lake)
-9. [Protocolo de Energia](#9-protocolo-de-energia)
-10. [Interface A1](#10-interface-a1)
-11. [xApps](#11-xapps)
-12. [Simulação ns-3](#12-simulação-ns-3)
-13. [Configurações](#13-configurações)
-14. [Commits e Histórico](#14-commits-e-histórico)
-15. [Status do Sistema](#15-status-do-sistema)
-16. [Próximos Passos](#16-próximos-passos)
+7. [Gráficos e Visualizações](#7-gráficos-e-visualizações)
+8. [Scheduler e Automação](#8-scheduler-e-automação)
+9. [Data Lake](#9-data-lake)
+10. [Protocolo de Energia](#10-protocolo-de-energia)
+11. [Interface A1](#11-interface-a1)
+12. [xApps](#12-xapps)
+13. [Simulação ns-3](#13-simulação-ns-3)
+14. [Configurações](#14-configurações)
+15. [Commits e Histórico](#15-commits-e-histórico)
+16. [Status do Sistema](#16-status-do-sistema)
+17. [Próximos Passos](#17-próximos-passos)
+18. [Estrutura de Pastas](#18-estrutura-de-pastas)
+19. [Como Executar o Sistema](#19-como-executar-o-sistema)
+20. [Glossário de Termos](#20-glossário-de-termos)
+21. [Referências](#21-referências)
 
 ---
 
@@ -676,7 +681,140 @@ python3 ./push_stats_to_influx.py --interval 5 &
 
 ---
 
-## 7. Scheduler e Automação
+## 7. Gráficos e Visualizações
+
+### 7.1 Gráficos Gerados via Data Lake
+
+Os gráficos abaixo são gerados pelo script `training/generate_charts.py` a partir dos dados do Data Lake SQLite (`/tmp/rapp_data_lake.db`).
+
+**Script:**
+```bash
+cd /home/robert/orange_nuclear
+python3 training/generate_charts.py
+```
+
+**Pasta de saída:** `/home/robert/orange_nuclear/charts/`
+
+| Gráfico | Arquivo | Dados de Origem | Descrição |
+|---------|---------|-----------------|-----------|
+| Latência vs Tempo | `latencia_vs_tempo.png` | `extended_metrics` (lat_mean_ms, latency_p95_us) | Latência média, P95 e máxima ao longo da simulação com linha SLA de 100ms |
+| CVaR por Período | `cvar_por_periodo.png` | `extended_metrics` (cvar_per_ue_us) | Boxplot comparando períodos de tráfego leve vs congestionamento + linha temporal |
+| Decisões rApp | `decisoes_rapp.png` | `decisions_history` | Timeline scatter das decisões (BLOCKED/ALLOWED/CONDITIONAL) + pizza de distribuição |
+| Energia vs Tempo | `energia_tempo.png` | `energy_commands` | Potência da rede (%) e economia de energia ao longo do tempo |
+| UEs e Câmeras | `ues_cameras.png` | `extended_metrics` (total_active_ues, total_active_cameras) | Quantidade de UEs e câmeras ativas ao longo da simulação |
+
+**Fontes de dados:**
+- Data Lake: `/tmp/rapp_data_lake.db` (tabelas: `extended_metrics`, `decisions_history`, `energy_commands`)
+- Latência bruta: `ns-O-RAN-flexric/mmwave-LENA-oran/DlPdcpStats.txt`
+
+---
+
+### 7.2 Dashboards Grafana
+
+Os dashboards são provisionados automaticamente pelo Docker e também podem ser criados via API.
+
+**Pasta dos dashboards JSON:**
+```
+/home/robert/orange_nuclear/ns-O-RAN-flexric/mmwave-LENA-oran/GUI/grafana/dashboards/
+```
+
+| Dashboard | Arquivo | Descrição | Painéis |
+|-----------|---------|-----------|---------|
+| App1 - Vigilância UFPA | `app1_greenran.json` | Monitoramento de câmaras de vigilância | 11 painéis (Visual Risk Score, Motion Intensity, Uploads, Latência, etc.) |
+| DRL GreenRAN | `drl_greenran.json` | Métricas do agente DRL | Reward, Loss, Epsilon, Q-values, Actions |
+| per_Cell_stats | `per_Cell_stats.json` | Estatísticas por célula | Throughput, latência, PRBs por célula |
+| per_UE_stats | `per_UE_stats.json` | Estatísticas por UE | Throughput, latência, perda de pacotes por UE |
+
+**Dashboard App2 - Monitoramento Ambiental:**
+- Criado dinamicamente via API pelo script `push/create_grafana_app2.py`
+- UID: `8NfKIQhDk`
+- URL: http://localhost:3001/d/8NfKIQhDk/app2-monitoramento-ambiental-ufpa
+
+**Painéis do App2:**
+| Painel | Métrica InfluxDB |
+|--------|------------------|
+| Sensores Ativos | `app2_summary.sensors_active` |
+| Temperatura Média | `app2_summary.avg_temperature` |
+| Umidade Média | `app2_summary.avg_humidity` |
+| Packet Loss (%) | `app2_summary.packet_loss` |
+| Temperatura por Sensor | `sensor_reading` (type=temperature) |
+| Alertas de Sensores | `app2_summary.alerts_count` |
+| Tráfego de Rede (Tx/Rx) | `app2_summary.tx_packets/rx_packets` |
+| Condutividade do Solo | `app2_summary.avg_soil_conductivity` |
+| Bateria Média | `app2_summary.avg_battery_percent` |
+| Latência Média | `app2_summary.avg_sensor_latency_ms` |
+
+**Provisionamento Grafana:**
+- Datasources: `ns-O-RAN-flexric/mmwave-LENA-oran/GUI/grafana/provisioning/datasources/influxdb.yml`
+- Dashboards: `ns-O-RAN-flexric/mmwave-LENA-oran/GUI/grafana/provisioning/dashboards/`
+
+**Acesso:**
+- URL: http://localhost:3001
+- Usuário: admin
+- Senha: admin
+
+---
+
+### 7.3 Experimentos de Conflitos (GNN/GraphSAGE)
+
+Gráficos gerados pelos experimentos de detecção de conflitos usando Graph Neural Networks.
+
+**Pasta dos experimentos:**
+```
+/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/
+```
+
+**Scripts geradores:**
+- `scripts/generate_graphsage_figures_v2.py` - Gera figuras principais
+- `scripts/run_conflict_experiments.py` - Executa experimentos
+- `scripts/learn_conflict_matrix.py` - Aprende matriz de conflitos
+
+#### Gráficos de Conflito Implícito
+
+**Pasta:** `implicito_final/`
+
+| Gráfico | Arquivo | Descrição |
+|---------|---------|-----------|
+| Implicit F1 vs Threshold | `conflito_implicito_implicit_f1_vs_threshold.png` | F1-Score de detecção de conflitos implícitos vs threshold (0.1-1.0). Melhor: ~85% com threshold 0.5 |
+| Reconstruction F1 vs Threshold | `conflito_implicito_reconstruction_f1_vs_threshold.png` | F1-Score de reconstrução de conflitos usando autoencoder. Melhor: ~80% |
+| Implicit F1 vs Épocas | `conflito_implicito_implicit_f1_vs_epochs.png` | Curva de aprendizado ao longo de 100 épocas. Converge em ~40-50 épocas |
+
+**O que são conflitos implícitos:**
+- Ocorrências onde a ML decide ALLOWED mas as regras dizem BLOCKED
+- Também conhecido como "falso positivo" da ML
+
+#### Gráficos de Recuperação
+
+**Pasta:** `recuperacao_final/`
+
+| Gráfico | Arquivo | Descrição |
+|---------|---------|-----------|
+| Indirect F1 vs Threshold | `recuperacao_indirect_f1_vs_threshold.png` | Taxa de recuperação de UEs não críticas afetadas por decisões. Melhor: ~88-92% |
+| Indirect F1 vs Épocas | `recuperacao_indirect_f1_vs_epochs.png` | Curva de aprendizado de recuperação |
+
+**Resumo dos Resultados:**
+
+| Métrica | Melhor Valor |
+|---------|-------------|
+| Implicit F1 | ~0.85 (85%) |
+| Reconstruction F1 | ~0.80 (80%) |
+| Indirect Recovery | ~0.90 (90%) |
+| Épocas para Convergir | ~40-50 |
+
+**Executar experimentos:**
+```bash
+cd /home/robert/orange_nuclear
+python3 scripts/run_conflict_experiments.py
+```
+
+**Gerar figuras:**
+```bash
+python3 scripts/generate_graphsage_figures_v2.py
+```
+
+---
+
+## 8. Scheduler e Automação
 
 ### greenran_scheduler.sh
 
@@ -708,7 +846,7 @@ RETRAIN_DELAY=300       # Retreinar após 5 minutos
 
 ---
 
-## 8. Data Lake
+## 9. Data Lake
 
 ### Tabelas SQLite
 
@@ -785,7 +923,7 @@ CREATE TABLE extended_metrics (
 
 ---
 
-## 9. Protocolo de Energia
+## 10. Protocolo de Energia
 
 ### Estados de Energia
 
@@ -821,7 +959,7 @@ Se Energy Saver não receber comando por 5s:
 
 ---
 
-## 10. Interface A1
+## 11. Interface A1
 
 ### Políticas A1
 
@@ -855,7 +993,7 @@ class A1PolicyInterface:
 
 ---
 
-## 11. xApps
+## 12. xApps
 
 ### xApp SLICER
 
@@ -897,7 +1035,7 @@ Registra resultado
 
 ---
 
-## 12. Simulação ns-3
+## 13. Simulação ns-3
 
 ### Parâmetros do Cenário
 
@@ -929,7 +1067,7 @@ Registra resultado
 
 ---
 
-## 13. Configurações
+## 14. Configurações
 
 ### Scheduler
 
@@ -986,7 +1124,7 @@ Background: Bursty (On=1s, Off=10s)
 
 ---
 
-## 14. Commits e Histórico
+## 15. Commits e Histórico
 
 | Hash | Tipo | Descrição |
 |------|------|-----------|
@@ -1014,7 +1152,7 @@ Background: Bursty (On=1s, Off=10s)
 
 ---
 
-## 15. Status do Sistema
+## 16. Status do Sistema
 
 ### Componentes Funcionais
 
@@ -1073,7 +1211,7 @@ Background: Bursty (On=1s, Off=10s)
 
 ---
 
-## 16. Próximos Passos
+## 17. Próximos Passos
 
 ### Melhorias Pendentes
 
@@ -1139,7 +1277,7 @@ Todos os componentes estão integrados e funcionando corretamente. O sistema é 
 
 ---
 
-## 17. Estrutura de Pastas
+## 18. Estrutura de Pastas
 
 ### Visão Geral
 
@@ -1198,7 +1336,7 @@ O projeto está organizado em pastas para melhor manutenção:
 
 ---
 
-## 18. Como Executar o Sistema
+## 19. Como Executar o Sistema
 
 ### Pré-requisitos
 
@@ -1236,7 +1374,7 @@ python3 monitoring/watchdog_xapps.py
 
 ---
 
-## 19. Glossário de Termos
+## 20. Glossário de Termos
 
 | Termo | Significado |
 |-------|-------------|
@@ -1255,7 +1393,7 @@ python3 monitoring/watchdog_xapps.py
 
 ---
 
-## 20. Referências
+## 21. Referências
 
 - [O-RAN Documentation](https://www.o-ran.org)
 - [ns-3 Documentation](https://www.nsnam.org)

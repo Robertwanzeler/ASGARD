@@ -23,22 +23,64 @@ import json
 import time
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request
-
-sys.path.insert(0, '/home/robert/orange_nuclear')
+from greenran_paths import (
+    STATE_DIR,
+    TEMPLATES_DIR,
+    EXTENDED_METRICS_JSON_PATH,
+    XAPP_HEALTH_PATH,
+    RAPP_POLICIES_DIR,
+    RAPP_LOG_PATH,
+    XAPP_INTENTS_DIR,
+    as_str,
+)
+from greenran_runtime import load_runtime_config
 
 from rapp_data_lake import DataLake
 from rapp_pattern_engine import PatternRecognition
 from rapp_alerts import AlertManager
 
-app = Flask(__name__, template_folder='../templates')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
+from apps.app3_veicular.backend.services import VehicleStateStore  # noqa: E402
+
+app = Flask(__name__, template_folder=as_str(TEMPLATES_DIR))
+RUNTIME_CONFIG = load_runtime_config()
 
 DATA_LAKE = DataLake()
 PATTERN_ENGINE = PatternRecognition(DATA_LAKE)
 ALERT_MANAGER = AlertManager()
+APP3_STORE = VehicleStateStore(STATE_DIR)
 
-METRICS_FILE = "/tmp/xapp_metrics/extended_metrics.json"
-XAPP_HEALTH_FILE = "/tmp/xapp_health.json"
-POLICY_STATUS_FILE = "/tmp/rapp_policies/policy_status.json"
+METRICS_FILE = as_str(EXTENDED_METRICS_JSON_PATH)
+XAPP_HEALTH_FILE = as_str(XAPP_HEALTH_PATH)
+POLICY_STATUS_FILE = as_str(RAPP_POLICIES_DIR / "policy_status.json")
+APP1_MONITORING_FILE = as_str(STATE_DIR / "app1_vigilancia" / "monitoring_snapshot.json")
+APP2_MONITORING_FILE = as_str(STATE_DIR / "app2_monitoramento" / "monitoring_snapshot.json")
+APP3_MONITORING_FILE = as_str(STATE_DIR / "app3_veicular" / "monitoring_snapshot.json")
+DEVICE_ROLES_FILE = as_str(STATE_DIR / "xapp_metrics" / "device_roles.json")
+CONFLICT_LEARNED_REPORT_FILE = as_str(STATE_DIR / "greenran_conflict_report.json")
+CONFLICT_LEARNED_ADJ_FILE = as_str(STATE_DIR / "greenran_conflict_adjacency.json")
+
+APP2_CONNECTED_CRITICAL_RATIO = 0.85
+APP2_CONNECTED_WARNING_RATIO = 0.90
+APP2_CONNECTED_GUARD_RATIO = 0.95
+APP2_PACKET_LOSS_CRITICAL_PERCENT = 10.0
+APP2_PACKET_LOSS_WARNING_PERCENT = 5.0
+APP2_DELIVERY_CRITICAL_PERCENT = 90.0
+APP2_DELIVERY_WARNING_PERCENT = 95.0
+APP2_LATENCY_CRITICAL_MS = 1000.0
+APP2_LATENCY_WARNING_MS = 500.0
+APP2_BATTERY_CRITICAL_PERCENT = 15.0
+APP2_BATTERY_WARNING_PERCENT = 25.0
+APP2_ERROR_CRITICAL_RATIO = 0.20
+APP2_ERROR_WARNING_COUNT = 2
+VEHICLE_LATENCY_WARNING_MS = 50.0
+VEHICLE_LATENCY_CRITICAL_MS = 100.0
+VEHICLE_PACKET_LOSS_WARNING_PERCENT = 2.0
+VEHICLE_PACKET_LOSS_CRITICAL_PERCENT = 5.0
 
 
 def get_current_metrics():
@@ -74,9 +116,671 @@ def get_policy_status():
     return {}
 
 
+def _safe_read_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return default
+
+
+def get_app1_monitoring():
+    """Obtém snapshot de monitoramento da App1-Vigilancia."""
+    if os.path.exists(APP1_MONITORING_FILE):
+        try:
+            with open(APP1_MONITORING_FILE, 'r') as f:
+                snapshot = json.load(f)
+                if isinstance(snapshot, dict) and 'camera_sla' not in snapshot:
+                    snapshot['camera_sla'] = {}
+                return snapshot
+        except Exception:
+            pass
+    return {}
+
+
+def evaluate_app2_sla(snapshot):
+    """Avalia a margem operacional da App2 com os mesmos limiares do rApp."""
+    sensors = snapshot.get('sensors', {}) if isinstance(snapshot, dict) else {}
+    readings = snapshot.get('readings', {}) if isinstance(snapshot, dict) else {}
+    network = snapshot.get('network', {}) if isinstance(snapshot, dict) else {}
+
+    total_sensors = int(sensors.get('total', 0) or 0)
+    connected_sensors = int(sensors.get('connected', 0) or 0)
+    error_sensors = int(sensors.get('error', 0) or 0)
+    low_battery_sensors = int(sensors.get('low_battery', 0) or 0)
+
+    connected_ratio = (connected_sensors / total_sensors) if total_sensors > 0 else 0.0
+    error_ratio = (error_sensors / total_sensors) if total_sensors > 0 else 0.0
+    packet_loss = float(network.get('packet_loss_percent', 0.0) or 0.0)
+    delivery_success = float(network.get('delivery_success_percent', 100.0) or 0.0)
+    avg_latency_ms = float(network.get('avg_latency_ms', 0.0) or 0.0)
+    avg_battery_percent = float(readings.get('avg_battery_percent', 0.0) or 0.0)
+
+    observed = {
+        'total_sensors': total_sensors,
+        'connected_sensors': connected_sensors,
+        'connected_ratio': round(connected_ratio, 4),
+        'error_sensors': error_sensors,
+        'error_ratio': round(error_ratio, 4),
+        'low_battery_sensors': low_battery_sensors,
+        'packet_loss_percent': round(packet_loss, 2),
+        'delivery_success_percent': round(delivery_success, 2),
+        'avg_latency_ms': round(avg_latency_ms, 2),
+        'avg_battery_percent': round(avg_battery_percent, 2),
+    }
+
+    if total_sensors <= 0:
+        return {
+            'status': 'INATIVA',
+            'runtime_status': 'idle',
+            'proposal_status': 'idle',
+            'reason': 'Nenhum sensor ativo no snapshot.',
+            'observed': observed,
+        }
+
+    critical_reasons = []
+    warning_reasons = []
+
+    if connected_ratio < APP2_CONNECTED_CRITICAL_RATIO:
+        critical_reasons.append(f"conectividade {connected_ratio:.0%} < 85%")
+    elif connected_ratio < APP2_CONNECTED_WARNING_RATIO:
+        warning_reasons.append(f"conectividade {connected_ratio:.0%} < 90%")
+    elif connected_ratio < APP2_CONNECTED_GUARD_RATIO:
+        warning_reasons.append(f"conectividade {connected_ratio:.0%} < 95%")
+
+    if packet_loss >= APP2_PACKET_LOSS_CRITICAL_PERCENT:
+        critical_reasons.append(f"packet loss {packet_loss:.1f}% >= 10%")
+    elif packet_loss >= APP2_PACKET_LOSS_WARNING_PERCENT:
+        warning_reasons.append(f"packet loss {packet_loss:.1f}% >= 5%")
+
+    if delivery_success < APP2_DELIVERY_CRITICAL_PERCENT:
+        critical_reasons.append(f"entrega {delivery_success:.1f}% < 90%")
+    elif delivery_success < APP2_DELIVERY_WARNING_PERCENT:
+        warning_reasons.append(f"entrega {delivery_success:.1f}% < 95%")
+
+    if avg_latency_ms >= APP2_LATENCY_CRITICAL_MS:
+        critical_reasons.append(f"latência média {avg_latency_ms:.0f}ms >= 1000ms")
+    elif avg_latency_ms >= APP2_LATENCY_WARNING_MS:
+        warning_reasons.append(f"latência média {avg_latency_ms:.0f}ms >= 500ms")
+
+    if avg_battery_percent < APP2_BATTERY_CRITICAL_PERCENT:
+        critical_reasons.append(f"bateria média {avg_battery_percent:.1f}% < 15%")
+    elif avg_battery_percent < APP2_BATTERY_WARNING_PERCENT or low_battery_sensors > 0:
+        warning_reasons.append(f"bateria média {avg_battery_percent:.1f}% / baixa={low_battery_sensors}")
+
+    if error_ratio >= APP2_ERROR_CRITICAL_RATIO:
+        critical_reasons.append(f"sensores em erro {error_ratio:.0%} >= 20%")
+    elif error_sensors >= APP2_ERROR_WARNING_COUNT:
+        warning_reasons.append(f"sensores em erro={error_sensors}")
+
+    if critical_reasons:
+        return {
+            'status': 'CRÍTICA',
+            'runtime_status': 'blocked',
+            'proposal_status': 'violation',
+            'reason': critical_reasons[0],
+            'observed': observed,
+        }
+    if warning_reasons:
+        return {
+            'status': 'GUARDA',
+            'runtime_status': 'warning',
+            'proposal_status': 'warning',
+            'reason': warning_reasons[0],
+            'observed': observed,
+        }
+    return {
+        'status': 'PROTEGIDA',
+        'runtime_status': 'ok',
+        'proposal_status': 'ok',
+        'reason': 'SLA mMTC atendido para conectividade, entrega, latência e bateria.',
+        'observed': observed,
+    }
+
+
+def get_app2_monitoring():
+    """Obtém snapshot da App2-Monitoramento, preferindo o Data Lake."""
+    snapshot = DATA_LAKE.get_latest_app2_snapshot()
+    if snapshot:
+        if isinstance(snapshot, dict):
+            snapshot['app2_sla'] = evaluate_app2_sla(snapshot)
+        return snapshot
+    if os.path.exists(APP2_MONITORING_FILE):
+        try:
+            with open(APP2_MONITORING_FILE, 'r') as f:
+                snapshot = json.load(f)
+                if isinstance(snapshot, dict):
+                    snapshot['app2_sla'] = evaluate_app2_sla(snapshot)
+                return snapshot
+        except Exception:
+            pass
+    return {}
+
+
+def evaluate_vehicle_sla(snapshot):
+    """Avalia a margem operacional veicular com os mesmos limiares do App3/rApp."""
+    summary = snapshot.get('vehicles', {}) if isinstance(snapshot, dict) else {}
+    total_vehicles = int(summary.get('total_vehicles', 0) or 0)
+    observed = {
+        'total_vehicles': total_vehicles,
+        'ego_present': bool(summary.get('ego_present', False)),
+        'high_risk_vehicles': int(summary.get('high_risk_vehicles', 0) or 0),
+        'medium_risk_vehicles': int(summary.get('medium_risk_vehicles', 0) or 0),
+        'degraded_autonomy_vehicles': int(summary.get('degraded_autonomy_vehicles', 0) or 0),
+        'max_latency_ms': round(float(summary.get('max_latency_ms', 0.0) or 0.0), 2),
+        'max_packet_loss_percent': round(float(summary.get('max_packet_loss_percent', 0.0) or 0.0), 2),
+        'max_speed_mps': round(float(summary.get('max_speed_mps', 0.0) or 0.0), 2),
+    }
+
+    if total_vehicles <= 0:
+        return {
+            'status': 'INATIVA',
+            'runtime_status': 'idle',
+            'proposal_status': 'idle',
+            'reason': 'Nenhum veículo ativo no snapshot.',
+            'observed': observed,
+        }
+
+    high_risk = observed['high_risk_vehicles']
+    medium_risk = observed['medium_risk_vehicles']
+    degraded = observed['degraded_autonomy_vehicles']
+    max_latency = observed['max_latency_ms']
+    max_packet_loss = observed['max_packet_loss_percent']
+
+    critical_reasons = []
+    warning_reasons = []
+
+    if high_risk > 0:
+        critical_reasons.append(f"veículos em risco alto={high_risk}")
+    if degraded > 0:
+        critical_reasons.append(f"autonomia degradada em {degraded} veículo(s)")
+    if max_latency >= VEHICLE_LATENCY_CRITICAL_MS:
+        critical_reasons.append(f"latência veicular {max_latency:.0f}ms >= 100ms")
+    elif max_latency >= VEHICLE_LATENCY_WARNING_MS:
+        warning_reasons.append(f"latência veicular {max_latency:.0f}ms >= 50ms")
+    if max_packet_loss >= VEHICLE_PACKET_LOSS_CRITICAL_PERCENT:
+        critical_reasons.append(f"packet loss veicular {max_packet_loss:.1f}% >= 5%")
+    elif max_packet_loss >= VEHICLE_PACKET_LOSS_WARNING_PERCENT:
+        warning_reasons.append(f"packet loss veicular {max_packet_loss:.1f}% >= 2%")
+    if medium_risk > 0 and not critical_reasons:
+        warning_reasons.append(f"veículos em risco médio={medium_risk}")
+
+    if critical_reasons:
+        return {
+            'status': 'CRÍTICA',
+            'runtime_status': 'blocked',
+            'proposal_status': 'violation',
+            'reason': critical_reasons[0],
+            'observed': observed,
+        }
+    if warning_reasons:
+        return {
+            'status': 'GUARDA',
+            'runtime_status': 'warning',
+            'proposal_status': 'warning',
+            'reason': warning_reasons[0],
+            'observed': observed,
+        }
+    return {
+        'status': 'PROTEGIDA',
+        'runtime_status': 'ok',
+        'proposal_status': 'ok',
+        'reason': 'SLA veicular atendido para risco, autonomia e rede.',
+        'observed': observed,
+    }
+
+
+def get_app3_monitoring():
+    """Obtém snapshot da App3-Veicular recalculando o estado vivo dos veículos."""
+    try:
+        snapshot = APP3_STORE.refresh_snapshot()
+        if isinstance(snapshot, dict):
+            snapshot['vehicle_sla'] = evaluate_vehicle_sla(snapshot)
+        return snapshot
+    except Exception:
+        if os.path.exists(APP3_MONITORING_FILE):
+            try:
+                with open(APP3_MONITORING_FILE, 'r') as f:
+                    snapshot = json.load(f)
+                    if isinstance(snapshot, dict):
+                        snapshot['vehicle_sla'] = evaluate_vehicle_sla(snapshot)
+                    return snapshot
+            except Exception:
+                pass
+    return {}
+
+
+def get_service_sla_status():
+    """Consolida os SLAs de App1/câmeras, App3/veículos e App2/sensores."""
+    app1_monitoring = get_app1_monitoring()
+    app2_monitoring = get_app2_monitoring()
+    app3_monitoring = get_app3_monitoring()
+    camera_protection = get_camera_protection()
+
+    app1_sla = (app1_monitoring.get('camera_sla', {}) if isinstance(app1_monitoring, dict) else {}) or {}
+    camera_service = {
+        'status': camera_protection.get('status', 'INATIVA'),
+        'reason': app1_sla.get('reason') or camera_protection.get('reason', 'Sem dados'),
+        'proposal_status': app1_sla.get('proposal_status', 'idle'),
+        'runtime_status': app1_sla.get('runtime_status', 'idle'),
+        'active': camera_protection.get('active_cameras', 0),
+        'throughput_mbps': round(float(camera_protection.get('min_throughput_mbps', 0.0) or 0.0), 1),
+        'latency_ms': round(float(camera_protection.get('max_latency', 0.0) or 0.0) / 1000.0, 1),
+    }
+
+    app2_sla = (app2_monitoring.get('app2_sla', {}) if isinstance(app2_monitoring, dict) else {}) or {}
+    app2_observed = app2_sla.get('observed', {}) or {}
+    app2_service = {
+        'status': app2_sla.get('status', 'INATIVA'),
+        'reason': app2_sla.get('reason', 'Sem dados'),
+        'proposal_status': app2_sla.get('proposal_status', 'idle'),
+        'runtime_status': app2_sla.get('runtime_status', 'idle'),
+        'active': app2_observed.get('total_sensors', 0),
+        'connected': app2_observed.get('connected_sensors', 0),
+        'latency_ms': round(float(app2_observed.get('avg_latency_ms', 0.0) or 0.0), 1),
+        'packet_loss_percent': round(float(app2_observed.get('packet_loss_percent', 0.0) or 0.0), 1),
+    }
+
+    app3_sla = (app3_monitoring.get('vehicle_sla', {}) if isinstance(app3_monitoring, dict) else {}) or {}
+    app3_observed = app3_sla.get('observed', {}) or {}
+    app3_service = {
+        'status': app3_sla.get('status', 'INATIVA'),
+        'reason': app3_sla.get('reason', 'Sem dados'),
+        'proposal_status': app3_sla.get('proposal_status', 'idle'),
+        'runtime_status': app3_sla.get('runtime_status', 'idle'),
+        'active': app3_observed.get('total_vehicles', 0),
+        'high_risk': app3_observed.get('high_risk_vehicles', 0),
+        'degraded': app3_observed.get('degraded_autonomy_vehicles', 0),
+        'latency_ms': round(float(app3_observed.get('max_latency_ms', 0.0) or 0.0), 1),
+        'packet_loss_percent': round(float(app3_observed.get('max_packet_loss_percent', 0.0) or 0.0), 1),
+    }
+
+    return {
+        'camera': camera_service,
+        'app3': app3_service,
+        'app2': app2_service,
+    }
+
+
+def get_scenario_actor_counts():
+    """Obtém contagens lógicas do cenário atual a partir do metadata de papéis."""
+    counts = {
+        'cameras': 0,
+        'pedestrians': 0,
+        'vehicles': 0,
+        'stationary_sensors': 0,
+        'total_roles': 0,
+    }
+    payload = _safe_read_json(DEVICE_ROLES_FILE, {})
+    roles = payload.get('roles', {}) if isinstance(payload, dict) else {}
+    if not isinstance(roles, dict):
+        return counts
+
+    for role in roles.values():
+        if not isinstance(role, dict):
+            continue
+        counts['total_roles'] += 1
+        device_type = str(role.get('device_type', '') or '').lower()
+        mobility = str(role.get('mobility_profile', '') or '').lower()
+        if device_type == 'camera':
+            counts['cameras'] += 1
+        elif mobility == 'pedestrian':
+            counts['pedestrians'] += 1
+        elif mobility == 'vehicle':
+            counts['vehicles'] += 1
+        elif mobility == 'stationary':
+            counts['stationary_sensors'] += 1
+    return counts
+
+
+def get_learned_conflict_assets():
+    """Obtém o relatório e a adjacência aprendida do pipeline de conflitos."""
+    report = _safe_read_json(CONFLICT_LEARNED_REPORT_FILE, {})
+    adjacency = _safe_read_json(CONFLICT_LEARNED_ADJ_FILE, {})
+    return report, adjacency
+
+
 def get_decision_stats():
     """Obtém estatísticas de decisões."""
     return DATA_LAKE.get_decision_stats(24)
+
+
+def get_drl_stats():
+    """Extrai estatísticas do DRL (SBiLSTM + A3C) do log."""
+    import re
+    from datetime import datetime
+    
+    drl_predictions = []
+    log_path = as_str(RAPP_LOG_PATH)
+    
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, 'r') as f:
+                for line in f:
+                    if 'rApp DRL' in line:
+                        match = re.search(
+                            r'\[rApp DRL\] CVaR predicted: ([\d.]+)ms, Decision: (\w+), Power: (\w+)',
+                            line
+                        )
+                        if match:
+                            # Extrair timestamp da linha
+                            ts_match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+                            timestamp = ts_match.group(1) if ts_match else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            drl_predictions.append({
+                                'timestamp': timestamp,
+                                'cvar': float(match.group(1)),
+                                'decision': match.group(2),
+                                'power': match.group(3)
+                            })
+        except Exception as e:
+            print(f"[Dashboard] DRL parse error: {e}")
+    
+    # Calcular estatísticas
+    total = len(drl_predictions)
+    allowed = sum(1 for p in drl_predictions if p['decision'] == 'ALLOWED')
+    blocked = sum(1 for p in drl_predictions if p['decision'] == 'BLOCKED')
+    conditional = sum(1 for p in drl_predictions if p['decision'] == 'CONDITIONAL')
+    
+    #Últimas previsões
+    recent = drl_predictions[-30:] if drl_predictions else []
+
+    runtime_status = {
+        'loaded': False,
+        'active': bool(drl_predictions),
+        'paused_by_priority': False,
+        'priority_source': '',
+        'reason': '',
+    }
+
+    try:
+        from greenran_paths import DRL_VENV_SITE_PACKAGES
+        if os.path.exists(as_str(DRL_VENV_SITE_PACKAGES)):
+            runtime_status['loaded'] = True
+    except Exception:
+        runtime_status['loaded'] = False
+
+    if not drl_predictions:
+        service_slas = get_service_sla_status()
+        camera = service_slas.get('camera', {}) or {}
+        app3 = service_slas.get('app3', {}) or {}
+        app2 = service_slas.get('app2', {}) or {}
+        latest_reason = ''
+        try:
+            row = DATA_LAKE.conn.execute(
+                "SELECT reason FROM decisions_history ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
+            latest_reason = row[0] if row and row[0] else ''
+        except Exception:
+            latest_reason = ''
+
+        if camera.get('runtime_status') in {'warning', 'blocked'}:
+            runtime_status.update({
+                'paused_by_priority': True,
+                'priority_source': 'camera',
+                'reason': latest_reason or camera.get('reason', 'Prioridade de câmera ativa'),
+            })
+        elif app3.get('runtime_status') in {'warning', 'blocked'}:
+            runtime_status.update({
+                'paused_by_priority': True,
+                'priority_source': 'vehicle',
+                'reason': app3.get('reason', 'Prioridade veicular ativa'),
+            })
+        elif app2.get('runtime_status') in {'warning', 'blocked'}:
+            runtime_status.update({
+                'paused_by_priority': True,
+                'priority_source': 'app2',
+                'reason': app2.get('reason', 'Prioridade de sensores ativa'),
+            })
+        elif runtime_status['loaded']:
+            runtime_status['reason'] = 'DRL carregada, mas ainda sem previsões registradas no log.'
+        else:
+            runtime_status['reason'] = 'DRL não carregada no runtime atual.'
+    
+    return {
+        'predictions': drl_predictions[-100:],  # últimas 100
+        'recent': recent,
+        'runtime_status': runtime_status,
+        'stats': {
+            'total': total,
+            'allowed': allowed,
+            'blocked': blocked,
+            'conditional': conditional,
+            'allowed_pct': (allowed / total * 100) if total > 0 else 0,
+            'blocked_pct': (blocked / total * 100) if total > 0 else 0,
+            'conditional_pct': (conditional / total * 100) if total > 0 else 0,
+            'avg_cvar': sum(p['cvar'] for p in drl_predictions) / total if total > 0 else 0
+        }
+    }
+
+
+def get_period_stats():
+    """
+    Obtém estatísticas por período de simulação.
+    
+    Período 1: 0-300s (tráfego leve)
+    Período 2: 300-600s (tráfego pesado)
+    
+    Returns:
+        Dict com current_period, period1_stats, period2_stats
+    """
+    try:
+        conn = DATA_LAKE.conn
+        cursor = conn.cursor()
+        
+        # Obter última métrica para determinar período atual
+        cursor.execute("SELECT sim_time_s FROM extended_metrics ORDER BY timestamp DESC LIMIT 1")
+        row = cursor.fetchone()
+        
+        if not row:
+            return {
+                'current_period': 1,
+                'current_period_name': 'Inicializando...',
+                'current_cvar': 0,
+                'period1': {'allowed': 0, 'blocked': 0, 'conditional': 0},
+                'period2': {'allowed': 0, 'blocked': 0, 'conditional': 0}
+            }
+        
+        sim_time = row[0] if row[0] else 0
+        
+        # Determinar período atual
+        if sim_time < 300:
+            current_period = 1
+            current_period_name = "PERÍODO 1 (0-5min) - Tráfego LEVE"
+        else:
+            current_period = 2
+            current_period_name = "PERÍODO 2 (5-10min) - Tráfego PESADO"
+        
+        # Obter CVaR atual
+        cursor.execute("SELECT cvar_per_ue_us FROM extended_metrics ORDER BY timestamp DESC LIMIT 1")
+        row = cursor.fetchone()
+        current_cvar = (row[0] / 1000) if row and row[0] else 0
+        
+        # Estatísticas Período 1 (0-300s)
+        cursor.execute("""
+            SELECT decision, COUNT(*) as cnt
+            FROM decisions_history 
+            WHERE timestamp IN (
+                SELECT timestamp FROM extended_metrics WHERE sim_time_s <= 300
+            )
+            GROUP BY decision
+        """)
+        period1 = {'allowed': 0, 'blocked': 0, 'conditional': 0}
+        for row in cursor.fetchall():
+            if row[0] == 'ALLOWED':
+                period1['allowed'] = row[1]
+            elif row[0] == 'BLOCKED':
+                period1['blocked'] = row[1]
+            elif row[0] == 'CONDITIONAL':
+                period1['conditional'] = row[1]
+        
+        # Estatísticas Período 2 (300-600s)
+        cursor.execute("""
+            SELECT decision, COUNT(*) as cnt
+            FROM decisions_history 
+            WHERE timestamp IN (
+                SELECT timestamp FROM extended_metrics WHERE sim_time_s > 300 AND sim_time_s <= 600
+            )
+            GROUP BY decision
+        """)
+        period2 = {'allowed': 0, 'blocked': 0, 'conditional': 0}
+        for row in cursor.fetchall():
+            if row[0] == 'ALLOWED':
+                period2['allowed'] = row[1]
+            elif row[0] == 'BLOCKED':
+                period2['blocked'] = row[1]
+            elif row[0] == 'CONDITIONAL':
+                period2['conditional'] = row[1]
+        
+        return {
+            'current_period': current_period,
+            'current_period_name': current_period_name,
+            'current_cvar': current_cvar,
+            'period1': period1,
+            'period2': period2
+        }
+        
+    except Exception as e:
+        print(f"Erro ao obter estatísticas de período: {e}")
+        return {
+            'current_period': 1,
+            'current_period_name': 'Erro',
+            'current_cvar': 0,
+            'period1': {'allowed': 0, 'blocked': 0, 'conditional': 0},
+            'period2': {'allowed': 0, 'blocked': 0, 'conditional': 0}
+        }
+
+
+def get_camera_protection():
+    """
+    Obtém status de proteção das câmeras.
+    
+    As câmeras têm prioridade máxima:
+    - throughput < 25Mbps: violação direta
+    - throughput 25-30Mbps: faixa de guarda
+    - latência >= 80ms: violação direta
+    
+    Returns:
+        Dict com status de proteção
+    """
+    try:
+        metrics = get_current_metrics()
+        if not metrics:
+            return {
+                'status': 'ATIVA',
+                'active_cameras': 0,
+                'max_latency': 0,
+                'min_throughput_mbps': 0,
+                'sla_compliant': True,
+                'guard_active': False,
+                'reason': 'Sem métricas atuais'
+            }
+
+        camera_entries = [
+            ue for ue in (metrics.get('ue_metrics', {}) or {}).values()
+            if ue.get('device_type') == 'camera'
+        ]
+
+        if not camera_entries:
+            return {
+                'status': 'ATIVA',
+                'active_cameras': 0,
+                'max_latency': 0,
+                'min_throughput_mbps': 0,
+                'sla_compliant': True,
+                'guard_active': False,
+                'reason': 'Nenhuma câmera ativa'
+            }
+
+        max_latency = max(float(ue.get('latency_us', 0) or 0) for ue in camera_entries)
+        min_throughput_kbps = min(
+            float(ue.get('rx_throughput_kbps', ue.get('throughput_kbps', 0)) or 0)
+            for ue in camera_entries
+        )
+        min_throughput_mbps = min_throughput_kbps / 1000.0
+
+        latency_block_ms = 80.0
+        throughput_min_mbps = 25.0
+        throughput_guard_mbps = 30.0
+
+        if min_throughput_mbps < throughput_min_mbps:
+            status = 'CRÍTICA'
+            sla_compliant = False
+            guard_active = False
+            reason = f'Throughput {min_throughput_mbps:.1f}Mbps < 25Mbps'
+        elif max_latency / 1000.0 >= latency_block_ms:
+            status = 'CRÍTICA'
+            sla_compliant = False
+            guard_active = False
+            reason = f'Latência {max_latency / 1000.0:.1f}ms >= 80ms'
+        elif min_throughput_mbps < throughput_guard_mbps:
+            status = 'GUARDA'
+            sla_compliant = True
+            guard_active = True
+            reason = f'Throughput {min_throughput_mbps:.1f}Mbps em [25-30Mbps]'
+        elif max_latency / 1000.0 >= 60.0:
+            status = 'GUARDA'
+            sla_compliant = True
+            guard_active = True
+            reason = f'Latência {max_latency / 1000.0:.1f}ms em [60-80ms]'
+        else:
+            status = 'PROTEGIDA'
+            sla_compliant = True
+            guard_active = False
+            reason = 'SLA com margem'
+        
+        return {
+            'status': status,
+            'active_cameras': len(camera_entries),
+            'max_latency': max_latency,
+            'min_throughput_mbps': min_throughput_mbps,
+            'sla_compliant': sla_compliant,
+            'guard_active': guard_active,
+            'reason': reason
+        }
+
+    except Exception as e:
+        print(f"Erro ao obter proteção das câmeras: {e}")
+        return {
+            'status': 'ATIVA',
+            'active_cameras': 0,
+            'max_latency': 0,
+            'min_throughput_mbps': 0,
+            'sla_compliant': True,
+            'guard_active': False,
+            'reason': 'Erro ao ler métricas'
+        }
+
+
+def get_cvar_history(count=50):
+    """
+    Obtém histórico de CVaR para gráfico.
+    
+    Args:
+        count: Número de amostras a retornar
+        
+    Returns:
+        List de valores de CVaR em ms
+    """
+    try:
+        cursor = DATA_LAKE.conn.cursor()
+        cursor.execute("""
+            SELECT cvar_per_ue_us 
+            FROM extended_metrics 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        """, (count,))
+        
+        cvar_values = [row[0] / 1000 for row in cursor.fetchall()]
+        cvar_values.reverse()
+        
+        return cvar_values
+        
+    except Exception as e:
+        print(f"Erro ao obter histórico de CVaR: {e}")
+        return [0] * count
 
 
 def get_recent_metrics(minutes=30):
@@ -123,15 +827,64 @@ def get_recent_decisions(minutes=60):
         return []
 
 
+def get_recent_conflicts(minutes=60):
+    """Obtém conflitos O-RAN recentes derivados das decisões do rApp."""
+    try:
+        return DATA_LAKE.get_recent_conflicts(minutes=minutes, limit=50)
+    except Exception as e:
+        print(f"Erro ao obter conflitos: {e}")
+        return []
+
+
+def get_vehicle_history(minutes=60, limit=60):
+    """Obtém histórico agregado dos veículos a partir do ue_metrics do Data Lake."""
+    cutoff = int(time.time()) - (minutes * 60)
+    history = []
+    try:
+        cursor = DATA_LAKE.conn.execute(
+            """
+            SELECT
+                timestamp,
+                MAX(COALESCE(latency_avg_us, latency_us, 0)) / 1000.0 AS max_latency_ms,
+                AVG(COALESCE(throughput_kbps, 0)) / 1000.0 AS avg_throughput_mbps,
+                COUNT(*) AS active_vehicles
+            FROM ue_metrics
+            WHERE device_type = 'vehicle' AND timestamp >= ?
+            GROUP BY timestamp
+            ORDER BY timestamp ASC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        )
+        for row in cursor.fetchall():
+            history.append(
+                {
+                    'timestamp': int(row['timestamp'] or 0),
+                    'label': datetime.fromtimestamp(int(row['timestamp'] or 0)).strftime('%H:%M:%S'),
+                    'max_latency_ms': round(float(row['max_latency_ms'] or 0.0), 3),
+                    'avg_throughput_mbps': round(float(row['avg_throughput_mbps'] or 0.0), 3),
+                    'active_vehicles': int(row['active_vehicles'] or 0),
+                }
+            )
+    except Exception as e:
+        print(f"Erro ao obter histórico veicular: {e}")
+    return history
+
+
 @app.route('/')
 def index():
     """Dashboard principal."""
     metrics = get_current_metrics()
     xapp_status = get_xapp_status()
     policy_status = get_policy_status()
+    app1_monitoring = get_app1_monitoring()
+    app2_monitoring = get_app2_monitoring()
+    app3_monitoring = get_app3_monitoring()
     decision_stats = get_decision_stats()
     pattern_summary = PATTERN_ENGINE.get_summary()
     recent_alerts = ALERT_MANAGER.get_recent_alerts(5)
+    vehicle_history = get_vehicle_history(60, limit=50)
+    scenario_counts = get_scenario_actor_counts()
     
     # Métricas para gráficos
     recent = get_recent_metrics(120)  # 2 horas para incluir dados antigos
@@ -161,6 +914,16 @@ def index():
     except:
         pass
     
+    # NOVO: Calcular estatísticas por período
+    period_stats = get_period_stats()
+    
+    # NOVO: Obter proteção das câmeras
+    camera_protection = get_camera_protection()
+    service_slas = get_service_sla_status()
+    
+    # NOVO: Obter histórico de CVaR para gráfico
+    cvar_history = get_cvar_history(50)
+    
     return render_template(
         'dashboard.html',
         metrics=metrics,
@@ -171,12 +934,27 @@ def index():
         recent_alerts=recent_alerts,
         latency_history=latency_history[-20:],
         cameras_history=cameras_history[-20:],
+        cvar_history=cvar_history,
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         # Novos dados para coordenação rApp-xApps
         network_health=network_health,
         trend_analysis=trend_analysis,
         slicer_state=slicer_state,
-        energy_saver=energy_saver
+        energy_saver=energy_saver,
+        # Dados de períodos
+        current_period=period_stats['current_period'],
+        current_period_name=period_stats['current_period_name'],
+        current_cvar=period_stats['current_cvar'],
+        period1_stats=period_stats['period1'],
+        period2_stats=period_stats['period2'],
+        # Dados de proteção das câmeras
+        camera_protection=camera_protection,
+        app1_monitoring=app1_monitoring,
+        app2_monitoring=app2_monitoring,
+        app3_monitoring=app3_monitoring,
+        vehicle_history=vehicle_history,
+        scenario_counts=scenario_counts,
+        service_slas=service_slas,
     )
 
 
@@ -210,6 +988,23 @@ def decisions_page():
     )
 
 
+@app.route('/conflicts')
+def conflicts_page():
+    """Página de gestão de conflitos O-RAN."""
+    conflict_stats = DATA_LAKE.get_conflict_stats(24)
+    recent_conflicts = get_recent_conflicts(60)
+    learned_report, learned_adjacency = get_learned_conflict_assets()
+
+    return render_template(
+        'conflicts.html',
+        conflict_stats=conflict_stats,
+        recent_conflicts=recent_conflicts,
+        learned_report=learned_report,
+        learned_adjacency=learned_adjacency,
+        timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    )
+
+
 @app.route('/pattern')
 def pattern_page():
     """Página de análise de padrões."""
@@ -233,6 +1028,9 @@ def xapps_page():
     """Página de status dos xApps."""
     xapp_status = get_xapp_status()
     policy_status = get_policy_status()
+    app1_monitoring = get_app1_monitoring()
+    app2_monitoring = get_app2_monitoring()
+    app3_monitoring = get_app3_monitoring()
     ack_stats = PATTERN_ENGINE.dl.conn.execute(
         "SELECT COUNT(*) FROM decisions_history WHERE datetime >= datetime('now', '-1 hour')"
     ).fetchone()[0]
@@ -241,7 +1039,13 @@ def xapps_page():
         'xapps.html',
         xapp_status=xapp_status,
         policy_status=policy_status,
+        app1_monitoring=app1_monitoring,
+        app2_monitoring=app2_monitoring,
+        app3_monitoring=app3_monitoring,
         ack_stats=ack_stats,
+        grafana_url=f"http://localhost:{RUNTIME_CONFIG['monitoring']['grafana_port']}",
+        app1_url="http://localhost:5100",
+        app3_url="http://localhost:5300",
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
 
@@ -414,6 +1218,22 @@ def api_decisions():
     return jsonify(stats)
 
 
+@app.route('/api/drl')
+def api_drl():
+    """API: Estatísticas do DRL (SBiLSTM + A3C)."""
+    stats = get_drl_stats()
+    return jsonify(stats)
+
+
+@app.route('/drl')
+def drl_page():
+    """Página: Visualização DRL."""
+    stats = get_drl_stats()
+    return render_template('drl_dashboard.html', 
+                        predictions=stats.get('recent', []),
+                        stats=stats.get('stats', {}))
+
+
 @app.route('/api/history/<int:minutes>')
 def api_history(minutes):
     """API: Histórico de métricas."""
@@ -421,10 +1241,40 @@ def api_history(minutes):
     return jsonify(history)
 
 
+@app.route('/api/vehicle-history/<int:minutes>')
+def api_vehicle_history(minutes):
+    """API: Histórico agregado dos veículos."""
+    return jsonify(get_vehicle_history(minutes, limit=120))
+
+
 @app.route('/api/health')
 def api_health():
     """API: Health dos xApps."""
     return jsonify(get_xapp_status())
+
+
+@app.route('/api/app1')
+def api_app1():
+    """API: Snapshot da App1-Vigilancia."""
+    return jsonify(get_app1_monitoring())
+
+
+@app.route('/api/app2')
+def api_app2():
+    """API: Snapshot da App2-Monitoramento."""
+    return jsonify(get_app2_monitoring())
+
+
+@app.route('/api/app3')
+def api_app3():
+    """API: Snapshot da App3-Veicular."""
+    return jsonify(get_app3_monitoring())
+
+
+@app.route('/api/service-slas')
+def api_service_slas():
+    """API: Resumo consolidado dos SLAs de App1/câmeras, App3/veículos e App2/sensores."""
+    return jsonify(get_service_sla_status())
 
 
 @app.route('/api/alerts')
@@ -459,7 +1309,7 @@ def api_energy():
 def api_energy_current():
     """API: Estado atual de energia."""
     import os
-    energy_file = "/tmp/xapp_intents/energy_command.json"
+    energy_file = as_str(XAPP_INTENTS_DIR / "energy_command.json")
     if os.path.exists(energy_file):
         try:
             with open(energy_file, 'r') as f:
@@ -482,8 +1332,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='GreenRAN rApp Dashboard')
-    parser.add_argument('--host', default='0.0.0.0', help='Host para bind')
-    parser.add_argument('--port', type=int, default=5000, help='Porta')
+    parser.add_argument('--host', default=RUNTIME_CONFIG["dashboard"]["host"], help='Host para bind')
+    parser.add_argument('--port', type=int, default=int(RUNTIME_CONFIG["dashboard"]["port"]), help='Porta')
     parser.add_argument('--debug', action='store_true', help='Debug mode')
     args = parser.parse_args()
     

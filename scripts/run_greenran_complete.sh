@@ -22,6 +22,10 @@
 
 set -e
 
+. "$(dirname "$0")/core_runtime.sh"
+load_greenran_runtime
+create_greenran_run "greenran_complete" >/dev/null
+
 # Cores
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -31,10 +35,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Pastas
-ORANGE_DIR="/home/robert/orange_nuclear"
-NS3_DIR="$ORANGE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran"
-RIC_DIR="$ORANGE_DIR/flexric/build_e2ap_v1"
-FLEXRIC_LIB="$ORANGE_DIR/flexric_lib"
+ORANGE_DIR="$BASE_DIR"
 
 # Funções
 log_info() {
@@ -79,7 +80,7 @@ stop_all() {
     pkill -9 -f "rapp_orchestrator" 2>/dev/null || true
     pkill -9 -f "rapp_dashboard" 2>/dev/null || true
     pkill -9 -f "watchdog_xapps" 2>/dev/null || true
-    rm -f /tmp/dashboard.pid /tmp/watchdog.pid 2>/dev/null || true
+    rm -f "$GREENRAN_DASHBOARD_PID" "$GREENRAN_WATCHDOG_PID" 2>/dev/null || true
     sleep 2
     log_success "Processos antigos parados"
 }
@@ -87,17 +88,17 @@ stop_all() {
 # Limpar dados (DESATIVADO - dataset é persistente)
 clean_data() {
     # NÃO APAGA DADOS - dataset é persistente entre execuções
-    # Para limpar manualmente: rm /tmp/rapp_data_lake.db
-    mkdir -p /tmp/xapp_metrics /tmp/xapp_intents /tmp/rapp_policies
+    # Para limpar manualmente: rm $GREENRAN_DB_PATH
+    mkdir -p "$STATE_DIR/xapp_metrics" "$STATE_DIR/xapp_intents" "$STATE_DIR/rapp_policies"
     log_info "Diretórios verificados (dataset persistente)"
 }
 
 # Mostrar status do dataset existente
 show_dataset_status() {
-    if [ -f /tmp/rapp_data_lake.db ]; then
-        local size=$(du -h /tmp/rapp_data_lake.db | cut -f1)
-        local records=$(python3 -c "import sqlite3; conn=sqlite3.connect('/tmp/rapp_data_lake.db'); c=conn.cursor(); c.execute('SELECT COUNT(*) FROM extended_metrics'); print(c.fetchone()[0])" 2>/dev/null || echo "0")
-        local period=$(python3 -c "import sqlite3; conn=sqlite3.connect('/tmp/rapp_data_lake.db'); c=conn.cursor(); c.execute('SELECT MIN(timestamp), MAX(timestamp) FROM extended_metrics'); r=c.fetchone(); print(f'{int(r[1]-r[0])}')" 2>/dev/null || echo "0")
+    if [ -f "$GREENRAN_DB_PATH" ]; then
+        local size=$(du -h "$GREENRAN_DB_PATH" | cut -f1)
+        local records=$(python3 -c "import sqlite3; conn=sqlite3.connect('$GREENRAN_DB_PATH'); c=conn.cursor(); c.execute('SELECT COUNT(*) FROM extended_metrics'); print(c.fetchone()[0])" 2>/dev/null || echo "0")
+        local period=$(python3 -c "import sqlite3; conn=sqlite3.connect('$GREENRAN_DB_PATH'); c=conn.cursor(); c.execute('SELECT MIN(timestamp), MAX(timestamp) FROM extended_metrics'); r=c.fetchone(); print(f'{int(r[1]-r[0])}')" 2>/dev/null || echo "0")
         local hours=$((period / 3600))
         local mins=$(((period % 3600) / 60))
         
@@ -105,7 +106,7 @@ show_dataset_status() {
         log_info "=========================================="
         log_info "  DATASET EXISTENTE ENCONTRADO"
         log_info "=========================================="
-        echo "  Arquivo:  /tmp/rapp_data_lake.db"
+        echo "  Arquivo:  $GREENRAN_DB_PATH"
         echo "  Tamanho:  ${size}"
         echo "  Registros: ${records}"
         if [ "$period" -gt 0 ]; then
@@ -113,7 +114,7 @@ show_dataset_status() {
         fi
         echo ""
         echo -e "  ${YELLOW}Novos dados serão ADICIONADOS aos existentes${NC}"
-        echo "  Para LIMPAR: rm /tmp/rapp_data_lake.db"
+        echo "  Para LIMPAR: rm $GREENRAN_DB_PATH"
         echo ""
         log_info "=========================================="
         echo ""
@@ -204,15 +205,15 @@ start_xapps() {
 start_collectors() {
     log_info "Iniciando csv_to_metrics..."
     cd "$ORANGE_DIR"
-    python3 ./csv_to_metrics.py --input-dir "$NS3_DIR" --output /tmp/xapp_metrics/metrics.json --poll-interval 1 > /tmp/csv_metrics.log 2>&1 &
-    echo $! > /tmp/csv_metrics.pid
+    python3 ./csv_to_metrics.py --input-dir "$NS3_DIR" --output "$STATE_DIR/xapp_metrics/metrics.json" --poll-interval "$GREENRAN_COLLECTOR_POLL_INTERVAL" > "$GREENRAN_CSV_LOG" 2>&1 &
+    echo $! > "$GREENRAN_CSV_PID"
     sleep 1
     
     log_info "Iniciando rApp-ResourceOptimizer..."
-    python3 ./rapp_orchestrator.py --interval 5 > /tmp/rapp.log 2>&1 &
-    echo $! > /tmp/rapp.pid
+    python3 ./rapp_orchestrator.py --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" --synthetic "$GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS" > "$GREENRAN_RAPP_LOG" 2>&1 &
+    echo $! > "$GREENRAN_RAPP_PID"
     sleep 1
-    log_success "Coletores iniciados (csv_to_metrics: $(cat /tmp/csv_metrics.pid), rApp: $(cat /tmp/rapp.pid))"
+    log_success "Coletores iniciados (csv_to_metrics: $(cat "$GREENRAN_CSV_PID"), rApp: $(cat "$GREENRAN_RAPP_PID"))"
 }
 
 # Status do sistema
@@ -250,10 +251,10 @@ show_status() {
     echo ""
     echo -e "${YELLOW}[2] DATA LAKE${NC}"
     echo "----------------------------------------"
-    if [ -f /tmp/rapp_data_lake.db ]; then
-        local size=$(du -h /tmp/rapp_data_lake.db | cut -f1)
-        local records=$(python3 -c "import sqlite3; conn=sqlite3.connect('/tmp/rapp_data_lake.db'); c=conn.cursor(); c.execute('SELECT COUNT(*) FROM extended_metrics'); print(c.fetchone()[0])" 2>/dev/null || echo "0")
-        echo "  Arquivo: /tmp/rapp_data_lake.db (${size})"
+    if [ -f "$GREENRAN_DB_PATH" ]; then
+        local size=$(du -h "$GREENRAN_DB_PATH" | cut -f1)
+        local records=$(python3 -c "import sqlite3; conn=sqlite3.connect('$GREENRAN_DB_PATH'); c=conn.cursor(); c.execute('SELECT COUNT(*) FROM extended_metrics'); print(c.fetchone()[0])" 2>/dev/null || echo "0")
+        echo "  Arquivo: $GREENRAN_DB_PATH (${size})"
         echo "  Registros: ${records}"
     else
         echo -e "  ${RED}Data Lake não encontrado${NC}"
@@ -262,10 +263,11 @@ show_status() {
     echo ""
     echo -e "${YELLOW}[3] MÉTRICAS ATUAIS${NC}"
     echo "----------------------------------------"
-    if [ -f /tmp/xapp_metrics/extended_metrics.json ]; then
+    if [ -f "$STATE_DIR/xapp_metrics/extended_metrics.json" ]; then
         python3 << 'PYEOF' 2>/dev/null
 import json
-with open('/tmp/xapp_metrics/extended_metrics.json') as f:
+import os
+with open(os.path.join(os.environ['GREENRAN_STATE_DIR'], 'xapp_metrics', 'extended_metrics.json')) as f:
     d = json.load(f)
     gm = d.get('global_metrics', {})
     lat = gm.get('global_avg_latency_us', 0) / 1000
@@ -284,9 +286,9 @@ PYEOF
     echo ""
     echo -e "${YELLOW}[4] POLÍTICAS DO RAPP${NC}"
     echo "----------------------------------------"
-    if [ -f /tmp/rapp_policies/energy_policy.json ]; then
-        local e_status=$(python3 -c "import json; d=json.load(open('/tmp/rapp_policies/energy_policy.json')); print(d.get('status', 'N/A'))" 2>/dev/null || echo "N/A")
-        local s_state=$(python3 -c "import json; d=json.load(open('/tmp/rapp_policies/slice_policy.json')); print(d.get('slicer_state', 'N/A'))" 2>/dev/null || echo "N/A")
+    if [ -f "$STATE_DIR/rapp_policies/energy_policy.json" ]; then
+        local e_status=$(python3 -c "import json,os; d=json.load(open(os.path.join(os.environ['GREENRAN_STATE_DIR'],'rapp_policies','energy_policy.json'))); print(d.get('status', 'N/A'))" 2>/dev/null || echo "N/A")
+        local s_state=$(python3 -c "import json,os; d=json.load(open(os.path.join(os.environ['GREENRAN_STATE_DIR'],'rapp_policies','slice_policy.json'))); print(d.get('slicer_state', 'N/A'))" 2>/dev/null || echo "N/A")
         echo "  Energy Policy: ${e_status}"
         echo "  Slicer State: ${s_state}"
     else
@@ -296,12 +298,12 @@ PYEOF
     echo ""
     
     # Verificar dashboard
-    if [ -f /tmp/dashboard.pid ] && kill -0 $(cat /tmp/dashboard.pid) 2>/dev/null; then
-        echo -e "${CYAN}  Dashboard: http://localhost:5000${NC}"
+    if [ -f "$GREENRAN_DASHBOARD_PID" ] && kill -0 $(cat "$GREENRAN_DASHBOARD_PID") 2>/dev/null; then
+        echo -e "${CYAN}  Dashboard: http://localhost:${GREENRAN_DASHBOARD_PORT}${NC}"
     fi
     
     separator
-    echo -e "${CYAN}Logs: /tmp/rapp.log | /tmp/xapp_slicer.log | /tmp/xapp_energy.log${NC}"
+    echo -e "${CYAN}Logs: $GREENRAN_RAPP_LOG | $GREENRAN_XAPP_SLICER_LOG | $GREENRAN_XAPP_ENERGY_LOG${NC}"
     separator
 }
 
@@ -319,14 +321,14 @@ show_menu() {
 start_dashboard() {
     log_info "Iniciando rApp-Dashboard Flask..."
     cd "$ORANGE_DIR"
-    python3 ./rapp_dashboard.py --host 0.0.0.0 --port 5000 > /tmp/dashboard.log 2>&1 &
-    echo $! > /tmp/dashboard.pid
+    python3 ./rapp_dashboard.py --host "$GREENRAN_DASHBOARD_HOST" --port "$GREENRAN_DASHBOARD_PORT" > "$GREENRAN_DASHBOARD_LOG" 2>&1 &
+    echo $! > "$GREENRAN_DASHBOARD_PID"
     sleep 2
     
-    if kill -0 $(cat /tmp/dashboard.pid) 2>/dev/null; then
-        log_success "Dashboard iniciado (PID: $(cat /tmp/dashboard.pid))"
+    if kill -0 $(cat "$GREENRAN_DASHBOARD_PID") 2>/dev/null; then
+        log_success "Dashboard iniciado (PID: $(cat "$GREENRAN_DASHBOARD_PID"))"
         echo ""
-        echo -e "${CYAN}  Dashboard disponível em: http://localhost:5000${NC}"
+        echo -e "${CYAN}  Dashboard disponível em: http://localhost:${GREENRAN_DASHBOARD_PORT}${NC}"
     else
         log_error "Falha ao iniciar dashboard. Verifique: python3 -m pip install flask"
     fi
@@ -336,10 +338,10 @@ start_dashboard() {
 start_watchdog() {
     log_info "Iniciando Watchdog xApps..."
     cd "$ORANGE_DIR"
-    python3 ./watchdog_xapps.py > /tmp/watchdog.log 2>&1 &
-    echo $! > /tmp/watchdog.pid
+    python3 ./watchdog_xapps.py > "$GREENRAN_WATCHDOG_LOG" 2>&1 &
+    echo $! > "$GREENRAN_WATCHDOG_PID"
     sleep 1
-    log_success "Watchdog iniciado (PID: $(cat /tmp/watchdog.pid))"
+    log_success "Watchdog iniciado (PID: $(cat "$GREENRAN_WATCHDOG_PID"))"
 }
 
 # =============================================================================
@@ -416,8 +418,9 @@ main() {
     separator
     
     if [ "$DASHBOARD" = true ]; then
-        echo -e "${CYAN}  Dashboard: http://localhost:5000${NC}"
+        echo -e "${CYAN}  Dashboard: http://localhost:${GREENRAN_DASHBOARD_PORT}${NC}"
     fi
+    echo -e "${CYAN}  Run Dir:   ${GREENRAN_RUN_DIR}${NC}"
     echo ""
     
     # Menu de monitoramento
@@ -425,7 +428,7 @@ main() {
 }
 
 # Tratamento de Ctrl+C
-trap 'echo ""; log_info "Parando sistema..."; stop_all; exit 0' INT
+trap 'echo ""; log_info "Parando sistema..."; snapshot_greenran_state; stop_all; exit 0' INT
 
 # Executar
 main

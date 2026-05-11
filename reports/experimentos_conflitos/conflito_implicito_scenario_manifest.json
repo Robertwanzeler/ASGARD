@@ -1,0 +1,10 @@
+{
+  "slug": "conflito_implicito",
+  "title": "Conflito implícito",
+  "goal": "mostrar KPI global saudável mascarando KPI local degradado",
+  "instructions": [
+    "mantenha CVaR/P95 global saudável",
+    "degrade App1 ou App2 localmente",
+    "o objetivo é gerar conflito implícito claro para o grafo"
+  ]
+}

@@ -194,5 +194,14 @@
       },
       "note": "GraphSAGE-CL ref: 450 samples | ARMD-GreenRAN chosen setting: 450 samples, 200 epochs"
     }
+  },
+  "implicit_reference_series": {
+    "Random": [0.0, 0.0, 0.0],
+    "GraphSAGE-CL 50": [0.25, 0.93, 0.88],
+    "GraphSAGE-CL 150": [0.18, 0.95, 0.86],
+    "GraphSAGE-CL 450": [0.28, 0.90, 1.0],
+    "GraphSAGE-CL 0.2": [0.82, 0.91, 0.95],
+    "GraphSAGE-CL 0.5": [0.30, 0.85, 1.0],
+    "GraphSAGE-CL 0.9": [0.0, 0.18, 0.0]
   }
 }

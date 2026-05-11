@@ -32,7 +32,9 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
-DEFAULT_DB_PATH = "/tmp/rapp_data_lake.db"
+from greenran_paths import RAPP_DB_PATH
+
+DEFAULT_DB_PATH = str(RAPP_DB_PATH)
 
 
 class DataLake:
@@ -218,6 +220,29 @@ class DataLake:
                 is_critical INTEGER
             )
         """)
+        existing_ue_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(ue_metrics)").fetchall()
+        }
+        for column_name, column_def in (
+            ("packet_loss_percent", "REAL"),
+            ("vehicle_id", "TEXT"),
+            ("vehicle_role", "TEXT"),
+            ("autonomy_state", "TEXT"),
+            ("risk_state", "TEXT"),
+            ("speed_mps", "REAL"),
+            ("heading_deg", "REAL"),
+            ("lane_id", "TEXT"),
+            ("waypoint_id", "TEXT"),
+            ("position_x", "REAL"),
+            ("position_y", "REAL"),
+            ("position_z", "REAL"),
+            ("connectivity", "TEXT"),
+            ("gateway_id", "TEXT"),
+            ("domain", "TEXT"),
+            ("mobility_profile", "TEXT"),
+        ):
+            if column_name not in existing_ue_columns:
+                cursor.execute(f"ALTER TABLE ue_metrics ADD COLUMN {column_name} {column_def}")
         
         # Índices para métricas extendidas
         cursor.execute("""
@@ -250,6 +275,111 @@ class DataLake:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_energy_timestamp 
             ON energy_commands(timestamp)
+        """)
+
+        # Snapshot agregado da App2-Monitoramento.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS app2_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                total_sensors INTEGER DEFAULT 0,
+                active_sensors INTEGER DEFAULT 0,
+                connected_sensors INTEGER DEFAULT 0,
+                error_sensors INTEGER DEFAULT 0,
+                low_battery_sensors INTEGER DEFAULT 0,
+                gateways_count INTEGER DEFAULT 0,
+                connectivity_modes_count INTEGER DEFAULT 0,
+                avg_temperature_c REAL DEFAULT 0,
+                avg_humidity_percent REAL DEFAULT 0,
+                avg_soil_conductivity REAL DEFAULT 0,
+                avg_battery_percent REAL DEFAULT 0,
+                avg_power_mw REAL DEFAULT 0,
+                packet_loss_percent REAL DEFAULT 0,
+                tx_packets INTEGER DEFAULT 0,
+                rx_packets INTEGER DEFAULT 0,
+                lost_packets INTEGER DEFAULT 0,
+                avg_latency_ms REAL DEFAULT 0,
+                avg_rssi_dbm REAL DEFAULT 0,
+                network_utilization_percent REAL DEFAULT 0,
+                delivery_success_percent REAL DEFAULT 100,
+                alerts_count INTEGER DEFAULT 0,
+                snapshot_json TEXT,
+                UNIQUE(timestamp)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_app2_snapshots_timestamp
+            ON app2_snapshots(timestamp)
+        """)
+
+        # Leituras individuais da App2 para historico central no Data Lake.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS app2_sensor_readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                sensor_id INTEGER,
+                sensor_type TEXT,
+                unit TEXT,
+                value REAL,
+                status TEXT,
+                domain TEXT,
+                connectivity TEXT,
+                gateway_id TEXT,
+                battery_percent REAL,
+                latency_ms REAL,
+                packet_loss_percent REAL,
+                rssi_dbm REAL,
+                power_mw REAL,
+                tx_interval_s REAL,
+                packets_tx INTEGER DEFAULT 0,
+                UNIQUE(timestamp, sensor_id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_app2_sensor_readings_timestamp
+            ON app2_sensor_readings(timestamp)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_app2_sensor_readings_sensor_id
+            ON app2_sensor_readings(sensor_id)
+        """)
+
+        # Eventos de conflito O-RAN (artigo00): xApps/agentes -> parâmetros -> KPIs.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conflict_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                source_agent TEXT,
+                target_agent TEXT,
+                conflict_type TEXT NOT NULL,
+                parameter TEXT,
+                affected_service TEXT,
+                affected_kpi TEXT,
+                observed_value REAL,
+                threshold_value REAL,
+                decision TEXT,
+                mitigation_action TEXT,
+                reason TEXT,
+                confidence REAL,
+                graph_path TEXT,
+                UNIQUE(timestamp, conflict_type, affected_kpi)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conflict_events_timestamp
+            ON conflict_events(timestamp)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conflict_events_type
+            ON conflict_events(conflict_type)
         """)
 
         # Additional indexes for performance
@@ -354,6 +484,19 @@ class DataLake:
         ml_predicted_cvar = ml_prediction.get('predicted_cvar_ms', 0.0)
         ml_influenced = 1 if decision.get('ml_influenced', False) else 0
 
+        # DEBUG: Log dos dados de ML que chegam
+        if ml_decision:
+            print(f"[DataLake DEBUG] ML Decision: '{ml_decision}', Confidence: {ml_confidence}, CVaR: {ml_predicted_cvar}")
+        else:
+            # Tentar obter do pattern_analysis como fallback
+            pattern_analysis = decision.get('pattern_analysis', {})
+            if pattern_analysis:
+                pattern_action = pattern_analysis.get('recommended_action', '')
+                if pattern_action:
+                    ml_decision = pattern_action
+                    ml_confidence = pattern_analysis.get('confidence', 0.0)
+                    print(f"[DataLake DEBUG] ML from pattern_analysis: '{ml_decision}', Confidence: {ml_confidence}")
+
         try:
             cursor = self.conn.cursor()
             cursor.execute("""
@@ -366,8 +509,190 @@ class DataLake:
                   agent_override, energy_state, slicer_state,
                   ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced))
             self.conn.commit()
+            self.record_conflict_from_decision(decision, timestamp=timestamp)
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar decisão: {e}")
+
+    def _derive_conflict_event(self, decision, timestamp):
+        """
+        Deriva um evento de conflito O-RAN a partir da decisão do rApp.
+
+        Mapeamento inspirado no artigo00:
+        - indireto: uma ação/política altera um parâmetro que afeta KPI de aplicação;
+        - implícito: KPIs globais parecem saudáveis, mas um KPI específico da aplicação
+          está em risco e precisa bloquear ML/energia.
+        """
+        priority = decision.get('priority_violation')
+        if not priority:
+            return None
+
+        reason = decision.get('reason', '')
+        network_health = decision.get('network_health') or {}
+        cvar_us = float(network_health.get('cvar_us', 0) or 0)
+        global_kpi_masks_app_kpi = 0 < cvar_us < 40000
+        conflict_type = 'implicit' if global_kpi_masks_app_kpi else 'indirect'
+
+        base = {
+            'timestamp': timestamp,
+            'datetime': datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+            'source_agent': 'xApp2-EnergySaver',
+            'target_agent': 'rApp-ResourceOptimizer',
+            'conflict_type': conflict_type,
+            'parameter': 'energy_policy',
+            'affected_service': 'network',
+            'affected_kpi': 'unknown',
+            'observed_value': None,
+            'threshold_value': None,
+            'decision': decision.get('energy_saver', 'UNKNOWN'),
+            'mitigation_action': decision.get('action', 'NONE'),
+            'reason': reason,
+            'confidence': float(decision.get('confidence', 0) or 0),
+            'graph_path': '',
+        }
+
+        if priority in ('THROUGHPUT', 'THROUGHPUT_WARNING', 'LATENCY', 'LATENCY_WARNING'):
+            camera = decision.get('camera_metrics') or {}
+            is_latency = priority in ('LATENCY', 'LATENCY_WARNING')
+            base.update({
+                'source_agent': 'rApp-CVaR/ML-Arbiter' if global_kpi_masks_app_kpi else 'xApp2-EnergySaver',
+                'target_agent': 'xApp1-RANSlicer',
+                'parameter': 'global_health_policy' if global_kpi_masks_app_kpi else 'energy_policy',
+                'affected_service': 'App1-Vigilancia',
+                'affected_kpi': 'camera_latency_ms' if is_latency else 'camera_throughput_mbps',
+                'observed_value': float(camera.get('latency_ms', 0) if is_latency else camera.get('throughput_mbps', 0) or 0),
+                'threshold_value': 80.0 if priority == 'LATENCY' else 60.0 if priority == 'LATENCY_WARNING' else 25.0 if priority == 'THROUGHPUT' else 30.0,
+                'graph_path': (
+                    'CVaR/ML global KPI -> energy recommendation -> App1 KPI -> rApp mitigation'
+                    if global_kpi_masks_app_kpi
+                    else 'xApp2-EnergySaver -> energy_policy -> App1 KPI -> xApp1-RANSlicer/rApp'
+                ),
+            })
+            return base
+
+        if priority in ('APP2_MTC_CRITICAL', 'APP2_MTC_WARNING'):
+            app2 = decision.get('app2_metrics') or {}
+            affected_kpi = 'app2_connected_ratio'
+            observed_value = float(app2.get('connected_ratio', 0) or 0) * 100.0
+            threshold_value = 85.0 if priority == 'APP2_MTC_CRITICAL' else 95.0
+
+            reason_lower = reason.lower()
+            if 'packet loss' in reason_lower:
+                affected_kpi = 'app2_packet_loss_percent'
+                observed_value = float(app2.get('packet_loss_percent', 0) or 0)
+                threshold_value = 10.0 if priority == 'APP2_MTC_CRITICAL' else 5.0
+            elif 'entrega' in reason_lower:
+                affected_kpi = 'app2_delivery_success_percent'
+                observed_value = float(app2.get('delivery_success_percent', 0) or 0)
+                threshold_value = 90.0 if priority == 'APP2_MTC_CRITICAL' else 95.0
+            elif 'latência' in reason_lower or 'latencia' in reason_lower:
+                affected_kpi = 'app2_avg_latency_ms'
+                observed_value = float(app2.get('avg_latency_ms', 0) or 0)
+                threshold_value = 1000.0 if priority == 'APP2_MTC_CRITICAL' else 500.0
+            elif 'bateria' in reason_lower:
+                affected_kpi = 'app2_avg_battery_percent'
+                observed_value = float(app2.get('avg_battery_percent', 0) or 0)
+                threshold_value = 15.0 if priority == 'APP2_MTC_CRITICAL' else 25.0
+
+            base.update({
+                'source_agent': 'rApp-CVaR/ML-Arbiter' if global_kpi_masks_app_kpi else 'xApp2-EnergySaver',
+                'target_agent': 'App2-Monitoramento',
+                'parameter': 'global_health_policy' if global_kpi_masks_app_kpi else 'energy_policy',
+                'affected_service': 'App2-Monitoramento',
+                'affected_kpi': affected_kpi,
+                'observed_value': observed_value,
+                'threshold_value': threshold_value,
+                'graph_path': (
+                    'CVaR/ML global KPI -> energy recommendation -> App2 mMTC KPI -> rApp mitigation'
+                    if global_kpi_masks_app_kpi
+                    else 'xApp2-EnergySaver -> energy_policy/slice resources -> App2 mMTC KPI -> rApp'
+                ),
+            })
+            return base
+
+        if priority in ('VEHICLE_CRITICAL', 'VEHICLE_WARNING'):
+            vehicle = decision.get('vehicle_metrics') or {}
+            affected_kpi = 'ego_latency_ms'
+            observed_value = float(vehicle.get('max_latency_ms', 0) or 0)
+            threshold_value = 100.0 if priority == 'VEHICLE_CRITICAL' else 50.0
+
+            reason_lower = reason.lower()
+            if 'packet loss' in reason_lower:
+                affected_kpi = 'vehicle_packet_loss_percent'
+                observed_value = float(vehicle.get('max_packet_loss_percent', 0) or 0)
+                threshold_value = 5.0 if priority == 'VEHICLE_CRITICAL' else 2.0
+            elif 'autonomia' in reason_lower:
+                affected_kpi = 'vehicle_degraded_autonomy_count'
+                observed_value = float(vehicle.get('degraded_autonomy_vehicles', 0) or 0)
+                threshold_value = 1.0
+            elif 'risco alto' in reason_lower:
+                affected_kpi = 'vehicle_high_risk_count'
+                observed_value = float(vehicle.get('high_risk_vehicles', 0) or 0)
+                threshold_value = 1.0
+            elif 'risco médio' in reason_lower or 'risco medio' in reason_lower:
+                affected_kpi = 'vehicle_medium_risk_count'
+                observed_value = float(vehicle.get('medium_risk_vehicles', 0) or 0)
+                threshold_value = 1.0
+
+            base.update({
+                'source_agent': 'rApp-CVaR/ML-Arbiter' if global_kpi_masks_app_kpi else 'xApp-VehicleSafety',
+                'target_agent': 'App3-Veicular',
+                'parameter': 'global_health_policy' if global_kpi_masks_app_kpi else 'vehicle_priority_policy',
+                'affected_service': 'App3-Veicular',
+                'affected_kpi': affected_kpi,
+                'observed_value': observed_value,
+                'threshold_value': threshold_value,
+                'graph_path': (
+                    'CVaR/ML global KPI -> vehicle priority policy -> App3 vehicular KPI -> rApp mitigation'
+                    if global_kpi_masks_app_kpi
+                    else 'xApp-VehicleSafety -> vehicle_priority_policy -> App3 vehicular KPI -> rApp'
+                ),
+            })
+            return base
+
+        return None
+
+    def record_conflict_event(self, event):
+        """Registra um evento de conflito O-RAN."""
+        if not event:
+            return False
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO conflict_events
+                (timestamp, datetime, source_agent, target_agent, conflict_type,
+                 parameter, affected_service, affected_kpi, observed_value,
+                 threshold_value, decision, mitigation_action, reason,
+                 confidence, graph_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event.get('timestamp'),
+                event.get('datetime'),
+                event.get('source_agent'),
+                event.get('target_agent'),
+                event.get('conflict_type'),
+                event.get('parameter'),
+                event.get('affected_service'),
+                event.get('affected_kpi'),
+                event.get('observed_value'),
+                event.get('threshold_value'),
+                event.get('decision'),
+                event.get('mitigation_action'),
+                event.get('reason'),
+                event.get('confidence'),
+                event.get('graph_path'),
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar conflito: {e}")
+            return False
+
+    def record_conflict_from_decision(self, decision, timestamp=None):
+        """Deriva e registra conflito a partir de uma decisão do rApp."""
+        if timestamp is None:
+            timestamp = int(time.time())
+        return self.record_conflict_event(self._derive_conflict_event(decision or {}, timestamp))
     
     def record_extended_metric(self, timestamp=None, sim_time_s=0, cell_id=0,
                                global_worst_latency=0, global_avg_latency=0,
@@ -414,12 +739,6 @@ class DataLake:
         
         dt = datetime.fromtimestamp(timestamp)
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Extrair métricas POR UE se disponíveis
-        latency_p95_per_ue = extended_metrics.get('latency_p95_per_ue_us', 0) if extended_metrics else 0
-        variance_per_ue = extended_metrics.get('variance_per_ue_us2', 0) if extended_metrics else 0
-        cvar_per_ue = extended_metrics.get('cvar_per_ue_us', 0) if extended_metrics else 0
-        ue_count = extended_metrics.get('ue_count', 0) if extended_metrics else 0
         
         latency_p95_per_ue = extended_metrics.get('latency_p95_per_ue_us', 0) if extended_metrics else 0
         variance_per_ue = extended_metrics.get('variance_per_ue_us2', 0) if extended_metrics else 0
@@ -489,15 +808,29 @@ class DataLake:
                      jitter_us, pdu_size_avg,
                      tx_bytes, rx_bytes, tx_pdus, rx_pdus,
                      throughput_kbps, packet_count,
-                     mcs_avg, tb_size_avg, is_critical)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     mcs_avg, tb_size_avg, is_critical,
+                     packet_loss_percent, vehicle_id, vehicle_role, autonomy_state, risk_state,
+                     speed_mps, heading_deg, lane_id, waypoint_id,
+                     position_x, position_y, position_z,
+                     connectivity, gateway_id, domain, mobility_profile)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (timestamp, ue.get('imsi'), ue.get('device_type'), ue.get('cell_id'),
                       ue.get('latency_us'), ue.get('latency_avg_us'), ue.get('latency_min_us'), ue.get('latency_max_us'),
                       ue.get('jitter_us'), ue.get('pdu_size_avg'),
                       ue.get('tx_bytes', 0), ue.get('rx_bytes', 0), ue.get('tx_pdus', 0), ue.get('rx_pdus', 0),
                       ue.get('throughput_kbps'), ue.get('packet_count', 0),
-                      ue.get('mcs_avg', 0), ue.get('tb_size_avg', 0), 
-                      1 if ue.get('is_critical') else 0))
+                      ue.get('mcs_avg', 0), ue.get('tb_size_avg', 0),
+                      1 if ue.get('is_critical') else 0,
+                      ue.get('packet_loss_percent'),
+                      ue.get('vehicle_id'), ue.get('vehicle_role'),
+                      ue.get('autonomy_state'), ue.get('risk_state'),
+                      ue.get('speed_mps'), ue.get('heading_deg'),
+                      ue.get('lane_id'), ue.get('waypoint_id'),
+                      (ue.get('position') or {}).get('x'),
+                      (ue.get('position') or {}).get('y'),
+                      (ue.get('position') or {}).get('z'),
+                      ue.get('connectivity'), ue.get('gateway_id'),
+                      ue.get('domain'), ue.get('mobility_profile')))
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar métricas de UE: {e}")
@@ -527,6 +860,292 @@ class DataLake:
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar comando de energia: {e}")
+
+    def record_app2_snapshot(self, snapshot=None, sensors=None, timestamp=None):
+        """
+        Registra snapshot agregado e leituras individuais da App2 no Data Lake.
+
+        Args:
+            snapshot: Dict do arquivo monitoring_snapshot.json
+            sensors: Lista opcional do arquivo sensors/latest.json
+            timestamp: Unix timestamp opcional
+        """
+        if not snapshot:
+            return
+
+        if sensors is None:
+            sensors = []
+
+        snapshot_ts = snapshot.get('timestamp')
+        if timestamp is None:
+            if isinstance(snapshot_ts, (int, float)):
+                timestamp = int(snapshot_ts)
+            elif isinstance(snapshot_ts, str):
+                try:
+                    timestamp = int(datetime.fromisoformat(snapshot_ts.replace('Z', '+00:00')).timestamp())
+                except ValueError:
+                    timestamp = int(time.time())
+            else:
+                timestamp = int(time.time())
+
+        dt = datetime.fromtimestamp(timestamp)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        sensors_summary = snapshot.get('sensors', {}) or {}
+        readings = snapshot.get('readings', {}) or {}
+        network = snapshot.get('network', {}) or {}
+        alerts = snapshot.get('alerts', []) or []
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO app2_snapshots
+                (timestamp, datetime, total_sensors, active_sensors, connected_sensors,
+                 error_sensors, low_battery_sensors, gateways_count, connectivity_modes_count,
+                 avg_temperature_c, avg_humidity_percent, avg_soil_conductivity,
+                 avg_battery_percent, avg_power_mw, packet_loss_percent,
+                 tx_packets, rx_packets, lost_packets, avg_latency_ms, avg_rssi_dbm,
+                 network_utilization_percent, delivery_success_percent, alerts_count, snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                timestamp,
+                dt_str,
+                int(sensors_summary.get('total', 0) or 0),
+                int(sensors_summary.get('active', 0) or 0),
+                int(sensors_summary.get('connected', 0) or 0),
+                int(sensors_summary.get('error', 0) or 0),
+                int(sensors_summary.get('low_battery', 0) or 0),
+                len(sensors_summary.get('gateways', []) or []),
+                len(sensors_summary.get('connectivity_modes', []) or []),
+                float(readings.get('avg_temperature_c', 0) or 0),
+                float(readings.get('avg_humidity_percent', 0) or 0),
+                float(readings.get('avg_soil_conductivity', 0) or 0),
+                float(readings.get('avg_battery_percent', 0) or 0),
+                float(readings.get('avg_power_mw', 0) or 0),
+                float(network.get('packet_loss_percent', 0) or 0),
+                int(network.get('tx_packets', 0) or 0),
+                int(network.get('rx_packets', 0) or 0),
+                int(network.get('lost_packets', 0) or 0),
+                float(network.get('avg_latency_ms', 0) or 0),
+                float(network.get('avg_rssi_dbm', 0) or 0),
+                float(network.get('network_utilization_percent', 0) or 0),
+                float(network.get('delivery_success_percent', 100) or 100),
+                len(alerts),
+                json.dumps(snapshot, ensure_ascii=True),
+            ))
+
+            if sensors:
+                sensor_rows = []
+                for sensor in sensors:
+                    if not isinstance(sensor, dict):
+                        continue
+                    sensor_rows.append((
+                        timestamp,
+                        dt_str,
+                        sensor.get('sensor_id'),
+                        sensor.get('type') or sensor.get('sensor_type'),
+                        sensor.get('unit'),
+                        sensor.get('value'),
+                        sensor.get('status'),
+                        sensor.get('domain'),
+                        sensor.get('connectivity'),
+                        sensor.get('gateway_id'),
+                        sensor.get('battery_percent'),
+                        sensor.get('latency_ms'),
+                        sensor.get('packet_loss_percent'),
+                        sensor.get('rssi_dbm'),
+                        sensor.get('power_mw'),
+                        sensor.get('tx_interval_s'),
+                        int(sensor.get('packets_tx', 0) or 0),
+                    ))
+                if sensor_rows:
+                    cursor.executemany("""
+                        INSERT OR REPLACE INTO app2_sensor_readings
+                        (timestamp, datetime, sensor_id, sensor_type, unit, value, status,
+                         domain, connectivity, gateway_id, battery_percent, latency_ms,
+                         packet_loss_percent, rssi_dbm, power_mw, tx_interval_s, packets_tx)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, sensor_rows)
+
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar snapshot da App2: {e}")
+
+    def get_latest_app2_snapshot(self):
+        """
+        Retorna o snapshot mais recente da App2 salvo no Data Lake.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT datetime, total_sensors, active_sensors, connected_sensors,
+                   error_sensors, low_battery_sensors, gateways_count,
+                   connectivity_modes_count, avg_temperature_c, avg_humidity_percent,
+                   avg_soil_conductivity, avg_battery_percent, avg_power_mw,
+                   packet_loss_percent, tx_packets, rx_packets, lost_packets,
+                   avg_latency_ms, avg_rssi_dbm, network_utilization_percent,
+                   delivery_success_percent, alerts_count, snapshot_json
+            FROM app2_snapshots
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+        if not row:
+            return {}
+
+        snapshot_json = row[22]
+        if snapshot_json:
+            try:
+                return json.loads(snapshot_json)
+            except json.JSONDecodeError:
+                pass
+
+        return {
+            'timestamp': row[0],
+            'sensors': {
+                'total': row[1],
+                'active': row[2],
+                'connected': row[3],
+                'error': row[4],
+                'low_battery': row[5],
+                'gateways_count': row[6],
+                'connectivity_modes_count': row[7],
+            },
+            'readings': {
+                'avg_temperature_c': row[8],
+                'avg_humidity_percent': row[9],
+                'avg_soil_conductivity': row[10],
+                'avg_battery_percent': row[11],
+                'avg_power_mw': row[12],
+            },
+            'network': {
+                'packet_loss_percent': row[13],
+                'tx_packets': row[14],
+                'rx_packets': row[15],
+                'lost_packets': row[16],
+                'avg_latency_ms': row[17],
+                'avg_rssi_dbm': row[18],
+                'network_utilization_percent': row[19],
+                'delivery_success_percent': row[20],
+            },
+            'alerts_count': row[21],
+        }
+
+    def get_recent_app2_snapshots(self, hours=24, limit=120):
+        """
+        Retorna histórico recente agregado da App2.
+        """
+        cursor = self.conn.cursor()
+        base_query = """
+            SELECT datetime, total_sensors, connected_sensors, error_sensors,
+                   low_battery_sensors, avg_temperature_c, avg_humidity_percent,
+                   avg_soil_conductivity, avg_battery_percent, avg_power_mw,
+                   packet_loss_percent, avg_latency_ms, avg_rssi_dbm,
+                   network_utilization_percent, delivery_success_percent, alerts_count
+            FROM app2_snapshots
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """
+
+        cutoff = int(time.time()) - (hours * 3600)
+        cursor.execute(base_query, (cutoff, limit))
+        rows = cursor.fetchall()
+
+        if not rows:
+            # Quando o banco contém apenas dados históricos/backfill, ancora a
+            # janela no snapshot mais recente salvo para manter relatórios úteis.
+            cursor.execute("SELECT MAX(timestamp) FROM app2_snapshots")
+            latest_timestamp = cursor.fetchone()[0]
+            if latest_timestamp is not None:
+                fallback_cutoff = int(latest_timestamp) - (hours * 3600)
+                cursor.execute(base_query, (fallback_cutoff, limit))
+                rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            results.append({
+                'datetime': row[0],
+                'total_sensors': row[1],
+                'connected_sensors': row[2],
+                'error_sensors': row[3],
+                'low_battery_sensors': row[4],
+                'avg_temperature_c': row[5],
+                'avg_humidity_percent': row[6],
+                'avg_soil_conductivity': row[7],
+                'avg_battery_percent': row[8],
+                'avg_power_mw': row[9],
+                'packet_loss_percent': row[10],
+                'avg_latency_ms': row[11],
+                'avg_rssi_dbm': row[12],
+                'network_utilization_percent': row[13],
+                'delivery_success_percent': row[14],
+                'alerts_count': row[15],
+            })
+        return results
+
+    def get_app2_report(self, hours=24):
+        """
+        Consolida um relatório operacional simples da App2.
+        """
+        history = self.get_recent_app2_snapshots(hours=hours, limit=max(1, hours * 24))
+        if not history:
+            return {
+                'window_hours': hours,
+                'samples': 0,
+                'status': 'no_data',
+            }
+
+        def _avg(key):
+            values = [float(item.get(key, 0) or 0) for item in history]
+            return round(sum(values) / len(values), 3) if values else 0.0
+
+        def _min(key):
+            values = [float(item.get(key, 0) or 0) for item in history]
+            return round(min(values), 3) if values else 0.0
+
+        def _max(key):
+            values = [float(item.get(key, 0) or 0) for item in history]
+            return round(max(values), 3) if values else 0.0
+
+        latest = history[0]
+        critical_samples = sum(1 for item in history if float(item.get('packet_loss_percent', 0) or 0) >= 10.0)
+        warning_samples = sum(1 for item in history if int(item.get('alerts_count', 0) or 0) > 0)
+
+        return {
+            'window_hours': hours,
+            'samples': len(history),
+            'status': 'ok',
+            'latest': latest,
+            'network': {
+                'avg_packet_loss_percent': _avg('packet_loss_percent'),
+                'max_packet_loss_percent': _max('packet_loss_percent'),
+                'avg_latency_ms': _avg('avg_latency_ms'),
+                'max_latency_ms': _max('avg_latency_ms'),
+                'avg_delivery_success_percent': _avg('delivery_success_percent'),
+                'min_delivery_success_percent': _min('delivery_success_percent'),
+                'avg_rssi_dbm': _avg('avg_rssi_dbm'),
+                'avg_network_utilization_percent': _avg('network_utilization_percent'),
+            },
+            'sensors': {
+                'avg_connected_sensors': _avg('connected_sensors'),
+                'avg_error_sensors': _avg('error_sensors'),
+                'max_error_sensors': _max('error_sensors'),
+                'avg_low_battery_sensors': _avg('low_battery_sensors'),
+            },
+            'environment': {
+                'avg_temperature_c': _avg('avg_temperature_c'),
+                'min_temperature_c': _min('avg_temperature_c'),
+                'max_temperature_c': _max('avg_temperature_c'),
+                'avg_humidity_percent': _avg('avg_humidity_percent'),
+                'avg_soil_conductivity': _avg('avg_soil_conductivity'),
+                'avg_battery_percent': _avg('avg_battery_percent'),
+                'avg_power_mw': _avg('avg_power_mw'),
+            },
+            'events': {
+                'warning_samples': warning_samples,
+                'critical_packet_loss_samples': critical_samples,
+            },
+        }
     
     def get_energy_stats(self, hours=24):
         """
@@ -888,6 +1507,72 @@ class DataLake:
             results['by_reason'][reason] = count
         
         return results
+
+    def get_recent_conflicts(self, minutes=60, limit=50):
+        """Retorna eventos recentes de conflito O-RAN."""
+        cursor = self.conn.cursor()
+        cutoff = int(time.time()) - minutes * 60
+
+        cursor.execute("""
+            SELECT timestamp, datetime, source_agent, target_agent, conflict_type,
+                   parameter, affected_service, affected_kpi, observed_value,
+                   threshold_value, decision, mitigation_action, reason,
+                   confidence, graph_path
+            FROM conflict_events
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (cutoff, limit))
+
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_conflict_stats(self, hours=24):
+        """Retorna estatísticas agregadas dos conflitos O-RAN."""
+        cursor = self.conn.cursor()
+        cutoff = int(time.time()) - hours * 3600
+
+        stats = {
+            'total': 0,
+            'direct': 0,
+            'indirect': 0,
+            'implicit': 0,
+            'by_service': {},
+            'by_kpi': {},
+            'latest': None,
+        }
+
+        cursor.execute("""
+            SELECT conflict_type, affected_service, affected_kpi, COUNT(*) as count
+            FROM conflict_events
+            WHERE timestamp >= ?
+            GROUP BY conflict_type, affected_service, affected_kpi
+        """, (cutoff,))
+
+        for row in cursor.fetchall():
+            conflict_type = row['conflict_type'] or 'unknown'
+            service = row['affected_service'] or 'unknown'
+            kpi = row['affected_kpi'] or 'unknown'
+            count = int(row['count'] or 0)
+
+            stats['total'] += count
+            if conflict_type in stats:
+                stats[conflict_type] += count
+            stats['by_service'][service] = stats['by_service'].get(service, 0) + count
+            stats['by_kpi'][kpi] = stats['by_kpi'].get(kpi, 0) + count
+
+        cursor.execute("""
+            SELECT timestamp, datetime, source_agent, target_agent, conflict_type,
+                   affected_service, affected_kpi, observed_value, threshold_value,
+                   mitigation_action, reason
+            FROM conflict_events
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+        if row:
+            stats['latest'] = dict(row)
+
+        return stats
     
     def calculate_moving_average(self, metric='latency', window_minutes=30):
         """
@@ -918,13 +1603,10 @@ class DataLake:
 
     def calculate_cvar(self, alpha=0.95, window_minutes=5):
         """
-        Calcula CVaR (Conditional Value at Risk) - Média dos piores valores.
-        
-        USA latency_p95_per_ue_us (P95 POR UE) em vez de latency_p95_us (agregado)
-        para capturar corretamente os UEs críticos.
+        Retorna o CVaR mais recente já calculado pelo coletor.
         
         Args:
-            alpha: Nível de confiança (0.95 = 95% = calcula média dos 5% piores)
+            alpha: Mantido por compatibilidade
             window_minutes: Janela de tempo em minutos para filtrar dados
         
         Returns:
@@ -934,7 +1616,6 @@ class DataLake:
         
         cutoff = int(time.time()) - (window_minutes * 60)
         
-        # Usar métricas POR UE (não agregado) com filtro de tempo
         cursor.execute("""
             SELECT cvar_per_ue_us
             FROM extended_metrics
@@ -942,43 +1623,39 @@ class DataLake:
             AND cvar_per_ue_us > 0
             AND timestamp >= ?
             ORDER BY timestamp DESC
+            LIMIT 1
         """, (cutoff,))
-        
-        cvar_values = [row[0] for row in cursor.fetchall() if row[0] > 0]
-        
-        if not cvar_values:
-            # Fallback para métricas agregadas se per-UE não disponível
-            cursor.execute("""
-                SELECT latency_p95_us
-                FROM extended_metrics
-                WHERE latency_p95_us < 500000
-                AND latency_p95_us > 0
-                AND timestamp >= ?
-                ORDER BY timestamp DESC
-            """, (cutoff,))
-            cvar_values = [row[0] for row in cursor.fetchall() if row[0] > 0]
-        
-        if not cvar_values:
-            return None
-        
-        # Ordenar valores
-        cvar_sorted = sorted(cvar_values)
-        
-        # Calcular índice do percentil
-        n = len(cvar_sorted)
-        k = int(n * alpha)
-        
-        # CVaR = média dos valores acima do percentil
-        if k >= n:
-            return cvar_sorted[-1]  # Se todos são ruins
-        
-        worst_values = cvar_sorted[k:]
-        
-        if not worst_values:
-            return cvar_sorted[-1]
-        
-        cvar = sum(worst_values) / len(worst_values)
-        return cvar
+
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+
+        cursor.execute("""
+            SELECT latency_p95_per_ue_us
+            FROM extended_metrics
+            WHERE latency_p95_per_ue_us < 500000
+            AND latency_p95_per_ue_us > 0
+            AND timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (cutoff,))
+
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+
+        cursor.execute("""
+            SELECT latency_p95_us
+            FROM extended_metrics
+            WHERE latency_p95_us < 500000
+            AND latency_p95_us > 0
+            AND timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (cutoff,))
+
+        row = cursor.fetchone()
+        return row[0] if row and row[0] else None
 
     def calculate_variance(self, window_minutes=5):
         """
@@ -1005,6 +1682,19 @@ class DataLake:
             WHERE variance_per_ue_us2 < 50000000000000
             AND variance_per_ue_us2 > 0
             ORDER BY timestamp DESC
+            LIMIT 100
+        """)
+        
+        variances = [row[0] for row in cursor.fetchall() if row[0] > 0]
+        
+        if not variances:
+            # Fallback para métricas agregadas se per-UE não disponível
+            cursor.execute("""
+                SELECT latency_p95_us
+                FROM extended_metrics
+                WHERE latency_p95_us < 500000
+                AND latency_p95_us > 0
+                ORDER BY timestamp DESC
             LIMIT 100
         """)
         
@@ -1054,26 +1744,29 @@ class DataLake:
         
         cutoff = int(time.time()) - (window_minutes * 60)
         
-        # Usar métricas POR UE (não agregado) com filtro de tempo
         cursor.execute("""
-            SELECT cvar_per_ue_us, variance_per_ue_us2, latency_p95_per_ue_us
+            SELECT cvar_per_ue_us, variance_per_ue_us2, latency_p95_per_ue_us, ue_count
             FROM extended_metrics
             WHERE cvar_per_ue_us > 0
             AND timestamp >= ?
             ORDER BY timestamp DESC
         """, (cutoff,))
         
+        rows = cursor.fetchall()
         cvar_values = []
         variance_values = []
         p95_values = []
+        ue_counts = []
         
-        for row in cursor.fetchall():
+        for row in rows:
             if row[0] and row[0] > 0:
                 cvar_values.append(row[0])
             if row[1] and row[1] > 0:
                 variance_values.append(row[1])
             if row[2] and row[2] > 0:
                 p95_values.append(row[2])
+            if len(row) > 3 and row[3]:
+                ue_counts.append(row[3])
         
         if not cvar_values:
             # Fallback para métricas agregadas se per-UE não disponível
@@ -1090,26 +1783,19 @@ class DataLake:
             if not cvar_values:
                 return None
         
-        # Calcular métricas usando POR UE
         n = len(cvar_values)
-        
+        latest_cvar = cvar_values[0] if cvar_values else 0
+        latest_p95 = p95_values[0] if p95_values else 0
+        latest_variance = variance_values[0] if variance_values else 0
+        latest_ue_count = ue_counts[0] if ue_counts else 0
+
         cvar_sorted = sorted(cvar_values)
         median = cvar_sorted[n // 2] if n > 0 else 0
-        
-        # P95 por UE
-        p95_idx = int(n * 0.95)
-        p95 = cvar_sorted[min(p95_idx, n - 1)] if n > 0 else 0
-        
-        # CVaR: média dos 5% piores
-        cvar_idx = int(n * 0.95)
-        worst_values = cvar_sorted[cvar_idx:] if cvar_idx < n else [cvar_sorted[-1]]
-        cvar = sum(worst_values) / len(worst_values) if worst_values else 0
-        
-        # Variância
-        mean = sum(cvar_values) / n
-        variance = sum((x - mean) ** 2 for x in cvar_values) / n if n > 1 else 0
-        
-        # Score de estabilidade (0-100, maior = mais estável)
+        p95 = latest_p95 if latest_p95 else (sorted(p95_values)[min(int(len(p95_values) * 0.95), len(p95_values) - 1)] if p95_values else 0)
+        cvar = latest_cvar if latest_cvar else cvar_sorted[-1]
+        variance = latest_variance if latest_variance else (sum(variance_values) / len(variance_values) if variance_values else 0)
+
+        mean = sum(cvar_values) / n if n > 0 else 0
         cv = (variance ** 0.5) / mean if mean > 0 else 0
         stability_score = max(0, min(100, 100 - (cv * 100)))
         
@@ -1121,6 +1807,9 @@ class DataLake:
             'variance_us': variance ** 0.5,
             'stability_score': stability_score,
             'sample_count': n,
+            'ue_count': latest_ue_count,
+            'latest_cvar_us': latest_cvar,
+            'window_median_cvar_us': median,
             'window_minutes': window_minutes
         }
 
@@ -1173,6 +1862,16 @@ class DataLake:
             DELETE FROM decisions_history 
             WHERE datetime < datetime('now', '-' || ? || ' days')
         """, (days_to_keep,))
+
+        cursor.execute("""
+            DELETE FROM app2_snapshots
+            WHERE datetime < datetime('now', '-' || ? || ' days')
+        """, (days_to_keep,))
+
+        cursor.execute("""
+            DELETE FROM app2_sensor_readings
+            WHERE datetime < datetime('now', '-' || ? || ' days')
+        """, (days_to_keep,))
         
         self.conn.commit()
         print(f"[DataLake] Dados antigos removidos (mantidos últimos {days_to_keep} dias)")
@@ -1192,6 +1891,12 @@ class DataLake:
         
         cursor.execute("SELECT COUNT(*) FROM decisions_history")
         decisions_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM app2_snapshots")
+        app2_snapshots_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM app2_sensor_readings")
+        app2_sensor_readings_count = cursor.fetchone()[0]
         
         # Primeiro e último registro
         cursor.execute("SELECT MIN(datetime), MAX(datetime) FROM metrics_history")
@@ -1200,6 +1905,8 @@ class DataLake:
         return {
             'metrics_count': metrics_count,
             'decisions_count': decisions_count,
+            'app2_snapshots_count': app2_snapshots_count,
+            'app2_sensor_readings_count': app2_sensor_readings_count,
             'first_record': row[0],
             'last_record': row[1],
             'db_size_bytes': os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
@@ -1400,12 +2107,27 @@ class DataLake:
             cursor.execute("DELETE FROM energy_commands WHERE timestamp < ?", (cutoff,))
             energy_deleted = cursor.rowcount
 
+            # Clean app2 snapshots
+            cursor.execute("DELETE FROM app2_snapshots WHERE timestamp < ?", (cutoff,))
+            app2_snapshots_deleted = cursor.rowcount
+
+            # Clean app2 sensor readings
+            cursor.execute("DELETE FROM app2_sensor_readings WHERE timestamp < ?", (cutoff,))
+            app2_sensor_readings_deleted = cursor.rowcount
+
             self.conn.commit()
 
             # Vacuum to reclaim space
             self.conn.execute("VACUUM")
 
-            total = metrics_deleted + decisions_deleted + ue_deleted + energy_deleted
+            total = (
+                metrics_deleted
+                + decisions_deleted
+                + ue_deleted
+                + energy_deleted
+                + app2_snapshots_deleted
+                + app2_sensor_readings_deleted
+            )
             if total > 0:
                 print(f"[DataLake] Limpeza: {total} registros antigos removidos (> {days} dias)")
 

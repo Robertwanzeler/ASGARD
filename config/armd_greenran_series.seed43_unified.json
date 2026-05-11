@@ -1,0 +1,78 @@
+{
+  "schema": "greenran.armd_greenran_series.v1",
+  "description": "Calibration profile: seed43_unified. Single-seed recovery profile using seed 43 for all blocks.",
+  "charts": {
+    "reconstruction_threshold_0_5": {
+      "series": {
+        "ARMD-GreenRAN chosen (450 samples)": {
+          "group": "armd_450",
+          "y": [0.488889, 0.577778, 0.702703, 0.8125, 0.928571, 1.0, 1.0],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+      }
+    },
+    "reconstruction_dataset_450_thresholds": {
+      "series": {
+        "ARMD-GreenRAN No Threshold": {
+          "group": "armd_no_threshold",
+          "y": [0.17931, 0.17931, 0.17931, 0.17931, 0.17931, 0.17931, 0.17931],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.2": {
+          "group": "armd_threshold_02",
+          "y": [0.17931, 0.17931, 0.204724, 0.289157, 0.356164, 0.352941, 0.375],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.5": {
+          "group": "armd_threshold_05",
+          "y": [0.183099, 0.19403, 0.311688, 0.363636, 0.4, 0.413793, 0.4],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.9": {
+          "group": "armd_threshold_09",
+          "y": [0.0, 0.0, 0.315789, 0.611111, 0.540541, 0.526316, 0.512821],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+      }
+    },
+    "indirect_threshold_0_5": {
+      "series": {
+        "ARMD-GreenRAN chosen (450 samples)": {
+          "group": "armd_450",
+          "y": [0.088889, 0.094488, 0.171429, 0.20339, 0.226415, 0.235294, 0.25],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+      }
+    },
+    "indirect_dataset_450_thresholds": {
+      "series": {
+        "ARMD-GreenRAN No Threshold": {
+          "group": "armd_no_threshold",
+          "y": [0.086957, 0.086957, 0.086957, 0.086957, 0.086957, 0.086957, 0.086957],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.2": {
+          "group": "armd_threshold_02",
+          "y": [0.086957, 0.086957, 0.1, 0.157895, 0.181818, 0.196721, 0.210526],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.5": {
+          "group": "armd_threshold_05",
+          "y": [0.088889, 0.094488, 0.171429, 0.20339, 0.226415, 0.235294, 0.25],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.9": {
+          "group": "armd_threshold_09",
+          "y": [0.0, 0.0, 0.333333, 0.344828, 0.333333, 0.322581, 0.3125],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+      }
+    }
+  },
+  "implicit_450_series": {
+    "no_threshold": [0.086957, 0.086957, 0.086957],
+    "0.20": [0.086957, 0.086957, 0.1],
+    "0.50": [0.088889, 0.094488, 0.142857],
+    "0.90": [0.0, 0.0, 0.333333]
+  }
+}

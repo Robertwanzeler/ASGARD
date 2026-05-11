@@ -25,13 +25,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from pathlib import Path
+from greenran_paths import STATE_DIR, XAPP_HEALTH_PATH, RAPP_POLICIES_DIR, as_str
 
-sys.path.insert(0, '/home/robert/orange_nuclear')
-
-ALERT_LOG = "/tmp/rapp_alerts.log"
-EMAIL_CONFIG = "/tmp/rapp_email_config.json"
-XAPP_HEALTH_FILE = "/tmp/xapp_health.json"
-POLICY_STATUS_FILE = "/tmp/rapp_policies/policy_status.json"
+ALERT_LOG = as_str(STATE_DIR / "rapp_alerts.log")
+EMAIL_CONFIG = as_str(STATE_DIR / "rapp_email_config.json")
+XAPP_HEALTH_FILE = as_str(XAPP_HEALTH_PATH)
+POLICY_STATUS_FILE = as_str(RAPP_POLICIES_DIR / "policy_status.json")
 
 
 class AlertManager:

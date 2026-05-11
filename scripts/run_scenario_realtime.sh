@@ -19,6 +19,9 @@
 # Autor: UFPA - GreenRAN Project
 # =============================================================================
 
+. "$(dirname "$0")/core_runtime.sh"
+load_greenran_runtime
+
 # Processar argumentos
 SHORT_SIM=false
 VERBOSE=false
@@ -53,7 +56,6 @@ echo "=========================================="
 echo ""
 
 # Diretórios
-BASE_DIR="/home/robert/orange_nuclear"
 NS3_DIR="$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran"
 RESULTS_DIR="$BASE_DIR/results"
 
@@ -80,10 +82,10 @@ echo "=== Criando diretório de resultados ==="
 mkdir -p $RESULTS_DIR
 
 # Limpar logs antigos
-> /tmp/ric.log
-> /tmp/ns3.log
-> /tmp/xapp_slicer.log
-> /tmp/xapp_energy.log
+: > "$GREENRAN_RIC_LOG"
+: > "$GREENRAN_NS3_LOG"
+: > "$GREENRAN_XAPP_SLICER_LOG"
+: > "$GREENRAN_XAPP_ENERGY_LOG"
 
 echo ""
 echo "=== 1. Iniciando nearRT-RIC (E2AP v1) ==="
@@ -91,7 +93,7 @@ cd $BASE_DIR
 stdbuf -oL -eL nohup ./flexric/build_e2ap_v1/examples/ric/nearRT-RIC \
     -c flexric/flexric.conf \
     -p flexric_lib/ \
-    > /tmp/ric.log 2>&1 &
+    > "$GREENRAN_RIC_LOG" 2>&1 &
 RIC_PID=$!
 echo "RIC iniciado (PID: $RIC_PID)"
 sleep 3
@@ -104,7 +106,7 @@ stdbuf -oL -eL nohup ./build/scratch/ns3.42-scenario-base-debug \
     --e2lteEnabled=true \
     --e2nrEnabled=true \
     --simTime=$SIM_TIME \
-    > /tmp/ns3.log 2>&1 &
+    > "$GREENRAN_NS3_LOG" 2>&1 &
 NS3_PID=$!
 echo "ns3 iniciado (PID: $NS3_PID)"
 
@@ -118,7 +120,7 @@ echo ""
 echo "=== 3. Verificando se há nós E2 conectados ==="
 CONNECTED=false
 for i in {1..3}; do
-    if grep -q "E2 node connected\|SETUP-REQUEST\|SETUP-RESPONSE\|Registered E2 Nodes" /tmp/ric.log 2>/dev/null; then
+    if grep -q "E2 node connected\|SETUP-REQUEST\|SETUP-RESPONSE\|Registered E2 Nodes" "$GREENRAN_RIC_LOG" 2>/dev/null; then
         CONNECTED=true
         break
     fi
@@ -136,7 +138,7 @@ echo ""
 echo "=== 4. Verificando se há tráfego (métricas KPM) ==="
 TRAFFIC=false
 for i in {1..5}; do
-    if grep -q "volume_dl\|bitrate_dl" /tmp/ns3.log 2>/dev/null; then
+    if grep -q "volume_dl\|bitrate_dl" "$GREENRAN_NS3_LOG" 2>/dev/null; then
         TRAFFIC=true
         break
     fi
@@ -156,7 +158,7 @@ cd $BASE_DIR
 stdbuf -oL -eL nohup ./flexric/build_e2ap_v1/examples/xApp/c/xapp_slicer \
     -c flexric/flexric.conf \
     -p flexric_lib/ \
-    > /tmp/xapp_slicer.log 2>&1 &
+    > "$GREENRAN_XAPP_SLICER_LOG" 2>&1 &
 SLICER_PID=$!
 echo "xApp Slicer iniciado (PID: $SLICER_PID)"
 sleep 15
@@ -166,7 +168,7 @@ echo "=== 6. Iniciando xApp Energy Saver ==="
 stdbuf -oL -eL nohup ./flexric/build_e2ap_v1/examples/xApp/c/xapp_energy_saver \
     -c flexric/flexric.conf \
     -p flexric_lib/ \
-    > /tmp/xapp_energy.log 2>&1 &
+    > "$GREENRAN_XAPP_ENERGY_LOG" 2>&1 &
 ENERGY_PID=$!
 echo "xApp Energy Saver iniciado (PID: $ENERGY_PID)"
 sleep 10
@@ -203,11 +205,11 @@ monitor_logs() {
         
         # Mostrar última linha de cada log
         echo -e "${BLUE}=== SLICER (últimas métricas) ===${NC}"
-        grep -E "CAMERA|UE |volume_dl|pacotes_dl|bitrate_dl|delay_dl|problema|acao" /tmp/xapp_slicer.log 2>/dev/null | tail -5
+        grep -E "CAMERA|UE |volume_dl|pacotes_dl|bitrate_dl|delay_dl|problema|acao" "$GREENRAN_XAPP_SLICER_LOG" 2>/dev/null | tail -5
         
         echo ""
         echo -e "${GREEN}=== ENERGY SAVER (últimas métricas) ===${NC}"
-        grep -E "CAMERA|UE |volume_dl|pacotes_dl|bitrate_dl|delay_dl|ENERGY|acao" /tmp/xapp_energy.log 2>/dev/null | tail -5
+        grep -E "CAMERA|UE |volume_dl|pacotes_dl|bitrate_dl|delay_dl|ENERGY|acao" "$GREENRAN_XAPP_ENERGY_LOG" 2>/dev/null | tail -5
         
         echo ""
         echo "---"
@@ -227,9 +229,9 @@ else
     echo "  ./monitor_logs.sh"
     echo ""
     echo "Ou em terminais separados:"
-    echo "  tail -f /tmp/xapp_slicer.log"
-    echo "  tail -f /tmp/xapp_energy.log"
-    echo "  tail -f /tmp/ns3.log"
+    echo "  tail -f $GREENRAN_XAPP_SLICER_LOG"
+    echo "  tail -f $GREENRAN_XAPP_ENERGY_LOG"
+    echo "  tail -f $GREENRAN_NS3_LOG"
 fi
 
 # Espera final
@@ -240,7 +242,7 @@ wait
 echo ""
 echo "=== Simulação concluída ==="
 echo "Logs salvos em:"
-echo "  /tmp/ric.log"
-echo "  /tmp/ns3.log"
-echo "  /tmp/xapp_slicer.log"
-echo "  /tmp/xapp_energy.log"
+echo "  $GREENRAN_RIC_LOG"
+echo "  $GREENRAN_NS3_LOG"
+echo "  $GREENRAN_XAPP_SLICER_LOG"
+echo "  $GREENRAN_XAPP_ENERGY_LOG"

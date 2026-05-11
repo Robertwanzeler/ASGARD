@@ -27,15 +27,22 @@ import time
 import argparse
 import requests
 from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from greenran_paths import NS3_DIR, as_str
+from greenran_runtime import load_runtime_config
+
+RUNTIME_CONFIG = load_runtime_config()
 
 # Configurações padrão
-DEFAULT_INFLUX_HOST = "localhost"
-DEFAULT_INFLUX_PORT = 8086
-DEFAULT_INFLUX_DB = "influx"
+DEFAULT_INFLUX_HOST = RUNTIME_CONFIG["monitoring"]["influxdb_host"]
+DEFAULT_INFLUX_PORT = int(RUNTIME_CONFIG["monitoring"]["influxdb_port"])
+DEFAULT_INFLUX_DB = RUNTIME_CONFIG["monitoring"]["influxdb_db"]
 DEFAULT_INFLUX_USER = "admin"
 DEFAULT_INFLUX_PASSWORD = "admin"
-DEFAULT_INTERVAL = 5  # segundos
-DEFAULT_STATS_DIR = "/home/robert/orange_nuclear/ns-O-RAN-flexric/mmwave-LENA-oran"
+DEFAULT_INTERVAL = int(RUNTIME_CONFIG["monitoring"]["push_interval_seconds"])
+DEFAULT_STATS_DIR = as_str(NS3_DIR)
 
 
 class InfluxDBPusher:

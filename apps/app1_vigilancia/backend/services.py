@@ -13,12 +13,28 @@ import hashlib
 import json
 import math
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-ARTICLE00_SCENARIO_CONTROL_FILE = Path("/tmp/article00_scenario_control.json")
+CURRENT_DIR = Path(__file__).resolve().parent
+APP_DIR = CURRENT_DIR.parent
+PROJECT_ROOT = APP_DIR.parent.parent
+SRC_DIR = PROJECT_ROOT / "src"
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from greenran_paths import ARTICLE00_SCENARIO_CONTROL_PATH, STATE_DIR  # noqa: E402
+
+ARTICLE00_SCENARIO_CONTROL_FILE = ARTICLE00_SCENARIO_CONTROL_PATH
+CAMERA_SLA_THROUGHPUT_MIN_MBPS = 25.0
+CAMERA_SLA_THROUGHPUT_GUARD_MBPS = 30.0
+CAMERA_SLA_LATENCY_TARGET_MS = 100.0
+CAMERA_SLA_LATENCY_GUARD_MS = 60.0
+CAMERA_SLA_LATENCY_BLOCK_MS = 80.0
 
 
 def _safe_read_json(path: Path, fallback: Any) -> Any:
@@ -50,13 +66,18 @@ def _extract_camera_network_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
     if override.get("enabled", False):
         min_tp = round(float(override.get("throughput_mbps", 0.0) or 0.0), 2)
         avg_tp = round(float(override.get("avg_throughput_mbps", min_tp) or min_tp), 2)
+        latency_ms = round(float(override.get("latency_ms", 0.0) or 0.0), 2)
         observed = int(override.get("observed_cameras", override.get("active_cameras", 0)) or 0)
         return {
             "camera_metrics_ready": bool(override.get("throughput_ready", True)),
+            "camera_latency_ready": bool(override.get("throughput_ready", True)),
             "observed_camera_metrics": observed,
             "min_camera_throughput_mbps": min_tp,
             "avg_camera_throughput_mbps": avg_tp,
             "observed_min_camera_throughput_mbps": min_tp if observed > 0 else 0.0,
+            "max_camera_latency_ms": latency_ms,
+            "avg_camera_latency_ms": latency_ms,
+            "observed_max_camera_latency_ms": latency_ms if observed > 0 else 0.0,
         }
 
     ue_metrics = metrics.get("ue_metrics", {}) or {}
@@ -83,14 +104,131 @@ def _extract_camera_network_summary(metrics: Dict[str, Any]) -> Dict[str, Any]:
         float(entry.get("rx_throughput_kbps", entry.get("throughput_kbps", 0)) or 0) / 1000.0
         for entry in observed_entries
     ]
+    latencies_ms = [
+        float(entry.get("latency_us", 0) or 0) / 1000.0
+        for entry in camera_entries
+    ]
+    observed_latencies_ms = [
+        float(entry.get("latency_us", 0) or 0) / 1000.0
+        for entry in observed_entries
+    ]
 
     return {
         "camera_metrics_ready": bool(camera_entries) and len(observed_entries) == len(camera_entries),
+        "camera_latency_ready": bool(camera_entries) and len(observed_entries) == len(camera_entries),
         "observed_camera_metrics": len(observed_entries),
         "min_camera_throughput_mbps": round(min(throughputs_mbps), 2) if throughputs_mbps else 0.0,
         "avg_camera_throughput_mbps": round(sum(throughputs_mbps) / len(throughputs_mbps), 2) if throughputs_mbps else 0.0,
         "observed_min_camera_throughput_mbps": round(min(observed_throughputs_mbps), 2) if observed_throughputs_mbps else 0.0,
+        "max_camera_latency_ms": round(max(latencies_ms), 2) if latencies_ms else 0.0,
+        "avg_camera_latency_ms": round(sum(latencies_ms) / len(latencies_ms), 2) if latencies_ms else 0.0,
+        "observed_max_camera_latency_ms": round(max(observed_latencies_ms), 2) if observed_latencies_ms else 0.0,
     }
+
+
+def _evaluate_camera_sla(network: Dict[str, Any]) -> Dict[str, Any]:
+    active_cameras = int(network.get("active_cameras", 0) or 0)
+    metrics_ready = bool(network.get("camera_metrics_ready", False))
+    min_throughput_mbps = float(network.get("min_camera_throughput_mbps", 0.0) or 0.0)
+    max_latency_ms = float(network.get("max_camera_latency_ms", 0.0) or 0.0)
+
+    targets = {
+        "throughput_min_mbps": CAMERA_SLA_THROUGHPUT_MIN_MBPS,
+        "throughput_guard_mbps": CAMERA_SLA_THROUGHPUT_GUARD_MBPS,
+        "latency_max_ms": CAMERA_SLA_LATENCY_TARGET_MS,
+        "latency_guard_ms": CAMERA_SLA_LATENCY_GUARD_MS,
+        "latency_block_ms": CAMERA_SLA_LATENCY_BLOCK_MS,
+    }
+    observed = {
+        "min_throughput_mbps": round(min_throughput_mbps, 2),
+        "avg_throughput_mbps": round(float(network.get("avg_camera_throughput_mbps", 0.0) or 0.0), 2),
+        "max_latency_ms": round(max_latency_ms, 2),
+        "avg_latency_ms": round(float(network.get("avg_camera_latency_ms", 0.0) or 0.0), 2),
+        "observed_cameras": int(network.get("observed_camera_metrics", 0) or 0),
+    }
+
+    if active_cameras <= 0:
+        return {
+            "ready": False,
+            "active_cameras": active_cameras,
+            "targets": targets,
+            "observed": observed,
+            "proposal_status": "idle",
+            "proposal_compliant": False,
+            "runtime_status": "idle",
+            "reason": "Nenhuma câmera ativa.",
+        }
+
+    if not metrics_ready:
+        return {
+            "ready": False,
+            "active_cameras": active_cameras,
+            "targets": targets,
+            "observed": observed,
+            "proposal_status": "pending",
+            "proposal_compliant": False,
+            "runtime_status": "pending",
+            "reason": "Aguardando amostras de throughput/latência das câmeras.",
+        }
+
+    proposal_reasons = []
+    if min_throughput_mbps < CAMERA_SLA_THROUGHPUT_MIN_MBPS:
+        proposal_reasons.append(
+            f"throughput mínimo {min_throughput_mbps:.1f} Mbps < {CAMERA_SLA_THROUGHPUT_MIN_MBPS:.0f} Mbps"
+        )
+    if max_latency_ms >= CAMERA_SLA_LATENCY_TARGET_MS:
+        proposal_reasons.append(
+            f"latência máxima {max_latency_ms:.1f} ms >= {CAMERA_SLA_LATENCY_TARGET_MS:.0f} ms"
+        )
+
+    if min_throughput_mbps < CAMERA_SLA_THROUGHPUT_MIN_MBPS or max_latency_ms >= CAMERA_SLA_LATENCY_BLOCK_MS:
+        runtime_status = "blocked"
+    elif min_throughput_mbps < CAMERA_SLA_THROUGHPUT_GUARD_MBPS or max_latency_ms >= CAMERA_SLA_LATENCY_GUARD_MS:
+        runtime_status = "warning"
+    else:
+        runtime_status = "ok"
+
+    if proposal_reasons:
+        proposal_status = "violation"
+        proposal_compliant = False
+        reason = "; ".join(proposal_reasons)
+    else:
+        proposal_status = "ok"
+        proposal_compliant = True
+        if runtime_status == "warning":
+            reason = "SLA da proposta atendido, mas o runtime já entrou na margem protegida do core."
+        elif runtime_status == "blocked":
+            reason = "SLA da proposta atendido parcialmente, mas o core bloqueou pela margem operacional protegida."
+        else:
+            reason = "SLA de câmera atendido para throughput e latência."
+
+    return {
+        "ready": True,
+        "active_cameras": active_cameras,
+        "targets": targets,
+        "observed": observed,
+        "proposal_status": proposal_status,
+        "proposal_compliant": proposal_compliant,
+        "runtime_status": runtime_status,
+        "reason": reason,
+    }
+
+
+def _evaluate_simulated_camera_profile(network_profile: Dict[str, Any]) -> Dict[str, Any]:
+    if not network_profile:
+        return {}
+
+    return _evaluate_camera_sla(
+        {
+            "active_cameras": 1,
+            "camera_metrics_ready": True,
+            "min_camera_throughput_mbps": float(network_profile.get("min_throughput_mbps", 0.0) or 0.0),
+            "avg_camera_throughput_mbps": float(network_profile.get("avg_throughput_mbps", 0.0) or 0.0),
+            "max_camera_latency_ms": float(network_profile.get("max_latency_ms", 0.0) or 0.0),
+            "avg_camera_latency_ms": float(network_profile.get("avg_latency_ms", 0.0) or 0.0),
+            "observed_camera_metrics": 1,
+        }
+    )
 
 
 class VigilanceEventStore:
@@ -389,6 +527,16 @@ class CameraRegistryStore:
             return ["-rtsp_transport", "tcp", "-i", source_input]
         return ["-i", source_input]
 
+    def _load_source_sidecar(self, source_input: str) -> Dict[str, Any]:
+        candidate = Path(source_input)
+        if not candidate.exists():
+            return {}
+        sidecar_path = candidate.with_suffix(".json")
+        if not sidecar_path.exists():
+            return {}
+        sidecar = _safe_read_json(sidecar_path, {})
+        return sidecar if isinstance(sidecar, dict) else {}
+
     def _capture_source_clip(self, camera: Dict[str, Any]) -> Dict[str, Any]:
         source_input = self._resolve_source_input(camera.get("source_url", ""))
         if not source_input:
@@ -435,6 +583,7 @@ class CameraRegistryStore:
             "content": content,
             "content_type": "video/mp4",
             "source_input": source_input,
+            "simulated_metadata": self._load_source_sidecar(source_input),
         }
 
     def process_camera_once(
@@ -487,6 +636,7 @@ class CameraRegistryStore:
                     "location": camera.get("location", "UFPA-Campus-Belem"),
                     "content_type": capture["content_type"],
                     "source": "camera_auto_ingest",
+                    "simulated_metadata": capture.get("simulated_metadata", {}),
                     "notes": f"Ingestão automática da fonte {camera['camera_id']} pela App1-Vigilancia.",
                 },
                 network_context=network_context,
@@ -920,6 +1070,67 @@ class VideoAnalysisStore:
             "frames_reference": self._state_reference(frames_dir),
         }
 
+    def _apply_simulated_inference(
+        self,
+        frame_heuristics: Dict[str, Any],
+        simulated_metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not simulated_metadata:
+            return {}
+
+        detector_outputs = simulated_metadata.get("detector_outputs", {}) or {}
+        pipeline_profile = simulated_metadata.get("pipeline_profile", {}) or {}
+        scenario = simulated_metadata.get("scenario", {}) or {}
+        network_profile = simulated_metadata.get("network_profile", {}) or {}
+
+        heuristic_visual = float(frame_heuristics.get("visual_risk_score", 0.0) or 0.0)
+        heuristic_motion = float(frame_heuristics.get("motion_intensity", 0.0) or 0.0)
+        useful_duration_ratio = float(frame_heuristics.get("useful_duration_ratio", 0.0) or 0.0)
+
+        violence_probability = float(detector_outputs.get("violence_probability", heuristic_visual) or heuristic_visual)
+        fight_pose_score = float(detector_outputs.get("fight_pose_score", 0.0) or 0.0)
+        anomaly_score = float(detector_outputs.get("anomaly_score", 0.0) or 0.0)
+        crowd_density = float(detector_outputs.get("crowd_density", 0.0) or 0.0)
+        occlusion_score = float(detector_outputs.get("occlusion_score", 0.0) or 0.0)
+        motion_level = float(detector_outputs.get("motion_level", heuristic_motion) or heuristic_motion)
+        simulated_people = int(detector_outputs.get("simulated_people", 1) or 1)
+
+        decision_score = min(
+            1.0,
+            (violence_probability * 0.42)
+            + (fight_pose_score * 0.26)
+            + (anomaly_score * 0.16)
+            + (motion_level * 0.10)
+            + (crowd_density * 0.04)
+            + (useful_duration_ratio * 0.02),
+        )
+        decision_score = max(decision_score - (occlusion_score * 0.05), 0.0)
+
+        event_threshold = 0.72 if scenario.get("suspicious") else 0.80
+        if crowd_density > 0.4 and not scenario.get("suspicious"):
+            event_threshold += 0.03
+        event_threshold = round(max(self.MIN_THRESHOLD, min(self.MAX_THRESHOLD, event_threshold)), 3)
+        simulated_camera_sla = _evaluate_simulated_camera_profile(network_profile)
+
+        return {
+            "score_source": pipeline_profile.get("score_source", "simulated_multistage_video_inference"),
+            "pipeline_status": "simulated_detector_pipeline",
+            "scenario_label": scenario.get("label"),
+            "scenario_key": scenario.get("key"),
+            "scenario_suspicious": bool(scenario.get("suspicious", False)),
+            "violence_score": round(violence_probability, 3),
+            "decision_score": round(decision_score, 3),
+            "visual_risk_score": round(max(heuristic_visual, decision_score), 3),
+            "motion_intensity": round(max(heuristic_motion, motion_level), 3),
+            "people_detected": simulated_people,
+            "faces_anonymized": int(pipeline_profile.get("faces_anonymized", simulated_people) or simulated_people),
+            "event_threshold": event_threshold,
+            "requires_manual_review": bool(pipeline_profile.get("requires_manual_review", False)),
+            "detector_outputs": detector_outputs,
+            "network_profile": network_profile,
+            "simulated_camera_sla": simulated_camera_sla,
+        }
+
     def refresh_monitoring_snapshot(
         self,
         network_context: Dict[str, Any],
@@ -949,6 +1160,8 @@ class VideoAnalysisStore:
                 "latest_visual_risk_score": float(latest_analysis.get("visual_risk_score", 0.0) or 0.0),
                 "latest_motion_intensity": float(latest_analysis.get("motion_intensity", 0.0) or 0.0),
                 "latest_pipeline_status": latest_analysis.get("pipeline_status", "unknown"),
+                "latest_camera_runtime_status": ((latest_analysis.get("simulated_camera_sla") or {}).get("runtime_status")),
+                "latest_camera_proposal_status": ((latest_analysis.get("simulated_camera_sla") or {}).get("proposal_status")),
             },
             "videos": {
                 "uploaded": len(videos),
@@ -966,6 +1179,7 @@ class VideoAnalysisStore:
                 "critical_active": sum(1 for camera in cameras if camera.get("last_event_generated")),
             },
             "network": network_context.get("network", {}),
+            "camera_sla": (network_context.get("network", {}) or {}).get("camera_sla", {}),
             "policies": network_context.get("policies", {}),
             "links": {
                 "app1_api": "http://localhost:5100/api/monitoring",
@@ -1018,6 +1232,14 @@ class VideoAnalysisStore:
             "source": payload.get("source", "video_analysis_pipeline"),
             "score_source": payload.get("score_source", "external_analysis"),
             "pipeline_status": payload.get("pipeline_status", "processed"),
+            "scenario_label": payload.get("scenario_label"),
+            "scenario_key": payload.get("scenario_key"),
+            "scenario_suspicious": bool(payload.get("scenario_suspicious", False)),
+            "requires_manual_review": bool(payload.get("requires_manual_review", False)),
+            "detector_outputs": payload.get("detector_outputs", {}),
+            "network_profile": payload.get("network_profile", {}),
+            "simulated_camera_sla": payload.get("simulated_camera_sla", {}),
+            "simulated_metadata": payload.get("simulated_metadata", {}),
             "thumbnail_reference": payload.get("thumbnail_reference"),
             "preview_reference": payload.get("preview_reference"),
             "notes": payload.get(
@@ -1067,6 +1289,7 @@ class VideoAnalysisStore:
         videos = self._read_videos()
         content_sha256 = hashlib.sha256(content).hexdigest()
         existing_video = self._find_video_by_content_hash(content_sha256)
+        simulated_metadata = payload.get("simulated_metadata") if isinstance(payload.get("simulated_metadata"), dict) else {}
 
         timestamp = int(payload.get("timestamp") or time.time())
         safe_name = Path(filename or "video_upload.bin").name
@@ -1153,8 +1376,14 @@ class VideoAnalysisStore:
             )
         )
         fps = int(payload.get("fps", round(probe.get("fps") or 24)))
-        visual_risk_score = float(frame_heuristics.get("visual_risk_score", 0.0) if probe.get("valid_video") else 0.0)
-        violence_score = visual_risk_score
+        simulated_inference = self._apply_simulated_inference(frame_heuristics, simulated_metadata)
+        visual_risk_score = float(
+            simulated_inference.get("visual_risk_score", frame_heuristics.get("visual_risk_score", 0.0))
+            if probe.get("valid_video")
+            else 0.0
+        )
+        violence_score = float(simulated_inference.get("violence_score", visual_risk_score))
+        event_threshold = float(simulated_inference.get("event_threshold", frame_heuristics.get("event_threshold", self.DETECTION_THRESHOLD)))
 
         video_record = {
             "id": video_id,
@@ -1182,18 +1411,26 @@ class VideoAnalysisStore:
             "heuristic_status": frame_heuristics["heuristic_status"],
             "frames_reference": frame_heuristics.get("frames_reference"),
             "frames_sampled": frame_heuristics["frames_sampled"],
-            "motion_intensity": frame_heuristics["motion_intensity"],
+            "motion_intensity": simulated_inference.get("motion_intensity", frame_heuristics["motion_intensity"]),
             "brightness_mean": frame_heuristics["brightness_mean"],
             "brightness_variance": frame_heuristics["brightness_variance"],
             "scene_changes": frame_heuristics["scene_changes"],
             "visual_risk_score": visual_risk_score,
             "useful_duration_ratio": frame_heuristics["useful_duration_ratio"],
             "useful_duration_s": frame_heuristics["useful_duration_s"],
-            "event_threshold": frame_heuristics["event_threshold"],
+            "event_threshold": event_threshold,
             "artifact_status": artifacts["artifact_status"],
             "artifact_error": artifacts["artifact_error"],
             "thumbnail_reference": artifacts["thumbnail_reference"],
             "preview_reference": artifacts["preview_reference"],
+            "score_source": simulated_inference.get("score_source", "video_frame_inference"),
+            "scenario_label": simulated_inference.get("scenario_label"),
+            "scenario_key": simulated_inference.get("scenario_key"),
+            "scenario_suspicious": simulated_inference.get("scenario_suspicious", False),
+            "requires_manual_review": simulated_inference.get("requires_manual_review", False),
+            "network_profile": simulated_inference.get("network_profile", {}),
+            "simulated_camera_sla": simulated_inference.get("simulated_camera_sla", {}),
+            "simulated_metadata": simulated_metadata,
         }
         videos.append(video_record)
         self._write_videos(videos)
@@ -1212,26 +1449,33 @@ class VideoAnalysisStore:
                 "fps": fps,
                 "frames_estimated": duration_s * fps,
                 "violence_score": violence_score,
-                "decision_score": visual_risk_score,
-                "motion_score": float(max(0.0, frame_heuristics.get("motion_intensity", 0.0))),
+                "decision_score": float(simulated_inference.get("decision_score", visual_risk_score)),
+                "motion_score": float(max(0.0, simulated_inference.get("motion_intensity", frame_heuristics.get("motion_intensity", 0.0)))),
                 "visual_risk_score": visual_risk_score,
-                "motion_intensity": frame_heuristics["motion_intensity"],
+                "motion_intensity": simulated_inference.get("motion_intensity", frame_heuristics["motion_intensity"]),
                 "scene_changes": frame_heuristics["scene_changes"],
                 "frames_sampled": frame_heuristics["frames_sampled"],
                 "useful_duration_ratio": frame_heuristics["useful_duration_ratio"],
                 "useful_duration_s": frame_heuristics["useful_duration_s"],
-                "event_threshold": frame_heuristics["event_threshold"],
-                "people_detected": int(payload.get("people_detected", 2 if violence_score >= 0.6 else 1)),
-                "faces_anonymized": int(payload.get("faces_anonymized", 2)),
+                "event_threshold": event_threshold,
+                "people_detected": int(payload.get("people_detected", simulated_inference.get("people_detected", 2 if violence_score >= 0.6 else 1))),
+                "faces_anonymized": int(payload.get("faces_anonymized", simulated_inference.get("faces_anonymized", 2))),
                 "source": video_record["source"],
-                "score_source": "video_frame_inference",
-                "pipeline_status": (
-                    "artifacts_ready"
-                    if video_record["artifact_status"] == "ready"
-                    else video_record["artifact_status"]
+                "score_source": video_record["score_source"],
+                "pipeline_status": simulated_inference.get(
+                    "pipeline_status",
+                    "artifacts_ready" if video_record["artifact_status"] == "ready" else video_record["artifact_status"],
                 ),
+                "scenario_label": video_record.get("scenario_label"),
+                "scenario_key": video_record.get("scenario_key"),
+                "scenario_suspicious": video_record.get("scenario_suspicious", False),
+                "requires_manual_review": video_record.get("requires_manual_review", False),
+                "detector_outputs": simulated_inference.get("detector_outputs", {}),
+                "network_profile": video_record.get("network_profile", {}),
+                "simulated_camera_sla": video_record.get("simulated_camera_sla", {}),
                 "thumbnail_reference": video_record["thumbnail_reference"],
                 "preview_reference": video_record["preview_reference"],
+                "simulated_metadata": simulated_metadata,
                 "notes": payload.get(
                     "notes",
                     f"Upload {safe_name} armazenado e analisado pela App1-Vigilancia.",
@@ -1275,22 +1519,28 @@ class GreenRANContextReader:
 
         global_metrics = metrics.get("global_metrics", {})
         camera_summary = _extract_camera_network_summary(metrics)
+        network = {
+            "avg_latency_ms": round(float(global_metrics.get("global_avg_latency_us", 0)) / 1000.0, 2),
+            "worst_latency_ms": round(float(global_metrics.get("global_worst_latency_us", 0)) / 1000.0, 2),
+            "cvar_ms": round(float(global_metrics.get("cvar_per_ue_us", 0)) / 1000.0, 2),
+            "active_cameras": int(global_metrics.get("total_active_cameras", 0)),
+            "active_ues": int(global_metrics.get("total_active_ues", 0)),
+            "throughput_mbps": round(float(global_metrics.get("throughput_kbps", 0)) / 1000.0, 2),
+            "total_throughput_mbps": round(float(global_metrics.get("throughput_kbps", 0)) / 1000.0, 2),
+            "min_camera_throughput_mbps": camera_summary["min_camera_throughput_mbps"],
+            "avg_camera_throughput_mbps": camera_summary["avg_camera_throughput_mbps"],
+            "observed_min_camera_throughput_mbps": camera_summary["observed_min_camera_throughput_mbps"],
+            "max_camera_latency_ms": camera_summary["max_camera_latency_ms"],
+            "avg_camera_latency_ms": camera_summary["avg_camera_latency_ms"],
+            "observed_max_camera_latency_ms": camera_summary["observed_max_camera_latency_ms"],
+            "camera_metrics_ready": camera_summary["camera_metrics_ready"],
+            "camera_latency_ready": camera_summary["camera_latency_ready"],
+            "observed_camera_metrics": camera_summary["observed_camera_metrics"],
+        }
+        network["camera_sla"] = _evaluate_camera_sla(network)
         return {
             "captured_at": int(time.time()),
-            "network": {
-                "avg_latency_ms": round(float(global_metrics.get("global_avg_latency_us", 0)) / 1000.0, 2),
-                "worst_latency_ms": round(float(global_metrics.get("global_worst_latency_us", 0)) / 1000.0, 2),
-                "cvar_ms": round(float(global_metrics.get("cvar_per_ue_us", 0)) / 1000.0, 2),
-                "active_cameras": int(global_metrics.get("total_active_cameras", 0)),
-                "active_ues": int(global_metrics.get("total_active_ues", 0)),
-                "throughput_mbps": round(float(global_metrics.get("throughput_kbps", 0)) / 1000.0, 2),
-                "total_throughput_mbps": round(float(global_metrics.get("throughput_kbps", 0)) / 1000.0, 2),
-                "min_camera_throughput_mbps": camera_summary["min_camera_throughput_mbps"],
-                "avg_camera_throughput_mbps": camera_summary["avg_camera_throughput_mbps"],
-                "observed_min_camera_throughput_mbps": camera_summary["observed_min_camera_throughput_mbps"],
-                "camera_metrics_ready": camera_summary["camera_metrics_ready"],
-                "observed_camera_metrics": camera_summary["observed_camera_metrics"],
-            },
+            "network": network,
             "policies": {
                 "energy_status": energy_policy.get("status", "UNKNOWN"),
                 "slice_state": slice_policy.get("slicer_state", "UNKNOWN"),

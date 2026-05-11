@@ -29,6 +29,11 @@ EXPERIMENT_PYTHON = PROJECT_ROOT / "drlexp" / ".venv" / "bin" / "python"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the isolated article00 pipeline.")
+    parser.add_argument(
+        "--runs-root",
+        default=str(DEFAULT_RUNS_ROOT),
+        help="root directory for datasets/training/reports/figures; defaults to runs/article00",
+    )
     parser.add_argument("--samples", type=int, default=600)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seeds", help="optional comma-separated list of seeds; overrides --seed")
@@ -128,15 +133,16 @@ def aggregate_histories(training_summaries: list[dict]) -> dict:
 def main() -> None:
     args = parse_args()
     seeds = parse_seed_list(args)
+    runs_root = Path(args.runs_root)
 
-    reports_dir = DEFAULT_RUNS_ROOT / "reports"
+    reports_dir = runs_root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     training_summaries = []
     run_entries = []
 
     for seed in seeds:
-        dataset_dir = DEFAULT_RUNS_ROOT / "datasets" / f"seed_{seed}"
-        training_dir = DEFAULT_RUNS_ROOT / "training" / f"seed_{seed}"
+        dataset_dir = runs_root / "datasets" / f"seed_{seed}"
+        training_dir = runs_root / "training" / f"seed_{seed}"
 
         run(
             [
@@ -308,9 +314,9 @@ def main() -> None:
                 experiment_python(),
                 "scripts/generate_graphsage_article00_figures.py",
                 "--training-root",
-                str(DEFAULT_RUNS_ROOT / "training"),
+                str(runs_root / "training"),
                 "--output-dir",
-                str(DEFAULT_RUNS_ROOT / "figures"),
+                str(runs_root / "figures"),
             ]
         )
 

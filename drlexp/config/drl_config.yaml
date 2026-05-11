@@ -1,0 +1,246 @@
+# GreenRAN DRL Configuration
+# =============================
+# Configuration file for EE-DRL-RA implementation
+# Based on IEEE paper: "Energy-Efficient Deep Reinforcement Learning Assisted Resource Allocation for 5G-RAN Slicing"
+
+# ==========================================
+# SYSTEM CONFIGURATION
+# ==========================================
+
+system:
+  name: "GreenRAN DRL"
+  version: "1.0.0"
+  based_on: "IEEE TVT 2022 - EE-DRL-RA"
+
+# ==========================================
+# ENVIRONMENT CONFIGURATION
+# ==========================================
+
+environment:
+  # State space
+  state_size: 18
+  state_features:
+    - cvar_ms              # CVaR atual (ms)
+    - cvar_trend           # Tendência de CVaR
+    - cvar_acceleration    # Aceleração do CVaR
+    - latency_p95_ms       # Latência P95
+    - jitter_ms            # Jitter
+    - packet_loss_pct     # Taxa de perda
+    - throughput_mbps      # Throughput
+    - active_ues           # UEs ativos
+    - active_cameras       # Câmeras ativas
+    - critical_ues         # UEs críticos
+    - camera_ratio         # Razão câmeras/UEs
+    - critical_ue_ratio    # Razão UEs críticos
+    - allocated_rbs        # RBs alocados
+    - current_power        # Potência atual
+    - power_budget         # Orçamento de potência
+    - hour_sin             # Hora (sin)
+    - hour_cos             # Hora (cos)
+  
+  # Action space - HÍBRIDO (9 ações)
+  action_space: "hybrid"
+  num_actions: 9
+  action_meanings:
+    0: "ALLOWED + REDUCE_POWER"
+    1: "ALLOWED + MAINTAIN_POWER"
+    2: "ALLOWED + INCREASE_POWER"
+    3: "CONDITIONAL + REDUCE_POWER"
+    4: "CONDITIONAL + MAINTAIN_POWER"
+    5: "CONDITIONAL + INCREASE_POWER"
+    6: "BLOCKED + REDUCE_POWER"
+    7: "BLOCKED + MAINTAIN_POWER"
+    8: "BLOCKED + INCREASE_POWER"
+  
+  # Reward configuration
+  reward:
+    w1_energy: 1.0          # Weight for energy saving
+    w2_sla: 2.0            # Weight for SLA penalty
+    threshold_warning: 60.0  # ms - green zone
+    threshold_critical: 80.0  # ms - yellow zone
+    threshold_sla: 100.0    # ms - red zone
+    
+    # Reward zones
+    zones:
+      green:   "< 60ms: +1.0 base"
+      yellow:  "60-80ms: +0.5 base"
+      orange:  "80-100ms: +0.0 base"
+      red:     "> 100ms: exponential penalty"
+
+# ==========================================
+# SBILSTM CONFIGURATION (Large Time-Scale)
+# ==========================================
+
+sbilstm:
+  # Architecture
+  input_size: 18
+  hidden_size_1: 128
+  hidden_size_2: 64
+  num_layers: 2
+  bidirectional: true
+  dropout: 0.2
+  
+  # Training
+  learning_rate: 0.001
+  batch_size: 32
+  epochs: 50-100
+  optimizer: "adam"
+  loss: "mse"
+  
+  # Prediction Window (from paper)
+  prediction_window: 1200
+  total_time_steps: 48000
+  
+  # Target metrics
+  target_mse: 0.00032  # From paper
+
+# ==========================================
+# A3C CONFIGURATION (Small Time-Scale)
+# ==========================================
+
+a3c:
+  # Workers (based on CPU: 8 cores, 16 threads)
+  num_workers: 8
+  num_episodes: 10000
+  max_steps_per_episode: 1000
+  
+  # Network architecture
+  actor:
+    state_size: 18
+    hidden_size_1: 256
+    hidden_size_2: 128
+    num_actions: 9
+    dropout: 0.2
+  
+  critic:
+    state_size: 18
+    hidden_size_1: 256
+    hidden_size_2: 128
+    dropout: 0.2
+  
+  # Training hyperparameters
+  gamma: 0.99                # Discount factor
+  actor_lr: 0.0001          # Actor learning rate
+  critic_lr: 0.0002         # Critic learning rate
+  entropy_coef: 0.01       # Entropy coefficient (exploration)
+  value_loss_coef: 0.5     # Value loss coefficient
+  max_grad_norm: 0.5       # Gradient clipping
+  update_frequency: 32     # Steps between updates
+  
+  # Convergence target
+  target_reward: 0.0        # Reward converges to 0
+  target_convergence: 1000  # episodes
+
+# ==========================================
+# EE-PA CONFIGURATION (Power Allocation)
+# ==========================================
+
+ee_pa:
+  # Algorithm parameters
+  max_iterations: 50
+  epsilon: 0.001          # Convergence tolerance
+  
+  # Power constraints
+  initial_power: 0.1      # dBm
+  max_power: 30.0        # dBm
+  min_rate: 1.0          # Mbps
+  circuit_power: 0.5     # W
+  
+  # Target
+  target_efficiency: 0.8  # 80% of optimal
+
+# ==========================================
+# DATA CONFIGURATION
+# ==========================================
+
+data:
+  # Database
+  db_path: "/tmp/rapp_data_lake.db"
+  
+  # Data splits
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  
+  # For validation (simulations)
+  validation:
+    enabled: true
+    ratio: 0.3  # 30% for validation
+
+# ==========================================
+# HARDWARE CONFIGURATION
+# ==========================================
+
+hardware:
+  # CPU
+  cpu:
+    model: "Intel i7-11700F"
+    cores: 8
+    threads: 16
+    workers_recommended: 8
+  
+  # GPU (not available for DL)
+  gpu:
+    available: false
+    model: "NVIDIA G210"
+    status: "limited"
+    recommendation: "CPU training"
+  
+  # RAM
+  ram:
+    total_gb: 16
+    available_gb: 8
+    batch_size: 32
+
+# ==========================================
+# LOGGING AND MONITORING
+# ==========================================
+
+logging:
+  level: "INFO"
+  log_dir: "./logs"
+  save_interval: 100     # Save models every N episodes
+  log_interval: 10      # Log every N episodes
+  tensorboard: true
+  checkpoint_dir: "./models/a3c"
+
+# ==========================================
+# COMPARISON WITH RANDOM FOREST
+# ==========================================
+
+comparison:
+  with_rf: true
+  metrics:
+    - accuracy           # Decision accuracy
+    - latency           # Inference latency
+    - energy_efficiency # Energy saved
+    - convergence       # Training convergence
+  
+  rf_baseline:
+    classifier_accuracy: 0.9801
+    regressor_mae: 0.58   # ms
+    regressor_r2: 0.9757
+    inference_time: 1.0   # ms
+
+# ==========================================
+# PRIORITIES
+# ==========================================
+
+priorities:
+  primary: "Latência"      # SLA compliance
+  secondary: "Energia"    # Energy efficiency  
+  tertiary: "Acurácia"     # Prediction accuracy
+
+# ==========================================
+# RISKS AND MITIGATIONS
+# ==========================================
+
+risks:
+  - name: "CPU bottleneck"
+    mitigation: "Use 8 workers, optimize code"
+    
+  - name: "Training instability"
+    mitigation: "Low learning rate, large replay buffer"
+    
+  - name: "Memory overflow"
+    mitigation: "Batch size 32, gradient accumulation"

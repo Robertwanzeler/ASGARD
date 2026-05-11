@@ -93,6 +93,41 @@ RISK_SCORE_BLOCKED = 0.78
 RISK_SCORE_RELEASE = 0.34
 
 
+def _compute_vehicle_pressure(state_dict):
+    """Collapse vehicle state into pressure terms compatible with the fixed 18-feature DRL input."""
+    active_vehicles = int(_bounded_float(state_dict.get('active_vehicles', state_dict.get('total_active_vehicles', 0)), 0, 100))
+    high_risk = int(_bounded_float(state_dict.get('vehicle_high_risk', 0), 0, 100))
+    medium_risk = int(_bounded_float(state_dict.get('vehicle_medium_risk', 0), 0, 100))
+    degraded = int(_bounded_float(state_dict.get('vehicle_degraded_autonomy', 0), 0, 100))
+    max_latency_ms = _bounded_float(state_dict.get('vehicle_max_latency_ms', 0), 0, 500)
+    max_packet_loss_percent = _bounded_float(state_dict.get('vehicle_max_packet_loss_percent', 0), 0, 100)
+
+    if active_vehicles <= 0:
+        return {
+            'active_vehicles': 0,
+            'virtual_critical_ues': 0,
+            'max_latency_ms': 0.0,
+            'max_packet_loss_percent': 0.0,
+        }
+
+    virtual_critical_ues = (high_risk * 3) + (degraded * 2) + medium_risk
+    if max_latency_ms >= 100.0:
+        virtual_critical_ues += 2
+    elif max_latency_ms >= 50.0:
+        virtual_critical_ues += 1
+    if max_packet_loss_percent >= 5.0:
+        virtual_critical_ues += 2
+    elif max_packet_loss_percent >= 2.0:
+        virtual_critical_ues += 1
+
+    return {
+        'active_vehicles': active_vehicles,
+        'virtual_critical_ues': virtual_critical_ues,
+        'max_latency_ms': max_latency_ms,
+        'max_packet_loss_percent': max_packet_loss_percent,
+    }
+
+
 def _bounded_float(value, lower, upper):
     try:
         value = float(value)
@@ -381,6 +416,12 @@ class DRLPredictor:
                     "active_ues": int(state_dict.get("active_ues", 0) or 0),
                     "active_cameras": int(state_dict.get("active_cameras", 0) or 0),
                     "critical_ues": int(state_dict.get("critical_ues", 0) or 0),
+                    "active_vehicles": int(state_dict.get("active_vehicles", 0) or 0),
+                    "vehicle_high_risk": int(state_dict.get("vehicle_high_risk", 0) or 0),
+                    "vehicle_medium_risk": int(state_dict.get("vehicle_medium_risk", 0) or 0),
+                    "vehicle_degraded_autonomy": int(state_dict.get("vehicle_degraded_autonomy", 0) or 0),
+                    "vehicle_max_latency_ms": float(state_dict.get("vehicle_max_latency_ms", 0) or 0),
+                    "vehicle_max_packet_loss_percent": float(state_dict.get("vehicle_max_packet_loss_percent", 0) or 0),
                 },
                 "output": {
                     "predicted_cvar_ms": result.get("predicted_cvar_ms"),
@@ -422,7 +463,18 @@ class DRLPredictor:
 
         active_ues = max(_bounded_float(enriched.get('active_ues', 20), 0, 200), 1.0)
         active_cameras = _bounded_float(enriched.get('active_cameras', 3), 0, 50)
-        critical_ues = _bounded_float(enriched.get('critical_ues', 0), 0, 200)
+        vehicle_pressure = _compute_vehicle_pressure(enriched)
+        critical_ues = _bounded_float(enriched.get('critical_ues', 0), 0, 200) + vehicle_pressure['virtual_critical_ues']
+        if vehicle_pressure['active_vehicles'] > 0:
+            enriched['latency_p95_ms'] = max(
+                _bounded_float(enriched.get('latency_p95_ms', 0), 0, 500),
+                vehicle_pressure['max_latency_ms'],
+            )
+            enriched['packet_loss_pct'] = max(
+                _bounded_float(enriched.get('packet_loss_pct', 0), 0, 100),
+                vehicle_pressure['max_packet_loss_percent'],
+            )
+        enriched['critical_ues'] = critical_ues
         enriched['camera_ratio'] = float(active_cameras / active_ues)
         enriched['critical_ue_ratio'] = float(critical_ues / active_ues)
 

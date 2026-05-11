@@ -33,8 +33,10 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-DEFAULT_INTENT_FILE = "/tmp/agent_intent.json"
-DEFAULT_STATUS_FILE = "/tmp/rapp_agent_status.json"
+from greenran_paths import AGENT_INTENT_PATH, AGENT_STATUS_PATH, as_str
+
+DEFAULT_INTENT_FILE = as_str(AGENT_INTENT_PATH)
+DEFAULT_STATUS_FILE = as_str(AGENT_STATUS_PATH)
 
 # Templates de intenção do O-RAN
 INTENT_TEMPLATES = {

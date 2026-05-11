@@ -2,29 +2,40 @@
   GreenRAN ML Training Report
 ============================================================
 
-Data: 2026-04-25 12:53:53
+Data: 2026-05-10 12:22:16
 
 CLASSIFIER (Decisão rApp)
 ----------------------------------------
-  Random Forest Accuracy: 0.1721
-  Cross-validation: 0.3671 ± 0.1544
+  Selecionado para runtime: random_forest
+  Random Forest Accuracy: 0.9686
+  Healthy Accuracy (<=20ms): 0.9650
+  Healthy ALLOWED recall: 0.9957
+  XGBoost Accuracy: 0.9282
+  XGBoost Healthy Accuracy (<=20ms): 0.9201
+  XGBoost Healthy ALLOWED recall: 0.8753
+  Cross-validation: 0.8620 ± 0.1129
   Classes: ['ALLOWED', 'BLOCKED', 'CONDITIONAL']
 
 REGRESSOR (CVaR prediction)
 ----------------------------------------
-  MAE: 0.25 ms
-  RMSE: 1.24 ms
-  R²: 0.9823
+  Modelo: HistGradientBoostingRegressor+log1p
+  MAE: 10.80 ms
+  RMSE: 40.38 ms
+  R²: 0.7918
+
+  Healthy MAE (<=20ms): 0.10 ms
+  Healthy bias (pred-real): 0.08 ms
+  Critical MAE (>=80ms): 105.58 ms
 
 TOP 10 FEATURES (by importance)
 ----------------------------------------
-  throughput_mbps: 0.0724
-  throughput_lag_2: 0.0723
-  throughput_lag_3: 0.0673
-  throughput_lag_1: 0.0588
-  variance_ms2: 0.0588
-  avg_latency_ms: 0.0485
-  tx_rx_ratio: 0.0439
-  latency_lag_1: 0.0424
-  packet_loss_rate: 0.0399
-  latency_p95_ms: 0.0377
+  cvar_ms: 0.1309
+  cvar_lag_1: 0.1290
+  cvar_rolling_3: 0.0847
+  cvar_lag_2: 0.0762
+  cvar_rolling_mean: 0.0671
+  variance_ms2: 0.0596
+  avg_latency_ms: 0.0516
+  cvar_lag_3: 0.0480
+  latency_lag_1: 0.0397
+  total_critical_ues: 0.0389

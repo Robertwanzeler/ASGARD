@@ -206,10 +206,12 @@ def mean_stdev(values: list[float]) -> tuple[float, float]:
 
 def feature_order_from_metadata(metadata: dict[str, Any]) -> list[str]:
     order = metadata.get("feature_order") or list(DEFAULT_FEATURE_ORDER)
-    if order != list(DEFAULT_FEATURE_ORDER):
-        missing = [feature for feature in DEFAULT_FEATURE_ORDER if feature not in order]
-        if missing:
-            raise SystemExit(f"dataset metadata is missing expected features: {missing}")
+    if not order:
+        raise SystemExit("dataset metadata must define a non-empty feature_order")
+    parameters = [feature for feature in order if feature.startswith("P")]
+    kpis = [feature for feature in order if feature.startswith("K")]
+    if not parameters or not kpis:
+        raise SystemExit("dataset metadata must contain at least one parameter feature (P*) and one KPI feature (K*)")
     return list(order)
 
 
@@ -313,8 +315,11 @@ def compute_binary_metrics(
     }
 
 
-def conflict_pair_universe(app_parameter_edges: set[tuple[str, str]]) -> set[tuple[str, str]]:
-    apps = sorted({source for source, _ in app_parameter_edges})
+def conflict_pair_universe(
+    app_parameter_edges: set[tuple[str, str]],
+    app_kpi_edges: set[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    apps = sorted(({source for source, _ in app_parameter_edges}) | ({source for source, _ in app_kpi_edges}))
     universe = set()
     for left in range(len(apps)):
         for right in range(left + 1, len(apps)):
@@ -342,7 +347,7 @@ def label_conflicts(
     for parameter, kpi in parameter_kpi_edges:
         parameter_to_kpis.setdefault(parameter, set()).add(kpi)
 
-    apps = sorted(app_to_parameters)
+    apps = sorted(set(app_to_parameters) | set(app_to_kpis))
     direct: set[tuple[str, str]] = set()
     indirect: set[tuple[str, str]] = set()
     implicit: set[tuple[str, str]] = set()
@@ -579,7 +584,7 @@ def evaluate_checkpoint(
 ) -> dict[str, Any]:
     correlation = correlation_from_reconstruction(reconstructed_raw)
     pk_universe = candidate_parameter_kpi_universe(feature_order)
-    pair_universe = conflict_pair_universe(app_parameter_truth)
+    pair_universe = conflict_pair_universe(app_parameter_truth, app_kpi_truth)
     truth_full = full_graph_edges(app_parameter_truth, app_kpi_truth, parameter_kpi_truth)
     truth_labels = label_conflicts(app_parameter_truth, app_kpi_truth, parameter_kpi_truth)
 

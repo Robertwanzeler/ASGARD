@@ -16,7 +16,8 @@
                     <tr><td>Throughput</td><td>{{ "%.0f"|format(metrics.global_metrics.throughput_kbps) }} kbps</td></tr>
                     <tr><td>UEs Ativas</td><td>{{ metrics.global_metrics.total_active_ues }}</td></tr>
                     <tr><td>Câmeras Ativas</td><td>{{ metrics.active_cameras }}</td></tr>
-                    <tr><td>UEs Críticos (>80ms)</td><td class="{% if metrics.critical_cameras > 0 or extended.global_metrics.critical_ues > 0 %}text-danger{% endif %}">{{ metrics.critical_cameras + (extended.global_metrics.critical_ues|int) }}</td></tr>
+                    {% set extended_critical_ues = extended.get('global_metrics', {}).get('critical_ues', 0) if extended else 0 %}
+                    <tr><td>UEs Críticos (>80ms)</td><td class="{% if metrics.critical_cameras > 0 or extended_critical_ues > 0 %}text-danger{% endif %}">{{ metrics.critical_cameras + (extended_critical_ues|int) }}</td></tr>
                 </table>
                 {% else %}
                 <p class="text-muted">Sem dados disponíveis</p>
@@ -39,6 +40,80 @@
                 </table>
                 {% else %}
                 <p class="text-muted">Sem dados para análise estendida</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+<div class="row mt-3">
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header"><h5>Scheduler mmWave por UE</h5></div>
+            <div class="card-body">
+                {% if metrics and metrics.global_metrics %}
+                <table class="table table-sm">
+                    <tr>
+                        <td>Modo do trace MAC</td>
+                        <td>{{ metrics.global_metrics.mac_trace_mode or 'unknown' }}</td>
+                    </tr>
+                    <tr>
+                        <td>LTE MAC observado</td>
+                        <td>{{ metrics.global_metrics.lte_mac_observed_ues or 0 }} UE(s)</td>
+                    </tr>
+                    <tr>
+                        <td>RNTIs de dados mmWave</td>
+                        <td>{{ metrics.global_metrics.mmwave_sched_observed_data_rntis or 0 }}</td>
+                    </tr>
+                    <tr>
+                        <td>UEs mapeados no scheduler mmWave</td>
+                        <td>{{ metrics.global_metrics.mmwave_sched_mapped_ues or 0 }}</td>
+                    </tr>
+                    <tr>
+                        <td>Célula usada para mapear RNTI → IMSI</td>
+                        <td>{{ metrics.global_metrics.mmwave_sched_mapping_cell_id or 0 }}</td>
+                    </tr>
+                </table>
+
+                {% set sched = metrics.get('mmwave_scheduler_metrics', {}) %}
+                {% set by_imsi = sched.get('by_imsi', {}) %}
+                {% if by_imsi %}
+                <table class="table table-striped table-sm">
+                    <thead>
+                        <tr>
+                            <th>IMSI</th>
+                            <th>RNTI</th>
+                            <th>Alocações</th>
+                            <th>Símbolos</th>
+                            <th>DL</th>
+                            <th>UL</th>
+                            <th>Retx</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for imsi, row in by_imsi|dictsort %}
+                        <tr>
+                            <td>{{ imsi }}</td>
+                            <td>{{ row.rnti }}</td>
+                            <td>{{ row.allocations }}</td>
+                            <td>{{ row.symbols }}</td>
+                            <td>{{ row.dl_allocations }}</td>
+                            <td>{{ row.ul_allocations }}</td>
+                            <td>{{ row.retx_allocations }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% if sched.get('unmapped_rntis') %}
+                <p class="text-warning">RNTIs sem mapeamento IMSI: {{ sched.unmapped_rntis|join(', ') }}</p>
+                {% endif %}
+                {% if sched.get('active_imsis_without_mmwave_sched') %}
+                <p class="text-warning">IMSIs ativos sem alocação mmWave mapeada: {{ sched.active_imsis_without_mmwave_sched|join(', ') }}</p>
+                {% endif %}
+                {% else %}
+                <p class="text-muted">Sem alocações mmWave mapeadas por UE.</p>
+                {% endif %}
+                {% else %}
+                <p class="text-muted">Sem dados disponíveis</p>
                 {% endif %}
             </div>
         </div>

@@ -1,29 +1,58 @@
-
 # Build artifacts
 __pycache__/
 *.pyc
 *.pyo
+*.so
+build/
+dist/
 
 # Logs
 nohup.out
 *.log
+*.pid
 
 # Binary libraries
 flexric_lib/
 
-# Simulation data files (stats)
-*.txt
-!requirements.txt
-!README*.txt
-!models/*.txt
-
-# Temporary files
-/tmp/
-
-# Docker
-nohup.out
-
 # IDE
 .vscode/
 .idea/
+.DS_Store
 
+# Python environments and tooling
+.venv/
+venv/
+env/
+drlexp/.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local databases and SQLite sidecars
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Runtime state and generated outputs
+/results/
+/runs/**
+/charts/*.csv
+/charts/*.png
+/models/*.joblib
+/models/*.pt
+/models/**/*.joblib
+/models/**/*.pt
+/models/*.png
+/models/a3c/
+/models/sbilstm/
+
+# Preserve text docs and dependency manifests
+*.txt
+!requirements.txt
+!requirements-dev.txt
+!README*.txt
+!models/*.txt

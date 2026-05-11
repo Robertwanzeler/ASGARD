@@ -36,7 +36,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_POLICY_DIR = "/tmp/rapp_policies/"
+from greenran_paths import RAPP_POLICIES_DIR, as_str
+
+DEFAULT_POLICY_DIR = as_str(RAPP_POLICIES_DIR)
 ENERGY_POLICY_FILE = "energy_policy.json"
 SLICE_POLICY_FILE = "slice_policy.json"
 ENERGY_ACK_FILE = "energy_policy_ack.json"

@@ -32,12 +32,13 @@ from datetime import datetime
 from pathlib import Path
 
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (
     classification_report, confusion_matrix, accuracy_score,
     mean_absolute_error, mean_squared_error, r2_score
 )
+from sklearn.compose import TransformedTargetRegressor
 import joblib
 
 try:
@@ -322,6 +323,7 @@ def train_classifier(df, feature_cols, output_dir):
     # Prepare data - USAR decision_next (target preditivo)
     X = df[feature_cols].values
     y = df['decision_next'].values  # <-- PREDITIVO: próximo ciclo
+    cvar_next = df['cvar_next'].values
 
     # Encode labels
     le = LabelEncoder()
@@ -329,11 +331,43 @@ def train_classifier(df, feature_cols, output_dir):
 
     # Temporal split
     X_train, X_test, y_train, y_test = temporal_train_test_split(X, y_encoded)
+    split_idx = len(X_train)
+    cvar_next_train = cvar_next[:split_idx]
+    cvar_next_test = cvar_next[split_idx:]
 
     # Scale features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
+
+    # Reponderação: o runtime precisa acertar especialmente o regime saudável.
+    # Quando o próximo CVaR é baixo, ALLOWED deve ganhar prioridade; quando o
+    # target é CONDITIONAL em regime saudável, reduzimos o peso para diminuir o
+    # viés conservador observado no runtime.
+    train_labels = le.inverse_transform(y_train)
+    sample_weights = np.ones_like(y_train, dtype=float)
+    healthy_mask = cvar_next_train <= 10.0
+    near_healthy_mask = (cvar_next_train > 10.0) & (cvar_next_train <= 20.0)
+    sample_weights[healthy_mask & (train_labels == 'ALLOWED')] = 4.0
+    sample_weights[near_healthy_mask & (train_labels == 'ALLOWED')] = 2.5
+    sample_weights[healthy_mask & (train_labels == 'CONDITIONAL')] = 0.55
+    sample_weights[healthy_mask & (train_labels == 'BLOCKED')] = 0.75
+    sample_weights[(cvar_next_train >= 80.0) & (train_labels == 'BLOCKED')] = 1.75
+
+    def _healthy_metrics(y_true_encoded, y_pred_encoded):
+        healthy_test_mask_local = cvar_next_test <= 20.0
+        healthy_accuracy_local = (
+            accuracy_score(y_true_encoded[healthy_test_mask_local], y_pred_encoded[healthy_test_mask_local])
+            if np.any(healthy_test_mask_local) else float("nan")
+        )
+        healthy_allowed_recall_local = float("nan")
+        if np.any(healthy_test_mask_local):
+            healthy_true_local = le.inverse_transform(y_true_encoded[healthy_test_mask_local])
+            healthy_pred_local = le.inverse_transform(y_pred_encoded[healthy_test_mask_local])
+            allowed_mask_local = healthy_true_local == 'ALLOWED'
+            if np.any(allowed_mask_local):
+                healthy_allowed_recall_local = float(np.mean(healthy_pred_local[allowed_mask_local] == 'ALLOWED'))
+        return healthy_accuracy_local, healthy_allowed_recall_local
 
     # Random Forest
     rf = RandomForestClassifier(
@@ -341,17 +375,20 @@ def train_classifier(df, feature_cols, output_dir):
         max_depth=10,
         min_samples_split=5,
         min_samples_leaf=2,
-        class_weight='balanced',
+        class_weight=None,
         random_state=42,
         n_jobs=-1
     )
-    rf.fit(X_train_scaled, y_train)
+    rf.fit(X_train_scaled, y_train, sample_weight=sample_weights)
 
     # Evaluate
     y_pred_rf = rf.predict(X_test_scaled)
     rf_accuracy = accuracy_score(y_test, y_pred_rf)
+    healthy_accuracy, healthy_allowed_recall = _healthy_metrics(y_test, y_pred_rf)
 
     print(f"    Random Forest Accuracy: {rf_accuracy:.4f}")
+    print(f"    Healthy Accuracy (<=20ms): {healthy_accuracy:.4f}")
+    print(f"    Healthy ALLOWED recall: {healthy_allowed_recall:.4f}")
     print(f"    Classification Report:")
     print(classification_report(y_test, y_pred_rf, target_names=le.classes_))
 
@@ -359,13 +396,10 @@ def train_classifier(df, feature_cols, output_dir):
     cv_mean, cv_std = temporal_cv_accuracy(X_train, y_train, n_splits=5)
     print(f"    Cross-validation temporal: {cv_mean:.4f} ± {cv_std:.4f}")
 
-    # Save
-    joblib.dump(rf, os.path.join(output_dir, 'rf_classifier.joblib'))
-    joblib.dump(scaler, os.path.join(output_dir, 'rf_scaler.joblib'))
-    joblib.dump(le, os.path.join(output_dir, 'label_encoder.joblib'))
-
     results = {
         'rf_accuracy': rf_accuracy,
+        'healthy_accuracy': healthy_accuracy,
+        'healthy_allowed_recall': healthy_allowed_recall,
         'cv_mean': cv_mean,
         'cv_std': cv_std,
         'feature_importance': dict(zip(feature_cols, rf.feature_importances_.tolist())),
@@ -373,6 +407,15 @@ def train_classifier(df, feature_cols, output_dir):
         'classes': le.classes_.tolist(),
         'split_mode': 'temporal_holdout'
     }
+
+    best_model = rf
+    best_scaler = scaler
+    best_name = 'random_forest'
+    best_score = (
+        healthy_allowed_recall if not np.isnan(healthy_allowed_recall) else -1.0,
+        healthy_accuracy if not np.isnan(healthy_accuracy) else -1.0,
+        rf_accuracy,
+    )
 
     # XGBoost if available
     if HAS_XGBOOST:
@@ -388,10 +431,34 @@ def train_classifier(df, feature_cols, output_dir):
         xgb.fit(X_train_scaled, y_train)
         y_pred_xgb = xgb.predict(X_test_scaled)
         xgb_accuracy = accuracy_score(y_test, y_pred_xgb)
+        xgb_healthy_accuracy, xgb_healthy_allowed_recall = _healthy_metrics(y_test, y_pred_xgb)
         print(f"    XGBoost Accuracy: {xgb_accuracy:.4f}")
+        print(f"    XGBoost Healthy Accuracy (<=20ms): {xgb_healthy_accuracy:.4f}")
+        print(f"    XGBoost Healthy ALLOWED recall: {xgb_healthy_allowed_recall:.4f}")
 
         joblib.dump(xgb, os.path.join(output_dir, 'xgb_classifier.joblib'))
         results['xgb_accuracy'] = xgb_accuracy
+        results['xgb_healthy_accuracy'] = xgb_healthy_accuracy
+        results['xgb_healthy_allowed_recall'] = xgb_healthy_allowed_recall
+
+        xgb_score = (
+            xgb_healthy_allowed_recall if not np.isnan(xgb_healthy_allowed_recall) else -1.0,
+            xgb_healthy_accuracy if not np.isnan(xgb_healthy_accuracy) else -1.0,
+            xgb_accuracy,
+        )
+        if xgb_score > best_score:
+            best_model = xgb
+            best_scaler = scaler
+            best_name = 'xgboost'
+            best_score = xgb_score
+
+    # Save chosen classifier for runtime
+    joblib.dump(best_model, os.path.join(output_dir, 'best_classifier.joblib'))
+    joblib.dump(rf, os.path.join(output_dir, 'rf_classifier.joblib'))
+    joblib.dump(best_scaler, os.path.join(output_dir, 'rf_scaler.joblib'))
+    joblib.dump(le, os.path.join(output_dir, 'label_encoder.joblib'))
+    results['selected_classifier'] = best_name
+    print(f"    Classificador selecionado para runtime: {best_name}")
 
     return results, rf, scaler, le
 
@@ -413,16 +480,30 @@ def train_regressor(df, feature_cols, output_dir):
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # Random Forest Regressor
-    rf_reg = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=10,
-        min_samples_split=5,
-        min_samples_leaf=2,
-        random_state=42,
-        n_jobs=-1
+    # Peso maior para o regime saudável, onde o runtime precisa de mais precisão.
+    train_weights = np.ones_like(y_train, dtype=float)
+    train_weights[y_train <= 10.0] = 5.0
+    train_weights[(y_train > 10.0) & (y_train <= 20.0)] = 3.5
+    train_weights[(y_train > 20.0) & (y_train <= 40.0)] = 2.0
+    train_weights[y_train >= 150.0] = 1.2
+
+    # Regressor com alvo transformado em log para reduzir superestimação
+    # nos regimes baixos e manter sensibilidade na cauda.
+    base_reg = HistGradientBoostingRegressor(
+        loss='squared_error',
+        learning_rate=0.05,
+        max_iter=300,
+        max_depth=8,
+        min_samples_leaf=20,
+        l2_regularization=0.1,
+        random_state=42
     )
-    rf_reg.fit(X_train_scaled, y_train)
+    rf_reg = TransformedTargetRegressor(
+        regressor=base_reg,
+        func=np.log1p,
+        inverse_func=np.expm1
+    )
+    rf_reg.fit(X_train_scaled, y_train, sample_weight=train_weights)
 
     # Evaluate
     y_pred = rf_reg.predict(X_test_scaled)
@@ -430,9 +511,18 @@ def train_regressor(df, feature_cols, output_dir):
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     r2 = r2_score(y_test, y_pred)
 
+    healthy_mask = y_test <= 20.0
+    healthy_mae = mean_absolute_error(y_test[healthy_mask], y_pred[healthy_mask]) if np.any(healthy_mask) else float("nan")
+    healthy_bias = float(np.mean(y_pred[healthy_mask] - y_test[healthy_mask])) if np.any(healthy_mask) else float("nan")
+    critical_mask = y_test >= 80.0
+    critical_mae = mean_absolute_error(y_test[critical_mask], y_pred[critical_mask]) if np.any(critical_mask) else float("nan")
+
     print(f"    MAE: {mae:.2f} ms")
     print(f"    RMSE: {rmse:.2f} ms")
     print(f"    R²: {r2:.4f}")
+    print(f"    Healthy MAE (<=20ms): {healthy_mae:.2f} ms")
+    print(f"    Healthy bias (pred-real): {healthy_bias:.2f} ms")
+    print(f"    Critical MAE (>=80ms): {critical_mae:.2f} ms")
 
     # Save
     joblib.dump(rf_reg, os.path.join(output_dir, 'rf_regressor.joblib'))
@@ -441,7 +531,11 @@ def train_regressor(df, feature_cols, output_dir):
     return {
         'mae': mae,
         'rmse': rmse,
-        'r2': r2
+        'r2': r2,
+        'healthy_mae': healthy_mae,
+        'healthy_bias': healthy_bias,
+        'critical_mae': critical_mae,
+        'model_name': 'HistGradientBoostingRegressor+log1p'
     }, rf_reg
 
 
@@ -454,6 +548,7 @@ def save_report(clf_results, reg_results, feature_cols, output_dir):
         'dataset_size': clf_results.get('dataset_size', 0),
         'features': feature_cols,
         'classifier': {
+            'selected_classifier': clf_results.get('selected_classifier', 'random_forest'),
             'random_forest_accuracy': clf_results['rf_accuracy'],
             'cross_validation_mean': clf_results['cv_mean'],
             'cross_validation_std': clf_results['cv_std'],
@@ -461,15 +556,23 @@ def save_report(clf_results, reg_results, feature_cols, output_dir):
             'classes': clf_results['classes'],
         },
         'regressor': {
+            'model': reg_results.get('model_name', 'unknown'),
             'mae_ms': reg_results['mae'],
             'rmse_ms': reg_results['rmse'],
             'r2': reg_results['r2'],
+            'healthy_mae_ms': reg_results.get('healthy_mae'),
+            'healthy_bias_ms': reg_results.get('healthy_bias'),
+            'critical_mae_ms': reg_results.get('critical_mae'),
         },
         'feature_importance': clf_results['feature_importance']
     }
 
     if 'xgb_accuracy' in clf_results:
         report['classifier']['xgboost_accuracy'] = clf_results['xgb_accuracy']
+        report['classifier']['xgb_healthy_accuracy'] = clf_results.get('xgb_healthy_accuracy')
+        report['classifier']['xgb_healthy_allowed_recall'] = clf_results.get('xgb_healthy_allowed_recall')
+    report['classifier']['healthy_accuracy'] = clf_results.get('healthy_accuracy')
+    report['classifier']['healthy_allowed_recall'] = clf_results.get('healthy_allowed_recall')
 
     report_path = os.path.join(output_dir, 'training_report.json')
     with open(report_path, 'w') as f:
@@ -485,17 +588,26 @@ def save_report(clf_results, reg_results, feature_cols, output_dir):
 
         f.write("CLASSIFIER (Decisão rApp)\n")
         f.write("-" * 40 + "\n")
+        f.write(f"  Selecionado para runtime: {clf_results.get('selected_classifier', 'random_forest')}\n")
         f.write(f"  Random Forest Accuracy: {clf_results['rf_accuracy']:.4f}\n")
+        f.write(f"  Healthy Accuracy (<=20ms): {clf_results.get('healthy_accuracy', float('nan')):.4f}\n")
+        f.write(f"  Healthy ALLOWED recall: {clf_results.get('healthy_allowed_recall', float('nan')):.4f}\n")
         if 'xgb_accuracy' in clf_results:
             f.write(f"  XGBoost Accuracy: {clf_results['xgb_accuracy']:.4f}\n")
+            f.write(f"  XGBoost Healthy Accuracy (<=20ms): {clf_results.get('xgb_healthy_accuracy', float('nan')):.4f}\n")
+            f.write(f"  XGBoost Healthy ALLOWED recall: {clf_results.get('xgb_healthy_allowed_recall', float('nan')):.4f}\n")
         f.write(f"  Cross-validation: {clf_results['cv_mean']:.4f} ± {clf_results['cv_std']:.4f}\n")
         f.write(f"  Classes: {clf_results['classes']}\n\n")
 
         f.write("REGRESSOR (CVaR prediction)\n")
         f.write("-" * 40 + "\n")
+        f.write(f"  Modelo: {reg_results.get('model_name', 'unknown')}\n")
         f.write(f"  MAE: {reg_results['mae']:.2f} ms\n")
         f.write(f"  RMSE: {reg_results['rmse']:.2f} ms\n")
         f.write(f"  R²: {reg_results['r2']:.4f}\n\n")
+        f.write(f"  Healthy MAE (<=20ms): {reg_results.get('healthy_mae', float('nan')):.2f} ms\n")
+        f.write(f"  Healthy bias (pred-real): {reg_results.get('healthy_bias', float('nan')):.2f} ms\n")
+        f.write(f"  Critical MAE (>=80ms): {reg_results.get('critical_mae', float('nan')):.2f} ms\n\n")
 
         f.write("TOP 10 FEATURES (by importance)\n")
         f.write("-" * 40 + "\n")

@@ -33,12 +33,10 @@ Uso:
     decision = trend.should_preempt_energy()
 """
 
-import sys
 import time
 from datetime import datetime, timedelta
-
-sys.path.insert(0, '/home/robert/orange_nuclear')
 from rapp_data_lake import DataLake
+from greenran_paths import RAPP_DB_PATH
 
 
 class TrendAnalysis:
@@ -54,7 +52,7 @@ class TrendAnalysis:
         slope ≈ 0: Latência ESTÁVEL
     """
     
-    def __init__(self, data_lake=None, db_path="/tmp/rapp_data_lake.db"):
+    def __init__(self, data_lake=None, db_path=str(RAPP_DB_PATH)):
         """
         Inicializa o módulo de Trend Analysis.
         
@@ -229,14 +227,14 @@ class TrendAnalysis:
         time_to_critical = None
         time_to_good = None
         
-        if slope_us_per_sec > 0:  # Latência subindo
+        if slope_ms_per_sec > self.thresholds['stable']:  # Latência subindo de forma relevante
             # Quando atinge 150ms?
             critical_us = self.thresholds['critical_latency_ms'] * 1000
             if current_latency_us < critical_us:
                 time_to_critical = (critical_us - current_latency_us) / slope_us_per_sec
                 time_to_critical = round(time_to_critical, 1)  # Segundos
         
-        if slope_us_per_sec < 0:  # Latência descendo
+        if slope_ms_per_sec < -self.thresholds['stable']:  # Latência descendo de forma relevante
             # Quando atinge 50ms?
             good_us = self.thresholds['good_latency_ms'] * 1000
             if current_latency_us > good_us:
@@ -278,12 +276,14 @@ class TrendAnalysis:
             return 'rising_fast'
         elif slope_ms_per_sec > th['rising_slow']:
             return 'rising_slow'
-        elif slope_ms_per_sec > th['stable']:
+        elif abs(slope_ms_per_sec) <= th['stable']:
             return 'stable'
-        elif slope_ms_per_sec > th['falling_slow']:
+        elif slope_ms_per_sec < th['falling_fast']:
+            return 'falling_fast'
+        elif slope_ms_per_sec < th['falling_slow']:
             return 'falling_slow'
         else:
-            return 'falling_fast'
+            return 'stable'
     
     def _calculate_confidence(self, r_squared, n_samples):
         """

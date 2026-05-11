@@ -32,9 +32,9 @@ Cenario final mais forte do metodo:
 - `indirect_f1 = 1.0`
 - `implicit_f1 = 1.0`
 
-Referencia:
+Referencia estavel:
 
-- [aggregate_report.json](/home/robert/orange_nuclear/runs/article00/reports/aggregate_report.json:1)
+- [article00_final_reference_summary.json](/home/robert/orange_nuclear/runs/article00/reports/article00_final_reference_summary.json:1)
 
 ## Melhor Resultado Estrito Em `threshold = 0.5`
 
@@ -58,6 +58,20 @@ Resultado:
 - `indirect_f1 = 1.0`
 - `implicit_f1 = 1.0`
 
+## Nota Sobre `threshold = 0.9`
+
+Foi feita uma trilha exploratoria separada para tentar melhorar o desempenho em
+`threshold = 0.9`, sem alterar o setup principal do projeto.
+
+Conclusao:
+
+- houve avancos locais em reconstrucao e em alguns seeds isolados;
+- nao houve ganho consistente no conjunto das metricas;
+- `0.9` continuou claramente inferior aos cenarios em `0.2` e `0.5`.
+
+Por isso, nenhuma configuracao de `0.9` foi promovida aos graficos ou ao
+veredito principal da trilha.
+
 ## Comparacao Com O Artigo
 
 Leitura honesta:
@@ -67,6 +81,22 @@ Leitura honesta:
   `implicit`, e fica muito proximo de `1.0` na reconstrucao total;
 - a vantagem principal veio de melhor modelagem temporal e melhor funcao de
   treino, nao de simplesmente aumentar o numero de epochs.
+
+### Tabela Comparativa
+
+| Metrica | Artigo base | Nosso melhor resultado | Leitura |
+|---|---|---|---|
+| Reconstrucao (`F1 Score`) | `1.0` com `450 samples`, `600 epochs`, `threshold 0.5` | `1.0` com `450 samples`, `200 epochs`, `threshold 0.2` | melhor no cenario geral |
+| Reconstrucao (`F1 Score`) em `threshold 0.5` | `1.0` com `450 samples`, `600 epochs` | `0.988889` com `450 samples`, `200 epochs` | quase igual, mas ainda abaixo |
+| `Indirect` | requer `>= 600 epochs` | `1.0` com `450 samples`, `200 epochs` | melhor que o artigo |
+| `Implicit` | `1.0` com `450 samples`, `200 epochs`, `threshold 0.5` | `1.0` com `450 samples`, `200 epochs` | igualamos o artigo |
+
+Resumo da tabela:
+
+- em `indirect`, o `ARMD-GreenRAN` supera o artigo em eficiencia de treino;
+- em `implicit`, o metodo chega ao mesmo teto do melhor caso do artigo;
+- em reconstrucao geral, o melhor cenario do metodo supera o artigo;
+- em reconstrucao estrita com `threshold 0.5`, o metodo fica muito proximo, mas ainda abaixo do `1.0`.
 
 ## O Que Melhorou O Metodo
 
@@ -93,7 +123,13 @@ Pasta organizada para artigo:
 
 - [graficos_selecionados_artigo](/home/robert/orange_nuclear/runs/article00/graficos_selecionados_artigo)
 
-Nessa pasta, os graficos foram separados em:
+Nessa pasta, os graficos foram separados por metrica:
+
+- `reconstrucao`
+- `indirect`
+- `implicit`
+
+E, dentro de cada metrica, por:
 
 - `threshold 0.2`
 - `threshold 0.5`
@@ -101,6 +137,13 @@ Nessa pasta, os graficos foram separados em:
 - `dataset 50`
 - `dataset 150`
 - `dataset 450`
+
+Observacao importante:
+
+- [aggregate_report.json](/home/robert/orange_nuclear/runs/article00/reports/aggregate_report.json:1)
+  reflete a ultima corrida executada e pode estar em `50`, `150` ou `450 samples`;
+- o resumo estavel do melhor cenario final fica em
+  [article00_final_reference_summary.json](/home/robert/orange_nuclear/runs/article00/reports/article00_final_reference_summary.json:1).
 
 ## Regra De Interpretacao Dos Graficos
 

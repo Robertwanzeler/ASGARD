@@ -7,11 +7,14 @@
 #   1. Inicia cenário completo (ns-3 + orchestrator + dashboard)
 #   2. Após 5 minutos, retreina ML com dados do banco
 #   3. Após 10 minutos, para todos os processos
-#   4. Logs salvos em /tmp/greenran_logs/
+#   4. Logs salvos em $GREENRAN_STATE_DIR/greenran_logs/
 # ==========================================
 
-BASE_DIR="/home/robert/orange_nuclear"
-LOG_DIR="/tmp/greenran_logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/core_runtime.sh"
+load_greenran_runtime
+
+LOG_DIR="$STATE_DIR/greenran_logs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$LOG_DIR/run_$TIMESTAMP.log"
 SIM_DURATION=600        # 10 minutos em segundos
@@ -38,7 +41,7 @@ echo -e "${BLUE}==========================================${NC}" | tee -a $LOG_F
 # 1. Iniciar cenário completo
 echo -e "\n${BLUE}[1/3] Iniciando cenário GreenRAN...${NC}" | tee -a $LOG_FILE
 cd $BASE_DIR
-./run_greenran_v2.sh >> $LOG_FILE 2>&1 &
+"$SCRIPT_DIR/run_greenran_v2.sh" >> $LOG_FILE 2>&1 &
 
 # Aguardar um pouco para o cenário inicializar
 sleep 10
@@ -48,7 +51,7 @@ echo -e "\n${YELLOW}[2/3] Aguardando ${RETRAIN_DELAY}s para retreinar ML...${NC}
 sleep $RETRAIN_DELAY
 
 echo -e "\n${GREEN}[2/3] Retreinando ML com dados do banco...${NC}" | tee -a $LOG_FILE
-python3 $BASE_DIR/train_ml_model.py --output $BASE_DIR/models >> $LOG_FILE 2>&1
+python3 "$BASE_DIR/training/train_ml_model.py" --output "$BASE_DIR/models" >> $LOG_FILE 2>&1
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}  ✓ Retreinamento concluído${NC}" | tee -a $LOG_FILE
@@ -71,7 +74,7 @@ sleep $REMAINING
 
 echo -e "\n${BLUE}[3/3] Parando todos os processos...${NC}" | tee -a $LOG_FILE
 cd $BASE_DIR
-./stop_all.sh >> $LOG_FILE 2>&1
+"$SCRIPT_DIR/stop_all.sh" >> $LOG_FILE 2>&1
 
 # Estatísticas finais
 echo -e "\n${BLUE}==========================================${NC}" | tee -a $LOG_FILE
@@ -82,7 +85,7 @@ echo -e "${BLUE}==========================================${NC}" | tee -a $LOG_F
 DECISIONS=$(python3 -c "
 import sqlite3
 try:
-    conn = sqlite3.connect('/tmp/rapp_data_lake.db')
+    conn = sqlite3.connect('$GREENRAN_DB_PATH')
     c = conn.cursor()
     c.execute('SELECT COUNT(*) FROM decisions_history WHERE timestamp >= strftime(\"%s\",\"now\") - 600')
     print(c.fetchone()[0])

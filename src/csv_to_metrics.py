@@ -19,19 +19,43 @@ import sys
 import json
 import time
 import argparse
+import math
 from pathlib import Path
 import threading
 import signal
 from collections import defaultdict
+from greenran_paths import (
+    NS3_DIR,
+    METRICS_JSON_PATH,
+    EXTENDED_METRICS_JSON_PATH,
+    STATE_DIR,
+    CARLA_STATE_DIR,
+    CARLA_VEHICLES_PATH,
+    CARLA_VEHICLE_MAP_PATH,
+    as_str,
+)
+from greenran_runtime import load_runtime_config
 
-DEFAULT_INPUT_DIR = "/home/robert/orange_nuclear/ns-O-RAN-flexric/mmwave-LENA-oran"
-DEFAULT_OUTPUT_FILE = "/tmp/xapp_metrics/metrics.json"
-DEFAULT_EXTENDED_OUTPUT_FILE = "/tmp/xapp_metrics/extended_metrics.json"
-DEFAULT_POLL_INTERVAL = 1.0
+RUNTIME_CONFIG = load_runtime_config()
+DEFAULT_INPUT_DIR = as_str(NS3_DIR)
+DEFAULT_OUTPUT_FILE = as_str(METRICS_JSON_PATH)
+DEFAULT_EXTENDED_OUTPUT_FILE = as_str(EXTENDED_METRICS_JSON_PATH)
+DEFAULT_POLL_INTERVAL = float(RUNTIME_CONFIG["collector"]["poll_interval_seconds"])
 
 CAMERA_IMSI_RANGE = (1, 3)
 SENSOR_IMSI_RANGE = (4, 50)
 UE_IMSI_RANGE = (51, 100)
+DEFAULT_SENSOR_PROFILES = [
+    {"sensor_type": "temperature", "unit": "°C", "connectivity": "5g_redcap", "gateway_id": "GW-5G-01", "domain": "environmental", "nominal_value": 27.0, "nominal_power_mw": 180.0},
+    {"sensor_type": "humidity", "unit": "%", "connectivity": "5g_redcap", "gateway_id": "GW-5G-01", "domain": "environmental", "nominal_value": 82.0, "nominal_power_mw": 185.0},
+    {"sensor_type": "soil_moisture", "unit": "%", "connectivity": "5g_native", "gateway_id": "GW-5G-02", "domain": "soil", "nominal_value": 58.0, "nominal_power_mw": 520.0},
+    {"sensor_type": "soil_temp", "unit": "°C", "connectivity": "5g_native", "gateway_id": "GW-5G-02", "domain": "soil", "nominal_value": 24.0, "nominal_power_mw": 500.0},
+    {"sensor_type": "soil_conductivity", "unit": "dS/m", "connectivity": "5g_redcap", "gateway_id": "GW-5G-02", "domain": "soil", "nominal_value": 1.15, "nominal_power_mw": 210.0},
+    {"sensor_type": "soil_nitrogen", "unit": "mg/kg", "connectivity": "5g_redcap", "gateway_id": "GW-5G-02", "domain": "soil", "nominal_value": 26.0, "nominal_power_mw": 215.0},
+    {"sensor_type": "air_quality", "unit": "AQI", "connectivity": "5g_native", "gateway_id": "GW-5G-03", "domain": "environmental", "nominal_value": 42.0, "nominal_power_mw": 540.0},
+    {"sensor_type": "rain_intensity", "unit": "mm/h", "connectivity": "5g_redcap", "gateway_id": "GW-5G-03", "domain": "environmental", "nominal_value": 1.0, "nominal_power_mw": 195.0},
+    {"sensor_type": "solar_radiation", "unit": "W/m²", "connectivity": "5g_native", "gateway_id": "GW-5G-03", "domain": "environmental", "nominal_value": 620.0, "nominal_power_mw": 530.0},
+]
 
 class ExtendedMetricsCollector:
     def __init__(self, input_dir, output_file, extended_output_file, poll_interval):
@@ -55,9 +79,25 @@ class ExtendedMetricsCollector:
         self.packet_loss_baseline = 0.001  # 0.1% baseline
         self.last_packet_loss = 0.0
         self.packet_loss_history = []
+        self.device_role_map_path = STATE_DIR / "xapp_metrics" / "device_roles.json"
+        self.device_role_map = {}
+        self.device_role_map_mtime = None
+        self.app2_state_dir = STATE_DIR / "app2_monitoramento"
+        self.app2_sensors_dir = self.app2_state_dir / "sensors"
+        self.app2_sensors_file = self.app2_sensors_dir / "latest.json"
+        self.app2_snapshot_file = self.app2_state_dir / "monitoring_snapshot.json"
+        self.carla_state_dir = CARLA_STATE_DIR
+        self.carla_vehicles_path = CARLA_VEHICLES_PATH
+        self.carla_vehicle_map_path = CARLA_VEHICLE_MAP_PATH
+        self.carla_vehicle_map = {}
+        self.carla_vehicle_state = {}
+        self.carla_vehicle_map_mtime = None
+        self.carla_vehicle_state_mtime = None
 
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         os.makedirs(os.path.dirname(extended_output_file), exist_ok=True)
+        os.makedirs(self.app2_sensors_dir, exist_ok=True)
+        os.makedirs(self.carla_state_dir, exist_ok=True)
         
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -113,9 +153,142 @@ class ExtendedMetricsCollector:
     
     def _signal_handler(self, signum, frame):
         self.running = False
+
+    def _refresh_device_role_map(self):
+        """Reload explicit IMSI role metadata when the scenario updates it."""
+        try:
+            if not self.device_role_map_path.exists():
+                self.device_role_map = {}
+                self.device_role_map_mtime = None
+                return
+
+            mtime = self.device_role_map_path.stat().st_mtime
+            if self.device_role_map_mtime is not None and mtime == self.device_role_map_mtime:
+                return
+
+            with open(self.device_role_map_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            roles = payload.get("roles", payload) if isinstance(payload, dict) else {}
+            self.device_role_map = roles if isinstance(roles, dict) else {}
+            self.device_role_map_mtime = mtime
+        except Exception as e:
+            print(f"[CSV_METRICS] Error reloading device role metadata: {e}")
+            self.device_role_map = {}
+            self.device_role_map_mtime = None
+
+    def _refresh_carla_vehicle_map(self):
+        try:
+            if not self.carla_vehicle_map_path.exists():
+                self.carla_vehicle_map = {}
+                self.carla_vehicle_map_mtime = None
+                return
+
+            mtime = self.carla_vehicle_map_path.stat().st_mtime
+            if self.carla_vehicle_map_mtime is not None and mtime == self.carla_vehicle_map_mtime:
+                return
+
+            with open(self.carla_vehicle_map_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            roles = payload.get("roles", {}) if isinstance(payload, dict) else {}
+            self.carla_vehicle_map = roles if isinstance(roles, dict) else {}
+            self.carla_vehicle_map_mtime = mtime
+        except Exception as e:
+            print(f"[CSV_METRICS] Error reloading CARLA vehicle map: {e}")
+            self.carla_vehicle_map = {}
+            self.carla_vehicle_map_mtime = None
+
+    def _refresh_carla_vehicle_state(self):
+        try:
+            if not self.carla_vehicles_path.exists():
+                self.carla_vehicle_state = {}
+                self.carla_vehicle_state_mtime = None
+                return
+
+            mtime = self.carla_vehicles_path.stat().st_mtime
+            if self.carla_vehicle_state_mtime is not None and mtime == self.carla_vehicle_state_mtime:
+                return
+
+            with open(self.carla_vehicles_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            vehicles = payload.get("vehicles", []) if isinstance(payload, dict) else []
+            self.carla_vehicle_state = {
+                str(vehicle.get("vehicle_id")): vehicle
+                for vehicle in vehicles
+                if isinstance(vehicle, dict) and vehicle.get("vehicle_id")
+            }
+            self.carla_vehicle_state_mtime = mtime
+        except Exception as e:
+            print(f"[CSV_METRICS] Error reloading CARLA vehicle state: {e}")
+            self.carla_vehicle_state = {}
+            self.carla_vehicle_state_mtime = None
+
+    def get_carla_vehicle_binding(self, imsi):
+        self._refresh_carla_vehicle_map()
+        meta = self.carla_vehicle_map.get(str(imsi), {})
+        return meta if isinstance(meta, dict) and meta else {}
+
+    def get_carla_vehicle_state(self, vehicle_id):
+        self._refresh_carla_vehicle_state()
+        if not vehicle_id:
+            return {}
+        state = self.carla_vehicle_state.get(str(vehicle_id), {})
+        return state if isinstance(state, dict) else {}
+
+    def get_device_meta(self, imsi):
+        """Return explicit metadata for an IMSI when available."""
+        carla_meta = self.get_carla_vehicle_binding(imsi)
+        if carla_meta.get("device_type") == "vehicle":
+            return carla_meta
+
+        self._refresh_device_role_map()
+        meta = self.device_role_map.get(str(imsi), {})
+        if isinstance(meta, dict) and meta:
+            return meta
+
+        try:
+            imsi_num = int(imsi)
+        except (TypeError, ValueError):
+            return {}
+
+        if CAMERA_IMSI_RANGE[0] <= imsi_num <= CAMERA_IMSI_RANGE[1]:
+            return {
+                "device_type": "camera",
+                "label": f"camera_{imsi_num}",
+            }
+
+        if SENSOR_IMSI_RANGE[0] <= imsi_num <= SENSOR_IMSI_RANGE[1]:
+            sensor_index = imsi_num - SENSOR_IMSI_RANGE[0]
+            profile = DEFAULT_SENSOR_PROFILES[sensor_index % len(DEFAULT_SENSOR_PROFILES)]
+            mobility_profile = "stationary"
+            if 4 <= imsi_num <= 10:
+                mobility_profile = "pedestrian"
+            elif 16 <= imsi_num <= 20:
+                mobility_profile = "vehicle"
+            return {
+                "device_type": "sensor",
+                "label": f"sensor_{sensor_index + 1}",
+                "sensor_type": profile["sensor_type"],
+                "unit": profile["unit"],
+                "connectivity": profile["connectivity"],
+                "gateway_id": profile["gateway_id"],
+                "domain": profile["domain"],
+                "nominal_value": profile["nominal_value"],
+                "nominal_power_mw": profile["nominal_power_mw"],
+                "nominal_battery_percent": 100.0,
+                "nominal_rssi_dbm": -88.0,
+                "tx_interval_s": 5 if profile["connectivity"] == "5g_native" else 10,
+                "mobility_profile": mobility_profile,
+            }
+
+        return {}
     
     def get_device_type(self, imsi):
         """Determine device type from IMSI"""
+        explicit_meta = self.get_device_meta(imsi)
+        explicit_type = explicit_meta.get("device_type")
+        if explicit_type:
+            return str(explicit_type)
+
         try:
             imsi_num = int(imsi)
             if CAMERA_IMSI_RANGE[0] <= imsi_num <= CAMERA_IMSI_RANGE[1]:
@@ -127,6 +300,148 @@ class ExtendedMetricsCollector:
         except ValueError:
             pass
         return "background"
+
+    def export_app2_metrics(self, extended_metrics):
+        """Export App2-compatible sensor views from real ns-3 sensor UEs."""
+        sensor_entries = []
+        ue_metrics = extended_metrics.get("ue_metrics", {}) or {}
+        global_metrics = extended_metrics.get("global_metrics", {}) or {}
+        sensor_values = []
+        sensor_latencies = []
+        sensor_rssi = []
+        observed_rx_packets = 0
+        global_loss_percent = float(global_metrics.get("global_packet_loss_rate", 0.0) or 0.0) * 100.0
+        global_loss_percent = max(0.0, min(global_loss_percent, 100.0))
+
+        for imsi, ue_data in ue_metrics.items():
+            if ue_data.get("device_type") != "sensor":
+                continue
+
+            meta = self.get_device_meta(imsi)
+            tx_pdus = int(ue_data.get("tx_pdus", 0) or 0)
+            rx_pdus = int(ue_data.get("rx_pdus", 0) or 0)
+            observed_rx_packets += rx_pdus
+            connected = bool(
+                ue_data.get("has_latency_samples")
+                or rx_pdus > 0
+                or float(ue_data.get("throughput_kbps", 0) or 0) > 0
+            )
+            packet_loss_percent = global_loss_percent
+            latency_ms = float(ue_data.get("latency_avg_us", ue_data.get("latency_us", 0)) or 0) / 1000.0
+            nominal_value = float(meta.get("nominal_value", 0.0) or 0.0)
+            value = nominal_value if nominal_value else round(float(ue_data.get("throughput_kbps", 0) or 0), 2)
+            unit = str(meta.get("unit", "kbps") or "kbps")
+            rssi_dbm = float(meta.get("nominal_rssi_dbm", -88.0) or -88.0)
+            battery_percent = float(meta.get("nominal_battery_percent", 100.0) or 100.0)
+            power_mw = float(meta.get("nominal_power_mw", 220.0) or 220.0)
+
+            sensor_entries.append({
+                "sensor_id": int(imsi),
+                "type": str(meta.get("sensor_type", "telemetry") or "telemetry"),
+                "value": round(value, 2),
+                "unit": unit,
+                "timestamp": extended_metrics.get("timestamp_iso"),
+                "status": "ok" if connected else "error",
+                "domain": str(meta.get("domain", "network") or "network"),
+                "connectivity": str(meta.get("connectivity", "5g_native") or "5g_native"),
+                "gateway_id": str(meta.get("gateway_id", "GW-5G-NS3") or "GW-5G-NS3"),
+                "battery_percent": round(battery_percent, 1),
+                "latency_ms": round(latency_ms, 2),
+                "packet_loss_percent": round(packet_loss_percent, 2),
+                "rssi_dbm": round(rssi_dbm, 1),
+                "power_mw": round(power_mw, 1),
+                "tx_interval_s": int(meta.get("tx_interval_s", 5) or 5),
+                "packets_tx": rx_pdus,
+                "mobility_profile": str(meta.get("mobility_profile", "stationary") or "stationary"),
+                "source": "ns3_ue_proxy",
+            })
+
+            sensor_values.append(value)
+            sensor_latencies.append(latency_ms)
+            sensor_rssi.append(rssi_dbm)
+
+        if not sensor_entries:
+            return
+
+        connected_count = sum(1 for s in sensor_entries if s["status"] == "ok")
+        error_count = len(sensor_entries) - connected_count
+        total_throughput_kbps = sum(
+            float(ue_data.get("throughput_kbps", 0) or 0)
+            for ue_data in ue_metrics.values()
+            if ue_data.get("device_type") == "sensor"
+        )
+        network_utilization = min(100.0, total_throughput_kbps / max(len(sensor_entries) * 64.0, 1.0))
+        estimated_tx_packets = int(round(observed_rx_packets / max(1e-9, (1.0 - global_loss_percent / 100.0)))) if observed_rx_packets > 0 and global_loss_percent < 100.0 else observed_rx_packets
+        packets_lost = max(estimated_tx_packets - observed_rx_packets, 0)
+        delivery_success = 100.0 - global_loss_percent
+
+        snapshot = {
+            "timestamp": extended_metrics.get("timestamp_iso"),
+            "sensors": {
+                "total": len(sensor_entries),
+                "active": connected_count,
+                "connected": connected_count,
+                "error": error_count,
+                "low_battery": 0,
+                "connectivity_modes": sorted({s["connectivity"] for s in sensor_entries}),
+                "gateways": sorted({s["gateway_id"] for s in sensor_entries}),
+            },
+            "readings": {
+                "avg_temperature_c": round(
+                    sum(s["value"] for s in sensor_entries if s["type"] == "temperature")
+                    / max(1, sum(1 for s in sensor_entries if s["type"] == "temperature")),
+                    2,
+                ) if any(s["type"] == "temperature" for s in sensor_entries) else 0,
+                "avg_humidity_percent": round(
+                    sum(s["value"] for s in sensor_entries if s["type"] in {"humidity", "soil_moisture"})
+                    / max(1, sum(1 for s in sensor_entries if s["type"] in {"humidity", "soil_moisture"})),
+                    2,
+                ) if any(s["type"] in {"humidity", "soil_moisture"} for s in sensor_entries) else 0,
+                "avg_soil_conductivity": round(
+                    sum(s["value"] for s in sensor_entries if s["type"] == "soil_conductivity")
+                    / max(1, sum(1 for s in sensor_entries if s["type"] == "soil_conductivity")),
+                    2,
+                ) if any(s["type"] == "soil_conductivity" for s in sensor_entries) else 0,
+                "avg_battery_percent": round(sum(s["battery_percent"] for s in sensor_entries) / len(sensor_entries), 2),
+                "avg_power_mw": round(sum(s["power_mw"] for s in sensor_entries) / len(sensor_entries), 2),
+            },
+            "network": {
+                "packet_loss_percent": round(global_loss_percent, 2),
+                "tx_packets": estimated_tx_packets,
+                "rx_packets": observed_rx_packets,
+                "lost_packets": packets_lost,
+                "avg_latency_ms": round(sum(sensor_latencies) / len(sensor_latencies), 2) if sensor_latencies else 0,
+                "avg_rssi_dbm": round(sum(sensor_rssi) / len(sensor_rssi), 2) if sensor_rssi else -88.0,
+                "network_utilization_percent": round(network_utilization, 2),
+                "delivery_success_percent": round(delivery_success, 2),
+            },
+            "alerts": [],
+            "simulation": {
+                "mode": "ns3_real_sensor_ues",
+                "simulated_hour": None,
+            },
+        }
+
+        self.write_metrics(sensor_entries, self.app2_sensors_file)
+        self.write_metrics(snapshot, self.app2_snapshot_file)
+
+    def export_device_roles_snapshot(self, extended_metrics):
+        """Persist a coherent device role map even when the scenario did not write one."""
+        roles = {}
+        for imsi, ue_data in (extended_metrics.get("ue_metrics", {}) or {}).items():
+            meta = dict(self.get_device_meta(imsi) or {})
+            meta.setdefault("device_type", ue_data.get("device_type", "background"))
+            roles[str(imsi)] = meta
+
+        if not roles:
+            return
+
+        payload = {
+            "generated_by": "csv_to_metrics_fallback",
+            "scenario": "runtime_fallback",
+            "roles": roles,
+        }
+        self.write_metrics(payload, str(self.device_role_map_path))
     
     def process_pdcp_stats(self, filepath):
         """Process DlPdcpStats.txt - Ground truth for latency
@@ -251,6 +566,94 @@ class ExtendedMetricsCollector:
             print(f"[CSV_METRICS] Error reading MAC stats: {e}")
         
         return metrics
+
+    def process_mmwave_sched_stats(self, filepath):
+        """Process EnbSchedAllocTraces.txt - mmWave scheduler allocations."""
+        if not filepath.exists():
+            return {}
+
+        recent_rows = []
+
+        try:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    if line.startswith('frame') or not line.strip():
+                        continue
+
+                    parts = line.strip().split('\t')
+                    if len(parts) < 10:
+                        continue
+
+                    try:
+                        recent_rows.append({
+                            'frame': int(parts[0]),
+                            'subframe': int(parts[1]),
+                            'slot': int(parts[2]),
+                            'rnti': int(parts[3]),
+                            'first_sym': int(parts[4]),
+                            'num_sym': int(parts[5]),
+                            'type': int(parts[6]),
+                            'tdd_mode': int(parts[7]),
+                            'retx_num': int(parts[8]),
+                            'cc_id': int(parts[9]),
+                        })
+                    except (ValueError, IndexError):
+                        continue
+        except Exception as e:
+            print(f"[CSV_METRICS] Error reading mmWave scheduler stats: {e}")
+            return {}
+
+        if not recent_rows:
+            return {}
+
+        window_rows = recent_rows[-5000:]
+        rnti_stats = defaultdict(lambda: {
+            'allocations': 0,
+            'symbols': 0,
+            'dl_allocations': 0,
+            'ul_allocations': 0,
+            'control_allocations': 0,
+            'retx_allocations': 0,
+            'cc_ids': set(),
+        })
+        for row in window_rows:
+            stats = rnti_stats[row['rnti']]
+            stats['allocations'] += 1
+            stats['symbols'] += row['num_sym']
+            stats['cc_ids'].add(row['cc_id'])
+            if row['retx_num'] > 0:
+                stats['retx_allocations'] += 1
+            if row['rnti'] == 0 or row['type'] == 2:
+                stats['control_allocations'] += 1
+            elif row['tdd_mode'] == 1:
+                stats['dl_allocations'] += 1
+            elif row['tdd_mode'] == 2:
+                stats['ul_allocations'] += 1
+
+        per_rnti = {}
+        for rnti, stats in rnti_stats.items():
+            per_rnti[str(rnti)] = {
+                'allocations': stats['allocations'],
+                'symbols': stats['symbols'],
+                'dl_allocations': stats['dl_allocations'],
+                'ul_allocations': stats['ul_allocations'],
+                'control_allocations': stats['control_allocations'],
+                'retx_allocations': stats['retx_allocations'],
+                'cc_ids': sorted(stats['cc_ids']),
+            }
+
+        data_rntis = [rnti for rnti in rnti_stats if rnti > 0]
+
+        return {
+            'row_count': len(recent_rows),
+            'window_row_count': len(window_rows),
+            'observed_rntis': len(rnti_stats),
+            'observed_data_rntis': len(data_rntis),
+            'observed_control_rntis': 1 if 0 in rnti_stats else 0,
+            'per_rnti': per_rnti,
+            'rnti_counts': {rnti: stats['allocations'] for rnti, stats in rnti_stats.items()},
+            'source_file': str(filepath),
+        }
     
     def process_rlc_stats(self, filepath):
         """Process DlRlcStats.txt - RLC layer metrics"""
@@ -291,6 +694,111 @@ class ExtendedMetricsCollector:
             print(f"[CSV_METRICS] Error reading RLC stats: {e}")
         
         return metrics
+
+    def process_cu_up_stats(self, filepaths):
+        """Process cu-up-cell-*.txt and extract the latest per-UE throughput snapshot.
+
+        The CU-UP file is not perfectly aligned with its header in all scenarios, so this
+        parser intentionally uses positional access for the fields that are consistently
+        present in the generated rows:
+            0: timestamp
+            1: IMSI
+            2: cell average latency (ms)
+            7: PDCP throughput (Mbps)
+            8: PDCP latency (ms)
+        """
+        latest_rows = []
+        source_files = []
+        file_snapshots = []
+
+        for filepath in sorted(filepaths):
+            if not filepath.exists():
+                continue
+
+            source_files.append(str(filepath))
+            file_latest_ts = None
+            file_latest_rows = []
+            file_mtime = filepath.stat().st_mtime
+
+            try:
+                with open(filepath, "r") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line or line.startswith("timestamp"):
+                            continue
+
+                        parts = [part.strip() for part in line.split(",")]
+                        if len(parts) < 9:
+                            continue
+
+                        try:
+                            timestamp = int(parts[0])
+                            imsi = str(int(parts[1]))
+                            cell_average_latency_ms = float(parts[2] or 0.0)
+                            pdcp_throughput_mbps = float(parts[7] or 0.0)
+                            pdcp_latency_ms = float(parts[8] or 0.0)
+                        except ValueError:
+                            continue
+
+                        row = {
+                            "timestamp": timestamp,
+                            "imsi": imsi,
+                            "cell_average_latency_ms": cell_average_latency_ms,
+                            "pdcp_throughput_mbps": pdcp_throughput_mbps,
+                            "pdcp_throughput_kbps": pdcp_throughput_mbps * 1000.0,
+                            "pdcp_latency_ms": pdcp_latency_ms,
+                            "source_file": str(filepath),
+                        }
+
+                        if file_latest_ts is None or timestamp > file_latest_ts:
+                            file_latest_ts = timestamp
+                            file_latest_rows = [row]
+                        elif timestamp == file_latest_ts:
+                            file_latest_rows.append(row)
+            except Exception as e:
+                print(f"[CSV_METRICS] Error reading CU-UP stats from {filepath}: {e}")
+
+            if file_latest_rows:
+                file_snapshots.append({
+                    "path": str(filepath),
+                    "mtime": file_mtime,
+                    "latest_timestamp": file_latest_ts,
+                    "rows": file_latest_rows,
+                })
+
+        if file_snapshots:
+            freshest_mtime = max(snapshot["mtime"] for snapshot in file_snapshots)
+            freshness_window_s = max(10.0, self.poll_interval * 10.0)
+            active_snapshots = [
+                snapshot for snapshot in file_snapshots
+                if freshest_mtime - snapshot["mtime"] <= freshness_window_s
+            ]
+            for snapshot in active_snapshots:
+                latest_rows.extend(snapshot["rows"])
+            source_files = [snapshot["path"] for snapshot in active_snapshots]
+
+        per_ue = {}
+        total_throughput_kbps = 0.0
+        latest_timestamp = 0
+
+        for row in latest_rows:
+            imsi = row["imsi"]
+            latest_timestamp = max(latest_timestamp, row["timestamp"])
+            per_ue[imsi] = {
+                "throughput_kbps": row["pdcp_throughput_kbps"],
+                "pdcp_latency_ms": row["pdcp_latency_ms"],
+                "cell_average_latency_ms": row["cell_average_latency_ms"],
+                "source_file": row["source_file"],
+            }
+            total_throughput_kbps += row["pdcp_throughput_kbps"]
+
+        return {
+            "source_files": source_files,
+            "latest_timestamp": latest_timestamp,
+            "total_throughput_kbps": total_throughput_kbps,
+            "per_ue": per_ue,
+            "row_count": len(latest_rows),
+        }
     
     def percentile(self, data, p):
         """Retorna percentil p (0-100)"""
@@ -321,8 +829,18 @@ class ExtendedMetricsCollector:
             return (sorted_data[n//2 - 1] + sorted_data[n//2]) / 2
         else:
             return sorted_data[n//2]
+
+    def calculate_cvar(self, data, tail_fraction=0.05):
+        """Tail-mean of the worst tail_fraction values."""
+        if not data:
+            return 0
+
+        sorted_desc = sorted(data, reverse=True)
+        tail_count = max(1, math.ceil(len(sorted_desc) * tail_fraction))
+        tail_values = sorted_desc[:tail_count]
+        return sum(tail_values) / len(tail_values)
     
-    def aggregate_metrics(self, pdcp_metrics, mac_metrics):
+    def aggregate_metrics(self, pdcp_metrics, mac_metrics, rlc_metrics=None, cu_up_metrics=None, mmwave_sched_metrics=None):
         """Aggregate all metrics into comprehensive JSON"""
         
         result = {
@@ -340,6 +858,7 @@ class ExtendedMetricsCollector:
                 'global_packet_loss_rate': 0.0,
                 'total_active_ues': 0,
                 'total_active_cameras': 0,
+                'total_active_vehicles': 0,
                 'total_critical_ues': 0,
                 'total_tx_bytes': 0,
                 'total_rx_bytes': 0,
@@ -361,17 +880,27 @@ class ExtendedMetricsCollector:
         if not pdcp_metrics:
             return result
         
-        current_time = pdcp_metrics[0].get('time_start', 0)
+        pdcp_metrics.sort(key=lambda m: (m.get('time_end', 0), m.get('time_start', 0)))
+
+        current_time = pdcp_metrics[-1].get('time_end', 0)
         recent_window = 30.0
-        recent_metrics = [m for m in pdcp_metrics if (current_time - m.get('time_start', 0)) <= recent_window]
+        recent_threshold = max(0.0, current_time - recent_window)
+        recent_metrics = [
+            m for m in pdcp_metrics
+            if m.get('time_end', m.get('time_start', 0)) >= recent_threshold
+        ]
         
         if not recent_metrics:
             return result
         
+        observed_window_start = recent_metrics[0].get('time_start', 0)
+        observed_window_end = recent_metrics[-1].get('time_end', recent_metrics[-1].get('time_start', 0))
+        observed_window_s = max(observed_window_end - observed_window_start, 1e-6)
+
         result['sim_time_range'] = {
-            'start': recent_metrics[0].get('time_start', 0),
-            'end': recent_metrics[-1].get('time_start', 0),
-            'window_s': recent_window
+            'start': observed_window_start,
+            'end': observed_window_end,
+            'window_s': observed_window_s
         }
         
         ue_data = defaultdict(lambda: {
@@ -384,7 +913,10 @@ class ExtendedMetricsCollector:
             'pdu_sizes': [],
             'lat_min': float('inf'),
             'lat_max': 0.0,
-            'device_type': 'unknown'
+            'device_type': 'unknown',
+            'cell_id': 0,
+            'time_start_min': float('inf'),
+            'time_end_max': 0.0,
         })
         
         all_latencies = []
@@ -402,20 +934,25 @@ class ExtendedMetricsCollector:
 
         for m in recent_metrics:
             imsi = m['imsi']
-            ue_data[imsi]['latencies'].append(m['delay_us'])
             ue_data[imsi]['tx_bytes'] += m['tx_bytes']
             ue_data[imsi]['rx_bytes'] += m['rx_bytes']
             ue_data[imsi]['tx_pdus'] += m['n_tx_pdus']
             ue_data[imsi]['rx_pdus'] += m['n_rx_pdus']
-            ue_data[imsi]['jitters'].append(m['delay_stddev_us'])
-            ue_data[imsi]['pdu_sizes'].append(m['pdu_size'])
-            ue_data[imsi]['lat_min'] = min(ue_data[imsi]['lat_min'], m['delay_min_us'])
-            ue_data[imsi]['lat_max'] = max(ue_data[imsi]['lat_max'], m['delay_max_us'])
             ue_data[imsi]['device_type'] = m['device_type']
             ue_data[imsi]['cell_id'] = m['cell_id']
-            
-            all_latencies.append(m['delay_us'])
-            all_jitters.append(m['delay_stddev_us'])
+            ue_data[imsi]['time_start_min'] = min(ue_data[imsi]['time_start_min'], m['time_start'])
+            ue_data[imsi]['time_end_max'] = max(ue_data[imsi]['time_end_max'], m['time_end'])
+
+            has_valid_latency = m['n_rx_pdus'] > 0 and m['delay_us'] > 0
+            if has_valid_latency:
+                ue_data[imsi]['latencies'].append(m['delay_us'])
+                ue_data[imsi]['jitters'].append(m['delay_stddev_us'])
+                ue_data[imsi]['pdu_sizes'].append(m['pdu_size'])
+                ue_data[imsi]['lat_min'] = min(ue_data[imsi]['lat_min'], m['delay_min_us'])
+                ue_data[imsi]['lat_max'] = max(ue_data[imsi]['lat_max'], m['delay_max_us'])
+
+                all_latencies.append(m['delay_us'])
+                all_jitters.append(m['delay_stddev_us'])
             
         # Garantir que UEs no cache mas sem tráfego recente também sejam processados
         for imsi in active_imsis:
@@ -424,6 +961,8 @@ class ExtendedMetricsCollector:
                 ue_data[imsi]['latencies'] = [] # Ativo mas sem dados novos
         
         camera_count = 0
+        sensor_count = 0
+        vehicle_count = 0
         camera_critical_count = 0
         critical_count = 0
         total_tx_bytes = 0
@@ -434,16 +973,20 @@ class ExtendedMetricsCollector:
         SLA_THRESHOLD_US = 100000
         
         for imsi, data in ue_data.items():
-            if not data['latencies']:
-                continue
-            
-            avg_latency = sum(data['latencies']) / len(data['latencies'])
-            max_latency = max(data['latencies'])
+            has_latency_samples = bool(data['latencies'])
+            avg_latency = sum(data['latencies']) / len(data['latencies']) if has_latency_samples else 0
+            max_latency = max(data['latencies']) if has_latency_samples else 0
             avg_jitter = sum(data['jitters']) / len(data['jitters']) if data['jitters'] else 0
             avg_pdu_size = sum(data['pdu_sizes']) / len(data['pdu_sizes']) if data['pdu_sizes'] else 0
             
-            throughput_bytes = data['tx_bytes'] + data['rx_bytes']
-            throughput_kbps = (throughput_bytes * 8) / (recent_window * 1000) if recent_window > 0 else 0
+            active_window_s = observed_window_s
+            if data['time_start_min'] != float('inf') and data['time_end_max'] > 0:
+                active_window_s = max(data['time_end_max'] - data['time_start_min'], 1e-6)
+
+            tx_throughput_kbps = (data['tx_bytes'] * 8) / (active_window_s * 1000) if active_window_s > 0 else 0
+            rx_throughput_kbps = (data['rx_bytes'] * 8) / (active_window_s * 1000) if active_window_s > 0 else 0
+            total_pdcp_throughput_kbps = ((data['tx_bytes'] + data['rx_bytes']) * 8) / (active_window_s * 1000) if active_window_s > 0 else 0
+            throughput_kbps = rx_throughput_kbps
             
             result['ue_metrics'][imsi] = {
                 'device_type': data['device_type'],
@@ -451,7 +994,7 @@ class ExtendedMetricsCollector:
                 'latency_us': max_latency,
                 'latency_avg_us': avg_latency,
                 'latency_min_us': data['lat_min'] if data['lat_min'] != float('inf') else 0,
-                'latency_max_us': data['lat_max'],
+                'latency_max_us': data['lat_max'] if has_latency_samples else 0,
                 'jitter_us': avg_jitter,
                 'pdu_size_avg': avg_pdu_size,
                 'tx_bytes': data['tx_bytes'],
@@ -459,43 +1002,83 @@ class ExtendedMetricsCollector:
                 'tx_pdus': data['tx_pdus'],
                 'rx_pdus': data['rx_pdus'],
                 'throughput_kbps': throughput_kbps,
+                'tx_throughput_kbps': tx_throughput_kbps,
+                'rx_throughput_kbps': rx_throughput_kbps,
+                'total_pdcp_throughput_kbps': total_pdcp_throughput_kbps,
                 'packet_count': len(data['latencies']),
-                'is_critical': max_latency >= SLA_THRESHOLD_US
+                'has_latency_samples': has_latency_samples,
+                'is_critical': has_latency_samples and max_latency >= SLA_THRESHOLD_US,
+                'throughput_source': 'pdcp_rx_window'
             }
+
+            vehicle_meta = self.get_carla_vehicle_binding(imsi)
+            if result['ue_metrics'][imsi]['device_type'] == 'vehicle' and vehicle_meta:
+                vehicle_id = vehicle_meta.get('vehicle_id')
+                vehicle_state = self.get_carla_vehicle_state(vehicle_id)
+                result['ue_metrics'][imsi].update({
+                    'vehicle_id': vehicle_id,
+                    'vehicle_role': vehicle_meta.get('vehicle_role', 'traffic'),
+                    'connectivity': vehicle_meta.get('connectivity', '5g_native'),
+                    'gateway_id': vehicle_meta.get('gateway_id', 'GW-VEH-01'),
+                    'domain': vehicle_meta.get('domain', 'vehicular'),
+                    'mobility_profile': vehicle_meta.get('mobility_profile', 'vehicle'),
+                    'autonomy_state': vehicle_state.get('autonomy_state', vehicle_meta.get('autonomy_state', 'normal')),
+                    'risk_state': vehicle_state.get('risk_state', vehicle_meta.get('risk_state', 'low')),
+                    'packet_loss_percent': float(vehicle_state.get('packet_loss_percent', 0.0) or 0.0),
+                    'speed_mps': float(vehicle_state.get('speed_mps', 0.0) or 0.0),
+                    'heading_deg': float(vehicle_state.get('heading_deg', 0.0) or 0.0),
+                    'lane_id': vehicle_state.get('lane_id'),
+                    'waypoint_id': vehicle_state.get('waypoint_id'),
+                    'position': {
+                        'x': float(vehicle_state.get('x', 0.0) or 0.0),
+                        'y': float(vehicle_state.get('y', 0.0) or 0.0),
+                        'z': float(vehicle_state.get('z', 0.0) or 0.0),
+                    },
+                })
+                override_latency_ms = vehicle_state.get('latency_ms')
+                if override_latency_ms is not None:
+                    override_latency_us = max(0.0, float(override_latency_ms or 0.0) * 1000.0)
+                    result['ue_metrics'][imsi]['latency_us'] = override_latency_us
+                    result['ue_metrics'][imsi]['latency_avg_us'] = override_latency_us
+                    result['ue_metrics'][imsi]['latency_max_us'] = override_latency_us
+                    result['ue_metrics'][imsi]['latency_min_us'] = override_latency_us
+                    result['ue_metrics'][imsi]['has_latency_samples'] = True
+                    result['ue_metrics'][imsi]['is_critical'] = override_latency_us >= SLA_THRESHOLD_US
+                    result['ue_metrics'][imsi]['latency_source'] = 'vehicle_override'
             
             total_tx_bytes += data['tx_bytes']
             total_rx_bytes += data['rx_bytes']
             
             if data['device_type'] == 'camera':
                 camera_count += 1
-                if max_latency >= SLA_THRESHOLD_US:
+                if has_latency_samples and max_latency >= SLA_THRESHOLD_US:
                     camera_critical_count += 1
-                if max_latency > worst_camera_latency:
+                if has_latency_samples and max_latency > worst_camera_latency:
                     worst_camera_latency = max_latency
+            elif data['device_type'] == 'sensor':
+                sensor_count += 1
+            elif data['device_type'] == 'vehicle':
+                vehicle_count += 1
             
-            if max_latency >= SLA_THRESHOLD_US:
+            if has_latency_samples and max_latency >= SLA_THRESHOLD_US:
                 critical_count += 1
             
-            if max_latency > worst_latency:
+            if has_latency_samples and max_latency > worst_latency:
                 worst_latency = max_latency
         
         global_avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else 0
         global_avg_jitter = sum(all_jitters) / len(all_jitters) if all_jitters else 0
         
-        # Filtrar valores zero para métricas de min (valores 0 são artefatos)
-        all_latencies_nonzero = [l for l in all_latencies if l > 0]
-        global_min_latency = min(all_latencies_nonzero) if all_latencies_nonzero else 0
+        global_min_latency = min(all_latencies) if all_latencies else 0
         global_max_latency = max(all_latencies) if all_latencies else 0
         
-        # Métricas robustas (percentis) - usar apenas valores não-zero
-        latency_p5 = self.percentile_5(all_latencies_nonzero) if all_latencies_nonzero else 0
+        # Métricas robustas - todas as amostras válidas já excluem zeros sem Rx
+        latency_p5 = self.percentile_5(all_latencies) if all_latencies else 0
         latency_p95 = self.percentile_95(all_latencies)
         latency_min_nonzero = self.min_nonzero(all_latencies)
-        latency_median = self.median(all_latencies_nonzero) if all_latencies_nonzero else 0
+        latency_median = self.median(all_latencies) if all_latencies else 0
         
-        # NOVO: Calcular métricas POR UE para capturar UEs críticos
-        # Isso corrige o problema onde P95 agregado não reflete UEs com latência alta
-        # Filtro de outliers: ignorar latências > 500ms para evitar dados corrompidos
+        # Métricas POR UE para capturar UEs críticos
         OUTLIER_THRESHOLD_US = 500000  # 500ms - filtrar outliers extremos
         ue_avg_latencies = []
         ue_worst_latencies = []
@@ -514,45 +1097,43 @@ class ExtendedMetricsCollector:
         
         # CVaR e Variância agora usam latência POR UE
         if ue_avg_latencies:
-            # P95 por UE - usa MÉDIA de cada UE
             latency_p95_per_ue = self.percentile_95(ue_avg_latencies)
             
-            # Variância por UE - mede dispersão entre UEs
             ue_mean = sum(ue_avg_latencies) / len(ue_avg_latencies)
             variance_per_ue = sum((x - ue_mean) ** 2 for x in ue_avg_latencies) / len(ue_avg_latencies)
             
-            # CVaR por UE - P95 da PIOR latência de cada UE (não da média!)
-            # Isso captura quando os 5% piores UEs estão com latência alta
             if ue_worst_latencies:
-                sorted_ue_worst = sorted(ue_worst_latencies, reverse=True)
-                cvar_idx = int(len(sorted_ue_worst) * 0.95)
-                cvar_per_ue = sum(sorted_ue_worst[:cvar_idx]) / cvar_idx if cvar_idx > 0 else sorted_ue_worst[0]
+                cvar_per_ue = self.calculate_cvar(ue_worst_latencies, tail_fraction=0.05)
+                cvar_tail_count = max(1, math.ceil(len(ue_worst_latencies) * 0.05))
             else:
                 cvar_per_ue = 0
+                cvar_tail_count = 0
         else:
             latency_p95_per_ue = latency_p95
             variance_per_ue = 0
             cvar_per_ue = 0
+            cvar_tail_count = 0
 
-        # Calculate throughput using DELTA (not cumulative)
+        # Calculate throughput using PDCP delta (fallback / cross-check)
         current_sim_time = recent_metrics[-1].get('time_end', 0) if recent_metrics else 0
         sim_time_delta = current_sim_time - self.last_sim_time
 
         if self.last_sim_time > 0 and sim_time_delta > 0:
-            # Use delta for real throughput
             delta_tx = total_tx_bytes - self.last_total_tx_bytes
             delta_rx = total_rx_bytes - self.last_total_rx_bytes
             delta_throughput = (delta_tx + delta_rx) * 8 / (sim_time_delta * 1000)
-            total_throughput_kbps = max(0, delta_throughput)  # Avoid negative from counter reset
+            pdcp_delta_throughput_kbps = max(0, delta_throughput)
         else:
-            # First reading, use window-based calculation
             total_throughput = total_tx_bytes + total_rx_bytes
-            total_throughput_kbps = (total_throughput * 8) / (recent_window * 1000) if recent_window > 0 else 0
+            pdcp_delta_throughput_kbps = (total_throughput * 8) / (observed_window_s * 1000) if observed_window_s > 0 else 0
 
-        # Update tracking variables
         self.last_total_tx_bytes = total_tx_bytes
         self.last_total_rx_bytes = total_rx_bytes
         self.last_sim_time = current_sim_time
+
+        cu_up_total_throughput_kbps = float((cu_up_metrics or {}).get('total_throughput_kbps', 0) or 0)
+        throughput_kbps = pdcp_delta_throughput_kbps
+        throughput_source = 'pdcp_delta'
         
         result['global_metrics'] = {
             'global_worst_latency_us': worst_latency,
@@ -564,22 +1145,35 @@ class ExtendedMetricsCollector:
             'global_packet_loss_rate': self._calculate_packet_loss(worst_latency, critical_count, camera_count),
             'total_active_ues': len(ue_data),
             'total_active_cameras': camera_count,
+            'total_active_sensors': sensor_count,
+            'total_active_vehicles': vehicle_count,
             'total_critical_ues': critical_count,
             'total_tx_bytes': total_tx_bytes,
             'total_rx_bytes': total_rx_bytes,
             'total_tx_pdus': sum(d['tx_pdus'] for d in ue_data.values()),
             'total_rx_pdus': sum(d['rx_pdus'] for d in ue_data.values()),
-            'throughput_kbps': total_throughput_kbps,
-            # Métricas robustas
+            'throughput_kbps': throughput_kbps,
+            'throughput_source': throughput_source,
+            'pdcp_delta_throughput_kbps': pdcp_delta_throughput_kbps,
+            'cu_up_total_throughput_kbps': cu_up_total_throughput_kbps,
             'latency_p5_us': latency_p5,
             'latency_p95_us': latency_p95,
             'latency_min_nonzero_us': latency_min_nonzero,
             'latency_median_us': latency_median,
-            # NOVO: Métricas POR UE (capturam UEs críticos)
             'latency_p95_per_ue_us': latency_p95_per_ue,
             'variance_per_ue_us2': variance_per_ue,
             'cvar_per_ue_us': cvar_per_ue,
-            'ue_count': len(ue_avg_latencies)
+            'cvar_tail_count': cvar_tail_count,
+            'ue_count': len(ue_avg_latencies),
+            'ues_with_latency_samples': len(ue_avg_latencies),
+            'ues_without_latency_samples': max(0, len(ue_data) - len(ue_avg_latencies)),
+            'lte_mac_observed_ues': 0,
+            'mmwave_sched_observed_rntis': 0,
+            'mmwave_sched_observed_data_rntis': 0,
+            'mmwave_sched_observed_control_rntis': 0,
+            'mmwave_sched_mapped_ues': 0,
+            'mmwave_sched_window_allocs': 0,
+            'mac_trace_mode': 'unknown',
         }
         
         result['active_cameras'] = camera_count
@@ -604,19 +1198,157 @@ class ExtendedMetricsCollector:
                 result['global_metrics']['global_mcs_min'] = min(all_mcs) if all_mcs else 0
                 result['global_metrics']['global_mcs_max'] = max(all_mcs) if all_mcs else 0
                 result['global_metrics']['global_tb_size_avg'] = sum(all_tb_sizes) / len(all_tb_sizes) if all_tb_sizes else 0
+            result['global_metrics']['lte_mac_observed_ues'] = len(mac_by_imsi)
             
             for imsi, data in mac_by_imsi.items():
                 if imsi in result['ue_metrics']:
                     result['ue_metrics'][imsi]['mcs_avg'] = sum(data['mcs']) / len(data['mcs']) if data['mcs'] else 0
                     result['ue_metrics'][imsi]['tb_size_avg'] = sum(data['tb_sizes']) / len(data['tb_sizes']) if data['tb_sizes'] else 0
+
+        if mmwave_sched_metrics:
+            mmwave_sched_observed_rntis = int(mmwave_sched_metrics.get('observed_rntis', 0) or 0)
+            mmwave_sched_data_rntis = int(mmwave_sched_metrics.get('observed_data_rntis', 0) or 0)
+            result['global_metrics']['mmwave_sched_observed_rntis'] = mmwave_sched_observed_rntis
+            result['global_metrics']['mmwave_sched_observed_data_rntis'] = mmwave_sched_data_rntis
+            result['global_metrics']['mmwave_sched_observed_control_rntis'] = int(mmwave_sched_metrics.get('observed_control_rntis', 0) or 0)
+            result['global_metrics']['mmwave_sched_window_allocs'] = int(mmwave_sched_metrics.get('window_row_count', 0) or 0)
+
+            lte_mac_observed = int(result['global_metrics'].get('lte_mac_observed_ues', 0) or 0)
+            if lte_mac_observed <= 1 and mmwave_sched_data_rntis > 1:
+                result['global_metrics']['mac_trace_mode'] = 'lte_anchor_only_mmwave_multi'
+            elif lte_mac_observed > 1:
+                result['global_metrics']['mac_trace_mode'] = 'lte_per_ue'
+            elif mmwave_sched_data_rntis > 0:
+                result['global_metrics']['mac_trace_mode'] = 'mmwave_scheduler_only'
+
+        if rlc_metrics:
+            rlc_by_imsi = defaultdict(int)
+            rlc_by_cell = defaultdict(lambda: {'imsis': set(), 'rnti_to_imsi': {}})
+            for item in rlc_metrics[-5000:]:
+                rlc_by_imsi[item['imsi']] += 1
+                if item.get('rnti', 0) > 0:
+                    cell_id = item.get('cell_id', 0)
+                    rlc_by_cell[cell_id]['imsis'].add(item['imsi'])
+                    rlc_by_cell[cell_id]['rnti_to_imsi'][item['rnti']] = item['imsi']
+
+            scheduler_cell_id = 0
+            rnti_to_imsi = {}
+            if rlc_by_cell:
+                scheduler_cell_id, scheduler_cell_data = max(
+                    rlc_by_cell.items(),
+                    key=lambda item: len(item[1]['imsis'])
+                )
+                rnti_to_imsi = scheduler_cell_data['rnti_to_imsi']
+
+            result['global_metrics']['rlc_record_count'] = len(rlc_metrics)
+            result['global_metrics']['rlc_observed_ues'] = len(rlc_by_imsi)
+            result['global_metrics']['mmwave_sched_mapping_cell_id'] = scheduler_cell_id
+
+            for imsi, count in rlc_by_imsi.items():
+                if imsi in result['ue_metrics']:
+                    result['ue_metrics'][imsi]['rlc_records'] = count
+
+            if mmwave_sched_metrics:
+                mmwave_by_imsi = {}
+                unmapped_rntis = []
+                for rnti_text, sched in mmwave_sched_metrics.get('per_rnti', {}).items():
+                    try:
+                        rnti = int(rnti_text)
+                    except ValueError:
+                        continue
+                    if rnti <= 0:
+                        continue
+
+                    imsi = rnti_to_imsi.get(rnti)
+                    if not imsi:
+                        unmapped_rntis.append(rnti)
+                        continue
+
+                    entry = {
+                        'rnti': rnti,
+                        'allocations': sched.get('allocations', 0),
+                        'symbols': sched.get('symbols', 0),
+                        'dl_allocations': sched.get('dl_allocations', 0),
+                        'ul_allocations': sched.get('ul_allocations', 0),
+                        'retx_allocations': sched.get('retx_allocations', 0),
+                        'cc_ids': sched.get('cc_ids', []),
+                    }
+                    mmwave_by_imsi[imsi] = entry
+                    if imsi in result['ue_metrics']:
+                        result['ue_metrics'][imsi]['mmwave_sched_rnti'] = rnti
+                        result['ue_metrics'][imsi]['mmwave_sched_allocations'] = entry['allocations']
+                        result['ue_metrics'][imsi]['mmwave_sched_symbols'] = entry['symbols']
+                        result['ue_metrics'][imsi]['mmwave_sched_dl_allocations'] = entry['dl_allocations']
+                        result['ue_metrics'][imsi]['mmwave_sched_ul_allocations'] = entry['ul_allocations']
+                        result['ue_metrics'][imsi]['mmwave_sched_retx_allocations'] = entry['retx_allocations']
+
+                result['mmwave_scheduler_metrics'] = {
+                    'by_imsi': mmwave_by_imsi,
+                    'unmapped_rntis': sorted(unmapped_rntis),
+                    'active_imsis_without_mmwave_sched': sorted(
+                        [imsi for imsi in result['ue_metrics'] if imsi not in mmwave_by_imsi],
+                        key=lambda value: int(value) if str(value).isdigit() else value
+                    ),
+                    'mapping_cell_id': scheduler_cell_id,
+                    'control_rnti': mmwave_sched_metrics.get('per_rnti', {}).get('0', {}),
+                    'window_row_count': mmwave_sched_metrics.get('window_row_count', 0),
+                    'source_file': mmwave_sched_metrics.get('source_file', ''),
+                }
+                result['global_metrics']['mmwave_sched_mapped_ues'] = len(mmwave_by_imsi)
+
+        if cu_up_metrics:
+            result['global_metrics']['cu_up_latest_timestamp'] = cu_up_metrics.get('latest_timestamp', 0)
+            result['global_metrics']['cu_up_row_count'] = cu_up_metrics.get('row_count', 0)
+            result['source_files'] = {
+                'pdcp': str(self.input_dir / "DlPdcpStats.txt"),
+                'mac': str(self.input_dir / "DlMacStats.txt"),
+                'rlc': str(self.input_dir / "DlRlcStats.txt"),
+                'cu_up': cu_up_metrics.get('source_files', []),
+            }
+
+            for imsi, data in cu_up_metrics.get('per_ue', {}).items():
+                if imsi in result['ue_metrics']:
+                    result['ue_metrics'][imsi]['cu_up_throughput_kbps'] = data.get('throughput_kbps', 0)
+                    result['ue_metrics'][imsi]['cu_up_pdcp_latency_ms'] = data.get('pdcp_latency_ms', 0)
+                else:
+                    result['ue_metrics'][imsi] = {
+                        'device_type': self.get_device_type(imsi),
+                        'cell_id': 0,
+                        'latency_us': 0,
+                        'latency_avg_us': 0,
+                        'latency_min_us': 0,
+                        'latency_max_us': 0,
+                        'jitter_us': 0,
+                        'pdu_size_avg': 0,
+                        'tx_bytes': 0,
+                        'rx_bytes': 0,
+                        'tx_pdus': 0,
+                        'rx_pdus': 0,
+                        'throughput_kbps': data.get('throughput_kbps', 0),
+                        'tx_throughput_kbps': 0,
+                        'rx_throughput_kbps': data.get('throughput_kbps', 0),
+                        'total_pdcp_throughput_kbps': data.get('throughput_kbps', 0),
+                        'packet_count': 0,
+                        'has_latency_samples': False,
+                        'is_critical': False,
+                        'cu_up_throughput_kbps': data.get('throughput_kbps', 0),
+                        'cu_up_pdcp_latency_ms': data.get('pdcp_latency_ms', 0),
+                        'throughput_source': 'cu_up',
+                    }
+
+        if mmwave_sched_metrics:
+            result.setdefault('source_files', {})
+            result['source_files']['mmwave_sched'] = mmwave_sched_metrics.get('source_file', '')
         
         return result
     
     def write_metrics(self, metrics, filepath):
         """Write metrics to JSON file"""
         try:
-            with open(filepath, 'w') as f:
+            tmp_path = f"{filepath}.tmp"
+            with open(tmp_path, 'w') as f:
                 json.dump(metrics, f, indent=2)
+            os.replace(tmp_path, filepath)
         except Exception as e:
             print(f"[CSV_METRICS] Error writing metrics to {filepath}: {e}")
     
@@ -637,7 +1369,9 @@ class ExtendedMetricsCollector:
             'global_worst_latency_us': extended_metrics.get('global_metrics', {}).get('global_worst_latency_us', 0),
             'latency_p95_us': extended_metrics.get('global_metrics', {}).get('latency_p95_us', 0),
             'active_cameras': extended_metrics.get('active_cameras', 0),
-            'critical_cameras': extended_metrics.get('critical_cameras', 0)
+            'critical_cameras': extended_metrics.get('critical_cameras', 0),
+            'active_sensors': extended_metrics.get('global_metrics', {}).get('total_active_sensors', 0),
+            'active_vehicles': extended_metrics.get('global_metrics', {}).get('total_active_vehicles', 0),
         }
         
         for imsi, ue_data in extended_metrics.get('ue_metrics', {}).items():
@@ -655,11 +1389,15 @@ class ExtendedMetricsCollector:
         pdcp_file = self.input_dir / "DlPdcpStats.txt"
         mac_file = self.input_dir / "DlMacStats.txt"
         rlc_file = self.input_dir / "DlRlcStats.txt"
+        mmwave_sched_file = self.input_dir / "EnbSchedAllocTraces.txt"
+        cu_up_files = sorted(self.input_dir.glob("cu-up-cell-*.txt"))
         
         print(f"[CSV_METRICS] Starting Extended Metrics Collector")
         print(f"[CSV_METRICS] PDCP: {pdcp_file}")
         print(f"[CSV_METRICS] MAC:  {mac_file}")
         print(f"[CSV_METRICS] RLC:  {rlc_file}")
+        print(f"[CSV_METRICS] mmWave Sched: {mmwave_sched_file}")
+        print(f"[CSV_METRICS] CU-UP: {', '.join(str(p) for p in cu_up_files) if cu_up_files else 'none'}")
         print(f"[CSV_METRICS] Output: {self.output_file}")
         print(f"[CSV_METRICS] Extended: {self.extended_output_file}")
         
@@ -670,11 +1408,21 @@ class ExtendedMetricsCollector:
             pdcp_metrics = self.process_pdcp_stats(pdcp_file)
             mac_metrics = self.process_mac_stats(mac_file)
             rlc_metrics = self.process_rlc_stats(rlc_file)
+            mmwave_sched_metrics = self.process_mmwave_sched_stats(mmwave_sched_file)
+            cu_up_metrics = self.process_cu_up_stats(cu_up_files)
             
             if pdcp_metrics:
-                extended = self.aggregate_metrics(pdcp_metrics, mac_metrics)
+                extended = self.aggregate_metrics(
+                    pdcp_metrics,
+                    mac_metrics,
+                    rlc_metrics=rlc_metrics,
+                    cu_up_metrics=cu_up_metrics,
+                    mmwave_sched_metrics=mmwave_sched_metrics,
+                )
                 
                 self.write_metrics(extended, self.extended_output_file)
+                self.export_device_roles_snapshot(extended)
+                self.export_app2_metrics(extended)
                 
                 standard = self.write_standard_metrics(extended)
                 self.write_metrics(standard, self.output_file)
@@ -685,6 +1433,7 @@ class ExtendedMetricsCollector:
                           f"lat={gm.get('global_worst_latency_us', 0)/1000:.1f}ms "
                           f"avg={gm.get('global_avg_latency_us', 0)/1000:.1f}ms "
                           f"cams={extended.get('active_cameras', 0)} "
+                          f"sensors={gm.get('total_active_sensors', 0)} "
                           f"critical={extended.get('critical_cameras', 0)} "
                           f"ues={gm.get('total_active_ues', 0)} "
                           f"tp={gm.get('throughput_kbps', 0):.0f}kbps")
