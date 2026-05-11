@@ -40,6 +40,9 @@ htmlcov/
 # Runtime state and generated outputs
 /results/
 !/runs/.gitkeep
+!/runs/existing_data/
+!/runs/article00/
+!/runs/experimentos_conflitos/
 /runs/**
 /runs/**/state_snapshot/
 /charts/*.csv

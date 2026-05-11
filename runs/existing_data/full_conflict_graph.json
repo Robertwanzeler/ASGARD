@@ -1,0 +1,497 @@
+{
+  "schema": "greenran.conflict_graph.v1",
+  "generated_at": 1778541697,
+  "window_events": 7704,
+  "stats": {
+    "total_events": 7704,
+    "by_conflict_type": {
+      "implicit": 4246,
+      "indirect": 3458
+    },
+    "by_service": {
+      "App1-Vigilancia": 4122,
+      "App2-Monitoramento": 3582
+    },
+    "by_kpi": {
+      "camera_throughput_mbps": 1985,
+      "app2_connected_ratio": 271,
+      "app2_packet_loss_percent": 31,
+      "app2_avg_battery_percent": 3280,
+      "camera_latency_ms": 2137
+    },
+    "by_mitigation": {
+      "FULL_POWER": 5839,
+      "FULL_POWER_GUARD": 1865
+    }
+  },
+  "nodes": [
+    {
+      "id": "App2-Monitoramento",
+      "label": "App2-Monitoramento",
+      "type": "agent",
+      "event_count": 7164
+    },
+    {
+      "id": "rApp-CVaR/ML-Arbiter",
+      "label": "rApp-CVaR/ML-Arbiter",
+      "type": "agent",
+      "event_count": 4246
+    },
+    {
+      "id": "xApp1-RANSlicer",
+      "label": "xApp1-RANSlicer",
+      "type": "agent",
+      "event_count": 4122
+    },
+    {
+      "id": "xApp2-EnergySaver",
+      "label": "xApp2-EnergySaver",
+      "type": "agent",
+      "event_count": 3458
+    },
+    {
+      "id": "rApp-ResourceOptimizer",
+      "label": "rApp-ResourceOptimizer",
+      "type": "arbiter",
+      "event_count": 7704
+    },
+    {
+      "id": "app2_avg_battery_percent",
+      "label": "app2_avg_battery_percent",
+      "type": "kpi",
+      "event_count": 3280
+    },
+    {
+      "id": "app2_connected_ratio",
+      "label": "app2_connected_ratio",
+      "type": "kpi",
+      "event_count": 271
+    },
+    {
+      "id": "app2_packet_loss_percent",
+      "label": "app2_packet_loss_percent",
+      "type": "kpi",
+      "event_count": 31
+    },
+    {
+      "id": "camera_latency_ms",
+      "label": "camera_latency_ms",
+      "type": "kpi",
+      "event_count": 2137
+    },
+    {
+      "id": "camera_throughput_mbps",
+      "label": "camera_throughput_mbps",
+      "type": "kpi",
+      "event_count": 1985
+    },
+    {
+      "id": "FULL_POWER",
+      "label": "FULL_POWER",
+      "type": "mitigation",
+      "event_count": 5839
+    },
+    {
+      "id": "FULL_POWER_GUARD",
+      "label": "FULL_POWER_GUARD",
+      "type": "mitigation",
+      "event_count": 1865
+    },
+    {
+      "id": "energy_policy",
+      "label": "energy_policy",
+      "type": "parameter",
+      "event_count": 3458
+    },
+    {
+      "id": "global_health_policy",
+      "label": "global_health_policy",
+      "type": "parameter",
+      "event_count": 4246
+    },
+    {
+      "id": "App1-Vigilancia",
+      "label": "App1-Vigilancia",
+      "type": "service",
+      "event_count": 4122
+    }
+  ],
+  "edges": [
+    {
+      "source": "FULL_POWER",
+      "target": "App1-Vigilancia",
+      "relation": "protects",
+      "weight": 2316,
+      "conflict_types": {
+        "implicit": 179,
+        "indirect": 2137
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 179,
+        "camera_latency_ms": 2137
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "App2-Monitoramento",
+      "relation": "protects",
+      "weight": 3523,
+      "conflict_types": {
+        "implicit": 2217,
+        "indirect": 1306
+      },
+      "affected_kpis": {
+        "app2_avg_battery_percent": 3260,
+        "app2_connected_ratio": 242,
+        "app2_packet_loss_percent": 21
+      },
+      "latest_timestamp": 1777908779,
+      "latest_reason": "APP2 mMTC SLA: packet loss 65.7% >= 10%"
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "App1-Vigilancia",
+      "relation": "protects",
+      "weight": 1806,
+      "conflict_types": {
+        "implicit": 1806
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 1806
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "App2-Monitoramento",
+      "relation": "protects",
+      "weight": 59,
+      "conflict_types": {
+        "implicit": 44,
+        "indirect": 15
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 29,
+        "app2_packet_loss_percent": 10,
+        "app2_avg_battery_percent": 20
+      },
+      "latest_timestamp": 1778522625,
+      "latest_reason": "APP2 mMTC: snapshot antigo (50544s) - margem protegida"
+    },
+    {
+      "source": "app2_avg_battery_percent",
+      "target": "App2-Monitoramento",
+      "relation": "belongs_to",
+      "weight": 3280,
+      "conflict_types": {
+        "implicit": 2066,
+        "indirect": 1214
+      },
+      "affected_kpis": {
+        "app2_avg_battery_percent": 3280
+      },
+      "latest_timestamp": 1777441869,
+      "latest_reason": "APP2 mMTC SLA: bateria média 3.0% < 15%"
+    },
+    {
+      "source": "app2_avg_battery_percent",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 3280,
+      "conflict_types": {
+        "implicit": 2066,
+        "indirect": 1214
+      },
+      "affected_kpis": {
+        "app2_avg_battery_percent": 3280
+      },
+      "latest_timestamp": 1777441869,
+      "latest_reason": "APP2 mMTC SLA: bateria média 3.0% < 15%"
+    },
+    {
+      "source": "app2_connected_ratio",
+      "target": "App2-Monitoramento",
+      "relation": "belongs_to",
+      "weight": 271,
+      "conflict_types": {
+        "implicit": 164,
+        "indirect": 107
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 271
+      },
+      "latest_timestamp": 1778522625,
+      "latest_reason": "APP2 mMTC: snapshot antigo (50544s) - margem protegida"
+    },
+    {
+      "source": "app2_connected_ratio",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 271,
+      "conflict_types": {
+        "implicit": 164,
+        "indirect": 107
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 271
+      },
+      "latest_timestamp": 1778522625,
+      "latest_reason": "APP2 mMTC: snapshot antigo (50544s) - margem protegida"
+    },
+    {
+      "source": "app2_packet_loss_percent",
+      "target": "App2-Monitoramento",
+      "relation": "belongs_to",
+      "weight": 31,
+      "conflict_types": {
+        "implicit": 31
+      },
+      "affected_kpis": {
+        "app2_packet_loss_percent": 31
+      },
+      "latest_timestamp": 1777908779,
+      "latest_reason": "APP2 mMTC SLA: packet loss 65.7% >= 10%"
+    },
+    {
+      "source": "app2_packet_loss_percent",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 31,
+      "conflict_types": {
+        "implicit": 31
+      },
+      "affected_kpis": {
+        "app2_packet_loss_percent": 31
+      },
+      "latest_timestamp": 1777908779,
+      "latest_reason": "APP2 mMTC SLA: packet loss 65.7% >= 10%"
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "App1-Vigilancia",
+      "relation": "belongs_to",
+      "weight": 2137,
+      "conflict_types": {
+        "indirect": 2137
+      },
+      "affected_kpis": {
+        "camera_latency_ms": 2137
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 2137,
+      "conflict_types": {
+        "indirect": 2137
+      },
+      "affected_kpis": {
+        "camera_latency_ms": 2137
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "App1-Vigilancia",
+      "relation": "belongs_to",
+      "weight": 1985,
+      "conflict_types": {
+        "implicit": 1985
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 1985
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 1985,
+      "conflict_types": {
+        "implicit": 1985
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 1985
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "energy_policy",
+      "target": "app2_avg_battery_percent",
+      "relation": "affects",
+      "weight": 1214,
+      "conflict_types": {
+        "indirect": 1214
+      },
+      "affected_kpis": {
+        "app2_avg_battery_percent": 1214
+      },
+      "latest_timestamp": 1777441869,
+      "latest_reason": "APP2 mMTC SLA: bateria média 3.0% < 15%"
+    },
+    {
+      "source": "energy_policy",
+      "target": "app2_connected_ratio",
+      "relation": "affects",
+      "weight": 107,
+      "conflict_types": {
+        "indirect": 107
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 107
+      },
+      "latest_timestamp": 1778522625,
+      "latest_reason": "APP2 mMTC: snapshot antigo (50544s) - margem protegida"
+    },
+    {
+      "source": "energy_policy",
+      "target": "camera_latency_ms",
+      "relation": "affects",
+      "weight": 2137,
+      "conflict_types": {
+        "indirect": 2137
+      },
+      "affected_kpis": {
+        "camera_latency_ms": 2137
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "global_health_policy",
+      "target": "app2_avg_battery_percent",
+      "relation": "affects",
+      "weight": 2066,
+      "conflict_types": {
+        "implicit": 2066
+      },
+      "affected_kpis": {
+        "app2_avg_battery_percent": 2066
+      },
+      "latest_timestamp": 1777440903,
+      "latest_reason": "APP2 mMTC SLA: bateria média 3.0% < 15%"
+    },
+    {
+      "source": "global_health_policy",
+      "target": "app2_connected_ratio",
+      "relation": "affects",
+      "weight": 164,
+      "conflict_types": {
+        "implicit": 164
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 164
+      },
+      "latest_timestamp": 1777439400,
+      "latest_reason": "APP2 mMTC SLA: sensores conectados 82% < 85%"
+    },
+    {
+      "source": "global_health_policy",
+      "target": "app2_packet_loss_percent",
+      "relation": "affects",
+      "weight": 31,
+      "conflict_types": {
+        "implicit": 31
+      },
+      "affected_kpis": {
+        "app2_packet_loss_percent": 31
+      },
+      "latest_timestamp": 1777908779,
+      "latest_reason": "APP2 mMTC SLA: packet loss 65.7% >= 10%"
+    },
+    {
+      "source": "global_health_policy",
+      "target": "camera_throughput_mbps",
+      "relation": "affects",
+      "weight": 1985,
+      "conflict_types": {
+        "implicit": 1985
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 1985
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "rApp-CVaR/ML-Arbiter",
+      "target": "global_health_policy",
+      "relation": "controls",
+      "weight": 4246,
+      "conflict_types": {
+        "implicit": 4246
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 1985,
+        "app2_connected_ratio": 164,
+        "app2_packet_loss_percent": 31,
+        "app2_avg_battery_percent": 2066
+      },
+      "latest_timestamp": 1778427438,
+      "latest_reason": "CÂMERA: Throughput 30.0Mbps em [25-30Mbps] - margem protegida"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER",
+      "relation": "mitigates",
+      "weight": 5839,
+      "conflict_types": {
+        "implicit": 2396,
+        "indirect": 3443
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 179,
+        "app2_avg_battery_percent": 3260,
+        "app2_connected_ratio": 242,
+        "camera_latency_ms": 2137,
+        "app2_packet_loss_percent": 21
+      },
+      "latest_timestamp": 1778439822,
+      "latest_reason": "CÂMERA SLA: Latência 149.3ms >= 80ms"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER_GUARD",
+      "relation": "mitigates",
+      "weight": 1865,
+      "conflict_types": {
+        "implicit": 1850,
+        "indirect": 15
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 1806,
+        "app2_connected_ratio": 29,
+        "app2_packet_loss_percent": 10,
+        "app2_avg_battery_percent": 20
+      },
+      "latest_timestamp": 1778522625,
+      "latest_reason": "APP2 mMTC: snapshot antigo (50544s) - margem protegida"
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "energy_policy",
+      "relation": "controls",
+      "weight": 3458,
+      "conflict_types": {
+        "indirect": 3458
+      },
+      "affected_kpis": {
+        "app2_connected_ratio": 107,
+        "app2_avg_battery_percent": 1214,
+        "camera_latency_ms": 2137
+      },
+      "latest_timestamp": 1778522625,
+      "latest_reason": "APP2 mMTC: snapshot antigo (50544s) - margem protegida"
+    }
+  ]
+}
