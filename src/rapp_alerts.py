@@ -26,11 +26,14 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from pathlib import Path
 from greenran_paths import STATE_DIR, XAPP_HEALTH_PATH, RAPP_POLICIES_DIR, as_str
+from rapp_policy_consumer import load_current_policies
 
 ALERT_LOG = as_str(STATE_DIR / "rapp_alerts.log")
 EMAIL_CONFIG = as_str(STATE_DIR / "rapp_email_config.json")
 XAPP_HEALTH_FILE = as_str(XAPP_HEALTH_PATH)
 POLICY_STATUS_FILE = as_str(RAPP_POLICIES_DIR / "policy_status.json")
+ENERGY_POLICY_FILE = RAPP_POLICIES_DIR / "energy_policy.json"
+SLICE_POLICY_FILE = RAPP_POLICIES_DIR / "slice_policy.json"
 
 
 class AlertManager:
@@ -44,9 +47,10 @@ class AlertManager:
     - LINK_QUALITY_DEGRADED: Qualidade do enlace ruim
     """
     
-    def __init__(self, alert_log=ALERT_LOG, email_config=EMAIL_CONFIG):
+    def __init__(self, alert_log=ALERT_LOG, email_config=EMAIL_CONFIG, policy_dir=RAPP_POLICIES_DIR):
         self.alert_log = alert_log
         self.email_config_file = email_config
+        self.policy_dir = Path(policy_dir)
         self.alerts_sent = []
         self.last_alert_time = {}
         self.alert_cooldown = 300  # 5 minutos entre alertas do mesmo tipo
@@ -276,6 +280,45 @@ class AlertManager:
             print(f"[ALERT] ERRO ao verificar ACK timeout: {e}")
         
         return alerts
+
+    def check_armd_policy_attention(self):
+        """Verifica se o consumidor recebeu política ARMD que exige atenção explícita."""
+        alerts = []
+
+        try:
+            policies = load_current_policies(self.policy_dir)
+            armd = policies.get("armd", {})
+            if not armd.get("present"):
+                return alerts
+
+            level = armd.get("attention_level", "none")
+            scenario = armd.get("scenario", "")
+            domain = armd.get("domain", "")
+            source = armd.get("source", "")
+            confidence = armd.get("confidence", 0.0)
+
+            if level in {"override", "critical"}:
+                alert_key = f"ARMD_{level}_{scenario}"
+                if self._should_send_alert(alert_key):
+                    alert = self._log_alert(
+                        "ARMD_POLICY_ATTENTION",
+                        "WARNING" if level == "override" else "INFO",
+                        f"ARMD ativo no consumidor: {scenario}",
+                        {
+                            "scenario": scenario,
+                            "domain": domain,
+                            "source": source,
+                            "confidence": confidence,
+                            "attention_level": level,
+                            "reason": armd.get("reason", ""),
+                            "policy_scope": armd.get("policy_scope", []),
+                        }
+                    )
+                    alerts.append(alert)
+        except Exception as e:
+            print(f"[ALERT] ERRO ao verificar atenção ARMD: {e}")
+
+        return alerts
     
     def check_sla_violation_trend(self, pattern_engine):
         """Verifica tendência de SLA violation."""
@@ -382,6 +425,9 @@ class AlertManager:
         
         # Verifica ACK timeout
         all_alerts.extend(self.check_ack_timeout())
+
+        # Verifica se há política ARMD explicitamente ativa no consumidor
+        all_alerts.extend(self.check_armd_policy_attention())
         
         # Verifica tendência SLA se pattern engine disponível
         if pattern_engine:

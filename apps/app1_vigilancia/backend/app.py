@@ -10,6 +10,7 @@ App1-Vigilancia.
 from __future__ import annotations
 
 import mimetypes
+import os
 import sys
 import threading
 import time
@@ -24,7 +25,12 @@ APP_DIR = CURRENT_DIR.parent
 PROJECT_ROOT = APP_DIR.parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 CONFIG_DIR = PROJECT_ROOT / "config" / "core"
-APP1_CAMERAS_BOOTSTRAP = CONFIG_DIR / "app1_cameras.json"
+APP1_CAMERAS_BOOTSTRAP = Path(
+    os.environ.get(
+        "GREENRAN_APP1_CAMERAS_BOOTSTRAP",
+        os.environ.get("APP1_CAMERAS_BOOTSTRAP", str(CONFIG_DIR / "app1_cameras.json")),
+    )
+)
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -151,8 +157,8 @@ def monitoring_refresh_loop():
                 event_store=STORE,
                 camera_store=CAMERA_STORE,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[App1] monitoring_refresh_loop error: {exc}", flush=True)
         time.sleep(MONITORING_REFRESH_SECONDS)
 
 
@@ -169,8 +175,8 @@ def camera_ingest_loop():
                 event_store=STORE,
                 camera_store=CAMERA_STORE,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[App1] camera_ingest_loop error: {exc}", flush=True)
         time.sleep(CAMERA_INGEST_POLL_SECONDS)
 
 

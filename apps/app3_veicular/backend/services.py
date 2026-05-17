@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from greenran_paths import CARLA_VEHICLES_PATH, CARLA_VEHICLE_MAP_PATH
+
 VEHICLE_LATENCY_WARNING_MS = 50.0
 VEHICLE_LATENCY_CRITICAL_MS = 100.0
 VEHICLE_PACKET_LOSS_WARNING_PERCENT = 2.0
@@ -105,6 +107,8 @@ class VehicleStateStore:
         self.vehicles_path = self.app_state_dir / "vehicles" / "latest.json"
         self.events_path = self.app_state_dir / "events" / "latest.json"
         self.extended_metrics_path = self.state_dir / "xapp_metrics" / "extended_metrics.json"
+        self.carla_vehicles_path = CARLA_VEHICLES_PATH
+        self.carla_vehicle_map_path = CARLA_VEHICLE_MAP_PATH
         self.app_state_dir.mkdir(parents=True, exist_ok=True)
         self.vehicles_path.parent.mkdir(parents=True, exist_ok=True)
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +122,62 @@ class VehicleStateStore:
     def _read_extended_metrics(self) -> Dict[str, Any]:
         data = _safe_read_json(self.extended_metrics_path, {})
         return data if isinstance(data, dict) else {}
+
+    def _read_carla_vehicle_sources(self) -> tuple[list[dict], dict]:
+        vehicles_doc = _safe_read_json(self.carla_vehicles_path, {})
+        mapping_doc = _safe_read_json(self.carla_vehicle_map_path, {})
+        vehicles = vehicles_doc.get("vehicles", []) if isinstance(vehicles_doc, dict) else []
+        roles = mapping_doc.get("roles", {}) if isinstance(mapping_doc, dict) else {}
+        return vehicles if isinstance(vehicles, list) else [], roles if isinstance(roles, dict) else {}
+
+    def _fallback_vehicles_from_carla(self) -> List[Dict[str, Any]]:
+        vehicles, roles = self._read_carla_vehicle_sources()
+        records: List[Dict[str, Any]] = []
+
+        by_vehicle_id = {}
+        for imsi, meta in roles.items():
+            if not isinstance(meta, dict):
+                continue
+            vehicle_id = str(meta.get("vehicle_id", "") or "")
+            if vehicle_id:
+                by_vehicle_id[vehicle_id] = (str(imsi), meta)
+
+        for vehicle in vehicles:
+            if not isinstance(vehicle, dict):
+                continue
+            vehicle_id = str(vehicle.get("vehicle_id", "") or "")
+            imsi, meta = by_vehicle_id.get(vehicle_id, ("", {}))
+            role = str(vehicle.get("role", meta.get("vehicle_role", "traffic")) or "traffic")
+            record = {
+                "imsi": imsi,
+                "vehicle_id": vehicle_id or f"veh-{imsi or 'unknown'}",
+                "vehicle_role": role,
+                "is_ego": role == "ego",
+                "latency_ms": round(float(vehicle.get("latency_ms", 0.0) or 0.0), 3),
+                "packet_loss_percent": round(float(vehicle.get("packet_loss_percent", 0.0) or 0.0), 3),
+                "throughput_mbps": 0.0,
+                "speed_mps": round(float(vehicle.get("speed_mps", 0.0) or 0.0), 3),
+                "heading_deg": round(float(vehicle.get("heading_deg", 0.0) or 0.0), 3),
+                "lane_id": vehicle.get("lane_id"),
+                "waypoint_id": vehicle.get("waypoint_id"),
+                "autonomy_state": str(vehicle.get("autonomy_state", meta.get("autonomy_state", "normal")) or "normal"),
+                "risk_state": str(vehicle.get("risk_state", meta.get("risk_state", "low")) or "low"),
+                "position": {
+                    "x": float(vehicle.get("x", 0.0) or 0.0),
+                    "y": float(vehicle.get("y", 0.0) or 0.0),
+                    "z": float(vehicle.get("z", 0.0) or 0.0),
+                },
+                "cell_id": None,
+                "gateway_id": meta.get("gateway_id", "GW-VEH-01"),
+                "connectivity": meta.get("connectivity", "5g_native"),
+                "domain": meta.get("domain", "vehicular"),
+                "mobility_profile": meta.get("mobility_profile", "vehicle"),
+                "timestamp_iso": _safe_read_json(self.carla_vehicles_path, {}).get("timestamp_iso"),
+            }
+            records.append(record)
+
+        records.sort(key=lambda item: (not item.get("is_ego", False), item.get("vehicle_id", "")))
+        return records
 
     def list_vehicles(self) -> List[Dict[str, Any]]:
         data = self._read_extended_metrics()
@@ -154,7 +214,9 @@ class VehicleStateStore:
             }
             vehicles.append(record)
         vehicles.sort(key=lambda item: (not item.get("is_ego", False), item.get("vehicle_id", "")))
-        return vehicles
+        if vehicles:
+            return vehicles
+        return self._fallback_vehicles_from_carla()
 
     def get_ego_vehicle(self) -> Optional[Dict[str, Any]]:
         for vehicle in self.list_vehicles():
@@ -242,6 +304,7 @@ class VehicleStateStore:
         vehicles = self.list_vehicles()
         summary = self.summarize(vehicles)
         events = self.build_events(vehicles)
+        vehicle_sla = evaluate_vehicle_sla(summary)
         snapshot = {
             "simulation": {
                 "source": "carla_ns3_combined",
@@ -253,7 +316,8 @@ class VehicleStateStore:
                 "max_packet_loss_percent": summary.get("max_packet_loss_percent", 0.0),
                 "max_speed_mps": summary.get("max_speed_mps", 0.0),
             },
-            "sla": evaluate_vehicle_sla(summary),
+            "sla": vehicle_sla,
+            "vehicle_sla": vehicle_sla,
             "events_count": len(events),
         }
         self._write_json(self.snapshot_path, snapshot)

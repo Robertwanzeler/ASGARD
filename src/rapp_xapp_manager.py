@@ -294,14 +294,25 @@ class XAppManager:
         """Limpa TODOS os processos zumbis de xApps."""
         import subprocess
         print("[XAppManager] Limpando processos zumbis...")
-        
-        # Matar processos zumbis de xApps
-        for pattern in ['xapp_slicer', 'xapp_energy_sav', 'run_slicer', 'run_energy']:
-            try:
-                subprocess.run(['pkill', '-9', '-f', pattern], 
-                              capture_output=True, timeout=2)
-            except:
-                pass
+
+        if os.environ.get("GREENRAN_CLEAN_SCOPE", "global") != "instance":
+            for pattern in ['xapp_slicer', 'xapp_energy_sav', 'run_slicer', 'run_energy']:
+                try:
+                    subprocess.run(['pkill', '-9', '-f', pattern],
+                                  capture_output=True, timeout=2)
+                except Exception:
+                    pass
+        else:
+            for xapp_name, pid_path in XAPP_PID_PATHS.items():
+                if not os.path.exists(pid_path):
+                    continue
+                try:
+                    with open(pid_path, 'r') as f:
+                        pid = int(f.read().strip())
+                    os.kill(pid, signal.SIGKILL)
+                    print(f"[XAppManager] Processo {xapp_name} PID {pid} finalizado")
+                except Exception:
+                    pass
         
         # Remover todos os PID files antigos
         for xapp_name, pid_path in XAPP_PID_PATHS.items():

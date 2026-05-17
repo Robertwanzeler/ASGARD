@@ -9,7 +9,7 @@
     "synthetic_days": 0
   },
   "monitoring": {
-    "grafana_port": 3001,
+    "grafana_port": 3000,
     "influxdb_host": "localhost",
     "influxdb_port": 8086,
     "influxdb_db": "influx",

@@ -149,6 +149,30 @@ class A1PolicyInterface:
     def _generate_policy_id(self, policy_type):
         """Gera ID único para política."""
         return f"{policy_type}_{int(time.time() * 1000)}"
+
+    @staticmethod
+    def _build_armd_context(decision):
+        """Extrai o contexto ARMD do decision dict para anexar às políticas A1."""
+        if not isinstance(decision, dict):
+            return {}
+
+        scenario = str(decision.get('armd_scenario', '') or '').strip()
+        if not scenario:
+            return {}
+
+        return {
+            'enabled': bool(decision.get('armd_enabled', False)),
+            'mode': decision.get('armd_mode', ''),
+            'scenario': scenario,
+            'domain': decision.get('armd_domain', ''),
+            'source': decision.get('armd_source', ''),
+            'confidence': float(decision.get('armd_confidence', 0.0) or 0.0),
+            'override_applied': bool(decision.get('armd_override_applied', False)),
+            'expected_energy_saver': decision.get('armd_expected_energy_saver', ''),
+            'expected_action': decision.get('armd_expected_action', ''),
+            'reason': decision.get('armd_reason', ''),
+            'evidence': decision.get('armd_evidence', []),
+        }
     
     def check_ack(self, policy_type):
         """
@@ -246,6 +270,7 @@ class A1PolicyInterface:
             status = 'ALLOWED'
         
         # Política completa
+        armd_context = self._build_armd_context(decision)
         policy = {
             'policy_type': 'energy_saving',
             'interface': 'A1',
@@ -272,9 +297,14 @@ class A1PolicyInterface:
             'recommendations': {
                 'cell_off_allowed': rules['allow_cell_shutdown'],
                 'mmwave_off_allowed': rules['allow_mmwave_off'],
-                'emergency_restore': rules['restore_immediately']
+                'emergency_restore': rules['restore_immediately'],
+                'armd_verified': bool(armd_context),
+                'armd_protection_escalation': bool(armd_context.get('override_applied', False)),
             }
         }
+
+        if armd_context:
+            policy['armd'] = armd_context
         
         # Adiciona informações de padrão se disponível
         if pattern_info:
@@ -316,7 +346,7 @@ class A1PolicyInterface:
             print(f"[A1] ERRO ao enviar política de energia: {e}")
             return None
     
-    def send_slice_policy(self, slicer_state, cameras_demand=None, prb_allocation=None):
+    def send_slice_policy(self, slicer_state, cameras_demand=None, prb_allocation=None, armd_info=None):
         """
         Envia política de fatiamento para Near-RT RIC.
         
@@ -372,10 +402,24 @@ class A1PolicyInterface:
             'recommendations': {
                 'prioritize_cameras': slicer_state in ['CRITICAL', 'WARNING'],
                 'reserve_prb': True,
-                'enforce_sla': slicer_state == 'CRITICAL'
+                'enforce_sla': slicer_state == 'CRITICAL',
+                'armd_verified': bool(armd_info),
+                'armd_attention_domain': (armd_info or {}).get('domain', ''),
             }
         }
-        
+
+        if armd_info:
+            policy['armd'] = {
+                'enabled': bool(armd_info.get('enabled', False)),
+                'mode': armd_info.get('mode', ''),
+                'scenario': armd_info.get('scenario', ''),
+                'domain': armd_info.get('domain', ''),
+                'source': armd_info.get('source', ''),
+                'confidence': float(armd_info.get('confidence', 0.0) or 0.0),
+                'override_applied': bool(armd_info.get('override_applied', False)),
+                'reason': armd_info.get('reason', ''),
+            }
+
         # Adiciona demanda de câmeras se disponível
         if cameras_demand:
             policy['camera_demand'] = cameras_demand
@@ -590,6 +634,11 @@ def print_policy(policy, prefix=""):
         print(f"{prefix}Regras:")
         for key, value in policy['rules'].items():
             print(f"{prefix}  {key}: {value}")
+    if 'armd' in policy:
+        print(f"{prefix}ARMD:")
+        for key in ('scenario', 'domain', 'source', 'confidence', 'override_applied'):
+            if key in policy['armd']:
+                print(f"{prefix}  {key}: {policy['armd'][key]}")
 
 
 def main():

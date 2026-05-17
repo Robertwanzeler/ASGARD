@@ -20,6 +20,7 @@ import json
 import time
 import argparse
 import math
+import traceback
 from pathlib import Path
 import threading
 import signal
@@ -93,6 +94,7 @@ class ExtendedMetricsCollector:
         self.carla_vehicle_state = {}
         self.carla_vehicle_map_mtime = None
         self.carla_vehicle_state_mtime = None
+        self._warned_missing_pdcp = False
 
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         os.makedirs(os.path.dirname(extended_output_file), exist_ok=True)
@@ -839,6 +841,213 @@ class ExtendedMetricsCollector:
         tail_count = max(1, math.ceil(len(sorted_desc) * tail_fraction))
         tail_values = sorted_desc[:tail_count]
         return sum(tail_values) / len(tail_values)
+
+    def aggregate_metrics_without_pdcp(self, mac_metrics, rlc_metrics=None, cu_up_metrics=None, mmwave_sched_metrics=None):
+        """Build a degraded-but-usable metric snapshot when PDCP stats are absent."""
+
+        result = {
+            'timestamp': int(time.time() * 1000),
+            'timestamp_iso': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'sim_time_range': {
+                'start': 0,
+                'end': float((cu_up_metrics or {}).get('latest_timestamp', 0) or 0),
+                'window_s': max(self.poll_interval, 1.0),
+            },
+            'ue_metrics': {},
+            'cell_metrics': {},
+            'global_metrics': {
+                'global_worst_latency_us': 0.0,
+                'global_worst_camera_latency_us': 0.0,
+                'global_avg_latency_us': 0.0,
+                'global_min_latency_us': 0.0,
+                'global_max_latency_us': 0.0,
+                'global_jitter_us': 0.0,
+                'global_packet_loss_rate': 0.0,
+                'total_active_ues': 0,
+                'total_active_cameras': 0,
+                'total_active_sensors': 0,
+                'total_active_vehicles': 0,
+                'total_critical_ues': 0,
+                'total_tx_bytes': 0,
+                'total_rx_bytes': 0,
+                'total_tx_pdus': 0,
+                'total_rx_pdus': 0,
+                'throughput_kbps': 0.0,
+                'throughput_source': 'cu_up_fallback',
+                'pdcp_delta_throughput_kbps': 0.0,
+                'cu_up_total_throughput_kbps': float((cu_up_metrics or {}).get('total_throughput_kbps', 0) or 0),
+                'latency_p5_us': 0.0,
+                'latency_p95_us': 0.0,
+                'latency_min_nonzero_us': 0.0,
+                'latency_median_us': 0.0,
+                'latency_p95_per_ue_us': 0.0,
+                'variance_per_ue_us2': 0.0,
+                'cvar_per_ue_us': 0.0,
+                'cvar_tail_count': 0,
+                'ue_count': 0,
+                'ues_with_latency_samples': 0,
+                'ues_without_latency_samples': 0,
+                'lte_mac_observed_ues': 0,
+                'mmwave_sched_observed_rntis': 0,
+                'mmwave_sched_observed_data_rntis': 0,
+                'mmwave_sched_observed_control_rntis': 0,
+                'mmwave_sched_mapped_ues': 0,
+                'mmwave_sched_window_allocs': 0,
+                'mac_trace_mode': 'unknown',
+                'collector_mode': 'no_pdcp_fallback',
+            },
+            'active_cameras': 0,
+            'critical_cameras': 0,
+            'critical_ues': 0,
+            'source_files': {
+                'pdcp': str(self.input_dir / "DlPdcpStats.txt"),
+                'mac': str(self.input_dir / "DlMacStats.txt"),
+                'rlc': str(self.input_dir / "DlRlcStats.txt"),
+                'cu_up': (cu_up_metrics or {}).get('source_files', []),
+            },
+        }
+
+        latencies = []
+        rlc_latest_by_imsi = {}
+        mac_by_imsi = defaultdict(lambda: {'mcs': [], 'tb_sizes': [], 'last_cell_id': 0})
+
+        if rlc_metrics:
+            result['global_metrics']['rlc_record_count'] = len(rlc_metrics)
+            for item in rlc_metrics[-5000:]:
+                rlc_latest_by_imsi[item['imsi']] = item
+
+        if mac_metrics:
+            all_mcs = []
+            all_tb_sizes = []
+            for item in mac_metrics[-5000:]:
+                data = mac_by_imsi[item['imsi']]
+                data['mcs'].append(item['mcs_tb1'])
+                data['tb_sizes'].append(item['size_tb1'] + item['size_tb2'])
+                data['last_cell_id'] = item.get('cell_id', 0)
+                all_mcs.append(item['mcs_tb1'])
+                all_tb_sizes.append(item['size_tb1'] + item['size_tb2'])
+
+            result['global_metrics']['lte_mac_observed_ues'] = len(mac_by_imsi)
+            if all_mcs:
+                result['global_metrics']['global_mcs_avg'] = sum(all_mcs) / len(all_mcs)
+                result['global_metrics']['global_mcs_min'] = min(all_mcs)
+                result['global_metrics']['global_mcs_max'] = max(all_mcs)
+                result['global_metrics']['global_tb_size_avg'] = sum(all_tb_sizes) / len(all_tb_sizes)
+
+        if mmwave_sched_metrics:
+            result['global_metrics']['mmwave_sched_observed_rntis'] = int(mmwave_sched_metrics.get('observed_rntis', 0) or 0)
+            result['global_metrics']['mmwave_sched_observed_data_rntis'] = int(mmwave_sched_metrics.get('observed_data_rntis', 0) or 0)
+            result['global_metrics']['mmwave_sched_observed_control_rntis'] = int(mmwave_sched_metrics.get('observed_control_rntis', 0) or 0)
+            result['global_metrics']['mmwave_sched_window_allocs'] = int(mmwave_sched_metrics.get('window_row_count', 0) or 0)
+            result['source_files']['mmwave_sched'] = mmwave_sched_metrics.get('source_file', '')
+
+        imsis = set()
+        imsis.update(mac_by_imsi.keys())
+        imsis.update(rlc_latest_by_imsi.keys())
+        imsis.update((cu_up_metrics or {}).get('per_ue', {}).keys())
+
+        SLA_THRESHOLD_US = 100000
+        critical_count = 0
+        camera_count = 0
+        camera_critical_count = 0
+        sensor_count = 0
+        vehicle_count = 0
+
+        for imsi in sorted(imsis, key=lambda value: int(value) if str(value).isdigit() else str(value)):
+            cu_up_entry = (cu_up_metrics or {}).get('per_ue', {}).get(imsi, {})
+            rlc_entry = rlc_latest_by_imsi.get(imsi, {})
+            mac_entry = mac_by_imsi.get(imsi, {})
+            device_type = self.get_device_type(imsi)
+            cell_id = (
+                rlc_entry.get('cell_id')
+                or mac_entry.get('last_cell_id')
+                or 0
+            )
+
+            latency_us = max(0.0, float(cu_up_entry.get('pdcp_latency_ms', 0.0) or 0.0) * 1000.0)
+            has_latency_samples = latency_us > 0
+            throughput_kbps = float(cu_up_entry.get('throughput_kbps', 0.0) or 0.0)
+            is_critical = has_latency_samples and latency_us >= SLA_THRESHOLD_US
+
+            if has_latency_samples:
+                latencies.append(latency_us)
+            if is_critical:
+                critical_count += 1
+
+            if device_type == 'camera':
+                camera_count += 1
+                if is_critical:
+                    camera_critical_count += 1
+            elif device_type == 'sensor':
+                sensor_count += 1
+            elif device_type == 'vehicle':
+                vehicle_count += 1
+
+            result['ue_metrics'][imsi] = {
+                'device_type': device_type,
+                'cell_id': cell_id,
+                'latency_us': latency_us,
+                'latency_avg_us': latency_us,
+                'latency_min_us': latency_us if has_latency_samples else 0,
+                'latency_max_us': latency_us if has_latency_samples else 0,
+                'jitter_us': 0,
+                'pdu_size_avg': 0,
+                'tx_bytes': 0,
+                'rx_bytes': 0,
+                'tx_pdus': 0,
+                'rx_pdus': 0,
+                'throughput_kbps': throughput_kbps,
+                'tx_throughput_kbps': 0,
+                'rx_throughput_kbps': throughput_kbps,
+                'total_pdcp_throughput_kbps': throughput_kbps,
+                'packet_count': 1 if has_latency_samples else 0,
+                'has_latency_samples': has_latency_samples,
+                'is_critical': is_critical,
+                'throughput_source': 'cu_up',
+                'cu_up_throughput_kbps': throughput_kbps,
+                'cu_up_pdcp_latency_ms': float(cu_up_entry.get('pdcp_latency_ms', 0.0) or 0.0),
+                'rlc_records': 1 if rlc_entry else 0,
+            }
+
+            if mac_entry:
+                if mac_entry['mcs']:
+                    result['ue_metrics'][imsi]['mcs_avg'] = sum(mac_entry['mcs']) / len(mac_entry['mcs'])
+                if mac_entry['tb_sizes']:
+                    result['ue_metrics'][imsi]['tb_size_avg'] = sum(mac_entry['tb_sizes']) / len(mac_entry['tb_sizes'])
+
+        worst_latency = max(latencies) if latencies else 0.0
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+        result['global_metrics']['global_worst_latency_us'] = worst_latency
+        result['global_metrics']['global_worst_camera_latency_us'] = max(
+            (data.get('latency_us', 0.0) for data in result['ue_metrics'].values() if data.get('device_type') == 'camera'),
+            default=0.0,
+        )
+        result['global_metrics']['global_avg_latency_us'] = avg_latency
+        result['global_metrics']['global_min_latency_us'] = min(latencies) if latencies else 0.0
+        result['global_metrics']['global_max_latency_us'] = worst_latency
+        result['global_metrics']['global_packet_loss_rate'] = self._calculate_packet_loss(worst_latency, critical_count, camera_count)
+        result['global_metrics']['throughput_kbps'] = float((cu_up_metrics or {}).get('total_throughput_kbps', 0) or 0)
+        result['global_metrics']['total_active_ues'] = len(result['ue_metrics'])
+        result['global_metrics']['total_active_cameras'] = camera_count
+        result['global_metrics']['total_active_sensors'] = sensor_count
+        result['global_metrics']['total_active_vehicles'] = vehicle_count
+        result['global_metrics']['total_critical_ues'] = critical_count
+        result['global_metrics']['latency_p5_us'] = self.percentile_5(latencies) if latencies else 0.0
+        result['global_metrics']['latency_p95_us'] = self.percentile_95(latencies) if latencies else 0.0
+        result['global_metrics']['latency_min_nonzero_us'] = self.min_nonzero(latencies)
+        result['global_metrics']['latency_median_us'] = self.median(latencies) if latencies else 0.0
+        result['global_metrics']['latency_p95_per_ue_us'] = result['global_metrics']['latency_p95_us']
+        result['global_metrics']['cvar_per_ue_us'] = self.calculate_cvar(latencies, tail_fraction=0.05) if latencies else 0.0
+        result['global_metrics']['cvar_tail_count'] = max(1, math.ceil(len(latencies) * 0.05)) if latencies else 0
+        result['global_metrics']['ue_count'] = len(latencies)
+        result['global_metrics']['ues_with_latency_samples'] = len(latencies)
+        result['global_metrics']['ues_without_latency_samples'] = max(0, len(result['ue_metrics']) - len(latencies))
+
+        result['active_cameras'] = camera_count
+        result['critical_cameras'] = camera_critical_count
+        result['critical_ues'] = critical_count
+
+        return result
     
     def aggregate_metrics(self, pdcp_metrics, mac_metrics, rlc_metrics=None, cu_up_metrics=None, mmwave_sched_metrics=None):
         """Aggregate all metrics into comprehensive JSON"""
@@ -871,14 +1080,24 @@ class ExtendedMetricsCollector:
         }
         
         if not pdcp_metrics:
-            return result
+            return self.aggregate_metrics_without_pdcp(
+                mac_metrics,
+                rlc_metrics=rlc_metrics,
+                cu_up_metrics=cu_up_metrics,
+                mmwave_sched_metrics=mmwave_sched_metrics,
+            )
         
         MAX_LATENCY_THRESHOLD_US = 500000  # 500ms - filter outliers
         
         pdcp_metrics = [m for m in pdcp_metrics if m.get('delay_us', 0) <= MAX_LATENCY_THRESHOLD_US]
         
         if not pdcp_metrics:
-            return result
+            return self.aggregate_metrics_without_pdcp(
+                mac_metrics,
+                rlc_metrics=rlc_metrics,
+                cu_up_metrics=cu_up_metrics,
+                mmwave_sched_metrics=mmwave_sched_metrics,
+            )
         
         pdcp_metrics.sort(key=lambda m: (m.get('time_end', 0), m.get('time_start', 0)))
 
@@ -1390,56 +1609,69 @@ class ExtendedMetricsCollector:
         mac_file = self.input_dir / "DlMacStats.txt"
         rlc_file = self.input_dir / "DlRlcStats.txt"
         mmwave_sched_file = self.input_dir / "EnbSchedAllocTraces.txt"
-        cu_up_files = sorted(self.input_dir.glob("cu-up-cell-*.txt"))
         
         print(f"[CSV_METRICS] Starting Extended Metrics Collector")
         print(f"[CSV_METRICS] PDCP: {pdcp_file}")
         print(f"[CSV_METRICS] MAC:  {mac_file}")
         print(f"[CSV_METRICS] RLC:  {rlc_file}")
         print(f"[CSV_METRICS] mmWave Sched: {mmwave_sched_file}")
-        print(f"[CSV_METRICS] CU-UP: {', '.join(str(p) for p in cu_up_files) if cu_up_files else 'none'}")
         print(f"[CSV_METRICS] Output: {self.output_file}")
         print(f"[CSV_METRICS] Extended: {self.extended_output_file}")
         
         iteration = 0
         while self.running:
             iteration += 1
-            
-            pdcp_metrics = self.process_pdcp_stats(pdcp_file)
-            mac_metrics = self.process_mac_stats(mac_file)
-            rlc_metrics = self.process_rlc_stats(rlc_file)
-            mmwave_sched_metrics = self.process_mmwave_sched_stats(mmwave_sched_file)
-            cu_up_metrics = self.process_cu_up_stats(cu_up_files)
-            
-            if pdcp_metrics:
-                extended = self.aggregate_metrics(
-                    pdcp_metrics,
-                    mac_metrics,
-                    rlc_metrics=rlc_metrics,
-                    cu_up_metrics=cu_up_metrics,
-                    mmwave_sched_metrics=mmwave_sched_metrics,
-                )
+
+            try:
+                cu_up_files = sorted(self.input_dir.glob("cu-up-cell-*.txt"))
+                if iteration == 1 or iteration % 60 == 0:
+                    print(
+                        f"[CSV_METRICS] CU-UP sources: "
+                        f"{', '.join(str(p) for p in cu_up_files) if cu_up_files else 'none'}"
+                    )
+
+                pdcp_metrics = self.process_pdcp_stats(pdcp_file)
+                mac_metrics = self.process_mac_stats(mac_file)
+                rlc_metrics = self.process_rlc_stats(rlc_file)
+                mmwave_sched_metrics = self.process_mmwave_sched_stats(mmwave_sched_file)
+                cu_up_metrics = self.process_cu_up_stats(cu_up_files)
+                has_fallback_data = bool(mac_metrics or rlc_metrics or (cu_up_metrics and cu_up_metrics.get('per_ue')))
                 
-                self.write_metrics(extended, self.extended_output_file)
-                self.export_device_roles_snapshot(extended)
-                self.export_app2_metrics(extended)
-                
-                standard = self.write_standard_metrics(extended)
-                self.write_metrics(standard, self.output_file)
-                
-                gm = extended.get('global_metrics', {})
-                if iteration % 5 == 0:
-                    print(f"[CSV_METRICS] iter={iteration} "
-                          f"lat={gm.get('global_worst_latency_us', 0)/1000:.1f}ms "
-                          f"avg={gm.get('global_avg_latency_us', 0)/1000:.1f}ms "
-                          f"cams={extended.get('active_cameras', 0)} "
-                          f"sensors={gm.get('total_active_sensors', 0)} "
-                          f"critical={extended.get('critical_cameras', 0)} "
-                          f"ues={gm.get('total_active_ues', 0)} "
-                          f"tp={gm.get('throughput_kbps', 0):.0f}kbps")
-            else:
-                if iteration % 20 == 0:
-                    print(f"[CSV_METRICS] Waiting for data... (iter {iteration})")
+                if pdcp_metrics or has_fallback_data:
+                    if not pdcp_metrics and not self._warned_missing_pdcp:
+                        print("[CSV_METRICS] DlPdcpStats.txt ausente; usando fallback com CU-UP/MAC/RLC.")
+                        self._warned_missing_pdcp = True
+                    extended = self.aggregate_metrics(
+                        pdcp_metrics,
+                        mac_metrics,
+                        rlc_metrics=rlc_metrics,
+                        cu_up_metrics=cu_up_metrics,
+                        mmwave_sched_metrics=mmwave_sched_metrics,
+                    )
+                    
+                    self.write_metrics(extended, self.extended_output_file)
+                    self.export_device_roles_snapshot(extended)
+                    self.export_app2_metrics(extended)
+                    
+                    standard = self.write_standard_metrics(extended)
+                    self.write_metrics(standard, self.output_file)
+                    
+                    gm = extended.get('global_metrics', {})
+                    if iteration % 5 == 0:
+                        print(f"[CSV_METRICS] iter={iteration} "
+                              f"lat={gm.get('global_worst_latency_us', 0)/1000:.1f}ms "
+                              f"avg={gm.get('global_avg_latency_us', 0)/1000:.1f}ms "
+                              f"cams={extended.get('active_cameras', 0)} "
+                              f"sensors={gm.get('total_active_sensors', 0)} "
+                              f"critical={extended.get('critical_cameras', 0)} "
+                              f"ues={gm.get('total_active_ues', 0)} "
+                              f"tp={gm.get('throughput_kbps', 0):.0f}kbps")
+                else:
+                    if iteration % 20 == 0:
+                        print(f"[CSV_METRICS] Waiting for data... (iter {iteration})")
+            except Exception as e:
+                print(f"[CSV_METRICS] Loop failure on iter {iteration}: {e}")
+                traceback.print_exc()
             
             time.sleep(self.poll_interval)
         

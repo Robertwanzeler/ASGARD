@@ -66,6 +66,7 @@ from rapp_pattern_engine import PatternRecognition
 from rapp_agent_openran import AgentOpenRAN
 from rapp_a1_interface import A1PolicyInterface
 from rapp_ml_predictor import MLPredictor
+from rapp_armd_runtime import ARMDRuntimeAdvisor
 
 # DRL Modules (SBiLSTM + A3C)
 try:
@@ -87,6 +88,8 @@ EXTENDED_METRICS_PATH = as_str(EXTENDED_METRICS_JSON_PATH)
 XAPP_HEALTH_FILE = as_str(XAPP_HEALTH_PATH)
 APP2_MONITORING_PATH = as_str(STATE_DIR / "app2_monitoramento" / "monitoring_snapshot.json")
 APP2_SENSORS_PATH = as_str(STATE_DIR / "app2_monitoramento" / "sensors" / "latest.json")
+APP1_MONITORING_PATH = as_str(STATE_DIR / "app1_vigilancia" / "monitoring_snapshot.json")
+APP3_MONITORING_PATH = as_str(STATE_DIR / "app3_veicular" / "monitoring_snapshot.json")
 ARTICLE00_SCENARIO_CONTROL_PATH = as_str(STATE_DIR / "article00_scenario_control.json")
 RAPP_DECISIONS_LOG_PATH = as_str(STATE_DIR / "rapp_decisions.jsonl")
 
@@ -110,6 +113,19 @@ def _safe_read_json_file(path):
 def _load_app1_camera_override():
     control = _safe_read_json_file(ARTICLE00_SCENARIO_CONTROL_PATH)
     override = control.get("app1_camera_override", {}) or {}
+    if not override.get("enabled", False):
+        return {}
+    return override
+
+
+def _load_app1_monitoring_snapshot():
+    snapshot = _safe_read_json_file(APP1_MONITORING_PATH)
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
+def _load_vehicle_override():
+    control = _safe_read_json_file(ARTICLE00_SCENARIO_CONTROL_PATH)
+    override = control.get("vehicle_override", {}) or {}
     if not override.get("enabled", False):
         return {}
     return override
@@ -314,6 +330,14 @@ class RappResourceOptimizer:
 
         # XApp Manager (controla ciclo de vida dos xApps)
         self.xapp_manager = XAppManager()
+        self.armd_runtime = ARMDRuntimeAdvisor()
+        if self.armd_runtime.loaded and self.armd_runtime.enabled:
+            print(
+                f"[rApp] ARMD-GreenRAN ativo "
+                f"(threshold={self.armd_runtime.threshold}, subset={self.armd_runtime.subset_size}, mode={self.armd_runtime.mode})"
+            )
+        else:
+            print(f"[rApp] ARMD-GreenRAN indisponível: {self.armd_runtime.load_error or 'disabled'}")
         
         # Limpar processos zumbis antes de iniciar
         self.xapp_manager.cleanup_zombies()
@@ -570,6 +594,23 @@ class RappResourceOptimizer:
             'sim_time_s': 0.0,
         }
 
+        camera_mode = str(os.environ.get("GREENRAN_APP1_CAMERA_SOURCE_MODE", "real") or "real").strip().lower()
+        if camera_mode == "simulated":
+            snapshot = _load_app1_monitoring_snapshot()
+            network = snapshot.get('network', {}) if isinstance(snapshot, dict) else {}
+            camera_sla = snapshot.get('camera_sla', {}) if isinstance(snapshot, dict) else {}
+            if network and camera_sla:
+                metrics.update({
+                    'latency_ms': float(network.get('max_camera_latency_ms', 0.0) or 0.0),
+                    'throughput_mbps': float(network.get('min_camera_throughput_mbps', 0.0) or 0.0),
+                    'active_cameras': int(network.get('active_cameras', 0) or 0),
+                    'critical_cameras': int(snapshot.get('cameras', {}).get('critical_active', 0) or 0),
+                    'observed_cameras': int(network.get('observed_camera_metrics', network.get('active_cameras', 0)) or 0),
+                    'throughput_ready': bool(network.get('camera_metrics_ready', False)),
+                    'throughput_source': 'app1_simulated_snapshot',
+                })
+                return metrics
+
         extended_metrics = self.read_extended_metrics()
         if extended_metrics:
             try:
@@ -799,6 +840,51 @@ class RappResourceOptimizer:
                 })
 
             if not vehicle_entries:
+                app3_snapshot = _safe_read_json_file(APP3_MONITORING_PATH)
+                vehicles_summary = app3_snapshot.get('vehicles', {}) if isinstance(app3_snapshot, dict) else {}
+                network_summary = app3_snapshot.get('network', {}) if isinstance(app3_snapshot, dict) else {}
+                if not isinstance(vehicles_summary, dict):
+                    return metrics
+
+                total_vehicles = int(vehicles_summary.get('total_vehicles', 0) or 0)
+                if total_vehicles <= 0:
+                    return metrics
+
+                age_seconds = None
+                try:
+                    age_seconds = max(0.0, time.time() - os.path.getmtime(APP3_MONITORING_PATH))
+                except OSError:
+                    age_seconds = None
+
+                metrics.update({
+                    'available': True,
+                    'stale': bool(age_seconds is not None and age_seconds > 20),
+                    'age_seconds': age_seconds,
+                    'total_vehicles': total_vehicles,
+                    'ego_present': bool(vehicles_summary.get('ego_present', False)),
+                    'high_risk_vehicles': int(vehicles_summary.get('high_risk_vehicles', 0) or 0),
+                    'medium_risk_vehicles': int(vehicles_summary.get('medium_risk_vehicles', 0) or 0),
+                    'degraded_autonomy_vehicles': int(vehicles_summary.get('degraded_autonomy_vehicles', 0) or 0),
+                    'max_latency_ms': float(
+                        vehicles_summary.get(
+                            'max_latency_ms',
+                            network_summary.get('max_latency_ms', 0.0),
+                        ) or 0.0
+                    ),
+                    'max_packet_loss_percent': float(
+                        vehicles_summary.get(
+                            'max_packet_loss_percent',
+                            network_summary.get('max_packet_loss_percent', 0.0),
+                        ) or 0.0
+                    ),
+                    'max_speed_mps': float(
+                        vehicles_summary.get(
+                            'max_speed_mps',
+                            network_summary.get('max_speed_mps', 0.0),
+                        ) or 0.0
+                    ),
+                    'vehicles': [],
+                })
                 return metrics
 
             age_seconds = None
@@ -829,6 +915,24 @@ class RappResourceOptimizer:
             print(f"[rApp] Erro ao ler métricas de veículos: {e}")
 
         return metrics
+
+    def _should_keep_vehicle_collection_active(self):
+        """
+        Permite continuar a coleta veicular mesmo quando o sim_time do ns-3
+        deixa de avançar, desde que o App3 continue publicando snapshot fresco.
+        """
+        vehicle_override = _load_vehicle_override()
+        if not vehicle_override:
+            return False
+
+        vehicle_metrics = self._get_vehicle_metrics()
+        if not vehicle_metrics.get('available'):
+            return False
+        if vehicle_metrics.get('stale'):
+            return False
+        if int(vehicle_metrics.get('total_vehicles', 0) or 0) <= 0:
+            return False
+        return True
     
     def record_current_metrics(self, slicer_intent, energy_intent):
         """Registra métricas atuais no Data Lake."""
@@ -860,7 +964,11 @@ class RappResourceOptimizer:
                 snapshot=app2_snapshot,
                 sensors=app2_sensors if isinstance(app2_sensors, list) else [],
             )
-        
+
+        app3_snapshot = _safe_read_json_file(APP3_MONITORING_PATH)
+        if isinstance(app3_snapshot, dict) and app3_snapshot:
+            self.data_lake.record_app3_snapshot(snapshot=app3_snapshot)
+
         extended_metrics = self.read_extended_metrics()
         if extended_metrics:
             self.data_lake.record_extended_from_json(
@@ -1843,6 +1951,20 @@ class RappResourceOptimizer:
             decision['confidence'] = min(0.9, trend_info['confidence'] + 0.1)
             decision['preventive_block'] = True
             self.stats['sla_violations'] += 1
+
+        # ========================================
+        # ETAPA 5: ARMD-GreenRAN Runtime Advisor
+        # Camada validada offline que só pode aumentar proteção.
+        # ========================================
+        armd_advice = self.armd_runtime.advise(
+            decision=decision,
+            camera_metrics=decision.get('camera_metrics'),
+            vehicle_metrics=decision.get('vehicle_metrics'),
+            app2_metrics=decision.get('app2_metrics'),
+            network_health=decision.get('network_health'),
+        )
+        decision['armd_analysis'] = armd_advice
+        decision = self.armd_runtime.apply(decision, armd_advice)
         
         return decision
     
@@ -1968,6 +2090,13 @@ class RappResourceOptimizer:
                 
                 if decision['pattern']:
                     f.write(f"|  Padrao detectado: {decision['pattern']:<40}|\n")
+
+                if decision.get('armd_scenario'):
+                    f.write(f"|  ARMD: {decision.get('armd_scenario', ''):<49}|\n")
+                    f.write(f"|  ARMD source: {decision.get('armd_source', ''):<42}|\n")
+                    f.write(f"|  ARMD conf: {float(decision.get('armd_confidence', 0) or 0)*100:.0f}%{' '*47}|\n")
+                    if decision.get('armd_override_applied'):
+                        f.write("|  ARMD override: escalou protecao                       |\n")
                 
                 f.write("=" * 70 + "\n")
                 f.write("\n")
@@ -1985,6 +2114,12 @@ class RappResourceOptimizer:
                 f.write(f"AGENT_OVERRIDE={str(decision['agent_override']).lower()}\n")
                 f.write(f"PATTERN={decision['pattern'] or 'none'}\n")
                 f.write(f"PREVENTIVE_BLOCK={str(decision.get('preventive_block', False)).lower()}\n")
+                f.write(f"ARMD_ENABLED={str(decision.get('armd_enabled', False)).lower()}\n")
+                f.write(f"ARMD_MODE={decision.get('armd_mode', 'unknown')}\n")
+                f.write(f"ARMD_SCENARIO={decision.get('armd_scenario', '')}\n")
+                f.write(f"ARMD_SOURCE={decision.get('armd_source', '')}\n")
+                f.write(f"ARMD_CONFIDENCE={float(decision.get('armd_confidence', 0) or 0):.4f}\n")
+                f.write(f"ARMD_OVERRIDE_APPLIED={str(decision.get('armd_override_applied', False)).lower()}\n")
                 if decision.get('trend_analysis'):
                     ta = decision['trend_analysis']
                     f.write(f"SLOPE_MS_PER_SEC={ta.get('slope_ms_per_sec', 0):.2f}\n")
@@ -2011,11 +2146,25 @@ class RappResourceOptimizer:
                 'confidence': pa['confidence'],
                 'reason': pa['pattern']
             }
+
+        armd_info = None
+        if decision.get('armd_scenario'):
+            armd_info = {
+                'enabled': decision.get('armd_enabled', False),
+                'mode': decision.get('armd_mode', ''),
+                'scenario': decision.get('armd_scenario', ''),
+                'domain': decision.get('armd_domain', ''),
+                'source': decision.get('armd_source', ''),
+                'confidence': decision.get('armd_confidence', 0.0),
+                'override_applied': decision.get('armd_override_applied', False),
+                'reason': decision.get('armd_reason', ''),
+            }
         
         self.a1.send_energy_policy(decision, pattern_info)
         self.a1.send_slice_policy(
             decision['slicer_state'],
-            {'active': int(decision['pattern_analysis']['current_cameras'])} if decision.get('pattern_analysis') else None
+            {'active': int(decision['pattern_analysis']['current_cameras'])} if decision.get('pattern_analysis') else None,
+            armd_info=armd_info,
         )
     
     def send_energy_command(self, decision):
@@ -2130,7 +2279,16 @@ class RappResourceOptimizer:
                 'app2_connected_ratio': (decision.get('app2_metrics') or {}).get('connected_ratio'),
                 'app2_packet_loss_percent': (decision.get('app2_metrics') or {}).get('packet_loss_percent'),
                 'app2_delivery_success_percent': (decision.get('app2_metrics') or {}).get('delivery_success_percent'),
-                'app2_avg_latency_ms': (decision.get('app2_metrics') or {}).get('avg_latency_ms')
+                'app2_avg_latency_ms': (decision.get('app2_metrics') or {}).get('avg_latency_ms'),
+                'armd_enabled': decision.get('armd_enabled', False),
+                'armd_mode': decision.get('armd_mode', ''),
+                'armd_scenario': decision.get('armd_scenario', ''),
+                'armd_domain': decision.get('armd_domain', ''),
+                'armd_source': decision.get('armd_source', ''),
+                'armd_confidence': decision.get('armd_confidence', 0),
+                'armd_override_applied': decision.get('armd_override_applied', False),
+                'armd_expected_energy_saver': decision.get('armd_expected_energy_saver', ''),
+                'armd_expected_action': decision.get('armd_expected_action', '')
             }
 
             with open(RAPP_DECISIONS_LOG_PATH, 'a') as f:
@@ -2256,6 +2414,13 @@ class RappResourceOptimizer:
             print(f"  DECISAO: Energy Saver = {status_display}")
             print(f"  Motivo: {decision['reason']}")
             print(f"  Confianca: {decision['confidence']*100:.0f}%")
+            if decision.get('armd_scenario'):
+                armd_override = " [override]" if decision.get('armd_override_applied') else ""
+                print(
+                    f"  ARMD:             {decision.get('armd_scenario')} "
+                    f"(src={decision.get('armd_source')}, conf={float(decision.get('armd_confidence', 0) or 0):.2f})"
+                    f"{armd_override}"
+                )
             
             if decision['agent_override']:
                 print(f"\033[1;35m  >>> AGENT-AL OVERRIDE: {decision['agent_policy']}\033[0m")
@@ -2398,15 +2563,16 @@ class RappResourceOptimizer:
     def print_final_stats(self):
         """Imprime estatísticas finais."""
         total = self.stats['total_cycles']
+        total_safe = total if total > 0 else 1
         
         print("")
         print("=" * 70)
         print("              rApp-ResourceOptimizer - ESTATÍSTICAS FINAIS")
         print("=" * 70)
         print(f"  Ciclos totais: {total}")
-        print(f"  Decisões BLOCKED: {self.stats['blocked']} ({self.stats['blocked']/total*100:.1f}%)")
-        print(f"  Decisões ALLOWED: {self.stats['allowed']} ({self.stats['allowed']/total*100:.1f}%)")
-        print(f"  Decisões CONDITIONAL: {self.stats['conditional']} ({self.stats['conditional']/total*100:.1f}%)")
+        print(f"  Decisões BLOCKED: {self.stats['blocked']} ({self.stats['blocked']/total_safe*100:.1f}%)")
+        print(f"  Decisões ALLOWED: {self.stats['allowed']} ({self.stats['allowed']/total_safe*100:.1f}%)")
+        print(f"  Decisões CONDITIONAL: {self.stats['conditional']} ({self.stats['conditional']/total_safe*100:.1f}%)")
         print(f"  Agent-Al Overrides: {self.stats['agent_overrides']}")
         print(f"  rApp Overrides (CRITICAL→OK): {self.stats.get('rap_overrides', 0)}")
         print(f"  Blocos Preventivos (Trend): {self.stats.get('preventive_blocks', 0)}")
@@ -2446,6 +2612,7 @@ class RappResourceOptimizer:
         self.data_fresh = True
         self.last_sim_time = 0
         self.stale_sim_cycles = 0
+        self.vehicle_only_mode = False
         
         # Para detecção de transição de simulação
         self.last_sim_time_for_reset = None
@@ -2473,6 +2640,7 @@ class RappResourceOptimizer:
                     if not self.data_fresh:
                         print(f"\n✅  [rApp] Nova simulação detectada! sim_time={new_sim_time}s (reset)")
                         self.data_fresh = True
+                    self.vehicle_only_mode = False
                     self.stale_sim_cycles = 0
                     self.ml_invalid_streak = 0
                     self.ml_predictor.reset_history()
@@ -2488,11 +2656,21 @@ class RappResourceOptimizer:
                             print(f"    → Entrando em modo OFFLINE - aguardando novos dados...")
                             self.data_fresh = False
                         if not self.data_fresh:
-                            time.sleep(self.interval)
-                            self.last_sim_time = new_sim_time
-                            continue
+                            if self._should_keep_vehicle_collection_active():
+                                if not self.vehicle_only_mode:
+                                    print(
+                                        f"\n⚠️  [rApp] SIM_TIME parado em {new_sim_time}s, "
+                                        "mas App3 segue ativo; mantendo coleta veicular."
+                                    )
+                                    self.vehicle_only_mode = True
+                            else:
+                                self.vehicle_only_mode = False
+                                time.sleep(self.interval)
+                                self.last_sim_time = new_sim_time
+                                continue
                     else:
                         self.stale_sim_cycles = 0
+                        self.vehicle_only_mode = False
                         if not self.data_fresh:
                             print(f"\n✅  [rApp] Simulação ativa! sim_time={new_sim_time}s")
                             self.data_fresh = True

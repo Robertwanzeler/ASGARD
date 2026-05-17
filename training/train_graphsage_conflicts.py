@@ -24,22 +24,49 @@ import csv
 import json
 import math
 import random
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from training.graphsage_report_utils import load_scenario_reports
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 DEFAULT_EXPERIMENT_ROOT = PROJECT_ROOT / "runs" / "experimentos_conflitos"
 DEFAULT_OUTPUT_STEM = "graphsage_training"
 DEFAULT_EPOCHS = (50, 100, 200, 400, 600, 800, 1000)
 DEFAULT_SUBSET_SIZES = (50, 150, 450)
 NODE_TYPES = ("agent", "parameter", "kpi", "service", "mitigation", "arbiter", "unknown")
+ALLOWED_TYPE_PAIRS = {
+    ("agent", "parameter"),
+    ("parameter", "kpi"),
+    ("kpi", "service"),
+    ("kpi", "agent"),
+    ("kpi", "arbiter"),
+    ("agent", "mitigation"),
+    ("arbiter", "mitigation"),
+    ("mitigation", "service"),
+}
+RELATION_TYPES = ("controls", "affects", "belongs_to", "triggers_arbitration", "mitigates", "protects")
+RELATION_BY_TYPE_PAIR = {
+    ("agent", "parameter"): "controls",
+    ("parameter", "kpi"): "affects",
+    ("kpi", "service"): "belongs_to",
+    ("kpi", "agent"): "triggers_arbitration",
+    ("kpi", "arbiter"): "triggers_arbitration",
+    ("agent", "mitigation"): "mitigates",
+    ("arbiter", "mitigation"): "mitigates",
+    ("mitigation", "service"): "protects",
+}
 ROLE_FIELDS = {
     "source_agent": "source_agent",
     "target_agent": "target_agent",
@@ -63,6 +90,17 @@ NUMERIC_FIELDS = (
 )
 CONFLICT_TYPES = ("direct", "indirect", "implicit", "unknown")
 DEFAULT_ARBITER_ID = "rApp-ResourceOptimizer"
+NODE_TYPE_PREFIXES = {
+    "agent": "agent",
+    "parameter": "param",
+    "kpi": "kpi",
+    "service": "svc",
+    "mitigation": "mit",
+    "arbiter": "arb",
+    "unknown": "unk",
+}
+DOMAIN_SCOPES = ("mixed", "app1", "app2", "app3")
+DOMAIN_SCOPE_MODES = ("auto", "service", "causal")
 
 
 @dataclass
@@ -129,6 +167,78 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=0.001, help="optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="optimizer weight decay")
     parser.add_argument("--threshold", type=float, default=0.5, help="edge threshold for reconstruction")
+    parser.add_argument(
+        "--loss-mask-mode",
+        choices=("all", "support"),
+        default="all",
+        help="which candidate pairs participate in the training loss; 'support' limits loss to observed support pairs plus positives",
+    )
+    parser.add_argument(
+        "--negative-edge-weight",
+        type=float,
+        default=1.0,
+        help="multiplier applied to negative-edge loss terms",
+    )
+    parser.add_argument(
+        "--pos-weight-scale",
+        type=float,
+        default=1.0,
+        help="scale applied to the automatic positive-class weight",
+    )
+    parser.add_argument(
+        "--max-pos-weight",
+        type=float,
+        default=0.0,
+        help="optional cap for the automatic positive-class weight; 0 disables the cap",
+    )
+    parser.add_argument(
+        "--fp-penalty-weight",
+        type=float,
+        default=0.0,
+        help="extra penalty on negative edges whose predicted probability exceeds --fp-penalty-margin",
+    )
+    parser.add_argument(
+        "--fp-penalty-margin",
+        type=float,
+        default=0.5,
+        help="probability margin used by --fp-penalty-weight on negative edges",
+    )
+    parser.add_argument(
+        "--selection-mode",
+        choices=("f1", "fp_penalized"),
+        default="f1",
+        help="criterion used to choose the best checkpoint",
+    )
+    parser.add_argument(
+        "--selection-fp-weight",
+        type=float,
+        default=0.25,
+        help="false-positive penalty weight used when --selection-mode=fp_penalized",
+    )
+    parser.add_argument(
+        "--selection-precision-weight",
+        type=float,
+        default=0.10,
+        help="precision bonus weight used when --selection-mode=fp_penalized",
+    )
+    parser.add_argument(
+        "--pair-mask-mode",
+        choices=("all", "valid_types"),
+        default="valid_types",
+        help="candidate edge pairs used in training/evaluation; 'valid_types' restricts pairs to semantically valid node-type chains",
+    )
+    parser.add_argument(
+        "--domain-scope",
+        choices=DOMAIN_SCOPES,
+        default="mixed",
+        help="optional supervision scope; app1/app2/app3 restrict training and evaluation to domain-specific structural pairs",
+    )
+    parser.add_argument(
+        "--domain-scope-mode",
+        choices=DOMAIN_SCOPE_MODES,
+        default="auto",
+        help="how domain rows are selected; 'auto' uses service for app1 and causal for app2/app3, while explicit 'service' or 'causal' force that policy",
+    )
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     parser.add_argument(
         "--split-by-rounds",
@@ -158,6 +268,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         help="directory where training artifacts will be written; defaults to <experiment>/graphsage_training",
+    )
+    parser.add_argument(
+        "--init-model",
+        help="optional checkpoint path used to warm-start model weights before training",
     )
     parser.add_argument(
         "--direct-test-fraction",
@@ -199,6 +313,67 @@ def read_round_summary(path: Path) -> list[dict]:
         row["rows"] = int(row["rows"])
         row["cumulative_rows"] = int(row.get("cumulative_rows", 0) or 0)
     return rows
+
+
+def normalize_node_value(value: str | None, fallback: str) -> str:
+    normalized = (value or fallback).strip()
+    return normalized or fallback
+
+
+def target_node_type(target: str) -> str:
+    return "arbiter" if target.startswith("rApp-") or target == DEFAULT_ARBITER_ID else "agent"
+
+
+def qualified_node_id(node_type: str, raw_value: str) -> str:
+    prefix = NODE_TYPE_PREFIXES.get(node_type, NODE_TYPE_PREFIXES["unknown"])
+    return f"{prefix}:{raw_value}"
+
+
+def contains_vehicle_signal(value: str | None) -> bool:
+    text = (value or "").strip().lower()
+    return "vehicle" in text or "veicular" in text
+
+
+def resolve_domain_scope_mode(domain_scope: str, scope_mode: str) -> str:
+    if scope_mode != "auto":
+        return scope_mode
+    if domain_scope == "app1":
+        return "service"
+    if domain_scope in {"app2", "app3"}:
+        return "causal"
+    return "service"
+
+
+def infer_row_domain(row: dict, scope_mode: str = "service") -> str:
+    affected_service = normalize_node_value(row.get("affected_service"), "")
+    affected_kpi = normalize_node_value(row.get("affected_kpi"), "")
+    source_agent = normalize_node_value(row.get("source_agent"), "")
+    target_agent = normalize_node_value(row.get("target_agent"), "")
+    parameter = normalize_node_value(row.get("parameter"), "")
+
+    if scope_mode == "service":
+        if (
+            affected_service == "App3-Veicular"
+            or contains_vehicle_signal(affected_kpi)
+        ):
+            return "app3"
+        if affected_service == "App2-Monitoramento" or "app2_" in affected_kpi.lower():
+            return "app2"
+        if affected_service == "App1-Vigilancia" or "camera_" in affected_kpi.lower():
+            return "app1"
+        return "mixed"
+
+    if (
+        parameter == "vehicle_priority_policy"
+        or contains_vehicle_signal(source_agent)
+        or contains_vehicle_signal(target_agent)
+    ):
+        return "app3"
+    if "EnergySaver" in source_agent or parameter == "energy_policy":
+        return "app2"
+    if "RANSlicer" in source_agent or parameter == "global_health_policy":
+        return "app1"
+    return "mixed"
 
 
 def safe_float(value: str | None) -> float:
@@ -251,8 +426,7 @@ def set_seed(seed: int) -> None:
 
 
 def selected_reports(experiment_dir: Path, slugs: list[str]) -> list[dict]:
-    report = load_json(experiment_dir / "experiment_report.json")
-    scenario_reports = report.get("scenario_reports", [])
+    scenario_reports = load_scenario_reports(experiment_dir)
     if not slugs:
         return scenario_reports
 
@@ -362,9 +536,10 @@ def build_graph_from_rows(rows: list[dict]) -> dict:
 
     def add_node(node_id: str, node_type: str) -> None:
         if node_id not in nodes:
+            raw_label = node_id.split(":", 1)[1] if ":" in node_id else node_id
             nodes[node_id] = {
                 "id": node_id,
-                "label": node_id,
+                "label": raw_label,
                 "type": node_type,
                 "event_count": 0,
             }
@@ -389,16 +564,23 @@ def build_graph_from_rows(rows: list[dict]) -> dict:
         edge["affected_kpis"][affected_kpi] = int(edge["affected_kpis"].get(affected_kpi, 0)) + 1
 
     for row in rows:
-        source = (row.get("source_agent") or "unknown_agent").strip() or "unknown_agent"
-        target = (row.get("target_agent") or DEFAULT_ARBITER_ID).strip() or DEFAULT_ARBITER_ID
-        parameter = (row.get("parameter") or "unknown_parameter").strip() or "unknown_parameter"
-        service = (row.get("affected_service") or "unknown_service").strip() or "unknown_service"
-        kpi = (row.get("affected_kpi") or "unknown_kpi").strip() or "unknown_kpi"
-        mitigation = (row.get("mitigation_action") or "NONE").strip() or "NONE"
+        raw_source = normalize_node_value(row.get("source_agent"), "unknown_agent")
+        raw_target = normalize_node_value(row.get("target_agent"), DEFAULT_ARBITER_ID)
+        raw_parameter = normalize_node_value(row.get("parameter"), "unknown_parameter")
+        raw_service = normalize_node_value(row.get("affected_service"), "unknown_service")
+        raw_kpi = normalize_node_value(row.get("affected_kpi"), "unknown_kpi")
+        raw_mitigation = normalize_node_value(row.get("mitigation_action"), "NONE")
+        resolved_target_type = target_node_type(raw_target)
+
+        source = qualified_node_id("agent", raw_source)
+        target = qualified_node_id(resolved_target_type, raw_target)
+        parameter = qualified_node_id("parameter", raw_parameter)
+        service = qualified_node_id("service", raw_service)
+        kpi = qualified_node_id("kpi", raw_kpi)
+        mitigation = qualified_node_id("mitigation", raw_mitigation)
 
         add_node(source, "agent")
-        add_node(target, "agent")
-        add_node(DEFAULT_ARBITER_ID, "arbiter")
+        add_node(target, resolved_target_type)
         add_node(parameter, "parameter")
         add_node(service, "service")
         add_node(kpi, "kpi")
@@ -407,8 +589,8 @@ def build_graph_from_rows(rows: list[dict]) -> dict:
         add_edge(source, parameter, "controls", row)
         add_edge(parameter, kpi, "affects", row)
         add_edge(kpi, service, "belongs_to", row)
-        add_edge(kpi, DEFAULT_ARBITER_ID, "triggers_arbitration", row)
-        add_edge(DEFAULT_ARBITER_ID, mitigation, "mitigates", row)
+        add_edge(kpi, target, "triggers_arbitration", row)
+        add_edge(target, mitigation, "mitigates", row)
         add_edge(mitigation, service, "protects", row)
 
     return {
@@ -419,20 +601,125 @@ def build_graph_from_rows(rows: list[dict]) -> dict:
 
 def build_support_matrix(rows: list[dict], node_index: dict[str, int]) -> torch.Tensor:
     support = torch.zeros((len(node_index), len(node_index)), dtype=torch.float32)
+
+    def connect(left: str, right: str) -> None:
+        if not left or not right:
+            return
+        if left not in node_index or right not in node_index:
+            return
+        li = node_index[left]
+        ri = node_index[right]
+        support[li, ri] += 1.0
+        support[ri, li] += 1.0
+
     for row in rows:
-        active_ids = []
-        for field in ROLE_FIELDS:
-            node_id = (row.get(field) or "").strip()
-            if node_id and node_id in node_index:
-                active_ids.append(node_id)
-        deduped = sorted(set(active_ids))
-        for left in range(len(deduped)):
-            li = node_index[deduped[left]]
-            for right in range(left + 1, len(deduped)):
-                ri = node_index[deduped[right]]
-                support[li, ri] += 1.0
-                support[ri, li] += 1.0
+        raw_source = normalize_node_value(row.get("source_agent"), "unknown_agent")
+        raw_target = normalize_node_value(row.get("target_agent"), DEFAULT_ARBITER_ID)
+        raw_parameter = normalize_node_value(row.get("parameter"), "unknown_parameter")
+        raw_service = normalize_node_value(row.get("affected_service"), "unknown_service")
+        raw_kpi = normalize_node_value(row.get("affected_kpi"), "unknown_kpi")
+        raw_mitigation = normalize_node_value(row.get("mitigation_action"), "NONE")
+        source = qualified_node_id("agent", raw_source)
+        target = qualified_node_id(target_node_type(raw_target), raw_target)
+        parameter = qualified_node_id("parameter", raw_parameter)
+        service = qualified_node_id("service", raw_service)
+        kpi = qualified_node_id("kpi", raw_kpi)
+        mitigation = qualified_node_id("mitigation", raw_mitigation)
+
+        # Keep support aligned with the intended causal chain instead of
+        # building a full clique for every row, which over-connects hubs and
+        # inflates false positives during reconstruction.
+        connect(source, parameter)
+        connect(parameter, kpi)
+        connect(kpi, service)
+        connect(kpi, target)
+        connect(target, mitigation)
+        connect(mitigation, service)
     return support
+
+
+def build_valid_pair_mask(graph: dict, node_ids: list[str]) -> torch.Tensor:
+    node_types = {node.get("id"): node.get("type", "unknown") for node in graph.get("nodes", [])}
+    mask = torch.zeros((len(node_ids), len(node_ids)), dtype=torch.bool)
+    for src_idx, source in enumerate(node_ids):
+        source_type = node_types.get(source, "unknown")
+        for dst_idx, target in enumerate(node_ids):
+            if src_idx == dst_idx:
+                continue
+            target_type = node_types.get(target, "unknown")
+            if (source_type, target_type) in ALLOWED_TYPE_PAIRS:
+                mask[src_idx, dst_idx] = True
+    return mask
+
+
+def build_domain_pair_mask(
+    graph: dict,
+    rows: list[dict],
+    node_ids: list[str],
+    domain_scope: str,
+    domain_scope_mode: str,
+) -> torch.Tensor:
+    mask = torch.zeros((len(node_ids), len(node_ids)), dtype=torch.bool)
+    if domain_scope == "mixed":
+        return mask
+
+    resolved_scope_mode = resolve_domain_scope_mode(domain_scope, domain_scope_mode)
+    node_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
+    node_types = {node.get("id"): node.get("type", "unknown") for node in graph.get("nodes", [])}
+    domain_nodes: set[str] = set()
+
+    for row in rows:
+        if infer_row_domain(row, resolved_scope_mode) != domain_scope:
+            continue
+
+        raw_source = normalize_node_value(row.get("source_agent"), "unknown_agent")
+        raw_target = normalize_node_value(row.get("target_agent"), DEFAULT_ARBITER_ID)
+        raw_parameter = normalize_node_value(row.get("parameter"), "unknown_parameter")
+        raw_service = normalize_node_value(row.get("affected_service"), "unknown_service")
+        raw_kpi = normalize_node_value(row.get("affected_kpi"), "unknown_kpi")
+        raw_mitigation = normalize_node_value(row.get("mitigation_action"), "NONE")
+
+        source = qualified_node_id("agent", raw_source)
+        target = qualified_node_id(target_node_type(raw_target), raw_target)
+        parameter = qualified_node_id("parameter", raw_parameter)
+        service = qualified_node_id("service", raw_service)
+        kpi = qualified_node_id("kpi", raw_kpi)
+        mitigation = qualified_node_id("mitigation", raw_mitigation)
+
+        domain_nodes.update((source, target, parameter, service, kpi, mitigation))
+
+    for src_node in domain_nodes:
+        if src_node not in node_index:
+            continue
+        src_idx = node_index[src_node]
+        src_type = node_types.get(src_node, "unknown")
+        for dst_node in domain_nodes:
+            if dst_node not in node_index or src_node == dst_node:
+                continue
+            dst_type = node_types.get(dst_node, "unknown")
+            if (src_type, dst_type) not in ALLOWED_TYPE_PAIRS:
+                continue
+            dst_idx = node_index[dst_node]
+            mask[src_idx, dst_idx] = True
+
+    return mask
+
+
+def build_relation_index_matrix(graph: dict, node_ids: list[str]) -> torch.Tensor:
+    node_types = {node.get("id"): node.get("type", "unknown") for node in graph.get("nodes", [])}
+    relation_to_idx = {name: idx for idx, name in enumerate(RELATION_TYPES)}
+    relation_index = torch.full((len(node_ids), len(node_ids)), -1, dtype=torch.long)
+    for src_idx, source in enumerate(node_ids):
+        source_type = node_types.get(source, "unknown")
+        for dst_idx, target in enumerate(node_ids):
+            if src_idx == dst_idx:
+                continue
+            target_type = node_types.get(target, "unknown")
+            relation = RELATION_BY_TYPE_PAIR.get((source_type, target_type))
+            if relation is None:
+                continue
+            relation_index[src_idx, dst_idx] = relation_to_idx[relation]
+    return relation_index
 
 
 def build_feature_matrix(
@@ -466,8 +753,26 @@ def build_feature_matrix(
         conflict_type = normalize_conflict_type(row.get("conflict_type"))
         active_ids = []
         for field, role_name in ROLE_FIELDS.items():
-            node_id = (row.get(field) or "").strip()
-            if not node_id or node_id not in per_node:
+            raw_value = (row.get(field) or "").strip()
+            if not raw_value:
+                continue
+            if field == "source_agent":
+                node_id = qualified_node_id("agent", raw_value)
+            elif field == "target_agent":
+                node_id = qualified_node_id(target_node_type(raw_value), raw_value)
+            elif field == "parameter":
+                node_id = qualified_node_id("parameter", raw_value)
+            elif field == "affected_service":
+                node_id = qualified_node_id("service", raw_value)
+            elif field == "affected_kpi":
+                node_id = qualified_node_id("kpi", raw_value)
+            elif field == "mitigation_action":
+                node_id = qualified_node_id("mitigation", raw_value)
+            elif field == "latest_energy_command":
+                node_id = qualified_node_id("mitigation", raw_value)
+            else:
+                node_id = raw_value
+            if node_id not in per_node:
                 continue
             per_node[node_id]["role_counts"][role_name] += 1.0
             active_ids.append(node_id)
@@ -608,10 +913,36 @@ def build_round_split(
     test_round_fraction: float,
     min_test_rounds: int,
 ) -> RoundSplit:
-    subset_rows, contributing_rounds, round_boundaries = subset_rows_with_boundaries(case)
+    try:
+        subset_rows, contributing_rounds, round_boundaries = subset_rows_with_boundaries(case)
+    except SystemExit:
+        rows = read_csv_rows(case.dataset_path)
+        fallback = build_direct_row_split(
+            rows,
+            test_fraction=max(float(test_round_fraction), 0.25),
+            min_test_rows=1,
+        )
+        return RoundSplit(
+            mode="direct_row_fallback_from_incomplete_round_index",
+            train_rows=fallback.train_rows,
+            test_rows=fallback.test_rows,
+            train_rounds=[],
+            test_rounds=[],
+            contributing_rounds=[],
+        )
     if len(contributing_rounds) < 2:
-        raise SystemExit(
-            f"round-based split requires at least 2 contributing rounds for {case.scenario} subset {case.subset_size}"
+        fallback = build_direct_row_split(
+            subset_rows,
+            test_fraction=max(float(test_round_fraction), 0.25),
+            min_test_rows=1,
+        )
+        return RoundSplit(
+            mode="direct_row_fallback_from_round_holdout",
+            train_rows=fallback.train_rows,
+            test_rows=fallback.test_rows,
+            train_rounds=[],
+            test_rounds=[],
+            contributing_rounds=contributing_rounds,
         )
 
     requested_test_rounds = max(min_test_rounds, int(math.ceil(len(contributing_rounds) * test_round_fraction)))
@@ -745,11 +1076,16 @@ class GraphSAGEReconstructor(nn.Module):
         self.sage2 = DenseGraphSAGELayer(hidden_dim, embed_dim)
         self.dropout = dropout
         decoder_dim = embed_dim * 4
-        self.decoder = nn.Sequential(
-            nn.Linear(decoder_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+        self.relation_decoders = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(decoder_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, 1),
+                )
+                for _ in RELATION_TYPES
+            ]
         )
 
     def encode(self, x: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
@@ -759,21 +1095,44 @@ class GraphSAGEReconstructor(nn.Module):
         embedding = self.sage2(hidden, support)
         return F.normalize(embedding, p=2, dim=1)
 
-    def decode(self, embedding: torch.Tensor) -> torch.Tensor:
+    def decode(self, embedding: torch.Tensor, relation_index: torch.Tensor) -> torch.Tensor:
         n_nodes = embedding.shape[0]
         src = embedding.unsqueeze(1).expand(n_nodes, n_nodes, -1)
         dst = embedding.unsqueeze(0).expand(n_nodes, n_nodes, -1)
         pair_features = torch.cat([src, dst, torch.abs(src - dst), src * dst], dim=-1)
-        logits = self.decoder(pair_features).squeeze(-1)
+        logits = torch.full(
+            (n_nodes, n_nodes),
+            -20.0,
+            dtype=pair_features.dtype,
+            device=pair_features.device,
+        )
+        for relation_idx, decoder in enumerate(self.relation_decoders):
+            relation_mask = relation_index == relation_idx
+            if not relation_mask.any():
+                continue
+            relation_logits = decoder(pair_features[relation_mask]).squeeze(-1)
+            logits[relation_mask] = relation_logits
         return logits
 
-    def forward(self, x: torch.Tensor, support: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        support: torch.Tensor,
+        relation_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         embedding = self.encode(x, support)
-        return embedding, self.decode(embedding)
+        return embedding, self.decode(embedding, relation_index)
 
 
-def compute_metrics(logits: torch.Tensor, target: torch.Tensor, threshold: float) -> dict:
+def compute_metrics(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    threshold: float,
+    pair_mask: torch.Tensor | None = None,
+) -> dict:
     mask = ~torch.eye(target.shape[0], dtype=torch.bool, device=target.device)
+    if pair_mask is not None:
+        mask = mask & pair_mask.to(device=target.device, dtype=torch.bool)
     probs = torch.sigmoid(logits)
     pred = (probs >= threshold).float()
     target_masked = target[mask]
@@ -806,6 +1165,7 @@ def top_edges(
     node_ids: list[str],
     target_graph: dict,
     threshold: float,
+    pair_mask: torch.Tensor | None = None,
 ) -> list[dict]:
     truth = {
         (edge.get("source"), edge.get("target")): edge.get("relation", "unknown")
@@ -816,6 +1176,8 @@ def top_edges(
     for src_idx, source in enumerate(node_ids):
         for dst_idx, target in enumerate(node_ids):
             if src_idx == dst_idx:
+                continue
+            if pair_mask is not None and not bool(pair_mask[src_idx, dst_idx].item()):
                 continue
             score = float(probs[src_idx, dst_idx].item())
             if score < threshold:
@@ -843,6 +1205,18 @@ def train_case(
     learning_rate: float,
     weight_decay: float,
     threshold: float,
+    loss_mask_mode: str,
+    negative_edge_weight: float,
+    pos_weight_scale: float,
+    max_pos_weight: float,
+    fp_penalty_weight: float,
+    fp_penalty_margin: float,
+    selection_mode: str,
+    selection_fp_weight: float,
+    selection_precision_weight: float,
+    pair_mask_mode: str,
+    domain_scope: str,
+    domain_scope_mode: str,
     seed: int,
     split_by_rounds: bool,
     test_round_fraction: float,
@@ -851,6 +1225,7 @@ def train_case(
     manual_test_rounds: list[int] | None,
     direct_test_fraction: float,
     direct_min_test_rows: int,
+    init_model_path: Path | None,
 ) -> dict:
     set_seed(seed)
     ensure_dir(case.output_dir)
@@ -909,6 +1284,10 @@ def train_case(
         embed_dim=embed_dim,
         dropout=dropout,
     ).to(device)
+    if init_model_path is not None:
+        checkpoint = torch.load(init_model_path, map_location=device)
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        model.load_state_dict(state_dict)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=learning_rate,
@@ -916,20 +1295,52 @@ def train_case(
     )
 
     max_epoch = max(epochs)
+    if split is not None:
+        mask_graph = combined_graph
+    else:
+        mask_graph = graph
+    valid_pair_mask = build_valid_pair_mask(mask_graph, node_ids).to(device)
+    resolved_domain_scope_mode = resolve_domain_scope_mode(domain_scope, domain_scope_mode)
+    domain_pair_mask = build_domain_pair_mask(
+        mask_graph,
+        rows,
+        node_ids,
+        domain_scope,
+        resolved_domain_scope_mode,
+    ).to(device)
+    relation_index = build_relation_index_matrix(mask_graph, node_ids).to(device)
     train_mask = ~torch.eye(train_target.shape[0], dtype=torch.bool, device=device)
-    positives = float(train_target[train_mask].sum().item())
-    negatives = float(train_mask.sum().item() - positives)
-    pos_weight = torch.tensor(
-        [negatives / max(positives, 1.0)],
-        dtype=torch.float32,
-        device=device,
-    )
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if pair_mask_mode == "valid_types":
+        train_mask = train_mask & valid_pair_mask
+    if domain_scope != "mixed":
+        train_mask = train_mask & domain_pair_mask
+        if int(domain_pair_mask.sum().item()) == 0:
+            raise SystemExit(
+                f"domain scope '{domain_scope}' with mode '{resolved_domain_scope_mode}' produced zero candidate pairs. "
+                "The selected dataset does not appear to contain compatible domain rows."
+            )
+    if loss_mask_mode == "support":
+        loss_mask = train_mask & ((train_support > 0) | (train_target > 0))
+    else:
+        loss_mask = train_mask
+    if int(loss_mask.sum().item()) == 0:
+        raise SystemExit(
+            f"training mask is empty for domain scope '{domain_scope}' ({resolved_domain_scope_mode}). "
+            "No valid supervised pairs remain after applying the current masks."
+        )
+    positives = float(train_target[loss_mask].sum().item())
+    negatives = float(loss_mask.sum().item() - positives)
+    raw_pos_weight = negatives / max(positives, 1.0)
+    effective_pos_weight = raw_pos_weight * max(pos_weight_scale, 0.0)
+    if max_pos_weight > 0.0:
+        effective_pos_weight = min(effective_pos_weight, max_pos_weight)
+    pos_weight = torch.tensor([effective_pos_weight], dtype=torch.float32, device=device)
+    negative_mask = loss_mask & (train_target < 0.5)
 
     checkpoints = set(epochs)
     history = []
     best = None
-    best_f1 = -1.0
+    best_score = float("-inf")
     started_at = time.time()
     checkpoint_dir = case.output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -937,8 +1348,21 @@ def train_case(
     for epoch in range(1, max_epoch + 1):
         model.train()
         optimizer.zero_grad()
-        _, train_logits = model(train_features, train_support)
-        loss = criterion(train_logits[train_mask], train_target[train_mask])
+        _, train_logits = model(train_features, train_support, relation_index)
+        loss_terms = F.binary_cross_entropy_with_logits(
+            train_logits[loss_mask],
+            train_target[loss_mask],
+            reduction="none",
+            pos_weight=pos_weight,
+        )
+        if negative_edge_weight != 1.0:
+            negative_targets = train_target[loss_mask] < 0.5
+            loss_terms = torch.where(negative_targets, loss_terms * negative_edge_weight, loss_terms)
+        loss = loss_terms.mean()
+        if fp_penalty_weight > 0.0 and negative_mask.any():
+            negative_probs = torch.sigmoid(train_logits[negative_mask])
+            fp_penalty = torch.relu(negative_probs - fp_penalty_margin).mean()
+            loss = loss + fp_penalty_weight * fp_penalty
         loss.backward()
         optimizer.step()
 
@@ -947,14 +1371,24 @@ def train_case(
 
         model.eval()
         with torch.no_grad():
-            train_embedding, train_logits = model(train_features, train_support)
-            train_metrics = compute_metrics(train_logits, train_target, threshold)
+            train_embedding, train_logits = model(train_features, train_support, relation_index)
+            train_metrics = compute_metrics(
+                train_logits,
+                train_target,
+                threshold,
+                pair_mask=train_mask,
+            )
             eval_embedding = train_embedding
             eval_logits = train_logits
             eval_metrics = train_metrics
             if test_features is not None and test_support is not None:
-                eval_embedding, eval_logits = model(test_features, test_support)
-                eval_metrics = compute_metrics(eval_logits, eval_target, threshold)
+                eval_embedding, eval_logits = model(test_features, test_support, relation_index)
+                eval_metrics = compute_metrics(
+                    eval_logits,
+                    eval_target,
+                    threshold,
+                    pair_mask=train_mask,
+                )
             snapshot = {
                 "epoch": epoch,
                 "loss": round(float(loss.item()), 6),
@@ -981,9 +1415,20 @@ def train_case(
                 },
                 checkpoint_dir / f"epoch_{epoch}.pt",
             )
-            if eval_metrics["f1"] >= best_f1:
-                best_f1 = eval_metrics["f1"]
+            if selection_mode == "fp_penalized":
+                fp_total = eval_metrics["fp"] + eval_metrics["tn"]
+                fp_rate = (eval_metrics["fp"] / fp_total) if fp_total else 0.0
+                score = (
+                    eval_metrics["f1"]
+                    + selection_precision_weight * eval_metrics["precision"]
+                    - selection_fp_weight * fp_rate
+                )
+            else:
+                score = eval_metrics["f1"]
+            if score >= best_score:
+                best_score = score
                 best = {
+                    "score": round(float(score), 6),
                     "epoch": epoch,
                     "metrics": eval_metrics,
                     "train_metrics": train_metrics,
@@ -991,7 +1436,13 @@ def train_case(
                     "logits": eval_logits.detach().cpu(),
                 }
 
-    best_edges = top_edges(best["logits"], node_ids, eval_graph, threshold) if best else []
+    best_edges = top_edges(
+        best["logits"],
+        node_ids,
+        eval_graph,
+        threshold,
+        pair_mask=train_mask.cpu(),
+    ) if best else []
     torch.save(
         {
             "state_dict": model.state_dict(),
@@ -1012,11 +1463,27 @@ def train_case(
         "dataset_path": str(case.dataset_path),
         "graph_path": str(case.graph_path),
         "output_dir": str(case.output_dir),
+        "init_model": str(init_model_path) if init_model_path else "",
+        "loss_mask_mode": loss_mask_mode,
+        "negative_edge_weight": negative_edge_weight,
+        "pos_weight_scale": pos_weight_scale,
+        "max_pos_weight": max_pos_weight,
+        "effective_pos_weight": round(float(effective_pos_weight), 6),
+        "fp_penalty_weight": fp_penalty_weight,
+        "fp_penalty_margin": fp_penalty_margin,
+        "selection_mode": selection_mode,
+        "selection_fp_weight": selection_fp_weight,
+        "selection_precision_weight": selection_precision_weight,
+        "pair_mask_mode": pair_mask_mode,
+        "domain_scope": domain_scope,
+        "domain_scope_mode": resolved_domain_scope_mode,
         "device": str(device),
         "rows": len(rows),
         "train_rows": len(train_rows),
         "test_rows": len(test_rows),
         "nodes": len(node_ids),
+        "candidate_pairs": int(train_mask.sum().item()),
+        "domain_candidate_pairs": int(domain_pair_mask.sum().item()) if domain_scope != "mixed" else 0,
         "target_edges": int(eval_target.sum().item()),
         "train_target_edges": int(train_target.sum().item()),
         "eval_target_edges": int(eval_target.sum().item()),
@@ -1028,6 +1495,7 @@ def train_case(
         "test_rounds": split.test_rounds if split else [],
         "contributing_rounds": split.contributing_rounds if split else [],
         "best_epoch": best["epoch"] if best else None,
+        "best_score": best.get("score") if best else None,
         "best_metrics": best["metrics"] if best else {},
         "train_metrics_at_best": best["train_metrics"] if best else {},
         "history": history,
@@ -1102,6 +1570,18 @@ def main() -> int:
         "epochs": list(epochs),
         "subset_sizes": [] if direct_mode else list(subset_sizes),
         "threshold": args.threshold,
+        "loss_mask_mode": args.loss_mask_mode,
+        "negative_edge_weight": args.negative_edge_weight,
+        "pos_weight_scale": args.pos_weight_scale,
+        "max_pos_weight": args.max_pos_weight,
+        "fp_penalty_weight": args.fp_penalty_weight,
+        "fp_penalty_margin": args.fp_penalty_margin,
+        "selection_mode": args.selection_mode,
+        "selection_fp_weight": args.selection_fp_weight,
+        "selection_precision_weight": args.selection_precision_weight,
+        "pair_mask_mode": args.pair_mask_mode,
+        "domain_scope": args.domain_scope,
+        "domain_scope_mode": resolve_domain_scope_mode(args.domain_scope, args.domain_scope_mode),
         "direct_mode": direct_mode,
         "dataset_path": args.dataset_path or "",
         "graph_path": args.graph_path or "",
@@ -1143,6 +1623,18 @@ def main() -> int:
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             threshold=args.threshold,
+            loss_mask_mode=args.loss_mask_mode,
+            negative_edge_weight=args.negative_edge_weight,
+            pos_weight_scale=args.pos_weight_scale,
+            max_pos_weight=args.max_pos_weight,
+            fp_penalty_weight=args.fp_penalty_weight,
+            fp_penalty_margin=args.fp_penalty_margin,
+            selection_mode=args.selection_mode,
+            selection_fp_weight=args.selection_fp_weight,
+            selection_precision_weight=args.selection_precision_weight,
+            pair_mask_mode=args.pair_mask_mode,
+            domain_scope=args.domain_scope,
+            domain_scope_mode=args.domain_scope_mode,
             seed=args.seed,
             split_by_rounds=args.split_by_rounds,
             test_round_fraction=args.test_round_fraction,
@@ -1151,6 +1643,7 @@ def main() -> int:
             manual_test_rounds=manual_test_rounds,
             direct_test_fraction=args.direct_test_fraction,
             direct_min_test_rows=args.direct_min_test_rows,
+            init_model_path=Path(args.init_model) if args.init_model else None,
         )
         aggregate["cases"].append(summary)
         best = summary.get("best_metrics", {})

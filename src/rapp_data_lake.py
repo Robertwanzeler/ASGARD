@@ -109,9 +109,28 @@ class DataLake:
                 ml_confidence REAL,
                 ml_predicted_cvar_ms REAL,
                 ml_influenced INTEGER DEFAULT 0,
+                armd_enabled INTEGER DEFAULT 0,
+                armd_mode TEXT,
+                armd_scenario TEXT,
+                armd_source TEXT,
+                armd_confidence REAL DEFAULT 0,
+                armd_override_applied INTEGER DEFAULT 0,
                 UNIQUE(timestamp)
             )
         """)
+        existing_decision_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(decisions_history)").fetchall()
+        }
+        for column_name, column_def in (
+            ("armd_enabled", "INTEGER DEFAULT 0"),
+            ("armd_mode", "TEXT"),
+            ("armd_scenario", "TEXT"),
+            ("armd_source", "TEXT"),
+            ("armd_confidence", "REAL DEFAULT 0"),
+            ("armd_override_applied", "INTEGER DEFAULT 0"),
+        ):
+            if column_name not in existing_decision_columns:
+                cursor.execute(f"ALTER TABLE decisions_history ADD COLUMN {column_name} {column_def}")
         
         # Tabela de estatísticas por hora
         cursor.execute("""
@@ -349,6 +368,30 @@ class DataLake:
             ON app2_sensor_readings(sensor_id)
         """)
 
+        # Snapshot agregado da App3-Veicular.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS app3_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                total_vehicles INTEGER DEFAULT 0,
+                ego_present INTEGER DEFAULT 0,
+                high_risk_vehicles INTEGER DEFAULT 0,
+                medium_risk_vehicles INTEGER DEFAULT 0,
+                degraded_autonomy_vehicles INTEGER DEFAULT 0,
+                max_latency_ms REAL DEFAULT 0,
+                max_packet_loss_percent REAL DEFAULT 0,
+                max_speed_mps REAL DEFAULT 0,
+                snapshot_json TEXT,
+                UNIQUE(timestamp)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_app3_snapshots_timestamp
+            ON app3_snapshots(timestamp)
+        """)
+
         # Eventos de conflito O-RAN (artigo00): xApps/agentes -> parâmetros -> KPIs.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS conflict_events (
@@ -483,6 +526,12 @@ class DataLake:
         ml_confidence = ml_prediction.get('confidence', 0.0)
         ml_predicted_cvar = ml_prediction.get('predicted_cvar_ms', 0.0)
         ml_influenced = 1 if decision.get('ml_influenced', False) else 0
+        armd_enabled = 1 if decision.get('armd_enabled', False) else 0
+        armd_mode = decision.get('armd_mode', '')
+        armd_scenario = decision.get('armd_scenario', '')
+        armd_source = decision.get('armd_source', '')
+        armd_confidence = decision.get('armd_confidence', 0.0)
+        armd_override_applied = 1 if decision.get('armd_override_applied', False) else 0
 
         # DEBUG: Log dos dados de ML que chegam
         if ml_decision:
@@ -503,15 +552,65 @@ class DataLake:
                 INSERT OR REPLACE INTO decisions_history
                 (timestamp, datetime, decision, reason, confidence, pattern,
                  agent_override, energy_state, slicer_state,
-                 ml_decision, ml_confidence, ml_predicted_cvar_ms, ml_influenced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ml_decision, ml_confidence, ml_predicted_cvar_ms, ml_influenced,
+                 armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (timestamp, dt_str, decision_str, reason, confidence, pattern,
                   agent_override, energy_state, slicer_state,
-                  ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced))
+                  ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced,
+                  armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied))
             self.conn.commit()
             self.record_conflict_from_decision(decision, timestamp=timestamp)
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar decisão: {e}")
+
+    def record_app3_snapshot(self, snapshot, timestamp=None):
+        """Registra snapshot agregado do App3 para fallback histórico do domínio veicular."""
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+
+        simulation = snapshot.get("simulation", {}) or {}
+        vehicles = snapshot.get("vehicles", {}) or {}
+        network = snapshot.get("network", {}) or {}
+
+        if timestamp is None:
+            timestamp_text = simulation.get("timestamp_iso")
+            if timestamp_text:
+                try:
+                    timestamp = int(datetime.fromisoformat(str(timestamp_text)).timestamp())
+                except (TypeError, ValueError, OSError):
+                    timestamp = None
+
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        dt = datetime.fromtimestamp(timestamp)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO app3_snapshots
+                (timestamp, datetime, total_vehicles, ego_present,
+                 high_risk_vehicles, medium_risk_vehicles, degraded_autonomy_vehicles,
+                 max_latency_ms, max_packet_loss_percent, max_speed_mps, snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                timestamp,
+                dt_str,
+                int(vehicles.get("total_vehicles", 0) or 0),
+                1 if vehicles.get("ego_present", False) else 0,
+                int(vehicles.get("high_risk_vehicles", 0) or 0),
+                int(vehicles.get("medium_risk_vehicles", 0) or 0),
+                int(vehicles.get("degraded_autonomy_vehicles", 0) or 0),
+                float(vehicles.get("max_latency_ms", network.get("max_latency_ms", 0.0)) or 0.0),
+                float(vehicles.get("max_packet_loss_percent", network.get("max_packet_loss_percent", 0.0)) or 0.0),
+                float(vehicles.get("max_speed_mps", network.get("max_speed_mps", 0.0)) or 0.0),
+                json.dumps(snapshot, ensure_ascii=False),
+            ))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar snapshot App3: {e}")
 
     def _derive_conflict_event(self, decision, timestamp):
         """

@@ -1,0 +1,28 @@
+{
+  "simulation": {
+    "source": "carla_ns3_combined",
+    "timestamp_iso": "2026-05-13 10:42:11"
+  },
+  "vehicles": {
+    "total_vehicles": 5,
+    "ego_present": true,
+    "high_risk_vehicles": 0,
+    "medium_risk_vehicles": 0,
+    "degraded_autonomy_vehicles": 0,
+    "max_latency_ms": 18.0,
+    "max_packet_loss_percent": 0.2,
+    "max_speed_mps": 6.8
+  },
+  "network": {
+    "max_latency_ms": 18.0,
+    "max_packet_loss_percent": 0.2,
+    "max_speed_mps": 6.8
+  },
+  "sla": {
+    "ready": true,
+    "runtime_status": "ok",
+    "proposal_status": "ok",
+    "reason": "SLA veicular atendido para risco, autonomia e rede."
+  },
+  "events_count": 0
+}

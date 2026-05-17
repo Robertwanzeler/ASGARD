@@ -161,6 +161,25 @@
         border-radius: 999px;
         font-size: 0.8rem;
     }
+
+    .sla-presence-card {
+        background: linear-gradient(180deg, rgba(15, 52, 96, 0.45), rgba(9, 18, 35, 0.88));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 16px;
+        height: 100%;
+    }
+
+    .sla-presence-card h6 {
+        color: #ffffff !important;
+        margin-bottom: 10px;
+    }
+
+    .sla-presence-card p {
+        color: #b8c7d9 !important;
+        margin-bottom: 6px;
+        font-size: 0.92rem;
+    }
 </style>
 
 <div class="conflict-hero">
@@ -170,6 +189,62 @@
         O rApp usa esse grafo operacional para impedir que energia, ML ou DRL sobrescrevam
         os SLAs de App1-Vigilância e App2-Monitoramento.
     </p>
+</div>
+
+<div class="card">
+    <div class="card-header"><h5>Estado Atual das Aplicações</h5></div>
+    <div class="card-body">
+        {% set camera_sla = service_slas.camera if service_slas else {} %}
+        {% set app3_sla = service_slas.app3 if service_slas else {} %}
+        {% set app2_sla = service_slas.app2 if service_slas else {} %}
+        <div class="row g-3">
+            <div class="col-lg-4">
+                <div class="sla-presence-card">
+                    <h6>App1-Vigilância</h6>
+                    <p>
+                        <span class="badge" style="background: {% if camera_sla.status == 'PROTEGIDA' %}#00ff88{% elif camera_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000;">
+                            {{ camera_sla.status or 'INATIVA' }}
+                        </span>
+                    </p>
+                    <p>Câmeras ativas: <strong>{{ camera_sla.active or 0 }}</strong></p>
+                    <p>Throughput mín: <strong>{{ "%.1f"|format(camera_sla.throughput_mbps or 0) }} Mbps</strong></p>
+                    <p>Latência máx: <strong>{{ "%.1f"|format(camera_sla.latency_ms or 0) }} ms</strong></p>
+                    <p>Motivo: <strong>{{ camera_sla.reason or 'Sem dados' }}</strong></p>
+                </div>
+            </div>
+            <div class="col-lg-4">
+                <div class="sla-presence-card">
+                    <h6>App2-Monitoramento</h6>
+                    <p>
+                        <span class="badge" style="background: {% if app2_sla.status == 'PROTEGIDA' %}#00ff88{% elif app2_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000;">
+                            {{ app2_sla.status or 'INATIVA' }}
+                        </span>
+                    </p>
+                    <p>Sensores: <strong>{{ app2_sla.connected or 0 }}/{{ app2_sla.active or 0 }}</strong></p>
+                    <p>Packet loss: <strong>{{ "%.1f"|format(app2_sla.packet_loss_percent or 0) }}%</strong></p>
+                    <p>Latência média: <strong>{{ "%.1f"|format(app2_sla.latency_ms or 0) }} ms</strong></p>
+                    <p>Motivo: <strong>{{ app2_sla.reason or 'Sem dados' }}</strong></p>
+                </div>
+            </div>
+            <div class="col-lg-4">
+                <div class="sla-presence-card">
+                    <h6>App3-Veicular</h6>
+                    <p>
+                        <span class="badge" style="background: {% if app3_sla.status == 'PROTEGIDA' %}#00ff88{% elif app3_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000;">
+                            {{ app3_sla.status or 'INATIVA' }}
+                        </span>
+                    </p>
+                    <p>Veículos ativos: <strong>{{ app3_sla.active or 0 }}</strong></p>
+                    <p>Risco alto / degr.: <strong>{{ app3_sla.high_risk or 0 }} / {{ app3_sla.degraded or 0 }}</strong></p>
+                    <p>Latência máx: <strong>{{ "%.1f"|format(app3_sla.latency_ms or 0) }} ms</strong></p>
+                    <p>Motivo: <strong>{{ app3_sla.reason or 'Sem dados' }}</strong></p>
+                </div>
+            </div>
+        </div>
+        <p class="mt-3 mb-0" style="color:#b8c7d9 !important;">
+            Apps saudáveis podem não aparecer nos eventos recentes abaixo. Esta faixa mostra o estado vivo de App1, App2 e App3 mesmo quando só um deles está em conflito.
+        </p>
+    </div>
 </div>
 
 <div class="row">

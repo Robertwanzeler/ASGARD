@@ -1,0 +1,16 @@
+{
+  "pending": {
+    "energy": {
+      "timestamp": 1778679729,
+      "policy_id": "energy_1778679729284",
+      "attempts": 1,
+      "last_sent": "2026-05-13T10:42:09.284732"
+    },
+    "slice": {
+      "timestamp": 1778679729,
+      "policy_id": "slice_1778679729284",
+      "attempts": 1,
+      "last_sent": "2026-05-13T10:42:09.285244"
+    }
+  }
+}

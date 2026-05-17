@@ -1,0 +1,44 @@
+{
+  "generated_at": "2026-05-13T10:41:49.159111",
+  "camera_id": "CAM-01",
+  "location": "Portao Principal",
+  "capture_resolution": "3840x2160",
+  "duration_s": 2.0,
+  "transport_profile": "4k_over_5g_fwa_simulated",
+  "scenario": {
+    "key": "violent_incident",
+    "label": "Incidente violento simulado",
+    "cycle_index": 11,
+    "suspicious": true
+  },
+  "detector_outputs": {
+    "simulated_people": 3,
+    "motion_level": 0.88,
+    "crowd_density": 0.41,
+    "violence_probability": 0.94,
+    "fight_pose_score": 0.91,
+    "anomaly_score": 0.86,
+    "occlusion_score": 0.18
+  },
+  "pipeline_profile": {
+    "score_source": "simulated_multistage_video_inference",
+    "faces_anonymized": 3,
+    "requires_manual_review": true
+  },
+  "network_profile": {
+    "min_throughput_mbps": 23.8,
+    "avg_throughput_mbps": 24.9,
+    "max_latency_ms": 91.0,
+    "avg_latency_ms": 84.0,
+    "jitter_ms": 21.0,
+    "packet_loss_percent": 7.1,
+    "transport": "5g_fwa_uplink",
+    "sla_reference": {
+      "throughput_min_mbps": 25.0,
+      "throughput_guard_mbps": 30.0,
+      "latency_target_ms": 100.0,
+      "latency_guard_ms": 60.0,
+      "latency_block_ms": 80.0
+    }
+  }
+}

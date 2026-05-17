@@ -1,10 +1,98 @@
 {% extends "base.html" %}
 {% block title %}xApps - GreenRAN rApp{% endblock %}
+{% block extra_head %}
+<style>
+    .armd-mini-panel {
+        background: linear-gradient(145deg, rgba(17, 29, 52, 0.96), rgba(9, 15, 28, 0.96));
+        border: 1px solid rgba(143, 211, 255, 0.14);
+        border-radius: 14px;
+        padding: 16px;
+    }
+    .armd-mini-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+    }
+    .armd-mini-label {
+        color: #7dbdf0;
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 4px;
+    }
+    .armd-mini-scenario {
+        color: #fff;
+        font-size: 1.4rem;
+        font-weight: 700;
+        line-height: 1.05;
+    }
+    .armd-mini-confidence {
+        text-align: right;
+    }
+    .armd-mini-confidence .value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        line-height: 1;
+    }
+    .armd-mini-confidence .caption {
+        color: #8da6c3;
+        font-size: 0.8rem;
+    }
+    .armd-mini-badges {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+    }
+    .armd-mini-badge {
+        padding: 5px 10px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.08);
+        color: #d7e7ff;
+        font-size: 0.84rem;
+    }
+    .armd-mini-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 10px;
+        margin-bottom: 12px;
+    }
+    .armd-mini-cell {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 10px;
+        padding: 10px 12px;
+    }
+    .armd-mini-cell .k {
+        color: #8da6c3;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 4px;
+    }
+    .armd-mini-cell .v {
+        color: #fff;
+        font-weight: 600;
+        word-break: break-word;
+    }
+    .armd-mini-reason {
+        color: #d3def0;
+        background: rgba(255,255,255,0.03);
+        border-left: 3px solid #8fd3ff;
+        border-radius: 8px;
+        padding: 10px 12px;
+    }
+</style>
+{% endblock %}
 {% block content %}
 <div class="row">
     <div class="col-md-6">
         <div class="card">
-            <div class="card-header"><h5>Status dos xApps</h5></div>
+            <div class="card-header"><h5>Status dos xApps e Apps</h5></div>
             <div class="card-body">
                 <table class="table">
                     {% for name in ['SLICER', 'ENERGY'] %}
@@ -26,6 +114,38 @@
                     <tr><td>Total Restarts</td><td>{{ xapp_status[name].total_restarts or 0 }}</td></tr>
                     {% endif %}
                     {% endfor %}
+                </table>
+                <hr>
+                <table class="table">
+                    <tr>
+                        <td><strong>APP1</strong></td>
+                        <td>
+                            <span class="badge {% if app1_monitoring and app1_monitoring.camera_sla and app1_monitoring.camera_sla.runtime_status == 'ok' %}bg-success{% elif app1_monitoring and app1_monitoring.camera_sla and app1_monitoring.camera_sla.runtime_status == 'warning' %}bg-warning text-dark{% else %}bg-danger{% endif %}">
+                                {{ (app1_monitoring.camera_sla.runtime_status if app1_monitoring and app1_monitoring.camera_sla else 'sem snapshot')|upper }}
+                            </span>
+                        </td>
+                    </tr>
+                    <tr><td>Endpoint</td><td><a href="{{ app1_url }}" target="_blank">{{ app1_url }}</a></td></tr>
+                    <tr><td>Câmeras ativas</td><td>{{ app1_monitoring.cameras.total if app1_monitoring and app1_monitoring.cameras else 0 }}</td></tr>
+                    <tr><td>Throughput mín</td><td>{{ "%.1f"|format(app1_monitoring.network.min_camera_throughput_mbps if app1_monitoring and app1_monitoring.network else 0) }} Mbps</td></tr>
+
+                    <tr><td><strong>APP2</strong></td><td>
+                        <span class="badge {% if app2_monitoring and app2_monitoring.app2_sla and app2_monitoring.app2_sla.runtime_status == 'ok' %}bg-success{% elif app2_monitoring and app2_monitoring.app2_sla and app2_monitoring.app2_sla.runtime_status == 'warning' %}bg-warning text-dark{% else %}bg-danger{% endif %}">
+                            {{ (app2_monitoring.app2_sla.runtime_status if app2_monitoring and app2_monitoring.app2_sla else 'sem snapshot')|upper }}
+                        </span>
+                    </td></tr>
+                    <tr><td>Endpoint</td><td>http://localhost:5200</td></tr>
+                    <tr><td>Sensores conectados</td><td>{{ (app2_monitoring.app2_sla.observed.connected_sensors if app2_monitoring and app2_monitoring.app2_sla and app2_monitoring.app2_sla.observed else 0) }}/{{ (app2_monitoring.app2_sla.observed.total_sensors if app2_monitoring and app2_monitoring.app2_sla and app2_monitoring.app2_sla.observed else 0) }}</td></tr>
+                    <tr><td>Packet loss</td><td>{{ "%.1f"|format(app2_monitoring.network.packet_loss_percent if app2_monitoring and app2_monitoring.network else 0) }}%</td></tr>
+
+                    <tr><td><strong>APP3</strong></td><td>
+                        <span class="badge {% if app3_monitoring and app3_monitoring.vehicle_sla and app3_monitoring.vehicle_sla.runtime_status == 'ok' %}bg-success{% elif app3_monitoring and app3_monitoring.vehicle_sla and app3_monitoring.vehicle_sla.runtime_status == 'warning' %}bg-warning text-dark{% else %}bg-danger{% endif %}">
+                            {{ (app3_monitoring.vehicle_sla.runtime_status if app3_monitoring and app3_monitoring.vehicle_sla else 'sem snapshot')|upper }}
+                        </span>
+                    </td></tr>
+                    <tr><td>Endpoint</td><td><a href="{{ app3_url }}" target="_blank">{{ app3_url }}</a></td></tr>
+                    <tr><td>Veículos ativos</td><td>{{ app3_monitoring.vehicles.total_vehicles if app3_monitoring and app3_monitoring.vehicles else 0 }}</td></tr>
+                    <tr><td>Latência máx</td><td>{{ "%.1f"|format(app3_monitoring.vehicles.max_latency_ms if app3_monitoring and app3_monitoring.vehicles else 0) }} ms</td></tr>
                 </table>
             </div>
         </div>
@@ -64,6 +184,67 @@
                 </details>
                 {% else %}
                 <p><span class="badge bg-success">Nenhuma política pendente</span></p>
+                {% endif %}
+
+                {% set armd = policy_status.armd if policy_status and policy_status.armd else {} %}
+                <hr>
+                <h6>ARMD-GreenRAN</h6>
+                {% if armd and armd.present %}
+                <div class="armd-mini-panel">
+                    <div class="armd-mini-top">
+                        <div>
+                            <div class="armd-mini-label">cenário ativo</div>
+                            <div class="armd-mini-scenario">{{ armd.scenario }}</div>
+                        </div>
+                        <div class="armd-mini-confidence">
+                            <div class="value" style="color: {% if (armd.confidence or 0) >= 0.95 %}#00ff88{% elif (armd.confidence or 0) >= 0.85 %}#ffaa00{% else %}#ff6b6b{% endif %};">
+                                {{ "%.2f"|format(armd.confidence or 0) }}
+                            </div>
+                            <div class="caption">confidence</div>
+                        </div>
+                    </div>
+                    <div class="armd-mini-badges">
+                        <span class="armd-mini-badge">domínio: {{ armd.domain or 'n/a' }}</span>
+                        <span class="armd-mini-badge">modo: {{ (armd.mode or 'n/a')|upper }}</span>
+                        <span class="armd-mini-badge">
+                            atenção:
+                            {% if armd.attention_level == 'override' %}
+                                <strong style="color:#ff6b6b;">OVERRIDE</strong>
+                            {% elif armd.attention_level == 'critical' %}
+                                <strong style="color:#ffbf69;">CRÍTICO</strong>
+                            {% elif armd.attention_level == 'guard' %}
+                                <strong style="color:#8fd3ff;">GUARDA</strong>
+                            {% else %}
+                                <strong>{{ (armd.attention_level or 'none')|upper }}</strong>
+                            {% endif %}
+                        </span>
+                        <span class="armd-mini-badge">
+                            override:
+                            <strong style="color: {% if armd.override_applied %}#ff6b6b{% else %}#00ff88{% endif %};">
+                                {{ 'SIM' if armd.override_applied else 'NÃO' }}
+                            </strong>
+                        </span>
+                    </div>
+                    <div class="armd-mini-grid">
+                        <div class="armd-mini-cell">
+                            <div class="k">Source</div>
+                            <div class="v">{{ armd.source or 'n/a' }}</div>
+                        </div>
+                        <div class="armd-mini-cell">
+                            <div class="k">Escopo</div>
+                            <div class="v">{{ (armd.policy_scope or [])|join(', ') if armd.policy_scope else 'n/a' }}</div>
+                        </div>
+                        <div class="armd-mini-cell">
+                            <div class="k">Ação</div>
+                            <div class="v">{{ armd.expected_action or 'n/a' }}</div>
+                        </div>
+                    </div>
+                    <div class="armd-mini-reason">
+                        {{ armd.reason or 'Sem motivo adicional.' }}
+                    </div>
+                </div>
+                {% else %}
+                <p><span class="badge bg-secondary">INATIVO</span> Sem contexto ARMD ativo nas políticas atuais.</p>
                 {% endif %}
             </div>
         </div>

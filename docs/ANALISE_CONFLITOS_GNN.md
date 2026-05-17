@@ -20,6 +20,72 @@ diagnostico mensuravel:
 - medir quanto treino e quantos dados sao necessarios;
 - medir se o cenario esta bem montado ou se ainda produz sinal fraco.
 
+## Protocolo oficial alinhado ao ARTICLE00
+
+Para a trilha GreenRAN, o `ARTICLE00` passa a ser a referencia metodologica de
+estrutura, mas nao de forma cega. O que fica congelado para nosso protocolo:
+
+- seeds: `42, 43, 44, 45, 46`
+- subsets: `50, 150, 450`
+- thresholds oficiais: `0.2, 0.5, 0.9`
+- split: holdout temporal por rodadas
+
+O que muda na nossa trilha:
+
+- `200 epochs` vira o alvo oficial de sucesso
+- checkpoints acima disso (`400, 600, 800, 1000`) ficam como auditoria e
+  fallback diagnostico, nao como criterio principal
+
+Conjunto valido congelado para treino:
+
+- `20260514_112557_conflict_protocol`: `vehicle_warning`
+- `20260515_194647_conflict_protocol`: `vehicle_critical` e `vehicle_implicito`
+- `20260516_101015_conflict_protocol`: `vehicle_recovery`
+- `20260516_122522_conflict_protocol`: `app1_throughput`
+- `20260515_224240_conflict_protocol`: `app1_latencia`,
+  `app2_degradado_leve` e `app2_degradado_critico`
+- `20260514_201216_conflict_protocol`: apenas `conflito_implicito`
+- `20260515_010148_conflict_protocol`: `recuperacao` corrigido
+
+Conjunto descartado:
+
+- `20260514_011612_conflict_protocol`: coleta veicular interrompida
+- `20260514_112557_conflict_protocol/vehicle_critical`: contaminacao residual de
+  `warning` no inicio da rodada
+- `20260514_112557_conflict_protocol/vehicle_implicito`: contaminacao residual de
+  `critical` no inicio da rodada
+- `20260514_112557_conflict_protocol/vehicle_recovery`: subset `450` incompleto
+  por teto curto de rodadas
+- `20260514_163705_conflict_protocol/app1_throughput`: mistura residual entre
+  `FULL_POWER` e `FULL_POWER_GUARD`
+- `20260514_163705_conflict_protocol/app1_latencia`: mistura residual com
+  `camera_throughput_mbps`
+- `20260514_163705_conflict_protocol/app2_degradado_leve`: mistura residual com
+  `app2_packet_loss_percent` e rastro de `App1`
+- `20260514_163705_conflict_protocol/app2_degradado_critico`: rastro residual de
+  `FULL_POWER_GUARD`
+- `20260514_201216_conflict_protocol/recuperacao`: `weak=5` recorrente e
+  dominancia indevida de `App1`
+
+O runner oficial desse protocolo agora e:
+
+- `scripts/run_greenran_graphsage_article00_protocol.py`
+
+Comando base:
+
+```bash
+./drlexp/.venv/bin/python scripts/run_greenran_graphsage_article00_protocol.py \
+  --output-root runs/graphsage_article00_protocol
+```
+
+Para inspecionar a matriz congelada e os comandos sem executar treino:
+
+```bash
+./drlexp/.venv/bin/python scripts/run_greenran_graphsage_article00_protocol.py \
+  --plan-only \
+  --output-root runs/graphsage_article00_protocol
+```
+
 Os graficos nao sao o objetivo final. Eles servem para dizer:
 
 - se o cenario produz estrutura consistente;

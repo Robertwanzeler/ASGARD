@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from greenran_paths import ARTICLE00_SCENARIO_CONTROL_PATH, STATE_DIR  # noqa: E402
+from rapp_policy_consumer import summarize_armd_policy  # noqa: E402
 
 ARTICLE00_SCENARIO_CONTROL_FILE = ARTICLE00_SCENARIO_CONTROL_PATH
 CAMERA_SLA_THROUGHPUT_MIN_MBPS = 25.0
@@ -1144,6 +1146,33 @@ class VideoAnalysisStore:
 
         latest_analysis = analyses[0] if analyses else {}
         latest_video = videos[0] if videos else {}
+        camera_mode = str(os.environ.get("GREENRAN_APP1_CAMERA_SOURCE_MODE", "real") or "real").strip().lower()
+        network = dict(network_context.get("network", {}) or {})
+        camera_sla = dict(network.get("camera_sla", {}) or {})
+
+        if camera_mode == "simulated":
+            simulated_profile = latest_analysis.get("network_profile", {}) or {}
+            simulated_camera_sla = latest_analysis.get("simulated_camera_sla", {}) or {}
+            if simulated_profile and simulated_camera_sla:
+                total_cameras = len(cameras)
+                network.update(
+                    {
+                        "active_cameras": total_cameras,
+                        "active_ues": total_cameras,
+                        "throughput_mbps": round(float(simulated_profile.get("avg_throughput_mbps", 0.0) or 0.0), 2),
+                        "total_throughput_mbps": round(float(simulated_profile.get("avg_throughput_mbps", 0.0) or 0.0), 2),
+                        "min_camera_throughput_mbps": round(float(simulated_profile.get("min_throughput_mbps", 0.0) or 0.0), 2),
+                        "avg_camera_throughput_mbps": round(float(simulated_profile.get("avg_throughput_mbps", 0.0) or 0.0), 2),
+                        "observed_min_camera_throughput_mbps": round(float(simulated_profile.get("min_throughput_mbps", 0.0) or 0.0), 2),
+                        "max_camera_latency_ms": round(float(simulated_profile.get("max_latency_ms", 0.0) or 0.0), 2),
+                        "avg_camera_latency_ms": round(float(simulated_profile.get("avg_latency_ms", 0.0) or 0.0), 2),
+                        "observed_max_camera_latency_ms": round(float(simulated_profile.get("max_latency_ms", 0.0) or 0.0), 2),
+                        "camera_metrics_ready": True,
+                        "camera_latency_ready": True,
+                        "observed_camera_metrics": total_cameras,
+                    }
+                )
+                camera_sla = simulated_camera_sla
 
         snapshot = {
             "app": "app1_vigilancia",
@@ -1178,8 +1207,8 @@ class VideoAnalysisStore:
                 "evidence_ready": sum(1 for camera in cameras if camera.get("fallback_upload_available")),
                 "critical_active": sum(1 for camera in cameras if camera.get("last_event_generated")),
             },
-            "network": network_context.get("network", {}),
-            "camera_sla": (network_context.get("network", {}) or {}).get("camera_sla", {}),
+            "network": network,
+            "camera_sla": camera_sla,
             "policies": network_context.get("policies", {}),
             "links": {
                 "app1_api": "http://localhost:5100/api/monitoring",
@@ -1545,6 +1574,7 @@ class GreenRANContextReader:
                 "energy_status": energy_policy.get("status", "UNKNOWN"),
                 "slice_state": slice_policy.get("slicer_state", "UNKNOWN"),
                 "energy_action": energy_command.get("action", "UNKNOWN"),
+                "armd": summarize_armd_policy(energy_policy, slice_policy),
             },
             "xapps": health,
         }

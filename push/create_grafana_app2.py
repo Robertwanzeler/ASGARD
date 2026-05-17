@@ -5,11 +5,74 @@ GreenRAN - Create Grafana Dashboard for App2-Monitoramento
 Cria/atualiza dashboard Grafana com consultas InfluxQL válidas.
 """
 
+from __future__ import annotations
+
+import base64
+import json
 import sys
 import time
-import requests
 from pathlib import Path
-import json
+from types import SimpleNamespace
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+DASHBOARD_FILE = (
+    BASE_DIR
+    / "ns-O-RAN-flexric"
+    / "mmwave-LENA-oran"
+    / "GUI"
+    / "grafana"
+    / "dashboards"
+    / "app2_greenran.json"
+)
+
+try:
+    import requests  # type: ignore
+except Exception:
+    class _CompatResponse:
+        def __init__(self, status_code: int, text: str):
+            self.status_code = status_code
+            self.text = text
+
+    class _CompatRequests:
+        RequestException = Exception
+
+        @staticmethod
+        def _request(method: str, url: str, auth=None, timeout: int | float = 10, json=None):
+            headers = {}
+            data = None
+            if auth is not None:
+                encoded = base64.b64encode(f"{auth[0]}:{auth[1]}".encode("utf-8")).decode("ascii")
+                headers["Authorization"] = f"Basic {encoded}"
+            if json is not None:
+                data = __import__("json").dumps(json).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+
+            req = urllib_request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib_request.urlopen(req, timeout=timeout) as response:
+                    body = response.read().decode("utf-8", errors="replace")
+                    return _CompatResponse(response.getcode(), body)
+            except urllib_error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                return _CompatResponse(exc.code, body)
+            except Exception as exc:
+                raise _CompatRequests.RequestException(str(exc)) from exc
+
+        @classmethod
+        def get(cls, url: str, auth=None, timeout: int | float = 10):
+            return cls._request("GET", url, auth=auth, timeout=timeout)
+
+        @classmethod
+        def post(cls, url: str, json=None, auth=None, timeout: int | float = 10):
+            return cls._request("POST", url, auth=auth, timeout=timeout, json=json)
+
+    requests = SimpleNamespace(
+        get=_CompatRequests.get,
+        post=_CompatRequests.post,
+        RequestException=_CompatRequests.RequestException,
+    )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from greenran_runtime import load_runtime_config
@@ -284,7 +347,7 @@ def stat_options(graph_mode: str = "area") -> dict:
 
 
 def create_dashboard():
-    """Cria/atualiza dashboard App2 usando InfluxQL no datasource InfluxDB."""
+    """Provisiona dashboard App2 por arquivo, sem depender da API autenticada."""
 
     dashboard = {
         "title": "App2 - Monitoramento Ambiental UFPA",
@@ -558,38 +621,13 @@ def create_dashboard():
         ],
     }
 
-    payload = {
-        "dashboard": dashboard,
-        "folderId": 0,
-        "message": "Dashboard App2-Monitoramento atualizado para InfluxQL",
-        "overwrite": True,
-    }
-    url = f"http://{GRAFANA_HOST}:{GRAFANA_PORT}/api/dashboards/db"
+    DASHBOARD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(DASHBOARD_FILE, "w", encoding="utf-8") as f:
+        json.dump(dashboard, f, indent=2, ensure_ascii=False)
 
-    for attempt in range(1, POST_RETRIES + 1):
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                auth=(ADMIN_USER, ADMIN_PASS),
-                timeout=API_TIMEOUT_S,
-            )
-            if response.status_code in (200, 202):
-                print("[SUCCESS] Dashboard App2 atualizado no Grafana")
-                print(f"[INFO] URL: http://{GRAFANA_HOST}:{GRAFANA_PORT}/d/8NfKIQhDk/app2-monitoramento-ambiental-ufpa")
-                return True
-
-            print(f"[WARN] Tentativa {attempt}/{POST_RETRIES} falhou com HTTP {response.status_code}")
-            if response.text:
-                print(response.text)
-        except requests.RequestException as exc:
-            print(f"[WARN] Tentativa {attempt}/{POST_RETRIES} falhou: {exc}")
-
-        if attempt < POST_RETRIES:
-            time.sleep(POST_RETRY_SLEEP_S)
-
-    print("[ERROR] Não foi possível atualizar o dashboard App2 no Grafana")
-    return False
+    print(f"[SUCCESS] Dashboard provisionado em {DASHBOARD_FILE}")
+    print("[INFO] O Grafana deve detectar a mudança em poucos segundos.")
+    return True
 
 
 if __name__ == "__main__":

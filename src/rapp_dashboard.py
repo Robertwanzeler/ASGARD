@@ -38,6 +38,7 @@ from greenran_runtime import load_runtime_config
 from rapp_data_lake import DataLake
 from rapp_pattern_engine import PatternRecognition
 from rapp_alerts import AlertManager
+from rapp_policy_consumer import load_current_policies
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -107,13 +108,19 @@ def get_xapp_status():
 
 def get_policy_status():
     """Obtém status das políticas."""
+    status = {}
     if os.path.exists(POLICY_STATUS_FILE):
         try:
             with open(POLICY_STATUS_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
+                status = json.load(f)
+        except Exception:
+            status = {}
+
+    current = load_current_policies()
+    status["current_energy_policy"] = current.get("energy_policy", {})
+    status["current_slice_policy"] = current.get("slice_policy", {})
+    status["armd"] = current.get("armd", {})
+    return status
 
 
 def _safe_read_json(path, default):
@@ -360,14 +367,25 @@ def get_service_sla_status():
     camera_protection = get_camera_protection()
 
     app1_sla = (app1_monitoring.get('camera_sla', {}) if isinstance(app1_monitoring, dict) else {}) or {}
+    app1_observed = app1_sla.get('observed', {}) or {}
+    app1_network = (app1_monitoring.get('network', {}) if isinstance(app1_monitoring, dict) else {}) or {}
+    app1_runtime_status = app1_sla.get('runtime_status', 'idle')
+    if app1_runtime_status == 'blocked':
+        app1_status = 'CRÍTICA'
+    elif app1_runtime_status == 'warning':
+        app1_status = 'GUARDA'
+    elif app1_runtime_status == 'ok':
+        app1_status = 'PROTEGIDA'
+    else:
+        app1_status = camera_protection.get('status', 'INATIVA')
     camera_service = {
-        'status': camera_protection.get('status', 'INATIVA'),
+        'status': app1_status,
         'reason': app1_sla.get('reason') or camera_protection.get('reason', 'Sem dados'),
         'proposal_status': app1_sla.get('proposal_status', 'idle'),
-        'runtime_status': app1_sla.get('runtime_status', 'idle'),
-        'active': camera_protection.get('active_cameras', 0),
-        'throughput_mbps': round(float(camera_protection.get('min_throughput_mbps', 0.0) or 0.0), 1),
-        'latency_ms': round(float(camera_protection.get('max_latency', 0.0) or 0.0) / 1000.0, 1),
+        'runtime_status': app1_runtime_status,
+        'active': int(app1_network.get('active_cameras', app1_sla.get('active_cameras', camera_protection.get('active_cameras', 0))) or 0),
+        'throughput_mbps': round(float(app1_observed.get('min_throughput_mbps', app1_network.get('min_camera_throughput_mbps', camera_protection.get('min_throughput_mbps', 0.0))) or 0.0), 1),
+        'latency_ms': round(float(app1_observed.get('max_latency_ms', app1_network.get('max_camera_latency_ms', float(camera_protection.get('max_latency', 0.0) or 0.0) / 1000.0)) or 0.0), 1),
     }
 
     app2_sla = (app2_monitoring.get('app2_sla', {}) if isinstance(app2_monitoring, dict) else {}) or {}
@@ -837,7 +855,12 @@ def get_recent_conflicts(minutes=60):
 
 
 def get_vehicle_history(minutes=60, limit=60):
-    """Obtém histórico agregado dos veículos a partir do ue_metrics do Data Lake."""
+    """Obtém histórico agregado dos veículos.
+
+    Prioriza `ue_metrics` quando o ns-3 exporta UEs `vehicle`. Se o runtime
+    estiver no caminho CARLA/mock, faz fallback para `app3_snapshots`, que é
+    onde o App3 já persiste o estado veicular consolidado.
+    """
     cutoff = int(time.time()) - (minutes * 60)
     history = []
     try:
@@ -864,6 +887,38 @@ def get_vehicle_history(minutes=60, limit=60):
                     'max_latency_ms': round(float(row['max_latency_ms'] or 0.0), 3),
                     'avg_throughput_mbps': round(float(row['avg_throughput_mbps'] or 0.0), 3),
                     'active_vehicles': int(row['active_vehicles'] or 0),
+                }
+            )
+        if history:
+            return history
+
+        cursor = DATA_LAKE.conn.execute(
+            """
+            SELECT
+                timestamp,
+                total_vehicles,
+                max_latency_ms,
+                max_packet_loss_percent,
+                high_risk_vehicles,
+                degraded_autonomy_vehicles
+            FROM app3_snapshots
+            WHERE timestamp >= ?
+            ORDER BY timestamp ASC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        )
+        for row in cursor.fetchall():
+            history.append(
+                {
+                    'timestamp': int(row['timestamp'] or 0),
+                    'label': datetime.fromtimestamp(int(row['timestamp'] or 0)).strftime('%H:%M:%S'),
+                    'max_latency_ms': round(float(row['max_latency_ms'] or 0.0), 3),
+                    'avg_throughput_mbps': 0.0,
+                    'active_vehicles': int(row['total_vehicles'] or 0),
+                    'high_risk_vehicles': int(row['high_risk_vehicles'] or 0),
+                    'degraded_autonomy_vehicles': int(row['degraded_autonomy_vehicles'] or 0),
+                    'max_packet_loss_percent': round(float(row['max_packet_loss_percent'] or 0.0), 3),
                 }
             )
     except Exception as e:
@@ -994,6 +1049,7 @@ def conflicts_page():
     conflict_stats = DATA_LAKE.get_conflict_stats(24)
     recent_conflicts = get_recent_conflicts(60)
     learned_report, learned_adjacency = get_learned_conflict_assets()
+    service_slas = get_service_sla_status()
 
     return render_template(
         'conflicts.html',
@@ -1001,6 +1057,7 @@ def conflicts_page():
         recent_conflicts=recent_conflicts,
         learned_report=learned_report,
         learned_adjacency=learned_adjacency,
+        service_slas=service_slas,
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
 

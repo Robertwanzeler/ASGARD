@@ -22,11 +22,12 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from greenran_paths import RAPP_DB_PATH  # noqa: E402
+from greenran_paths import RAPP_DB_PATH, STATE_DIR  # noqa: E402
 
 
 DEFAULT_DATASET_PATH = Path("/tmp/greenran_conflict_dataset.csv")
 DEFAULT_GRAPH_PATH = Path("/tmp/greenran_conflict_graph.json")
+LIVE_APP3_SNAPSHOT_PATH = STATE_DIR / "app3_veicular" / "monitoring_snapshot.json"
 
 
 BASE_CONFLICT_QUERY = """
@@ -261,7 +262,85 @@ def build_vehicle_selects(ue_columns):
 
 def build_conflict_query(conn):
     ue_columns = table_columns(conn, "ue_metrics")
-    return BASE_CONFLICT_QUERY.format(vehicle_selects=build_vehicle_selects(ue_columns))
+    app3_columns = table_columns(conn, "app3_snapshots")
+    return BASE_CONFLICT_QUERY.format(
+        vehicle_selects=build_vehicle_selects(ue_columns) + build_app3_fallback_selects(app3_columns)
+    )
+
+
+def build_app3_fallback_selects(app3_columns):
+    if "total_vehicles" not in app3_columns:
+        return """
+    ,
+    0 AS app3_total_vehicles,
+    0 AS app3_ego_present,
+    0 AS app3_high_risk_vehicles,
+    0 AS app3_medium_risk_vehicles,
+    0 AS app3_degraded_autonomy_vehicles,
+    0 AS app3_max_latency_ms,
+    0 AS app3_max_packet_loss_percent,
+    0 AS app3_max_speed_mps
+"""
+
+    return """
+    ,
+    (
+        SELECT a3.total_vehicles
+        FROM app3_snapshots a3
+        WHERE a3.timestamp <= ce.timestamp
+        ORDER BY a3.timestamp DESC
+        LIMIT 1
+    ) AS app3_total_vehicles,
+    (
+        SELECT a3.ego_present
+        FROM app3_snapshots a3
+        WHERE a3.timestamp <= ce.timestamp
+        ORDER BY a3.timestamp DESC
+        LIMIT 1
+    ) AS app3_ego_present,
+    (
+        SELECT a3.high_risk_vehicles
+        FROM app3_snapshots a3
+        WHERE a3.timestamp <= ce.timestamp
+        ORDER BY a3.timestamp DESC
+        LIMIT 1
+    ) AS app3_high_risk_vehicles,
+    (
+        SELECT a3.medium_risk_vehicles
+        FROM app3_snapshots a3
+        WHERE a3.timestamp <= ce.timestamp
+        ORDER BY a3.timestamp DESC
+        LIMIT 1
+    ) AS app3_medium_risk_vehicles,
+    (
+        SELECT a3.degraded_autonomy_vehicles
+        FROM app3_snapshots a3
+        WHERE a3.timestamp <= ce.timestamp
+        ORDER BY a3.timestamp DESC
+        LIMIT 1
+    ) AS app3_degraded_autonomy_vehicles,
+    (
+        SELECT a3.max_latency_ms
+        FROM app3_snapshots a3
+        WHERE a3.timestamp <= ce.timestamp
+        ORDER BY a3.timestamp DESC
+        LIMIT 1
+    ) AS app3_max_latency_ms,
+    (
+        SELECT a3.max_packet_loss_percent
+        FROM app3_snapshots a3
+        WHERE a3.timestamp <= ce.timestamp
+        ORDER BY a3.timestamp DESC
+        LIMIT 1
+    ) AS app3_max_packet_loss_percent,
+    (
+        SELECT a3.max_speed_mps
+        FROM app3_snapshots a3
+        WHERE a3.timestamp <= ce.timestamp
+        ORDER BY a3.timestamp DESC
+        LIMIT 1
+    ) AS app3_max_speed_mps
+"""
 
 
 def load_rows(conn, hours, limit, since_ts=0, until_ts=0, until_exclusive_ts=0):
@@ -293,8 +372,61 @@ def load_dataset_rows(path):
         return [dict(row) for row in csv.DictReader(f)]
 
 
+def _load_live_app3_snapshot():
+    try:
+        with LIVE_APP3_SNAPSHOT_PATH.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _apply_app3_fallback(row, live_snapshot):
+    vehicle_total = int(_safe_float(row.get("total_active_vehicles"), 0) or 0)
+    if vehicle_total > 0:
+        return
+
+    fallback = {
+        "total_active_vehicles": int(_safe_float(row.get("app3_total_vehicles"), 0) or 0),
+        "ego_vehicle_count": int(_safe_float(row.get("app3_ego_present"), 0) or 0),
+        "vehicle_high_risk_count": int(_safe_float(row.get("app3_high_risk_vehicles"), 0) or 0),
+        "vehicle_medium_risk_count": int(_safe_float(row.get("app3_medium_risk_vehicles"), 0) or 0),
+        "vehicle_degraded_autonomy_count": int(_safe_float(row.get("app3_degraded_autonomy_vehicles"), 0) or 0),
+        "vehicle_max_latency_ms": _safe_float(row.get("app3_max_latency_ms"), 0.0),
+        "vehicle_max_packet_loss_percent": _safe_float(row.get("app3_max_packet_loss_percent"), 0.0),
+        "vehicle_avg_speed_mps": _safe_float(row.get("app3_max_speed_mps"), 0.0),
+    }
+
+    if fallback["total_active_vehicles"] <= 0 and live_snapshot:
+        vehicles = live_snapshot.get("vehicles", {}) if isinstance(live_snapshot, dict) else {}
+        network = live_snapshot.get("network", {}) if isinstance(live_snapshot, dict) else {}
+        if isinstance(vehicles, dict):
+            fallback = {
+                "total_active_vehicles": int(vehicles.get("total_vehicles", 0) or 0),
+                "ego_vehicle_count": 1 if vehicles.get("ego_present", False) else 0,
+                "vehicle_high_risk_count": int(vehicles.get("high_risk_vehicles", 0) or 0),
+                "vehicle_medium_risk_count": int(vehicles.get("medium_risk_vehicles", 0) or 0),
+                "vehicle_degraded_autonomy_count": int(vehicles.get("degraded_autonomy_vehicles", 0) or 0),
+                "vehicle_max_latency_ms": float(
+                    vehicles.get("max_latency_ms", network.get("max_latency_ms", 0.0)) or 0.0
+                ),
+                "vehicle_max_packet_loss_percent": float(
+                    vehicles.get("max_packet_loss_percent", network.get("max_packet_loss_percent", 0.0)) or 0.0
+                ),
+                "vehicle_avg_speed_mps": float(
+                    vehicles.get("max_speed_mps", network.get("max_speed_mps", 0.0)) or 0.0
+                ),
+            }
+
+    if fallback["total_active_vehicles"] <= 0:
+        return
+
+    row.update(fallback)
+
+
 def enrich_rows(rows):
     previous_by_kpi = {}
+    live_app3_snapshot = _load_live_app3_snapshot()
     for row in rows:
         observed = _safe_float(row.get("observed_value"))
         threshold = _safe_float(row.get("threshold_value"))
@@ -313,6 +445,8 @@ def enrich_rows(rows):
         row["throughput_mbps"] = _kbps_to_mbps(row.get("throughput_kbps"))
         row["global_packet_loss_percent"] = _safe_float(row.get("global_packet_loss_rate"), 0.0) * 100.0
         row["vehicle_max_latency_ms"] = _us_to_ms(row.get("vehicle_max_latency_us"))
+        if is_vehicle_row(row):
+            _apply_app3_fallback(row, live_app3_snapshot)
 
         if observed is not None:
             previous_by_kpi[kpi] = observed

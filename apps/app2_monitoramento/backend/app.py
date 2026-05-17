@@ -5,6 +5,7 @@ MVP da App2-Monitoramento.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -60,6 +61,11 @@ def _load_monitoring_snapshot():
     if not isinstance(snapshot, dict):
         snapshot = {}
     snapshot["app2_sla"] = evaluate_app2_sla(snapshot)
+    snapshot["sensor_source"] = {
+        "configured": os.environ.get("GREENRAN_APP2_SENSOR_SOURCE", "ns3"),
+        "effective": os.environ.get("GREENRAN_APP2_SENSOR_SOURCE_EFFECTIVE", os.environ.get("GREENRAN_APP2_SENSOR_SOURCE", "ns3")),
+        "real_ns3_detected": os.environ.get("GREENRAN_APP2_REAL_SENSOR_UES_DETECTED", "0") == "1",
+    }
     return snapshot
 
 
@@ -94,6 +100,11 @@ def health():
             "state_dir": str(STATE_DIR),
             "readings": len(STORE.list_readings()),
             "alerts": len(STORE.list_alerts()),
+            "sensor_source": {
+                "configured": os.environ.get("GREENRAN_APP2_SENSOR_SOURCE", "ns3"),
+                "effective": os.environ.get("GREENRAN_APP2_SENSOR_SOURCE_EFFECTIVE", os.environ.get("GREENRAN_APP2_SENSOR_SOURCE", "ns3")),
+                "real_ns3_detected": os.environ.get("GREENRAN_APP2_REAL_SENSOR_UES_DETECTED", "0") == "1",
+            },
         }
     )
 
