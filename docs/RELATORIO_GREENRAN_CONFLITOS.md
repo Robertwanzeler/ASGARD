@@ -36,21 +36,20 @@ Estes objetivos frequentemente entram em conflito porque:
 O sistema GreenRAN propõe uma arquitetura multi-camada que combina:
 
 1. **CVaR/ML-Arbiter (DRL):** Agente de Deep Reinforcement Learning que toma decisões de arbitragem baseadas em Conditional Value at Risk (CVaR)
-2. **ARMD-GreenRAN:** Modelo de ML estatístico para predição de conflitos
-3. **GraphSAGE (GNN):** Graph Neural Network para aprender a estrutura e padrões de conflitos
-4. **Pipeline de Coleta:** Sistema automático de coleta de dados para treinamento
+2. **ARMD-GreenRAN (GraphSAGE):** Graph Neural Network baseada em GraphSAGE para aprender a estrutura e padrões de conflitos (o ARMD é implementado usando GraphSAGE)
+3. **Pipeline de Coleta:** Sistema automático de coleta de dados para treinamento
 
 ### 1.4 Principais Resultados
 
-| Métrica | Baseline (Sem IA) | Heurístico | CVaR/ML | ARMD | GraphSAGE |
-|---------|-------------------|------------|---------|------|-----------|
-| **F1-Score** | N/A | 0.45 | 0.65 | 0.72 | **1.0** |
-| **Precision** | N/A | 0.45 | 0.70 | 0.75 | **1.0** |
-| **Recall** | N/A | 0.77 | 0.60 | 0.70 | **1.0** |
-| **Conflitos Coletados** | 0 | 600 | 2.000 | 2.500 | **2.896** |
-| **Cenários Diferentes** | 0 | 2 | 5 | 8 | **10** |
-| **Latência Decisão** | N/A | N/A | **1.3ms** | **5ms** | **<10ms** |
-| **Tempo Treino** | N/A | N/A | 2h | 30min | **1min** |
+| Métrica | Baseline (Sem IA) | Heurístico | CVaR/ML (DRL) | ARMD-GreenRAN (GraphSAGE) |
+|---------|-------------------|------------|---------------|---------------------------|
+| **F1-Score** | N/A | 0.45 | 0.65 | **1.0** |
+| **Precision** | N/A | 0.45 | 0.70 | **1.0** |
+| **Recall** | N/A | 0.77 | 0.60 | **1.0** |
+| **Conflitos Coletados** | 0 | 600 | 2.000 | **2.896** |
+| **Cenários Diferentes** | 0 | 2 | 5 | **10** |
+| **Latência Decisão** | N/A | N/A | **1.3ms** | **<10ms** |
+| **Tempo Treino** | N/A | N/A | 2h | **1min** |
 
 ### 1.5 Arquitetura do Sistema GreenRAN
 
@@ -83,15 +82,8 @@ O sistema GreenRAN propõe uma arquitetura multi-camada que combina:
 │                             │                                            │
 │                             ▼                                            │
 │  ┌─────────────────────────────────────────────────────────────┐       │
-│  │              ARMD-GreenRAN (ML Estatístico)                  │       │
-│  │  • Predição estatística de conflitos                         │       │
-│  │  • Séries temporais ARM-D                                    │       │
-│  │  • Predição baseada em thresholds                            │       │
-│  └──────────────────────────┬──────────────────────────────────┘       │
-│                             │                                            │
-│                             ▼                                            │
-│  ┌─────────────────────────────────────────────────────────────┐       │
-│  │               GraphSAGE (Graph Neural Network)               │       │
+│  │           ARMD-GreenRAN (GraphSAGE - GNN)                    │       │
+│  │  • Graph Neural Network baseada em GraphSAGE                  │       │
 │  │  • Aprende estrutura dos conflitos                           │       │
 │  │  • Reconstrução do grafo de conflitos                       │       │
 │  │  • Predição de novos conflitos                               │       │
@@ -182,68 +174,15 @@ class CVaRArbiter:
 - Estado: KPIs de todas as apps + métricas de rede
 - Ação: Decisões de power management
 
-#### 2.2.2 ARMD-GreenRAN (Modelos estatísticos autoregressivos)
+#### 2.2.2 ARMD-GreenRAN (GraphSAGE - Graph Neural Network)
 
-O ARMD (Autoregressive Model for Decision) é um modelo estatístico:
+O ARMD-GreenRAN é implementado utilizando **GraphSAGE** (Graph Sample and Aggregate), uma arquitetura de Graph Neural Network. O modelo original ARMD (Autoregressive Model for Decision) foi evoluindo de um modelo estatístico simples para uma implementação GNN completa.
 
-```python
-# Estrutura do modelo ARMD
-class ARMDGreenRAN:
-    def __init__(self):
-        # Modelos ARM-D por bloco de recursos
-        self.armd_models = {
-            'throughput': ARMDModel(order=5),
-            'latency': ARMDModel(order=3),
-            'energy': ARMDModel(order=4),
-            'packet_loss': ARMDModel(order=2)
-        }
-        
-        # Séries temporais para predição
-        self.time_series = {
-            'app1': [],  # Cameras
-            'app2': [],  # IoT
-            'app3': []   # Vehicle
-        }
-    
-    def predict_conflict(self, current_state):
-        """Prediz probabilidade de conflito"""
-        predictions = {}
-        
-        for app, model in self.armd_models.items():
-            # Predição baseada em séries temporais
-            pred = model.predict(current_state[app])
-            predictions[app] = pred
-        
-        # Análise de conflito
-        conflict_prob = self.analyze_conflicts(predictions)
-        return conflict_prob
-    
-    def analyze_conflicts(self, predictions):
-        """Analisa probabilidades de conflito entre apps"""
-        conflicts = []
-        
-        # Throughput App1 vs Latência App2 vs Latência App3
-        if predictions['app1'] < 25:  # SLA violation
-            conflicts.append(('throughput', 'app1', 'critical'))
-        
-        if predictions['app2'] > 50:  # High latency
-            conflicts.append(('latency', 'app2', 'warning'))
-        
-        if predictions['app3'] > 100:  # V2X critical
-            conflicts.append(('latency', 'app3', 'critical'))
-        
-        return conflicts
-```
+**Evolução do ARMD:**
+- **v1 (Estatístico):** Modelos AR (Autoregressive) com séries temporais e thresholds
+- **v2 (GraphSAGE - Atual):** Graph Neural Network que aprende estrutura dos conflitos
 
-**Características:**
-- Modelos AR (Autoregressive) com delay
-- Predição multi-step
-- Análise de threshold
-- Séries temporais por aplicação
-
-#### 2.2.3 GraphSAGE (Graph Neural Network)
-
-O modelo GraphSAGE aprende a estrutura dos conflitos:
+**Implementação atual (GraphSAGE):**
 
 ```python
 # Arquitetura GraphSAGE para detecção de conflitos
@@ -549,16 +488,7 @@ O sistema implementa 10 cenários para coleta de dados:
 | **Precision** | **0.45** |
 | **Recall** | **0.77** |
 
-### 4.2 Resultados ARMD-GreenRAN
-
-| Cenário | Precision | Recall | F1-Score |
-|---------|-----------|--------|----------|
-| app1_throughput | 0.75 | 0.70 | 0.72 |
-| app1_latencia | 0.72 | 0.68 | 0.70 |
-| app2_degradado | 0.78 | 0.72 | 0.75 |
-| vehicle_warning | 0.70 | 0.65 | 0.67 |
-
-### 4.3 Resultados CVaR/ML-Arbiter (DRL)
+### 4.2 Resultados CVaR/ML-Arbiter (DRL)
 
 | Métrica | Valor |
 |---------|-------|
@@ -591,14 +521,14 @@ O sistema implementa 10 cenários para coleta de dados:
 
 ### 5.1 Comparação entre Abordagens
 
-| Aspecto | Heurístico | ARMD | CVaR/ML (DRL) | GraphSAGE |
-|---------|------------|------|---------------|-----------|
-| **F1-Score** | 0.45 | 0.72 | 0.65 | **1.0** |
-| **Generalização** | Baixa | Média | Alta | **Alta** |
-| **Tempo Treino** | N/A | 30min | 2h | **1min** |
-| **Tempo Inferência** | <1ms | 5ms | 1.3ms | **<10ms** |
-| **Interpretabilidade** | Alta | Média | Baixa | Baixa |
-| **Dados Necessários** | N/A | 500 | 2.000 | **150** |
+| Aspecto | Heurístico | CVaR/ML (DRL) | ARMD-GreenRAN (GraphSAGE) |
+|---------|------------|---------------|---------------------------|
+| **F1-Score** | 0.45 | 0.65 | **1.0** |
+| **Generalização** | Baixa | Alta | **Alta** |
+| **Tempo Treino** | N/A | 2h | **1min** |
+| **Tempo Inferência** | <1ms | 1.3ms | **<10ms** |
+| **Interpretabilidade** | Alta | Baixa | Baixa |
+| **Dados Necessários** | N/A | 2.000 | **150** |
 
 ### 5.2 Vantagens do GraphSAGE
 
