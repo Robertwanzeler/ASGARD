@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Shadow-only MARL evaluator for the article-aligned GreenRAN path."""
+"""Checkpoint-backed shadow-only MARL evaluator for the article-aligned GreenRAN path."""
 
 from __future__ import annotations
 
+import json
 import os
+import sys
+from pathlib import Path
 from typing import Any, Dict, List
 
 
@@ -28,8 +31,102 @@ class MARLShadowRuntimeEvaluator:
         self.enabled = str(os.environ.get('GREENRAN_MARL_SHADOW_ENABLE', '1')).strip().lower() not in {'0', 'false', 'no'}
         self.policy_id = os.environ.get('GREENRAN_MARL_SHADOW_POLICY_ID', 'ta_sam_marl_shadow_v1')
         self.mode = 'shadow_only'
+        self.project_root = Path(__file__).resolve().parent.parent
+        self.eval_manifest_path = Path(
+            os.environ.get(
+                'GREENRAN_TASAM_EVAL_MANIFEST',
+                self.project_root / 'runs' / 'sac_bootstrap' / 'tasam_candidate_evaluation_latest.json',
+            )
+        )
+        self.checkpoint_source = 'heuristic'
+        self.checkpoint_run_dir = ''
+        self.checkpoint_readiness = 'unknown'
+        self.checkpoint_meta: Dict[str, Any] = {}
+        self._torch = None
+        self._actors = None
+        self._checkpoint_error = ''
+        if self.enabled:
+            self._try_load_checkpoint()
 
-    def _du_action(self, du_state: Dict[str, Any]) -> List[float]:
+    def _load_json(self, path: Path) -> dict:
+        try:
+            return json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            return {}
+
+    def _ensure_local_torch_importable(self) -> None:
+        venv_site = self.project_root / 'drlexp' / '.venv' / 'lib'
+        if not venv_site.exists():
+            return
+        for child in sorted(venv_site.glob('python*/site-packages')):
+            candidate = child / 'torch'
+            if candidate.exists():
+                site_path = str(child)
+                if site_path not in sys.path:
+                    sys.path.insert(0, site_path)
+                return
+
+    def _try_load_checkpoint(self) -> None:
+        manifest = self._load_json(self.eval_manifest_path)
+        best = (manifest or {}).get('best_run') or {}
+        if not best:
+            self._checkpoint_error = 'best_run missing from evaluation manifest'
+            return
+        self.checkpoint_readiness = str(best.get('readiness', 'unknown') or 'unknown')
+        self.checkpoint_run_dir = str(best.get('run_dir', '') or '')
+        if not bool(best.get('promote_shadow', False)):
+            self._checkpoint_error = 'best_run not approved for shadow promotion'
+            return
+        if not self.checkpoint_run_dir:
+            self._checkpoint_error = 'run_dir missing from evaluation manifest'
+            return
+        run_dir = Path(self.checkpoint_run_dir)
+        meta_path = run_dir / 'tasam_marl_checkpoint_meta.json'
+        ckpt_path = run_dir / 'tasam_marl_actors.pt'
+        if not meta_path.exists() or not ckpt_path.exists():
+            self._checkpoint_error = 'checkpoint files missing'
+            return
+        self.checkpoint_meta = self._load_json(meta_path)
+        try:
+            self._ensure_local_torch_importable()
+            import torch
+            from torch import nn
+        except Exception as exc:
+            self._checkpoint_error = f'torch unavailable: {exc}'
+            return
+
+        du_count = int(self.checkpoint_meta.get('du_count', 0) or 0)
+        du_state_dim = int(self.checkpoint_meta.get('du_state_dim', 0) or 0)
+        if du_count <= 0 or du_state_dim <= 0:
+            self._checkpoint_error = 'invalid checkpoint metadata'
+            return
+
+        class _ActorNetwork(nn.Module):
+            def __init__(self, input_dim: int, hidden_dim: int = 64, action_dim: int = 3) -> None:
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, action_dim),
+                    nn.Sigmoid(),
+                )
+
+            def forward(self, x):
+                return self.net(x)
+
+        actors = nn.ModuleList([_ActorNetwork(du_state_dim) for _ in range(du_count)])
+        state_dict = torch.load(ckpt_path, map_location='cpu')
+        actors.load_state_dict(state_dict)
+        actors.eval()
+        self._torch = torch
+        self._actors = actors
+        self.policy_id = f"{self.policy_id}:{run_dir.name}"
+        self.checkpoint_source = 'checkpoint'
+        self._checkpoint_error = ''
+
+    def _heuristic_du_action(self, du_state: Dict[str, Any]) -> List[float]:
         state = list(du_state.get('state_vector', []) or [])
         if len(state) < 10:
             return [0.33, 0.33, 0.34]
@@ -43,6 +140,31 @@ class MARLShadowRuntimeEvaluator:
         total = embb_score + mmtc_score + urllc_score
         return [embb_score / total, mmtc_score / total, urllc_score / total]
 
+    def _checkpoint_du_action(self, du_index: int, du_state: Dict[str, Any]) -> List[float] | None:
+        if self._actors is None or self._torch is None:
+            return None
+        state = list(du_state.get('state_vector', []) or [])
+        if du_index >= len(self._actors):
+            return None
+        expected_dim = int(self.checkpoint_meta.get('du_state_dim', len(state)) or len(state))
+        if len(state) != expected_dim:
+            return None
+        with self._torch.no_grad():
+            tensor = self._torch.tensor(state, dtype=self._torch.float32)
+            out = self._actors[du_index](tensor).tolist()
+        if len(out) != 3:
+            return None
+        total = sum(float(v) for v in out)
+        if total <= 1e-9:
+            return None
+        return [float(v) / total for v in out]
+
+    def _du_action(self, du_index: int, du_state: Dict[str, Any]) -> tuple[List[float], str]:
+        checkpoint_action = self._checkpoint_du_action(du_index, du_state)
+        if checkpoint_action is not None:
+            return checkpoint_action, 'checkpoint'
+        return self._heuristic_du_action(du_state), 'heuristic'
+
     def evaluate(self, marl_state: Dict[str, Any] | None, resource_snapshot: Dict[str, Any] | None = None) -> Dict[str, Any]:
         if not self.enabled:
             return {'enabled': False, 'policy_id': self.policy_id, 'mode': self.mode}
@@ -51,18 +173,30 @@ class MARLShadowRuntimeEvaluator:
         du_states = marl_state.get('du_states', []) or []
         slice_state = marl_state.get('slice_state', {}) or {}
         if not du_states:
-            return {'enabled': True, 'policy_id': self.policy_id, 'mode': self.mode, 'available': False}
+            return {
+                'enabled': True,
+                'policy_id': self.policy_id,
+                'mode': self.mode,
+                'available': False,
+                'source': self.checkpoint_source,
+                'checkpoint_readiness': self.checkpoint_readiness,
+                'checkpoint_error': self._checkpoint_error,
+            }
 
         du_recommendations = []
         mean_embb = mean_mmtc = mean_urllc = 0.0
-        for du in du_states:
-            action = self._du_action(du)
+        used_checkpoint = 0
+        for idx, du in enumerate(du_states):
+            action, source = self._du_action(idx, du)
+            if source == 'checkpoint':
+                used_checkpoint += 1
             mean_embb += action[0]
             mean_mmtc += action[1]
             mean_urllc += action[2]
             du_recommendations.append({
                 'du_id': du.get('du_id', 'unknown'),
                 'primary_slice': du.get('primary_slice', 'unknown'),
+                'source': source,
                 'action_vector': [round(v, 4) for v in action],
             })
         count = max(len(du_recommendations), 1)
@@ -81,12 +215,19 @@ class MARLShadowRuntimeEvaluator:
         shadow_ran_share = _clamp(0.4 + (0.35 * mean_embb) + (0.15 * embb_pressure) - (0.10 * ai_pressure), 0.15, 0.9)
         shadow_r_ran = usable_budget * shadow_ran_share
         shadow_r_ai = max(0.0, usable_budget - shadow_r_ran)
+        final_source = 'checkpoint' if used_checkpoint == len(du_recommendations) and du_recommendations else 'heuristic'
+        if used_checkpoint and used_checkpoint < len(du_recommendations):
+            final_source = 'mixed'
 
         return {
             'enabled': True,
             'available': True,
             'policy_id': self.policy_id,
             'mode': self.mode,
+            'source': final_source,
+            'checkpoint_readiness': self.checkpoint_readiness,
+            'checkpoint_run_dir': self.checkpoint_run_dir,
+            'checkpoint_error': self._checkpoint_error,
             'topology_id': marl_state.get('topology_id', 'unknown'),
             'du_count': len(du_recommendations),
             'du_recommendations': du_recommendations,

@@ -21,6 +21,7 @@ import os
 import sys
 import json
 import time
+from pathlib import Path
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request
 from greenran_paths import (
@@ -71,6 +72,7 @@ DEVICE_ROLES_FILE = as_str(STATE_DIR / "xapp_metrics" / "device_roles.json")
 CONFLICT_LEARNED_REPORT_FILE = as_str(STATE_DIR / "greenran_conflict_report.json")
 CONFLICT_LEARNED_ADJ_FILE = as_str(STATE_DIR / "greenran_conflict_adjacency.json")
 SCENARIO_CONTROL_FILE = as_str(ARTICLE00_SCENARIO_CONTROL_PATH)
+TASAM_EVAL_FILE = as_str(Path(PROJECT_DIR) / 'runs' / 'sac_bootstrap' / 'tasam_candidate_evaluation_latest.json')
 
 APP2_CONNECTED_CRITICAL_RATIO = 0.85
 APP2_CONNECTED_WARNING_RATIO = 0.90
@@ -1036,6 +1038,27 @@ def get_collection_health_summary():
         return summary
 
 
+
+
+def get_latest_tasam_evaluation():
+    """Return latest TA-SAM checkpoint evaluation manifest."""
+    try:
+        payload = _safe_read_json(TASAM_EVAL_FILE, {})
+        best = (payload or {}).get('best_run') or {}
+        return {
+            'readiness': best.get('readiness', 'unknown'),
+            'promote_shadow': bool(best.get('promote_shadow', False)),
+            'promote_control_candidate': bool(best.get('promote_control_candidate', False)),
+            'run_dir': best.get('run_dir', ''),
+            'critic_loss': round(float(((best.get('final_metrics') or {}).get('critic_loss', 0.0) or 0.0)), 6),
+            'selected_fraction': round(float(((best.get('final_metrics') or {}).get('selected_fraction', 0.0) or 0.0)), 4),
+            'reasons': best.get('reasons', []),
+        }
+    except Exception as e:
+        print(f"Erro ao obter avaliação TA-SAM: {e}")
+        return {}
+
+
 def build_mobile_ops_snapshot():
     """Monta um resumo curto para operação móvel do cenário."""
     metrics = get_current_metrics() or {}
@@ -1047,6 +1070,7 @@ def build_mobile_ops_snapshot():
     collection = get_collection_health_summary()
     xapp_status = get_xapp_status()
     fixed_scenario = get_fixed_scenario_metadata()
+    tasam_eval = get_latest_tasam_evaluation()
 
     return {
         'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1071,6 +1095,7 @@ def build_mobile_ops_snapshot():
         'service_slas': service_slas,
         'latest_decision': latest_decision,
         'latest_allocation': latest_alloc,
+        'tasam_evaluation': tasam_eval,
         'collection': collection,
         'xapps': {
             name: {
