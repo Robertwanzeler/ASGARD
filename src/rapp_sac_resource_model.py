@@ -21,6 +21,11 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+try:
+    from .greenran_marl_topology import build_du_state_snapshot
+except ImportError:
+    from greenran_marl_topology import build_du_state_snapshot
+
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     try:
@@ -270,7 +275,7 @@ def compute_shared_resource_snapshot(
     ai_completion = 1.0 if d_ai <= 1e-9 else _clamp(r_ai / d_ai)
     utilization = _clamp((r_ran + r_ai) / r_max)
 
-    return {
+    snapshot = {
         "controller_id": "caora_bootstrap_heuristic",
         "target_policy_id": "caora_sac_resource_allocation",
         "decision_domain": "resource_allocation",
@@ -289,3 +294,11 @@ def compute_shared_resource_snapshot(
         "ran_components": ran["components"],
         "ai_components": ai["components"],
     }
+    snapshot["article_marl_state"] = build_du_state_snapshot(
+        camera_metrics=camera_metrics,
+        app2_metrics=app2_metrics,
+        vehicle_metrics=vehicle_metrics,
+        network_health=network_health,
+        resource_snapshot=snapshot,
+    )
+    return snapshot

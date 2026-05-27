@@ -29,6 +29,11 @@ import os
 import sqlite3
 import time
 import json
+
+try:
+    from .greenran_marl_topology import build_du_state_snapshot_from_resource_snapshot
+except ImportError:
+    from greenran_marl_topology import build_du_state_snapshot_from_resource_snapshot
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -358,6 +363,69 @@ class DataLake:
         ):
             if column_name not in existing_resource_columns:
                 cursor.execute(f"ALTER TABLE resource_allocation_history ADD COLUMN {column_name} {column_def}")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS marl_global_state_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                topology_id TEXT,
+                logical_du_count INTEGER DEFAULT 0,
+                total_demand REAL DEFAULT 0,
+                usable_budget REAL DEFAULT 0,
+                state_vector_json TEXT,
+                snapshot_json TEXT,
+                UNIQUE(timestamp)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_marl_global_timestamp
+            ON marl_global_state_history(timestamp)
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS marl_slice_state_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                slice_id TEXT NOT NULL,
+                ue_count INTEGER DEFAULT 0,
+                demand REAL DEFAULT 0,
+                allocation REAL DEFAULT 0,
+                qos_pressure REAL DEFAULT 0,
+                completion_ratio REAL DEFAULT 0,
+                min_qos_met REAL DEFAULT 0,
+                budget_share REAL DEFAULT 0,
+                snapshot_json TEXT,
+                UNIQUE(timestamp, slice_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_marl_slice_timestamp
+            ON marl_slice_state_history(timestamp)
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS marl_du_state_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                du_id TEXT NOT NULL,
+                role TEXT,
+                primary_slice TEXT,
+                ue_count INTEGER DEFAULT 0,
+                demand_share REAL DEFAULT 0,
+                allocation_share REAL DEFAULT 0,
+                slice_mix_json TEXT,
+                state_vector_json TEXT,
+                snapshot_json TEXT,
+                UNIQUE(timestamp, du_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_marl_du_timestamp
+            ON marl_du_state_history(timestamp)
+        """)
 
         # Snapshot agregado da App2-Monitoramento.
         cursor.execute("""
@@ -691,8 +759,91 @@ class DataLake:
                 json.dumps(snapshot, ensure_ascii=False),
             ))
             self.conn.commit()
+            self.record_article_marl_state(snapshot, timestamp=timestamp)
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar snapshot de recursos: {e}")
+
+    def record_article_marl_state(self, snapshot, timestamp=None):
+        """Persist article-aligned MARL state for global, slice and DU views."""
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+
+        marl_state = snapshot.get('article_marl_state')
+        if not isinstance(marl_state, dict) or not marl_state:
+            marl_state = build_du_state_snapshot_from_resource_snapshot(snapshot)
+
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        dt = datetime.fromtimestamp(timestamp)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        global_state = marl_state.get('global_state', {}) or {}
+        slice_state = marl_state.get('slice_state', {}) or {}
+        du_states = marl_state.get('du_states', []) or []
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO marl_global_state_history
+                (timestamp, datetime, topology_id, logical_du_count, total_demand, usable_budget,
+                 state_vector_json, snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                timestamp,
+                dt_str,
+                str(marl_state.get('topology_id', global_state.get('topology_id', 'unknown')) or 'unknown'),
+                int(global_state.get('logical_du_count', len(du_states)) or len(du_states)),
+                float(global_state.get('total_demand', 0.0) or 0.0),
+                float(global_state.get('usable_budget', snapshot.get('usable_budget', 0.0)) or 0.0),
+                json.dumps(global_state.get('state_vector', []), ensure_ascii=False),
+                json.dumps(global_state, ensure_ascii=False),
+            ))
+
+            for slice_id, payload in slice_state.items():
+                payload = payload or {}
+                cursor.execute("""
+                    INSERT OR REPLACE INTO marl_slice_state_history
+                    (timestamp, datetime, slice_id, ue_count, demand, allocation, qos_pressure,
+                     completion_ratio, min_qos_met, budget_share, snapshot_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    timestamp,
+                    dt_str,
+                    str(slice_id),
+                    int(payload.get('ue_count', 0) or 0),
+                    float(payload.get('demand', 0.0) or 0.0),
+                    float(payload.get('allocation', 0.0) or 0.0),
+                    float(payload.get('qos_pressure', 0.0) or 0.0),
+                    float(payload.get('completion_ratio', 0.0) or 0.0),
+                    float(payload.get('min_qos_met', 0.0) or 0.0),
+                    float(payload.get('budget_share', 0.0) or 0.0),
+                    json.dumps(payload, ensure_ascii=False),
+                ))
+
+            for du_payload in du_states:
+                du_payload = du_payload or {}
+                cursor.execute("""
+                    INSERT OR REPLACE INTO marl_du_state_history
+                    (timestamp, datetime, du_id, role, primary_slice, ue_count, demand_share, allocation_share,
+                     slice_mix_json, state_vector_json, snapshot_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    timestamp,
+                    dt_str,
+                    str(du_payload.get('du_id', 'unknown') or 'unknown'),
+                    str(du_payload.get('role', '') or ''),
+                    str(du_payload.get('primary_slice', '') or ''),
+                    int(du_payload.get('ue_count', 0) or 0),
+                    float(du_payload.get('demand_share', 0.0) or 0.0),
+                    float(du_payload.get('allocation_share', 0.0) or 0.0),
+                    json.dumps(du_payload.get('slice_mix', {}), ensure_ascii=False),
+                    json.dumps(du_payload.get('state_vector', []), ensure_ascii=False),
+                    json.dumps(du_payload, ensure_ascii=False),
+                ))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar estado MARL: {e}")
 
     def record_app3_snapshot(self, snapshot, timestamp=None):
         """Registra snapshot agregado do App3 para fallback histórico do domínio veicular."""

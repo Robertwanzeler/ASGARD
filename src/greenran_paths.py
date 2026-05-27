@@ -118,3 +118,29 @@ def get_fixed_vehicle_base_imsi(default: int = 16) -> int:
 
 def get_fixed_max_vehicles(default: int = 5) -> int:
     return _scenario_int(("apps", "app3", "max_vehicles"), default)
+
+
+def get_fixed_camera_imsis(default: tuple[int, ...] = (1, 2, 3)) -> tuple[int, ...]:
+    payload = load_fixed_scenario_config()
+    values = (((payload.get("ns3") or {}).get("camera_imsis")) or list(default))
+    try:
+        return tuple(int(v) for v in values)
+    except (TypeError, ValueError):
+        return tuple(default)
+
+
+def get_fixed_background_imsi_range(default: tuple[int, int] = (4, 12)) -> tuple[int, int]:
+    payload = load_fixed_scenario_config()
+    values = (((payload.get("ns3") or {}).get("background_imsi_range")) or list(default))
+    try:
+        if len(values) != 2:
+            raise ValueError
+        return (int(values[0]), int(values[1]))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_fixed_marl_topology() -> dict:
+    payload = load_fixed_scenario_config()
+    topology = payload.get("marl") if isinstance(payload, dict) else {}
+    return topology if isinstance(topology, dict) else {}

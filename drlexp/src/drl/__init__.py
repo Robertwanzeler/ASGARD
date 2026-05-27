@@ -18,6 +18,11 @@ except Exception:
 from .replay_buffer import ReplayBuffer
 
 try:
+    from .ta_sam_marl import TASAMMultiAgentTrainer
+except Exception:
+    TASAMMultiAgentTrainer = None
+
+try:
     from .gym_environment import GreenRANGymEnv
 except Exception:
     GreenRANGymEnv = None
@@ -25,5 +30,6 @@ except Exception:
 __all__ = [
     'CAORASACEnv',
     'ReplayBuffer',
+    'TASAMMultiAgentTrainer',
     'GreenRANGymEnv',
 ]

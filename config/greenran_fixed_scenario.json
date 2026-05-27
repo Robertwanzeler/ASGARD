@@ -3,8 +3,15 @@
   "ns3": {
     "scenario_binary_pattern": "scenario-greenran",
     "total_ues": 12,
-    "camera_imsis": [1, 2, 3],
-    "background_imsi_range": [4, 12],
+    "camera_imsis": [
+      1,
+      2,
+      3
+    ],
+    "background_imsi_range": [
+      4,
+      12
+    ],
     "s1u_datarate_mbps": 15,
     "s1u_delay_ms": 5,
     "p2p_datarate_mbps": 30,
@@ -30,7 +37,10 @@
     "app3": {
       "domain": "vehicle",
       "max_vehicles": 5,
-      "vehicle_imsi_range": [16, 20],
+      "vehicle_imsi_range": [
+        16,
+        20
+      ],
       "base_imsi": 16
     }
   },
@@ -43,5 +53,82 @@
     "keep_greenran_architecture": true,
     "keep_armd_greenran": true,
     "freeze_camera_vehicle_ue_counts": true
+  },
+  "marl": {
+    "topology_id": "greenran_fixed_marl_v1",
+    "logical_du_count": 3,
+    "logical_dus": [
+      {
+        "du_id": "du_camera_edge",
+        "role": "camera_edge",
+        "primary_slice": "eMBB",
+        "camera_imsis": [
+          1,
+          2,
+          3
+        ],
+        "background_imsis": [
+          4,
+          5,
+          6
+        ],
+        "slice_mix": {
+          "eMBB": 0.85,
+          "mMTC": 0.1,
+          "URLLC": 0.05
+        }
+      },
+      {
+        "du_id": "du_sensor_mixed",
+        "role": "sensor_mixed",
+        "primary_slice": "mMTC",
+        "background_imsis": [
+          7,
+          8,
+          9
+        ],
+        "slice_mix": {
+          "eMBB": 0.35,
+          "mMTC": 0.55,
+          "URLLC": 0.1
+        }
+      },
+      {
+        "du_id": "du_vehicle_edge",
+        "role": "vehicle_edge",
+        "primary_slice": "URLLC",
+        "background_imsis": [
+          10,
+          11,
+          12
+        ],
+        "vehicle_imsi_range": [
+          16,
+          20
+        ],
+        "slice_mix": {
+          "eMBB": 0.2,
+          "mMTC": 0.15,
+          "URLLC": 0.65
+        }
+      }
+    ],
+    "slice_profiles": {
+      "eMBB": {
+        "app": "app1",
+        "domain": "camera",
+        "qos_target": "throughput"
+      },
+      "mMTC": {
+        "app": "app2",
+        "domain": "sensor",
+        "qos_target": "delivery"
+      },
+      "URLLC": {
+        "app": "app3",
+        "domain": "vehicle",
+        "qos_target": "latency"
+      }
+    }
   }
 }

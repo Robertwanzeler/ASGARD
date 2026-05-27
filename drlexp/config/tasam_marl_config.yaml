@@ -1,0 +1,24 @@
+trainer:
+  name: TA-SAM-MARL
+  topology_id: greenran_fixed_marl_v1
+  article_alignment: task_specific_sharpness_aware_oran_resource_management
+  du_count: 3
+  state_dim_per_du: 10
+  global_state_dim: 10
+  action_dim_per_du: 3
+
+optimization:
+  epochs: 25
+  learning_rate: 0.0003
+  sam_rho: 0.05
+  td_variance_threshold: 0.01
+
+slices:
+  - eMBB
+  - mMTC
+  - URLLC
+
+runtime:
+  keep_greenran_architecture: true
+  keep_armd_greenran: true
+  fixed_scenario_id: greenran_fixed_baseline_v1
