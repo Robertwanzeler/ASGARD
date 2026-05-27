@@ -889,7 +889,8 @@ def get_latest_resource_allocation():
                 r_ai,
                 ran_completion_ratio,
                 ai_completion_ratio,
-                utilization_ratio
+                utilization_ratio,
+                snapshot_json
             FROM resource_allocation_history
             ORDER BY timestamp DESC
             LIMIT 1
@@ -898,6 +899,12 @@ def get_latest_resource_allocation():
         row = cursor.fetchone()
         if not row:
             return {}
+        shadow = {}
+        try:
+            payload = json.loads(row[10] or '{}') if row[10] else {}
+            shadow = (payload.get('marl_shadow') or {}) if isinstance(payload, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            shadow = {}
         return {
             'datetime': row[0],
             'controller_id': row[1],
@@ -909,6 +916,13 @@ def get_latest_resource_allocation():
             'ran_completion_ratio': round(float(row[7] or 0.0), 4),
             'ai_completion_ratio': round(float(row[8] or 0.0), 4),
             'utilization_ratio': round(float(row[9] or 0.0), 4),
+            'marl_shadow': {
+                'policy_id': shadow.get('policy_id', ''),
+                'available': bool(shadow.get('available', False)),
+                'delta_r_ran_vs_live': round(float(shadow.get('delta_r_ran_vs_live', 0.0) or 0.0), 4),
+                'delta_r_ai_vs_live': round(float(shadow.get('delta_r_ai_vs_live', 0.0) or 0.0), 4),
+                'mean_action_vector': shadow.get('mean_action_vector', []),
+            },
         }
     except Exception as e:
         print(f"Erro ao obter alocação mais recente: {e}")

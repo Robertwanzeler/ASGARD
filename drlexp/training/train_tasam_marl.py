@@ -23,6 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--sam-rho', type=float, default=0.05, help='Initial SAM rho')
     parser.add_argument('--td-var-threshold', type=float, default=0.01, help='Selective SAM threshold over TD proxy variance')
+    parser.add_argument('--min-selected-fraction', type=float, default=0.10, help='Minimum fraction of agent updates selected each epoch')
+    parser.add_argument('--warmup-epochs', type=int, default=2, help='Force actor updates during early epochs before selective SAM takes over')
     return parser
 
 
@@ -47,8 +49,14 @@ def main() -> int:
 
     history = []
     for epoch in range(1, args.epochs + 1):
-        metrics = trainer.train_epoch(records, td_var_threshold=args.td_var_threshold)
+        metrics = trainer.train_epoch(
+            records,
+            td_var_threshold=args.td_var_threshold,
+            min_selected_fraction=args.min_selected_fraction,
+            warmup=epoch <= args.warmup_epochs,
+        )
         metrics['epoch'] = epoch
+        metrics['warmup'] = epoch <= args.warmup_epochs
         history.append(metrics)
 
     summary = {
@@ -57,9 +65,14 @@ def main() -> int:
         'du_count': du_count,
         'du_state_dim': du_state_dim,
         'global_state_dim': global_state_dim,
+        'sam_rho': args.sam_rho,
+        'requested_td_var_threshold': args.td_var_threshold,
+        'min_selected_fraction': args.min_selected_fraction,
+        'warmup_epochs': args.warmup_epochs,
         'final_metrics': history[-1],
         'history': history,
     }
+    trainer.export_checkpoint(output_dir, metadata=summary)
     (output_dir / 'tasam_marl_summary.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(summary['final_metrics'], indent=2))
     return 0

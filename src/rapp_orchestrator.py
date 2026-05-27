@@ -72,6 +72,7 @@ from rapp_ml_predictor import MLPredictor
 from rapp_armd_runtime import ARMDRuntimeAdvisor
 from rapp_rl_policy import build_runtime_rl_policy
 from rapp_sac_resource_model import compute_shared_resource_snapshot
+from rapp_marl_shadow import MARLShadowRuntimeEvaluator
 
 # from rapp_synthetic_generator import SyntheticDataGenerator  # Removed - not available
 from rapp_xapp_manager import XAppManager
@@ -213,6 +214,7 @@ class RappResourceOptimizer:
         self.history_display_interval = 1  # Exibir a cada ciclo (mais frequente)
         self.app2_connectivity_history = deque(maxlen=3)
         self._resource_allocation_prev = {'r_ran': 0.5, 'r_ai': 0.5}
+        self.marl_shadow_evaluator = MARLShadowRuntimeEvaluator()
         
         # Inicializa componentes
         print("[rApp] Inicializando componentes...")
@@ -1336,6 +1338,12 @@ class RappResourceOptimizer:
                     f"resource policy predict failed: {exc}"
                 )
                 print(f"[rApp RL-RESOURCE] fallback to heuristic allocator: {exc}")
+        marl_shadow = self.marl_shadow_evaluator.evaluate(
+            (resource_allocation or {}).get('article_marl_state'),
+            resource_snapshot=resource_allocation,
+        )
+        resource_allocation['marl_shadow'] = marl_shadow
+        decision['rl_policy_runtime']['marl_shadow'] = marl_shadow
         decision['resource_allocation'] = resource_allocation
         self._resource_allocation_prev = {
             'r_ran': float(resource_allocation.get('r_ran', 0.5) or 0.5),
@@ -2250,7 +2258,11 @@ class RappResourceOptimizer:
                 'r_ai': (decision.get('resource_allocation') or {}).get('r_ai'),
                 'ran_completion_ratio': (decision.get('resource_allocation') or {}).get('ran_completion_ratio'),
                 'ai_completion_ratio': (decision.get('resource_allocation') or {}).get('ai_completion_ratio'),
-                'utilization_ratio': (decision.get('resource_allocation') or {}).get('utilization_ratio')
+                'utilization_ratio': (decision.get('resource_allocation') or {}).get('utilization_ratio'),
+                'marl_shadow_policy_id': (((decision.get('resource_allocation') or {}).get('marl_shadow') or {}).get('policy_id', '')),
+                'marl_shadow_available': (((decision.get('resource_allocation') or {}).get('marl_shadow') or {}).get('available', False)),
+                'marl_shadow_delta_r_ran': (((decision.get('resource_allocation') or {}).get('marl_shadow') or {}).get('delta_r_ran_vs_live')),
+                'marl_shadow_delta_r_ai': (((decision.get('resource_allocation') or {}).get('marl_shadow') or {}).get('delta_r_ai_vs_live'))
             }
 
             with open(RAPP_DECISIONS_LOG_PATH, 'a') as f:

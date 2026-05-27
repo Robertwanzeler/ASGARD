@@ -77,23 +77,98 @@ class SAMOptimizer:
         self.base.step()
 
 
+def calibrate_td_variance_threshold(
+    td_variances: List[float],
+    requested_threshold: float,
+    min_selected_fraction: float = 0.1,
+    warmup: bool = False,
+) -> float:
+    if not td_variances:
+        return 0.0
+    if warmup:
+        return 0.0
+
+    values = sorted(max(0.0, float(v)) for v in td_variances)
+    if requested_threshold <= 0.0:
+        return 0.0
+
+    n = len(values)
+    min_selected_fraction = max(0.0, min(1.0, float(min_selected_fraction)))
+    target_selected = max(1, int(round(n * min_selected_fraction)))
+    idx = max(0, n - target_selected)
+    threshold_from_fraction = values[idx]
+    observed_max = values[-1]
+    effective = min(float(requested_threshold), float(threshold_from_fraction))
+    if requested_threshold > observed_max:
+        effective = float(threshold_from_fraction)
+    return max(0.0, effective)
+
+
 class TASAMMultiAgentTrainer:
     def __init__(self, du_count: int, du_state_dim: int, global_state_dim: int, lr: float = 3e-4, rho: float = 0.05) -> None:
         self.actors = nn.ModuleList([ActorNetwork(du_state_dim) for _ in range(du_count)])
         self.critic = GlobalCritic(global_state_dim + (du_count * 3))
         self.actor_opt = SAMOptimizer(self.actors.parameters(), torch.optim.Adam, lr=lr, rho=rho)
         self.critic_opt = SAMOptimizer(self.critic.parameters(), torch.optim.Adam, lr=lr, rho=rho)
+        self.du_count = du_count
+        self.du_state_dim = du_state_dim
+        self.global_state_dim = global_state_dim
 
-    def train_epoch(self, records: List[MARLRecord], td_var_threshold: float = 0.01) -> dict[str, float]:
+    def export_checkpoint(self, output_dir: str | Path, metadata: dict | None = None) -> None:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        torch.save(self.actors.state_dict(), out / 'tasam_marl_actors.pt')
+        torch.save(self.critic.state_dict(), out / 'tasam_marl_critic.pt')
+        payload = {
+            'du_count': self.du_count,
+            'du_state_dim': self.du_state_dim,
+            'global_state_dim': self.global_state_dim,
+        }
+        if metadata:
+            payload.update(metadata)
+        (out / 'tasam_marl_checkpoint_meta.json').write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
+
+    def train_epoch(
+        self,
+        records: List[MARLRecord],
+        td_var_threshold: float = 0.01,
+        min_selected_fraction: float = 0.1,
+        warmup: bool = False,
+    ) -> dict[str, float]:
         if not records:
-            return {'actor_loss': 0.0, 'critic_loss': 0.0, 'selected_agents': 0.0}
+            return {
+                'actor_loss': 0.0,
+                'critic_loss': 0.0,
+                'selected_agents': 0.0,
+                'selected_fraction': 0.0,
+                'effective_td_var_threshold': 0.0,
+                'td_var_mean': 0.0,
+                'td_var_max': 0.0,
+            }
+
+        calibration_vars: List[float] = []
+        for record in records:
+            for actor, du_state in zip(self.actors, record.du_states):
+                du_x = torch.tensor(du_state, dtype=torch.float32)
+                with torch.no_grad():
+                    action = actor(du_x)
+                calibration_vars.append(float(torch.var(action).item()))
+
+        effective_threshold = calibrate_td_variance_threshold(
+            calibration_vars,
+            requested_threshold=td_var_threshold,
+            min_selected_fraction=min_selected_fraction,
+            warmup=warmup,
+        )
 
         actor_losses = []
         critic_losses = []
         selected_agents = 0
+        total_agents = 0
         for record in records:
             global_x = torch.tensor(record.global_state, dtype=torch.float32)
             du_inputs = [torch.tensor(du_state, dtype=torch.float32) for du_state in record.du_states]
+            total_agents += len(du_inputs)
 
             actor_actions = []
             td_errors = []
@@ -113,7 +188,7 @@ class TASAMMultiAgentTrainer:
             critic_losses.append(float(critic_loss.item()))
 
             td_variance = sum(td_errors) / max(len(td_errors), 1)
-            if td_variance >= td_var_threshold:
+            if td_variance >= effective_threshold:
                 actor_actions = [actor(du_x) for actor, du_x in zip(self.actors, du_inputs)]
                 actor_in = torch.cat([global_x, torch.cat(actor_actions, dim=0)], dim=0)
                 actor_value = self.critic(actor_in).squeeze(0)
@@ -128,4 +203,8 @@ class TASAMMultiAgentTrainer:
             'actor_loss': sum(actor_losses) / max(len(actor_losses), 1),
             'critic_loss': sum(critic_losses) / max(len(critic_losses), 1),
             'selected_agents': float(selected_agents),
+            'selected_fraction': float(selected_agents / max(total_agents, 1)),
+            'effective_td_var_threshold': float(effective_threshold),
+            'td_var_mean': float(sum(calibration_vars) / max(len(calibration_vars), 1)),
+            'td_var_max': float(max(calibration_vars) if calibration_vars else 0.0),
         }
