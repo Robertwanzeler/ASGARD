@@ -1,0 +1,13 @@
+{
+  "model": "SBiLSTM",
+  "epochs_requested": 150,
+  "epochs_completed": 64,
+  "best_val_loss": 0.09754389046106048,
+  "test_metrics": {
+    "mse": 0.13243736326694489,
+    "mae": 0.030984701588749886,
+    "r2": 0.9942166805267334
+  },
+  "history_json": "./models/sbilstm/sbilstm_training_history.json",
+  "history_csv": "./models/sbilstm/sbilstm_training_history.csv"
+}

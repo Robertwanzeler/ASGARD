@@ -1,0 +1,53 @@
+# GreenRAN SAC Configuration
+# ==========================
+# AI-and-RAN coexistence over shared compute resources
+# Based on Lotfi et al. (2025) "Task-Specific Sharpness-Aware O-RAN Resource
+# Management using Multi-Agent Reinforcement Learning". arXiv:2511.15002.
+
+system:
+  name: "GreenRAN SAC"
+  version: "0.1.0"
+  based_on: "CAORA / AI-and-RAN coexistence with SAC"
+
+environment:
+  state_size: 4
+  state_features:
+    - d_ran
+    - d_ai
+    - r_ran_prev
+    - r_ai_prev
+  action_space: "continuous"
+  action_size: 2
+  action_meanings:
+    0: "delta_r_ran"
+    1: "delta_r_ai"
+  resource_budget:
+    r_max: 1.0
+    delta_step: 0.1
+  reward:
+    w_ran: 2.0
+    w_ai: 1.0
+    w_utilization: 0.5
+    rationale:
+      - "Prioritize completion of RAN requests"
+      - "Still serve AI workloads when capacity exists"
+      - "Penalize underutilization of the shared platform"
+
+sac:
+  gamma: 0.99
+  tau: 0.005
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  alpha_lr: 0.0003
+  batch_size: 256
+  replay_buffer_size: 100000
+  warmup_steps: 5000
+  target_entropy: "auto"
+
+data:
+  workload_csv: ""
+  output_dir: "./runs/sac_bootstrap"
+
+logging:
+  level: "INFO"
+  checkpoint_dir: "./models/sac"

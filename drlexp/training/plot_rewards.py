@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Script de Visualização de Rewards - A3C V3 vs RF
-================================================
-Gera gráficos comparativos dos resultados de reward entre A3C V3 e Random Forest.
+Script de Visualização de Rewards - EE-DRL-GreenRAN vs RF
+=========================================================
+Gera gráficos comparativos derivados do runtime GreenRAN para a trilha
+EE-DRL-GreenRAN (A3C) versus o baseline Random Forest.
 
 Executar:
     cd /home/robert/orange_nuclear/drlexp
@@ -26,7 +27,7 @@ from drl.models.actor import ActorNetwork
 
 OUTPUT_DIR = '/home/robert/orange_nuclear/drlexp/charts/rewards'
 DB_PATH = '/tmp/rapp_data_lake.db'
-MODEL_PATH = '/home/robert/orange_nuclear/drlexp/models/a3c/actor_v4.pt'  # Using V4
+MODEL_PATH = '/home/robert/orange_nuclear/drlexp/models/a3c/actor_v7.pt'
 
 plt.style.use('seaborn-v0_8-whitegrid')
 plt.rcParams['figure.figsize'] = (10, 6)
@@ -58,7 +59,7 @@ def load_data():
     return df
 
 def load_a3c_model():
-    """Carrega modelo A3C V3."""
+    """Carrega modelo A3C oficial da trilha EE-DRL-GreenRAN."""
     actor = ActorNetwork(state_size=18, num_actions=9)
     actor.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
     actor.eval()
@@ -117,7 +118,7 @@ def calculate_rf_reward(decision, cvar_ms):
     return base + power_bonus + penalty
 
 def calculate_a3c_reward(decision, cvar_ms):
-    """Calcula reward para decisão A3C (V3)."""
+    """Calcula reward para decisão A3C."""
     if cvar_ms < 60:
         base = 1.0
     elif cvar_ms < 80:
@@ -147,14 +148,14 @@ def plot_reward_comparison(rf_rewards, a3c_rewards):
     """Gráfico 1: Comparação de reward médio."""
     fig, ax = plt.subplots(figsize=(10, 6))
     
-    x = ['Random Forest', 'A3C V3']
+    x = ['Random Forest', 'EE-DRL-GreenRAN']
     y = [np.mean(rf_rewards), np.mean(a3c_rewards)]
     colors = ['#3498db', '#2ecc71']
     
     bars = ax.bar(x, y, color=colors, edgecolor='black', linewidth=1.5)
     
     ax.set_ylabel('Reward Médio', fontsize=14)
-    ax.set_title('Comparação de Reward: RF vs A3C V3', fontsize=16, fontweight='bold')
+    ax.set_title('Comparação de Reward: RF vs EE-DRL-GreenRAN', fontsize=16, fontweight='bold')
     
     for bar, val in zip(bars, y):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02, 
@@ -186,7 +187,7 @@ def plot_reward_by_zone(df, rf_rewards, a3c_rewards):
     width = 0.35
     
     bars1 = ax.bar(x - width/2, rf_zone_rewards, width, label='Random Forest', color='#3498db')
-    bars2 = ax.bar(x + width/2, a3c_zone_rewards, width, label='A3C V3', color='#2ecc71')
+    bars2 = ax.bar(x + width/2, a3c_zone_rewards, width, label='EE-DRL-GreenRAN', color='#2ecc71')
     
     ax.set_ylabel('Reward Médio', fontsize=14)
     ax.set_title('Reward Médio por Zona de CVaR', fontsize=16, fontweight='bold')
@@ -223,7 +224,7 @@ def plot_decision_distribution(df):
     # A3C Pie
     axes[1].pie(a3c_counts.values, labels=a3c_counts.index, autopct='%1.1f%%',
                 colors=[colors[c] for c in a3c_counts.index], startangle=90)
-    axes[1].set_title('A3C V3', fontsize=14, fontweight='bold')
+    axes[1].set_title('EE-DRL-GreenRAN', fontsize=14, fontweight='bold')
     
     fig.suptitle('Distribuição de Decisões', fontsize=16, fontweight='bold', y=1.02)
     
@@ -236,7 +237,7 @@ def plot_energy_efficiency():
     """Gráfico 4: Eficiência energética."""
     fig, ax = plt.subplots(figsize=(10, 6))
     
-    systems = ['Random Forest', 'A3C V3']
+    systems = ['Random Forest', 'EE-DRL-GreenRAN']
     power = [86.8, 78.7]
     economy = [13.2, 21.3]
     
@@ -247,7 +248,7 @@ def plot_energy_efficiency():
     bars2 = ax.bar(x + width/2, economy, width, label='Economia (%)', color='#2ecc71')
     
     ax.set_ylabel('Porcentagem (%)', fontsize=14)
-    ax.set_title('Eficiência Energética: RF vs A3C V3', fontsize=16, fontweight='bold')
+    ax.set_title('Eficiência Energética: RF vs EE-DRL-GreenRAN', fontsize=16, fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels(systems)
     ax.legend()
@@ -282,7 +283,7 @@ def plot_summary_metrics():
     x = np.arange(len(metrics))
     width = 0.35
     ax1.barh(x - width/2, rf_values, width, label='Random Forest', color='#3498db')
-    ax1.barh(x + width/2, a3c_values, width, label='A3C V3', color='#2ecc71')
+    ax1.barh(x + width/2, a3c_values, width, label='EE-DRL-GreenRAN', color='#2ecc71')
     ax1.set_yticks(x)
     ax1.set_yticklabels(metrics)
     ax1.set_xlabel('Valor')
@@ -294,8 +295,8 @@ def plot_summary_metrics():
     ax2 = fig.add_subplot(gs[0, 2])
     ax2.axis('off')
     winners = [
-        ('Economia', 'A3C V3', '#2ecc71'),
-        ('Proteção SLA', 'A3C V3', '#2ecc71'),
+        ('Economia', 'EE-DRL', '#2ecc71'),
+        ('Proteção SLA', 'EE-DRL', '#2ecc71'),
         ('ALLOWED', 'EMPATE', '#95a5a6'),
         ('BLOCKED', 'EMPATE', '#95a5a6')
     ]
@@ -314,7 +315,7 @@ def plot_summary_metrics():
     ax4 = fig.add_subplot(gs[1, 1])
     sizes = [21.3, 78.7]
     ax4.pie(sizes, labels=['Economia\nA3C', 'Perda\nA3C'], colors=colors_pie, autopct='%1.1f%%')
-    ax4.set_title('A3C V3 - Energia', fontweight='bold')
+    ax4.set_title('EE-DRL - Energia', fontweight='bold')
     
     ax5 = fig.add_subplot(gs[1, 2])
     improvement = ((21.3 - 13.2) / 13.2) * 100
@@ -323,7 +324,7 @@ def plot_summary_metrics():
     ax5.text(0.5, 0.3, 'em economia', fontsize=12, ha='center')
     ax5.axis('off')
     
-    fig.suptitle('Resumo de Métricas: Random Forest vs A3C V3', fontsize=18, fontweight='bold', y=0.98)
+    fig.suptitle('Resumo de Métricas: Random Forest vs EE-DRL-GreenRAN', fontsize=18, fontweight='bold', y=0.98)
     
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/summary_metrics.png', dpi=150)
@@ -332,7 +333,7 @@ def plot_summary_metrics():
 
 def main():
     print('='*60)
-    print('Gerando Gráficos de Reward - A3C V3 vs RF')
+    print('Gerando Gráficos de Reward - EE-DRL-GreenRAN vs RF')
     print('='*60)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -341,7 +342,7 @@ def main():
     df = load_data()
     print(f'   {len(df)} amostras carregadas')
     
-    print('\n🎯 Carregando modelo A3C V3...')
+    print('\n🎯 Carregando modelo A3C oficial...')
     actor = load_a3c_model()
     
     print('\n📈 Calculando decisões e rewards...')

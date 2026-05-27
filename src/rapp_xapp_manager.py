@@ -36,8 +36,10 @@ from greenran_paths import (
     FLEXRIC_BUILD_DIR,
     XAPP_SLICER_LOG_PATH,
     XAPP_ENERGY_LOG_PATH,
+    XAPP_VEHICLE_LOG_PATH,
     XAPP_SLICER_PID_PATH,
     XAPP_ENERGY_PID_PATH,
+    XAPP_VEHICLE_PID_PATH,
     STATE_DIR,
     as_str,
 )
@@ -49,17 +51,20 @@ FLEXRIC_BUILD = as_str(FLEXRIC_BUILD_DIR)
 
 XAPP_PATHS = {
     "slicer": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_slicer",
-    "energy_saver": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_energy_saver"
+    "energy_saver": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_energy_saver",
+    "vehicle_control": f"{BASE_DIR}/src/xapp_vehicle_control.py",
 }
 
 XAPP_LOG_PATHS = {
     "slicer": as_str(XAPP_SLICER_LOG_PATH),
-    "energy_saver": as_str(XAPP_ENERGY_LOG_PATH)
+    "energy_saver": as_str(XAPP_ENERGY_LOG_PATH),
+    "vehicle_control": as_str(XAPP_VEHICLE_LOG_PATH),
 }
 
 XAPP_PID_PATHS = {
     "slicer": as_str(XAPP_SLICER_PID_PATH),
-    "energy_saver": as_str(XAPP_ENERGY_PID_PATH)
+    "energy_saver": as_str(XAPP_ENERGY_PID_PATH),
+    "vehicle_control": as_str(XAPP_VEHICLE_PID_PATH),
 }
 
 
@@ -128,9 +133,14 @@ class XAppManager:
             return False
         
         try:
+            if xapp_name == "vehicle_control":
+                command = [sys.executable, binary_path, "--interval", "2"]
+            else:
+                command = [binary_path, "-c", self.config_file, "-p", f"{self.flexric_lib}/"]
+
             with open(log_path, 'w') as log_file:
                 process = subprocess.Popen(
-                    [binary_path, "-c", self.config_file, "-p", f"{self.flexric_lib}/"],
+                    command,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     env=self._get_env(),
@@ -296,7 +306,7 @@ class XAppManager:
         print("[XAppManager] Limpando processos zumbis...")
 
         if os.environ.get("GREENRAN_CLEAN_SCOPE", "global") != "instance":
-            for pattern in ['xapp_slicer', 'xapp_energy_sav', 'run_slicer', 'run_energy']:
+            for pattern in ['xapp_slicer', 'xapp_energy_sav', 'xapp_vehicle_control.py', 'run_slicer', 'run_energy', 'VehicleControl']:
                 try:
                     subprocess.run(['pkill', '-9', '-f', pattern],
                                   capture_output=True, timeout=2)

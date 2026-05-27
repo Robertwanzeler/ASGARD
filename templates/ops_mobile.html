@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+
+{% block title %}Ops Mobile - GreenRAN{% endblock %}
+
+{% block extra_head %}
+<style>
+    .ops-shell {
+        max-width: 760px;
+        margin: 0 auto;
+    }
+    .ops-hero {
+        background:
+            radial-gradient(circle at top left, rgba(255, 128, 0, 0.18), transparent 40%),
+            radial-gradient(circle at top right, rgba(0, 255, 136, 0.12), transparent 35%),
+            linear-gradient(160deg, rgba(10, 16, 30, 0.98), rgba(17, 33, 62, 0.98));
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 18px;
+        padding: 18px;
+        margin-bottom: 16px;
+    }
+    .ops-kicker {
+        color: #8fd3ff !important;
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 6px;
+    }
+    .ops-title {
+        color: #fff !important;
+        font-size: 1.8rem;
+        font-weight: 700;
+        line-height: 1.05;
+        margin-bottom: 8px;
+    }
+    .ops-subtitle {
+        color: #a9bdd7 !important;
+        font-size: 0.94rem;
+        margin-bottom: 0;
+    }
+    .ops-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 12px;
+        margin-top: 16px;
+    }
+    .ops-card {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        padding: 15px 16px;
+    }
+    .ops-card-title {
+        color: #8da6c3 !important;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 6px;
+    }
+    .ops-value {
+        color: #fff !important;
+        font-size: 1.55rem;
+        font-weight: 700;
+        line-height: 1.05;
+    }
+    .ops-note {
+        color: #b8c6d8 !important;
+        font-size: 0.88rem;
+        margin-top: 6px;
+        margin-bottom: 0;
+    }
+    .ops-pill-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-top: 12px;
+    }
+    .ops-pill {
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 0.82rem;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(255,255,255,0.04);
+        color: #dce7f6 !important;
+    }
+    .ops-status-good { color: #00ff88 !important; }
+    .ops-status-warn { color: #ffbf69 !important; }
+    .ops-status-bad { color: #ff6b6b !important; }
+    .ops-section {
+        margin-bottom: 14px;
+    }
+    .ops-list {
+        display: grid;
+        gap: 10px;
+    }
+    .ops-line {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: baseline;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        padding-bottom: 8px;
+    }
+    .ops-line:last-child {
+        border-bottom: none;
+        padding-bottom: 0;
+    }
+    .ops-line .k {
+        color: #8da6c3 !important;
+        font-size: 0.84rem;
+    }
+    .ops-line .v {
+        color: #fff !important;
+        font-weight: 600;
+        text-align: right;
+    }
+    .ops-sla-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+    }
+    .ops-sla {
+        border-radius: 14px;
+        padding: 12px 14px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+    }
+    .ops-sla h6 {
+        margin-bottom: 4px;
+        font-size: 1rem;
+        color: #fff !important;
+    }
+    .ops-sla p {
+        margin-bottom: 4px;
+        font-size: 0.88rem;
+        color: #b8c6d8 !important;
+    }
+    .ops-sla strong {
+        color: #fff !important;
+    }
+    .ops-footer {
+        text-align: center;
+        color: #8da6c3 !important;
+        font-size: 0.82rem;
+        margin-top: 18px;
+    }
+    @media (max-width: 576px) {
+        .ops-title { font-size: 1.5rem; }
+        .ops-value { font-size: 1.35rem; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+{% set collection = snapshot.collection or {} %}
+{% set global_metrics = snapshot.global_metrics or {} %}
+{% set latest_decision = snapshot.latest_decision or {} %}
+{% set latest_allocation = snapshot.latest_allocation or {} %}
+{% set scenario = snapshot.scenario or {} %}
+{% set slas = snapshot.service_slas or {} %}
+
+<div class="ops-shell">
+    <div class="ops-hero">
+        <div class="ops-kicker">GreenRAN Mobile Ops</div>
+        <div class="ops-title">Situação do cenário em tempo real</div>
+        <p class="ops-subtitle">
+            Página curta para celular: coleta, guardas, AWAC e estado atual do cenário real.
+        </p>
+
+        <div class="ops-pill-row">
+            <span class="ops-pill">Atualizado: {{ snapshot.generated_at }}</span>
+            <span class="ops-pill">Estágio: {{ scenario.stage or 'unknown' }}</span>
+            <span class="ops-pill">Ciclo: {{ scenario.cycle or 0 }}</span>
+            <span class="ops-pill">Fonte TP: {{ global_metrics.throughput_source or 'unknown' }}</span>
+        </div>
+
+        <div class="ops-grid">
+            <div class="ops-card">
+                <div class="ops-card-title">Coleta</div>
+                <div class="ops-value {% if collection.status == 'collecting' %}ops-status-good{% elif collection.status == 'slow' %}ops-status-warn{% else %}ops-status-bad{% endif %}">
+                    {{ collection.label or 'Sem dados' }}
+                </div>
+                <p class="ops-note">{{ collection.note or 'Sem resumo.' }}</p>
+            </div>
+            <div class="ops-card">
+                <div class="ops-card-title">sim_time</div>
+                <div class="ops-value">{{ snapshot.sim_time_range.end if snapshot.sim_time_range else 0 }}s</div>
+                <p class="ops-note">Janela: {{ snapshot.sim_time_range.window_s if snapshot.sim_time_range else 0 }}s</p>
+            </div>
+            <div class="ops-card">
+                <div class="ops-card-title">Throughput</div>
+                <div class="ops-value">{{ "%.1f"|format((global_metrics.throughput_kbps or 0) / 1000.0) }} Mbps</div>
+                <p class="ops-note">CVaR {{ "%.1f"|format(global_metrics.cvar_ms or 0) }} ms</p>
+            </div>
+            <div class="ops-card">
+                <div class="ops-card-title">Decisão</div>
+                <div class="ops-value {% if latest_decision.decision == 'ALLOWED' %}ops-status-good{% elif latest_decision.decision == 'CONDITIONAL' %}ops-status-warn{% else %}ops-status-bad{% endif %}">
+                    {{ latest_decision.decision or 'N/A' }}
+                </div>
+                <p class="ops-note">{{ latest_decision.energy_state or 'Sem comando' }}</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="ops-section ops-card">
+        <div class="ops-card-title">Última alocação AWAC</div>
+        <div class="ops-list">
+            <div class="ops-line"><span class="k">Controlador</span><span class="v">{{ latest_allocation.controller_id or 'N/A' }}</span></div>
+            <div class="ops-line"><span class="k">d_ran / d_ai</span><span class="v">{{ latest_allocation.d_ran or 0 }} / {{ latest_allocation.d_ai or 0 }}</span></div>
+            <div class="ops-line"><span class="k">r_ran / r_ai</span><span class="v">{{ latest_allocation.r_ran or 0 }} / {{ latest_allocation.r_ai or 0 }}</span></div>
+            <div class="ops-line"><span class="k">RAN completion</span><span class="v">{{ "%.1f"|format((latest_allocation.ran_completion_ratio or 0) * 100) }}%</span></div>
+            <div class="ops-line"><span class="k">AI completion</span><span class="v">{{ "%.1f"|format((latest_allocation.ai_completion_ratio or 0) * 100) }}%</span></div>
+            <div class="ops-line"><span class="k">Utilização</span><span class="v">{{ "%.1f"|format((latest_allocation.utilization_ratio or 0) * 100) }}%</span></div>
+        </div>
+    </div>
+
+    <div class="ops-section ops-card">
+        <div class="ops-card-title">Decisão operacional</div>
+        <div class="ops-list">
+            <div class="ops-line"><span class="k">Timestamp</span><span class="v">{{ latest_decision.datetime or 'N/A' }}</span></div>
+            <div class="ops-line"><span class="k">Confiança</span><span class="v">{{ "%.0f"|format((latest_decision.confidence or 0) * 100) }}%</span></div>
+            <div class="ops-line"><span class="k">Motivo</span><span class="v">{{ latest_decision.reason or 'Sem motivo' }}</span></div>
+        </div>
+    </div>
+
+    <div class="ops-section">
+        <div class="ops-sla-grid">
+            <div class="ops-sla">
+                <h6>App1 / Câmeras</h6>
+                <p><strong>Status:</strong> {{ slas.camera.status if slas.camera else 'N/A' }}</p>
+                <p><strong>Throughput:</strong> {{ slas.camera.throughput_mbps if slas.camera else 0 }} Mbps</p>
+                <p><strong>Latência:</strong> {{ slas.camera.latency_ms if slas.camera else 0 }} ms</p>
+                <p>{{ slas.camera.reason if slas.camera else 'Sem dados' }}</p>
+            </div>
+            <div class="ops-sla">
+                <h6>App2 / Sensores</h6>
+                <p><strong>Status:</strong> {{ slas.app2.status if slas.app2 else 'N/A' }}</p>
+                <p><strong>Conectados:</strong> {{ slas.app2.connected if slas.app2 else 0 }}/{{ slas.app2.active if slas.app2 else 0 }}</p>
+                <p><strong>Loss:</strong> {{ slas.app2.packet_loss_percent if slas.app2 else 0 }}%</p>
+                <p>{{ slas.app2.reason if slas.app2 else 'Sem dados' }}</p>
+            </div>
+            <div class="ops-sla">
+                <h6>App3 / Veículos</h6>
+                <p><strong>Status:</strong> {{ slas.app3.status if slas.app3 else 'N/A' }}</p>
+                <p><strong>Ativos:</strong> {{ slas.app3.active if slas.app3 else 0 }}</p>
+                <p><strong>Latência:</strong> {{ slas.app3.latency_ms if slas.app3 else 0 }} ms</p>
+                <p>{{ slas.app3.reason if slas.app3 else 'Sem dados' }}</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="ops-section ops-card">
+        <div class="ops-card-title">xApps</div>
+        <div class="ops-list">
+            {% for name, payload in snapshot.xapps.items() %}
+            <div class="ops-line">
+                <span class="k">{{ name }}</span>
+                <span class="v">{{ payload.status }}{% if payload.last_cycle %} · ciclo {{ payload.last_cycle }}{% endif %}</span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="ops-footer">
+        A página recarrega automaticamente pelo dashboard base. URL direta para celular: <strong>/ops</strong>
+    </div>
+</div>
+{% endblock %}

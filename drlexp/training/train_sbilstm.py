@@ -17,6 +17,7 @@ Author: GreenRAN Team - UFPA
 import os
 import sys
 import argparse
+import json
 import yaml
 import numpy as np
 import pandas as pd
@@ -34,6 +35,12 @@ import seaborn as sns
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from drl.models.sbilstm import SBiLSTM, create_sbilstm_model
+
+
+def write_json(path: str, payload: dict | list) -> None:
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=True)
+        f.write('\n')
 
 
 # Default configuration
@@ -76,7 +83,7 @@ class GreenRANDataset(Dataset):
         return self.sequences[idx], self.targets[idx]
 
 
-def load_data(db_path: str, prediction_window: int = 1200) -> pd.DataFrame:
+def load_data(db_path: str, prediction_window: int = 100) -> pd.DataFrame:
     """
     Load and preprocess data from GreenRAN Data Lake.
     
@@ -175,7 +182,7 @@ def load_data(db_path: str, prediction_window: int = 1200) -> pd.DataFrame:
 
 
 def create_sequences(df: pd.DataFrame, feature_cols: list, target_col: str, 
-                    prediction_window: int = 1200) -> tuple:
+                    prediction_window: int = 100) -> tuple:
     """
     Create sequences for SBiLSTM training.
     
@@ -306,6 +313,7 @@ def train_sbilstm(config: dict = None):
     best_val_loss = float('inf')
     patience = 20
     patience_counter = 0
+    training_history = []
     
     for epoch in range(config['epochs']):
         # Training
@@ -352,6 +360,15 @@ def train_sbilstm(config: dict = None):
             patience_counter += 1
             
         # Logging
+        current_lr = float(optimizer.param_groups[0]['lr'])
+        training_history.append({
+            'epoch': epoch + 1,
+            'train_loss': float(train_loss),
+            'val_loss': float(val_loss),
+            'best_val_loss': float(best_val_loss),
+            'learning_rate': current_lr,
+            'patience_counter': int(patience_counter),
+        })
         if epoch % 5 == 0:
             print(f"Epoch {epoch+1}/{config['epochs']}: "
                   f"Train Loss={train_loss:.6f}, Val Loss={val_loss:.6f}")
@@ -408,8 +425,25 @@ def train_sbilstm(config: dict = None):
         'config': config,
         'metrics': {'mse': mse, 'mae': mae, 'r2': r2}
     }, os.path.join(config['model_dir'], 'sbilstm_final.pt'))
-    
+
+    history_json = os.path.join(config['model_dir'], 'sbilstm_training_history.json')
+    history_csv = os.path.join(config['model_dir'], 'sbilstm_training_history.csv')
+    summary_json = os.path.join(config['model_dir'], 'sbilstm_training_summary.json')
+
+    write_json(history_json, training_history)
+    pd.DataFrame(training_history).to_csv(history_csv, index=False)
+    write_json(summary_json, {
+        'model': 'SBiLSTM',
+        'epochs_requested': int(config['epochs']),
+        'epochs_completed': len(training_history),
+        'best_val_loss': float(best_val_loss),
+        'test_metrics': {'mse': float(mse), 'mae': float(mae), 'r2': float(r2)},
+        'history_json': history_json,
+        'history_csv': history_csv,
+    })
+
     print(f"\n✅ Model saved to {config['model_dir']}")
+    print(f"✅ History saved to {history_json} and {history_csv}")
     
     return model, {'mse': mse, 'mae': mae, 'r2': r2}
 
@@ -452,7 +486,7 @@ if __name__ == "__main__":
                         help='Number of epochs')
     parser.add_argument('--db', type=str, default='/tmp/rapp_data_lake.db',
                         help='Path to data lake')
-    parser.add_argument('--pw', type=int, default=1200,
+    parser.add_argument('--pw', type=int, default=100,
                         help='Prediction window size')
     
     args = parser.parse_args()

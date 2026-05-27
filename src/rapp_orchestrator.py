@@ -47,12 +47,15 @@ from greenran_paths import (
     STATE_DIR,
     SLICER_INTENT_PATH,
     ENERGY_INTENT_PATH,
+    VEHICLE_INTENT_PATH,
     RAPP_DECISION_PATH,
     EXTENDED_METRICS_JSON_PATH,
     XAPP_HEALTH_PATH,
     XAPP_INTENTS_DIR,
     ensure_runtime_dirs,
     as_str,
+    get_fixed_active_cameras,
+    get_fixed_total_ues,
 )
 from greenran_runtime import load_runtime_config
 
@@ -67,22 +70,21 @@ from rapp_agent_openran import AgentOpenRAN
 from rapp_a1_interface import A1PolicyInterface
 from rapp_ml_predictor import MLPredictor
 from rapp_armd_runtime import ARMDRuntimeAdvisor
-
-# DRL Modules (SBiLSTM + A3C)
-try:
-    from rapp_drl_predictor import DRLPredictor
-    HAS_DRL = True
-except ImportError as e:
-    HAS_DRL = False
-    print(f"[rApp] DRL import error: {e} - using RF only")
+from rapp_rl_policy import build_runtime_rl_policy
+from rapp_sac_resource_model import compute_shared_resource_snapshot
 
 # from rapp_synthetic_generator import SyntheticDataGenerator  # Removed - not available
 from rapp_xapp_manager import XAppManager
 from rapp_trend_analysis import TrendAnalysis
 from energy_command_protocol import EnergyCommand
+from vehicle_policy_runtime import (
+    evaluate_vehicle_policy as shared_evaluate_vehicle_policy,
+    get_vehicle_metrics as shared_get_vehicle_metrics,
+)
 
 SLICER_INTENT_PATH = as_str(SLICER_INTENT_PATH)
 ENERGY_INTENT_PATH = as_str(ENERGY_INTENT_PATH)
+VEHICLE_INTENT_PATH = as_str(VEHICLE_INTENT_PATH)
 RAPP_DECISION_PATH = as_str(RAPP_DECISION_PATH)
 EXTENDED_METRICS_PATH = as_str(EXTENDED_METRICS_JSON_PATH)
 XAPP_HEALTH_FILE = as_str(XAPP_HEALTH_PATH)
@@ -95,6 +97,8 @@ RAPP_DECISIONS_LOG_PATH = as_str(STATE_DIR / "rapp_decisions.jsonl")
 
 RUNTIME_CONFIG = load_runtime_config()
 DEFAULT_INTERVAL = max(1, float(RUNTIME_CONFIG["orchestrator"]["interval_seconds"]))
+FIXED_TOTAL_UES = get_fixed_total_ues()
+FIXED_ACTIVE_CAMERAS = get_fixed_active_cameras()
 
 _INT_RE = re.compile(r"^[+-]?\d+$")
 _FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+-]?\d+)?$")
@@ -162,84 +166,7 @@ def _coerce_intent_value(raw_value):
 
 
 def evaluate_vehicle_policy(vehicle_metrics):
-    """Avalia risco veicular sem depender do runtime completo do rApp."""
-    metrics = vehicle_metrics or {}
-    if not metrics.get("available"):
-        return {
-            "available": False,
-            "severity": "none",
-            "violation": "",
-            "action": "",
-            "reason": "",
-            "confidence": 0.0,
-            "sla_violated": False,
-            "guard_active": False,
-        }
-
-    high_risk = int(metrics.get("high_risk_vehicles", 0) or 0)
-    medium_risk = int(metrics.get("medium_risk_vehicles", 0) or 0)
-    degraded_autonomy = int(metrics.get("degraded_autonomy_vehicles", 0) or 0)
-    vehicle_latency_ms = float(metrics.get("max_latency_ms", 0) or 0)
-    vehicle_packet_loss = float(metrics.get("max_packet_loss_percent", 0) or 0)
-    ego_present = bool(metrics.get("ego_present", False))
-
-    critical_reasons = []
-    warning_reasons = []
-
-    if metrics.get("stale"):
-        age = metrics.get("age_seconds")
-        warning_reasons.append(
-            f"snapshot de veículo antigo ({age:.0f}s)" if age is not None else "snapshot de veículo antigo"
-        )
-    if high_risk > 0:
-        critical_reasons.append(f"veículos em risco alto={high_risk}")
-    if degraded_autonomy > 0:
-        critical_reasons.append(f"autonomia degradada em {degraded_autonomy} veículo(s)")
-    if ego_present and vehicle_latency_ms >= 100:
-        critical_reasons.append(f"latência veicular {vehicle_latency_ms:.0f}ms >= 100ms")
-    elif ego_present and vehicle_latency_ms >= 50:
-        warning_reasons.append(f"latência veicular {vehicle_latency_ms:.0f}ms >= 50ms")
-    if vehicle_packet_loss >= 5:
-        critical_reasons.append(f"packet loss veicular {vehicle_packet_loss:.1f}% >= 5%")
-    elif vehicle_packet_loss >= 2:
-        warning_reasons.append(f"packet loss veicular {vehicle_packet_loss:.1f}% >= 2%")
-    if medium_risk > 0 and not critical_reasons:
-        warning_reasons.append(f"veículos em risco médio={medium_risk}")
-
-    if critical_reasons:
-        return {
-            "available": True,
-            "severity": "critical",
-            "violation": "VEHICLE_CRITICAL",
-            "action": "FULL_POWER",
-            "reason": critical_reasons[0],
-            "confidence": 0.95,
-            "sla_violated": True,
-            "guard_active": False,
-        }
-
-    if warning_reasons:
-        return {
-            "available": True,
-            "severity": "warning",
-            "violation": "VEHICLE_WARNING",
-            "action": "FULL_POWER_GUARD",
-            "reason": warning_reasons[0],
-            "confidence": 0.8,
-            "sla_violated": False,
-            "guard_active": True,
-        }
-
-    return {
-        "available": True,
-        "severity": "none",
-        "violation": "",
-        "action": "",
-        "reason": "",
-        "confidence": 0.0,
-        "sla_violated": False,
-        "guard_active": False,
-    }
+    return shared_evaluate_vehicle_policy(vehicle_metrics)
 
 
 class RappResourceOptimizer:
@@ -285,6 +212,7 @@ class RappResourceOptimizer:
         self.ml_history = deque(maxlen=50)  # Mantém últimas 50 predições
         self.history_display_interval = 1  # Exibir a cada ciclo (mais frequente)
         self.app2_connectivity_history = deque(maxlen=3)
+        self._resource_allocation_prev = {'r_ran': 0.5, 'r_ai': 0.5}
         
         # Inicializa componentes
         print("[rApp] Inicializando componentes...")
@@ -311,16 +239,27 @@ class RappResourceOptimizer:
         self.ml_predictor = MLPredictor(data_lake=self.data_lake)
         self.ml_invalid_streak = 0
 
-        # DRL Predictor (SBiLSTM + A3C)
-        if HAS_DRL:
-            try:
-                self.drl_predictor = DRLPredictor()
-                self.drl_predictor.load_models()
-                print("[rApp] DRL Predictor loaded (SBiLSTM + A3C)")
-            except Exception as e:
-                print(f"[rApp] DRL load failed: {e}")
-                self.drl_predictor = None
-        else:
+        # RL policy selection. The legacy A3C line remains attached to the
+        # current energy-control runtime, while the CAORA SAC/AWAC line can
+        # optionally steer resource-allocation snapshots online.
+        self.rl_policy = None
+        self.drl_predictor = None
+        try:
+            self.rl_policy = build_runtime_rl_policy()
+            self.rl_policy.load_models()
+            meta = self.rl_policy.metadata
+            print(
+                f"[rApp] RL policy loaded: {meta.policy_id} "
+                f"({meta.algorithm}, domain={meta.decision_domain})"
+            )
+            if meta.legacy_runtime_compatible:
+                self.drl_predictor = self.rl_policy
+                print("[rApp] RL policy attached to legacy energy runtime")
+            else:
+                print("[rApp] RL policy attached to runtime resource-allocation path")
+        except Exception as e:
+            print(f"[rApp] RL policy load failed: {e}")
+            self.rl_policy = None
             self.drl_predictor = None
 
         # Retreinamento automático do ML (2x por dia = a cada 12h)
@@ -357,9 +296,11 @@ class RappResourceOptimizer:
         # INICIA xApps CONTROLADOS PELO RAPP
         # Slicer SEMPRE inicia com rApp (prioridade)
         self._start_slicer()
-        
+        self._start_vehicle_control()
+
         # Energy Saver NÃO inicia automaticamente - rApp decide quando ativar
         self._energy_active = False
+        self._vehicle_active = self.xapp_manager.is_running("vehicle_control")
         
         print(f"[rApp] Inicializado - Intervalo: {self.interval}s")
     
@@ -397,6 +338,20 @@ class RappResourceOptimizer:
         else:
             print("[rApp] ERRO: Não foi possível iniciar xApp ENERGY SAVER")
             return False
+
+    def _start_vehicle_control(self):
+        """Inicia o xApp VEHICLE CONTROL (sempre ativo para o App3)."""
+        print("[rApp] Iniciando xApp VEHICLE CONTROL (App3)...")
+        if self.xapp_manager.start("vehicle_control"):
+            if self.xapp_manager.wait_for_ready("vehicle_control", timeout=10):
+                self._vehicle_active = True
+                print("[rApp] xApp VEHICLE CONTROL pronto e ativo")
+            else:
+                self._vehicle_active = True
+                print("[rApp] AVISO: xApp VEHICLE CONTROL pode não estar pronto")
+        else:
+            self._vehicle_active = False
+            print("[rApp] ERRO: Não foi possível iniciar xApp VEHICLE CONTROL")
     
     def _stop_energy_saver(self):
         """Para o xApp ENERGY SAVER (se estiver ativo)."""
@@ -444,7 +399,8 @@ class RappResourceOptimizer:
         # Mesmo se rApp morrer, Slicer continua rodando
         return {
             'slicer_active': self.xapp_manager.is_running("slicer"),
-            'energy_active': self._energy_active
+            'energy_active': self._energy_active,
+            'vehicle_active': self.xapp_manager.is_running("vehicle_control"),
         }
     
     def get_xapp_status(self):
@@ -468,6 +424,16 @@ class RappResourceOptimizer:
         status['ENERGY'] = {
             'status': 'RUNNING' if energy_running else 'STOPPED',
             'pid': energy_pid,
+            'last_cycle': getattr(self, 'cycle', 0),
+            'total_restarts': 0,
+            'last_heartbeat': datetime.now().isoformat()
+        }
+
+        vehicle_pid = self.xapp_manager.get_pid('vehicle_control')
+        vehicle_running = self.xapp_manager.is_running('vehicle_control')
+        status['VEHICLE'] = {
+            'status': 'RUNNING' if vehicle_running else 'STOPPED',
+            'pid': vehicle_pid,
             'last_cycle': getattr(self, 'cycle', 0),
             'total_restarts': 0,
             'last_heartbeat': datetime.now().isoformat()
@@ -514,6 +480,23 @@ class RappResourceOptimizer:
             return intent
         except Exception as e:
             print(f"[rApp] ERRO ao ler ENERGY: {e}")
+            return None
+
+    def read_vehicle_intent(self):
+        """Lê intenção do xApp VEHICLE CONTROL."""
+        try:
+            if not os.path.exists(VEHICLE_INTENT_PATH):
+                return None
+
+            intent = {}
+            with open(VEHICLE_INTENT_PATH, 'r') as f:
+                for line in f:
+                    if '=' in line:
+                        key, value = line.strip().split('=', 1)
+                        intent[key.strip()] = _coerce_intent_value(value)
+            return intent
+        except Exception as e:
+            print(f"[rApp] ERRO ao ler VEHICLE CONTROL: {e}")
             return None
     
     def read_extended_metrics(self):
@@ -594,6 +577,23 @@ class RappResourceOptimizer:
             'sim_time_s': 0.0,
         }
 
+        override = _load_app1_camera_override()
+        if override:
+            metrics.update({
+                'latency_ms': float(override.get('latency_ms', 0.0) or 0.0),
+                'throughput_mbps': float(override.get('throughput_mbps', 0.0) or 0.0),
+                'active_cameras': int(override.get('active_cameras', 0) or 0),
+                'critical_cameras': int(override.get('critical_cameras', 0) or 0),
+                'observed_cameras': int(
+                    override.get('observed_cameras', override.get('active_cameras', 0)) or 0
+                ),
+                'throughput_ready': bool(override.get('throughput_ready', True)),
+                'throughput_source': str(
+                    override.get('throughput_source', 'article00_control') or 'article00_control'
+                ),
+            })
+            return metrics
+
         camera_mode = str(os.environ.get("GREENRAN_APP1_CAMERA_SOURCE_MODE", "real") or "real").strip().lower()
         if camera_mode == "simulated":
             snapshot = _load_app1_monitoring_snapshot()
@@ -619,23 +619,6 @@ class RappResourceOptimizer:
                 )
             except (TypeError, ValueError):
                 metrics['sim_time_s'] = 0.0
-
-            override = _load_app1_camera_override()
-            if override:
-                metrics.update({
-                    'latency_ms': float(override.get('latency_ms', 0.0) or 0.0),
-                    'throughput_mbps': float(override.get('throughput_mbps', 0.0) or 0.0),
-                    'active_cameras': int(override.get('active_cameras', 0) or 0),
-                    'critical_cameras': int(override.get('critical_cameras', 0) or 0),
-                    'observed_cameras': int(
-                        override.get('observed_cameras', override.get('active_cameras', 0)) or 0
-                    ),
-                    'throughput_ready': bool(override.get('throughput_ready', True)),
-                    'throughput_source': str(
-                        override.get('throughput_source', 'article00_control') or 'article00_control'
-                    ),
-                })
-                return metrics
 
             ue_metrics = extended_metrics.get('ue_metrics', {}) or {}
             camera_entries = [
@@ -790,131 +773,7 @@ class RappResourceOptimizer:
         return metrics
 
     def _get_vehicle_metrics(self):
-        """
-        Resume a saúde operacional dos veículos conectados exportados pelo
-        coletor combinado ns-3 + CARLA.
-        """
-        metrics = {
-            'available': False,
-            'stale': False,
-            'age_seconds': None,
-            'total_vehicles': 0,
-            'ego_present': False,
-            'high_risk_vehicles': 0,
-            'medium_risk_vehicles': 0,
-            'degraded_autonomy_vehicles': 0,
-            'max_latency_ms': 0.0,
-            'max_packet_loss_percent': 0.0,
-            'max_speed_mps': 0.0,
-            'vehicles': [],
-        }
-
-        try:
-            if not os.path.exists(EXTENDED_METRICS_PATH):
-                return metrics
-
-            with open(EXTENDED_METRICS_PATH, 'r', encoding='utf-8') as f:
-                extended = json.load(f)
-
-            ue_metrics = (extended.get('ue_metrics', {}) or {})
-            vehicle_entries = []
-            for imsi, ue_data in ue_metrics.items():
-                if ue_data.get('device_type') != 'vehicle':
-                    continue
-                vehicle_entries.append({
-                    'imsi': imsi,
-                    'vehicle_id': ue_data.get('vehicle_id', f"veh-imsi-{imsi}"),
-                    'vehicle_role': ue_data.get('vehicle_role', 'traffic'),
-                    'autonomy_state': ue_data.get('autonomy_state', 'unknown'),
-                    'risk_state': ue_data.get('risk_state', 'unknown'),
-                    'latency_ms': float(ue_data.get('latency_avg_us', ue_data.get('latency_us', 0)) or 0) / 1000.0,
-                    'packet_loss_percent': float(
-                        ue_data.get(
-                            'packet_loss_percent',
-                            float(extended.get('global_metrics', {}).get('global_packet_loss_rate', 0) or 0) * 100.0,
-                        ) or 0
-                    ),
-                    'speed_mps': float(ue_data.get('speed_mps', 0.0) or 0.0),
-                    'lane_id': ue_data.get('lane_id'),
-                    'waypoint_id': ue_data.get('waypoint_id'),
-                })
-
-            if not vehicle_entries:
-                app3_snapshot = _safe_read_json_file(APP3_MONITORING_PATH)
-                vehicles_summary = app3_snapshot.get('vehicles', {}) if isinstance(app3_snapshot, dict) else {}
-                network_summary = app3_snapshot.get('network', {}) if isinstance(app3_snapshot, dict) else {}
-                if not isinstance(vehicles_summary, dict):
-                    return metrics
-
-                total_vehicles = int(vehicles_summary.get('total_vehicles', 0) or 0)
-                if total_vehicles <= 0:
-                    return metrics
-
-                age_seconds = None
-                try:
-                    age_seconds = max(0.0, time.time() - os.path.getmtime(APP3_MONITORING_PATH))
-                except OSError:
-                    age_seconds = None
-
-                metrics.update({
-                    'available': True,
-                    'stale': bool(age_seconds is not None and age_seconds > 20),
-                    'age_seconds': age_seconds,
-                    'total_vehicles': total_vehicles,
-                    'ego_present': bool(vehicles_summary.get('ego_present', False)),
-                    'high_risk_vehicles': int(vehicles_summary.get('high_risk_vehicles', 0) or 0),
-                    'medium_risk_vehicles': int(vehicles_summary.get('medium_risk_vehicles', 0) or 0),
-                    'degraded_autonomy_vehicles': int(vehicles_summary.get('degraded_autonomy_vehicles', 0) or 0),
-                    'max_latency_ms': float(
-                        vehicles_summary.get(
-                            'max_latency_ms',
-                            network_summary.get('max_latency_ms', 0.0),
-                        ) or 0.0
-                    ),
-                    'max_packet_loss_percent': float(
-                        vehicles_summary.get(
-                            'max_packet_loss_percent',
-                            network_summary.get('max_packet_loss_percent', 0.0),
-                        ) or 0.0
-                    ),
-                    'max_speed_mps': float(
-                        vehicles_summary.get(
-                            'max_speed_mps',
-                            network_summary.get('max_speed_mps', 0.0),
-                        ) or 0.0
-                    ),
-                    'vehicles': [],
-                })
-                return metrics
-
-            age_seconds = None
-            try:
-                age_seconds = max(0.0, time.time() - os.path.getmtime(EXTENDED_METRICS_PATH))
-            except OSError:
-                age_seconds = None
-
-            metrics.update({
-                'available': True,
-                'stale': bool(age_seconds is not None and age_seconds > 20),
-                'age_seconds': age_seconds,
-                'total_vehicles': len(vehicle_entries),
-                'ego_present': any(v.get('vehicle_role') == 'ego' for v in vehicle_entries),
-                'high_risk_vehicles': sum(1 for v in vehicle_entries if str(v.get('risk_state', '')).lower() in {'high', 'critical'}),
-                'medium_risk_vehicles': sum(1 for v in vehicle_entries if str(v.get('risk_state', '')).lower() in {'medium', 'warning'}),
-                'degraded_autonomy_vehicles': sum(
-                    1 for v in vehicle_entries
-                    if str(v.get('autonomy_state', '')).lower() not in {'normal', 'unknown'}
-                ),
-                'max_latency_ms': max(float(v.get('latency_ms', 0) or 0) for v in vehicle_entries),
-                'max_packet_loss_percent': max(float(v.get('packet_loss_percent', 0) or 0) for v in vehicle_entries),
-                'max_speed_mps': max(float(v.get('speed_mps', 0) or 0) for v in vehicle_entries),
-                'vehicles': vehicle_entries,
-            })
-        except Exception as e:
-            metrics['error'] = str(e)
-            print(f"[rApp] Erro ao ler métricas de veículos: {e}")
-
-        return metrics
+        return shared_get_vehicle_metrics()
 
     def _should_keep_vehicle_collection_active(self):
         """
@@ -1005,7 +864,7 @@ class RappResourceOptimizer:
         else:
             return sorted_lat[n//2]
     
-    def make_decision(self, slicer_intent, energy_intent):
+    def make_decision(self, slicer_intent, energy_intent, vehicle_intent=None):
         """
         Toma decisão estratégica.
         
@@ -1036,14 +895,28 @@ class RappResourceOptimizer:
             'preventive_block': False,
             'camera_metrics': None,
             'vehicle_metrics': None,
+            'vehicle_state': 'UNKNOWN',
             'app2_metrics': None,
             'drl_prediction': {},
             'drl_influenced': False,
             'drl_rejected_reason': '',
             'drl_policy_action': '',
             'drl_policy_applied': False,
-            'ml_risk_cap_applied': False
+            'ml_risk_cap_applied': False,
+            'resource_allocation': {},
+            'rl_policy_runtime': {}
         }
+
+        if self.rl_policy is not None:
+            meta = self.rl_policy.metadata
+            decision['rl_policy_runtime'] = {
+                'policy_id': meta.policy_id,
+                'family': meta.family,
+                'algorithm': meta.algorithm,
+                'decision_domain': meta.decision_domain,
+                'action_semantics': meta.action_semantics,
+                'legacy_runtime_compatible': meta.legacy_runtime_compatible,
+            }
         
         slicer_state = 'UNKNOWN'
         energy_state = 'UNKNOWN'
@@ -1058,6 +931,8 @@ class RappResourceOptimizer:
             decision['energy_state'] = energy_state
             # Também capturar o power level
             decision['energy_power_level'] = energy_intent.get('POWER_LEVEL', 'UNKNOWN')
+        if vehicle_intent:
+            decision['vehicle_state'] = str(vehicle_intent.get('STATE', 'UNKNOWN') or 'UNKNOWN').upper()
         
         # ========================================
         # REGRA DE PRIORIDADE DA PROPOSTA
@@ -1065,95 +940,94 @@ class RappResourceOptimizer:
         # 2) App2/mMTC: saúde agregada de sensores/gateways.
         # ========================================
         
-        if slicer_intent:
-            camera_metrics = self._get_camera_sla_metrics(slicer_intent)
-            camera_latency_ms = camera_metrics['latency_ms']
-            camera_throughput_mbps = camera_metrics['throughput_mbps']
-            active_cameras = camera_metrics['active_cameras']
-            critical_cameras = camera_metrics['critical_cameras']
-            observed_cameras = int(camera_metrics.get('observed_cameras', 0) or 0)
-            throughput_ready = bool(camera_metrics.get('throughput_ready', False))
-            sim_time_s = float(camera_metrics.get('sim_time_s', 0) or 0)
+        camera_metrics = self._get_camera_sla_metrics(slicer_intent)
+        camera_latency_ms = camera_metrics['latency_ms']
+        camera_throughput_mbps = camera_metrics['throughput_mbps']
+        active_cameras = camera_metrics['active_cameras']
+        critical_cameras = camera_metrics['critical_cameras']
+        observed_cameras = int(camera_metrics.get('observed_cameras', 0) or 0)
+        throughput_ready = bool(camera_metrics.get('throughput_ready', False))
+        sim_time_s = float(camera_metrics.get('sim_time_s', 0) or 0)
 
-            decision['camera_metrics'] = {
-                'latency_ms': camera_latency_ms,
-                'throughput_mbps': camera_throughput_mbps,
-                'active_cameras': active_cameras,
-                'critical_cameras': critical_cameras,
-                'observed_cameras': observed_cameras,
-                'throughput_ready': throughput_ready,
-                'throughput_source': camera_metrics.get('throughput_source', 'unavailable'),
-                'sim_time_s': sim_time_s,
-            }
-            
-            CAMERA_THROUGHPUT_WARNING_MBPS = 30.0
-            CAMERA_THROUGHPUT_MIN_MBPS = 25.0
+        decision['camera_metrics'] = {
+            'latency_ms': camera_latency_ms,
+            'throughput_mbps': camera_throughput_mbps,
+            'active_cameras': active_cameras,
+            'critical_cameras': critical_cameras,
+            'observed_cameras': observed_cameras,
+            'throughput_ready': throughput_ready,
+            'throughput_source': camera_metrics.get('throughput_source', 'unavailable'),
+            'sim_time_s': sim_time_s,
+        }
 
-            # Se a telemetria por câmera ainda não apareceu, manter guarda total
-            # sem gerar falso bloqueio de throughput=0 no warm-up.
-            if active_cameras > 0 and not throughput_ready:
-                decision['energy_saver'] = 'CONDITIONAL'
-                decision['action'] = 'FULL_POWER_GUARD'
-                decision['reason'] = (
-                    f'CÂMERA: aguardando amostras de throughput '
-                    f'({observed_cameras}/{active_cameras} câmeras observadas, sim_time={sim_time_s:.1f}s)'
-                )
-                decision['confidence'] = 0.6
-                decision['priority_violation'] = 'THROUGHPUT_WARMUP'
-                print(
-                    f"\033[1;33m[rApp] CÂMERA: aguardando amostras de throughput "
-                    f"({observed_cameras}/{active_cameras}, sim_time={sim_time_s:.1f}s) - FULL_POWER_GUARD\033[0m"
-                )
+        CAMERA_THROUGHPUT_WARNING_MBPS = 30.0
+        CAMERA_THROUGHPUT_MIN_MBPS = 25.0
 
-            # REGRA: Throughput < 25Mbps → BLOCKED (SLA mínimo violado)
-            elif active_cameras > 0 and camera_throughput_mbps < CAMERA_THROUGHPUT_MIN_MBPS:
-                decision['energy_saver'] = 'BLOCKED'
-                decision['action'] = 'FULL_POWER'
-                decision['reason'] = (
-                    f'CÂMERA SLA: Throughput {camera_throughput_mbps:.1f}Mbps '
-                    f'< {CAMERA_THROUGHPUT_MIN_MBPS:.0f}Mbps (mínimo)'
-                )
-                decision['confidence'] = 1.0
-                decision['priority_violation'] = 'THROUGHPUT'
-                self.stats['sla_violations'] += 1
-                print(
-                    f"\033[1;31m[rApp] CÂMERA SLA: Throughput {camera_throughput_mbps:.1f}Mbps "
-                    f"< {CAMERA_THROUGHPUT_MIN_MBPS:.0f}Mbps - BLOCKED\033[0m"
-                )
-                
-            # REGRA: Latência ≥ 80ms → BLOCKED
-            elif active_cameras > 0 and camera_latency_ms >= 80:
-                decision['energy_saver'] = 'BLOCKED'
-                decision['action'] = 'FULL_POWER'
-                decision['reason'] = f'CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= 80ms'
-                decision['confidence'] = 1.0
-                decision['priority_violation'] = 'LATENCY'
-                self.stats['sla_violations'] += 1
-                print(f"\033[1;31m[rApp] CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= 80ms - BLOCKED\033[0m")
-            
-            # REGRA: Throughput na faixa 25-30Mbps → CONDITIONAL (faixa de cautela)
-            elif active_cameras > 0 and camera_throughput_mbps < CAMERA_THROUGHPUT_WARNING_MBPS:
-                decision['energy_saver'] = 'CONDITIONAL'
-                decision['action'] = 'FULL_POWER_GUARD'
-                decision['reason'] = (
-                    f'CÂMERA: Throughput {camera_throughput_mbps:.1f}Mbps em '
-                    f'[{CAMERA_THROUGHPUT_MIN_MBPS:.0f}-{CAMERA_THROUGHPUT_WARNING_MBPS:.0f}Mbps] - margem protegida'
-                )
-                decision['confidence'] = 0.85
-                decision['priority_violation'] = 'THROUGHPUT_WARNING'
-                print(
-                    f"\033[1;33m[rApp] CÂMERA: Throughput {camera_throughput_mbps:.1f}Mbps em "
-                    f"[{CAMERA_THROUGHPUT_MIN_MBPS:.0f}-{CAMERA_THROUGHPUT_WARNING_MBPS:.0f}Mbps] - CONDITIONAL\033[0m"
-                )
+        # A política de câmera precisa continuar válida mesmo quando o SLICER
+        # ainda não publicou intent; a fonte primária é App1/override.
+        if active_cameras > 0 and not throughput_ready:
+            decision['energy_saver'] = 'CONDITIONAL'
+            decision['action'] = 'FULL_POWER_GUARD'
+            decision['reason'] = (
+                f'CÂMERA: aguardando amostras de throughput '
+                f'({observed_cameras}/{active_cameras} câmeras observadas, sim_time={sim_time_s:.1f}s)'
+            )
+            decision['confidence'] = 0.6
+            decision['priority_violation'] = 'THROUGHPUT_WARMUP'
+            print(
+                f"\033[1;33m[rApp] CÂMERA: aguardando amostras de throughput "
+                f"({observed_cameras}/{active_cameras}, sim_time={sim_time_s:.1f}s) - FULL_POWER_GUARD\033[0m"
+            )
 
-            # REGRA: Latência 60-80ms → CONDITIONAL
-            elif active_cameras > 0 and camera_latency_ms >= 60:
-                decision['energy_saver'] = 'CONDITIONAL'
-                decision['action'] = 'FULL_POWER_GUARD'
-                decision['reason'] = f'CÂMERA: Latência {camera_latency_ms:.1f}ms em [60-80ms] - margem protegida'
-                decision['confidence'] = 0.7
-                decision['priority_violation'] = 'LATENCY_WARNING'
-                print(f"\033[1;33m[rApp] CÂMERA: Latência {camera_latency_ms:.1f}ms em [60-80ms] - CONDITIONAL\033[0m")
+        # REGRA: Throughput < 25Mbps → BLOCKED (SLA mínimo violado)
+        elif active_cameras > 0 and camera_throughput_mbps < CAMERA_THROUGHPUT_MIN_MBPS:
+            decision['energy_saver'] = 'BLOCKED'
+            decision['action'] = 'FULL_POWER'
+            decision['reason'] = (
+                f'CÂMERA SLA: Throughput {camera_throughput_mbps:.1f}Mbps '
+                f'< {CAMERA_THROUGHPUT_MIN_MBPS:.0f}Mbps (mínimo)'
+            )
+            decision['confidence'] = 1.0
+            decision['priority_violation'] = 'THROUGHPUT'
+            self.stats['sla_violations'] += 1
+            print(
+                f"\033[1;31m[rApp] CÂMERA SLA: Throughput {camera_throughput_mbps:.1f}Mbps "
+                f"< {CAMERA_THROUGHPUT_MIN_MBPS:.0f}Mbps - BLOCKED\033[0m"
+            )
+
+        # REGRA: Latência ≥ 80ms → BLOCKED
+        elif active_cameras > 0 and camera_latency_ms >= 80:
+            decision['energy_saver'] = 'BLOCKED'
+            decision['action'] = 'FULL_POWER'
+            decision['reason'] = f'CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= 80ms'
+            decision['confidence'] = 1.0
+            decision['priority_violation'] = 'LATENCY'
+            self.stats['sla_violations'] += 1
+            print(f"\033[1;31m[rApp] CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= 80ms - BLOCKED\033[0m")
+
+        # REGRA: Throughput na faixa 25-30Mbps → CONDITIONAL (faixa de cautela)
+        elif active_cameras > 0 and camera_throughput_mbps < CAMERA_THROUGHPUT_WARNING_MBPS:
+            decision['energy_saver'] = 'CONDITIONAL'
+            decision['action'] = 'FULL_POWER_GUARD'
+            decision['reason'] = (
+                f'CÂMERA: Throughput {camera_throughput_mbps:.1f}Mbps em '
+                f'[{CAMERA_THROUGHPUT_MIN_MBPS:.0f}-{CAMERA_THROUGHPUT_WARNING_MBPS:.0f}Mbps] - margem protegida'
+            )
+            decision['confidence'] = 0.85
+            decision['priority_violation'] = 'THROUGHPUT_WARNING'
+            print(
+                f"\033[1;33m[rApp] CÂMERA: Throughput {camera_throughput_mbps:.1f}Mbps em "
+                f"[{CAMERA_THROUGHPUT_MIN_MBPS:.0f}-{CAMERA_THROUGHPUT_WARNING_MBPS:.0f}Mbps] - CONDITIONAL\033[0m"
+            )
+
+        # REGRA: Latência 60-80ms → CONDITIONAL
+        elif active_cameras > 0 and camera_latency_ms >= 60:
+            decision['energy_saver'] = 'CONDITIONAL'
+            decision['action'] = 'FULL_POWER_GUARD'
+            decision['reason'] = f'CÂMERA: Latência {camera_latency_ms:.1f}ms em [60-80ms] - margem protegida'
+            decision['confidence'] = 0.7
+            decision['priority_violation'] = 'LATENCY_WARNING'
+            print(f"\033[1;33m[rApp] CÂMERA: Latência {camera_latency_ms:.1f}ms em [60-80ms] - CONDITIONAL\033[0m")
         
         # Câmera tem prioridade máxima. BLOCKED é violação direta; CONDITIONAL é
         # faixa de guarda e também não pode ser relaxada por CVaR/ML/DRL.
@@ -1174,7 +1048,26 @@ class RappResourceOptimizer:
         vehicle_guard_active = False
 
         if not camera_priority_active and vehicle_metrics.get('available'):
-            vehicle_policy = evaluate_vehicle_policy(vehicle_metrics)
+            if vehicle_intent and vehicle_intent.get('STATE'):
+                raw_state = str(vehicle_intent.get('STATE', 'UNKNOWN') or 'UNKNOWN').upper()
+                severity = {
+                    'CRITICAL': 'critical',
+                    'WARNING': 'warning',
+                    'NORMAL': 'normal',
+                    'IDLE': 'none',
+                }.get(raw_state, 'none')
+                vehicle_policy = {
+                    'available': str(vehicle_intent.get('AVAILABLE', 'true')).lower() == 'true',
+                    'severity': severity,
+                    'violation': vehicle_intent.get('VIOLATION', '') or '',
+                    'action': vehicle_intent.get('ACTION', '') or '',
+                    'reason': vehicle_intent.get('REASON', '') or '',
+                    'confidence': float(vehicle_intent.get('CONFIDENCE', 0.0) or 0.0),
+                    'sla_violated': severity == 'critical',
+                    'guard_active': severity == 'warning',
+                }
+            else:
+                vehicle_policy = evaluate_vehicle_policy(vehicle_metrics)
             if vehicle_policy['severity'] == 'critical':
                 decision['energy_saver'] = 'BLOCKED'
                 decision['action'] = vehicle_policy['action']
@@ -1392,6 +1285,62 @@ class RappResourceOptimizer:
                 print(f"[rApp DEBUG] Fallback CVaR = {cvar_us}us = {cvar_us/1000:.1f}ms")
             else:
                 print(f"[rApp DEBUG] Sem dados de CVaR disponíveis")
+
+        resource_allocation = compute_shared_resource_snapshot(
+            camera_metrics=decision.get('camera_metrics'),
+            app2_metrics=decision.get('app2_metrics'),
+            vehicle_metrics=decision.get('vehicle_metrics'),
+            network_health=decision.get('network_health'),
+            shared_resource_config=RUNTIME_CONFIG.get('shared_resources', {}),
+            previous_allocation=self._resource_allocation_prev,
+        )
+        if (
+            self.rl_policy is not None
+            and not self.rl_policy.metadata.legacy_runtime_compatible
+            and self.rl_policy.is_available()
+        ):
+            try:
+                rl_resource_result = self.rl_policy.predict(
+                    {
+                        'resource_allocation_baseline': resource_allocation,
+                        'previous_allocation': self._resource_allocation_prev,
+                        'camera_metrics': decision.get('camera_metrics'),
+                        'app2_metrics': decision.get('app2_metrics'),
+                        'vehicle_metrics': decision.get('vehicle_metrics'),
+                        'network_health': decision.get('network_health'),
+                        'shared_resource_config': RUNTIME_CONFIG.get('shared_resources', {}),
+                    }
+                )
+                resource_candidate = rl_resource_result.get('resource_allocation') or {}
+                if resource_candidate:
+                    resource_allocation = resource_candidate
+                    decision['rl_policy_runtime']['resource_policy_applied'] = (
+                        rl_resource_result.get('final_decision') == 'RESOURCE_REALLOCATED'
+                    )
+                    decision['rl_policy_runtime']['resource_policy_reason'] = rl_resource_result.get('reason', '')
+                    decision['rl_policy_runtime']['resource_policy_confidence'] = float(
+                        rl_resource_result.get('confidence', 0.0) or 0.0
+                    )
+                    print(
+                        f"[rApp RL-RESOURCE] {self.rl_policy.metadata.algorithm}: "
+                        f"{rl_resource_result.get('reason', 'no reason')}"
+                    )
+                else:
+                    decision['rl_policy_runtime']['resource_policy_applied'] = False
+                    decision['rl_policy_runtime']['resource_policy_reason'] = (
+                        rl_resource_result.get('reason', 'empty resource allocation result')
+                    )
+            except Exception as exc:
+                decision['rl_policy_runtime']['resource_policy_applied'] = False
+                decision['rl_policy_runtime']['resource_policy_reason'] = (
+                    f"resource policy predict failed: {exc}"
+                )
+                print(f"[rApp RL-RESOURCE] fallback to heuristic allocator: {exc}")
+        decision['resource_allocation'] = resource_allocation
+        self._resource_allocation_prev = {
+            'r_ran': float(resource_allocation.get('r_ran', 0.5) or 0.5),
+            'r_ai': float(resource_allocation.get('r_ai', 0.5) or 0.5),
+        }
         
         # Só aplica CVaR se não houve bloco preventivo, não houve violação/guarda
         # prioritária e temos dados. Caso contrário, a decisão prioritária prevalece.
@@ -1603,8 +1552,8 @@ class RappResourceOptimizer:
                 'latency_p95_per_ue_us': p95_value,
                 'global_avg_latency_us': float(row.get('global_avg_latency_us', 0) or 0) if latest_extended else 0,
                 'variance_per_ue_us2': variance_us2 if variance_us2 else 0,
-                'total_active_cameras': slicer_intent.get('ACTIVE_CAMERAS', 0) if slicer_intent else 0,
-                'total_active_ues': slicer_intent.get('ACTIVE_UES', 20) if slicer_intent else 20,
+                'total_active_cameras': slicer_intent.get('ACTIVE_CAMERAS', FIXED_ACTIVE_CAMERAS) if slicer_intent else FIXED_ACTIVE_CAMERAS,
+                'total_active_ues': slicer_intent.get('ACTIVE_UES', FIXED_TOTAL_UES) if slicer_intent else FIXED_TOTAL_UES,
                 'total_critical_ues': slicer_intent.get('CRITICAL_UES', 0) if slicer_intent else 0,
                 'sim_time_s': float(row.get('sim_time_s', 0) or 0) if latest_extended else 0,
                 # Novas features
@@ -1776,12 +1725,12 @@ class RappResourceOptimizer:
                     'jitter_ms': float(jitter_ms) if jitter_ms else 2,
                     'packet_loss_pct': float(packet_loss_rate) * 100 if packet_loss_rate else 0.1,
                     'throughput_mbps': float(throughput_kbps) / 1000.0 if throughput_kbps else 100,
-                    'active_ues': int(slicer_intent.get('ACTIVE_UES', 20)) if slicer_intent else 20,
-                    'active_cameras': int(slicer_intent.get('ACTIVE_CAMERAS', 3)) if slicer_intent else 3,
+                    'active_ues': int(slicer_intent.get('ACTIVE_UES', FIXED_TOTAL_UES)) if slicer_intent else FIXED_TOTAL_UES,
+                    'active_cameras': int(slicer_intent.get('ACTIVE_CAMERAS', FIXED_ACTIVE_CAMERAS)) if slicer_intent else FIXED_ACTIVE_CAMERAS,
                     'critical_ues': int(slicer_intent.get('CRITICAL_UES', 0)) if slicer_intent else 0,
-                    'camera_ratio': float(slicer_intent.get('ACTIVE_CAMERAS', 3)) / max(float(slicer_intent.get('ACTIVE_UES', 20)), 1) if slicer_intent else 0.15,
-                    'critical_ue_ratio': float(slicer_intent.get('CRITICAL_UES', 0)) / max(float(slicer_intent.get('ACTIVE_UES', 20)), 1) if slicer_intent else 0,
-                    'allocated_rbs': int(slicer_intent.get('ACTIVE_UES', 20)) * 10 if slicer_intent else 200,
+                    'camera_ratio': float(slicer_intent.get('ACTIVE_CAMERAS', FIXED_ACTIVE_CAMERAS)) / max(float(slicer_intent.get('ACTIVE_UES', FIXED_TOTAL_UES)), 1) if slicer_intent else float(FIXED_ACTIVE_CAMERAS) / max(float(FIXED_TOTAL_UES), 1.0),
+                    'critical_ue_ratio': float(slicer_intent.get('CRITICAL_UES', 0)) / max(float(slicer_intent.get('ACTIVE_UES', FIXED_TOTAL_UES)), 1) if slicer_intent else 0,
+                    'allocated_rbs': int(slicer_intent.get('ACTIVE_UES', FIXED_TOTAL_UES)) * 10 if slicer_intent else FIXED_TOTAL_UES * 10,
                     'current_power': 20,
                     'power_budget': 30,
                     'hour_sin': 0,
@@ -2111,6 +2060,7 @@ class RappResourceOptimizer:
                 f.write(f"CONFIDENCE={decision['confidence']}\n")
                 f.write(f"SLICER_STATE={decision['slicer_state']}\n")
                 f.write(f"ENERGY_STATE={decision['energy_state']}\n")
+                f.write(f"VEHICLE_STATE={decision.get('vehicle_state', 'UNKNOWN')}\n")
                 f.write(f"AGENT_OVERRIDE={str(decision['agent_override']).lower()}\n")
                 f.write(f"PATTERN={decision['pattern'] or 'none'}\n")
                 f.write(f"PREVENTIVE_BLOCK={str(decision.get('preventive_block', False)).lower()}\n")
@@ -2288,7 +2238,19 @@ class RappResourceOptimizer:
                 'armd_confidence': decision.get('armd_confidence', 0),
                 'armd_override_applied': decision.get('armd_override_applied', False),
                 'armd_expected_energy_saver': decision.get('armd_expected_energy_saver', ''),
-                'armd_expected_action': decision.get('armd_expected_action', '')
+                'armd_expected_action': decision.get('armd_expected_action', ''),
+                'rl_policy_id': (decision.get('rl_policy_runtime') or {}).get('policy_id', ''),
+                'rl_policy_algorithm': (decision.get('rl_policy_runtime') or {}).get('algorithm', ''),
+                'resource_controller_id': (decision.get('resource_allocation') or {}).get('controller_id', ''),
+                'resource_budget': (decision.get('resource_allocation') or {}).get('resource_budget'),
+                'usable_budget': (decision.get('resource_allocation') or {}).get('usable_budget'),
+                'd_ran': (decision.get('resource_allocation') or {}).get('d_ran'),
+                'd_ai': (decision.get('resource_allocation') or {}).get('d_ai'),
+                'r_ran': (decision.get('resource_allocation') or {}).get('r_ran'),
+                'r_ai': (decision.get('resource_allocation') or {}).get('r_ai'),
+                'ran_completion_ratio': (decision.get('resource_allocation') or {}).get('ran_completion_ratio'),
+                'ai_completion_ratio': (decision.get('resource_allocation') or {}).get('ai_completion_ratio'),
+                'utilization_ratio': (decision.get('resource_allocation') or {}).get('utilization_ratio')
             }
 
             with open(RAPP_DECISIONS_LOG_PATH, 'a') as f:
@@ -2337,10 +2299,13 @@ class RappResourceOptimizer:
             # xAPPS STATUS
             slicer_active = xapp_status.get('slicer_active', False)
             energy_active = xapp_status.get('energy_active', False)
+            vehicle_active = xapp_status.get('vehicle_active', False)
             slicer_status = "\033[1;32m[ATIVO]\033[0m" if slicer_active else "\033[1;31m[PARADO]\033[0m"
             energy_status = "\033[1;32m[ATIVO]\033[0m" if energy_active else "\033[1;33m[PARADO]\033[0m"
+            vehicle_status = "\033[1;32m[ATIVO]\033[0m" if vehicle_active else "\033[1;31m[PARADO]\033[0m"
             print(f"  xApp SLICER:      {slicer_status} (prioridade - sempre ativo)")
             print(f"  xApp ENERGY:      {energy_status} (controlado pelo rApp)")
+            print(f"  xApp VEHICLE:     {vehicle_status} (App3 / segurança veicular)")
             print("")
             
             # SLICER STATE
@@ -2366,6 +2331,7 @@ class RappResourceOptimizer:
                 energy_display = "[UNKNOWN]"
             
             print(f"  ENERGY STATE:     {energy_display}")
+            print(f"  VEHICLE STATE:    [{decision.get('vehicle_state', 'UNKNOWN')}]")
             
             # Pattern
             if decision.get('pattern_analysis'):
@@ -2682,12 +2648,13 @@ class RappResourceOptimizer:
             # 1. Lê intenções dos xApps
             slicer_intent = self.read_slicer_intent()
             energy_intent = self.read_energy_intent()
+            vehicle_intent = self.read_vehicle_intent()
             
             # 2. Registra métricas no Data Lake
             self.record_current_metrics(slicer_intent, energy_intent)
             
             # 3. Toma decisão estratégica
-            decision = self.make_decision(slicer_intent, energy_intent)
+            decision = self.make_decision(slicer_intent, energy_intent, vehicle_intent)
             
             # 3.1 Controla xApps baseado na decisão
             xapp_status = self.decide_xapp_activation(decision)

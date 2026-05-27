@@ -1,0 +1,10 @@
+{
+  "model": "A3C",
+  "episodes_requested": 500,
+  "logged_points": 400,
+  "mean_logged_reward": 948.3207939798972,
+  "max_logged_reward": 952.9000000000166,
+  "min_logged_reward": -10.62548505353311,
+  "history_json": "./models/a3c/a3c_training_history.json",
+  "history_csv": "./models/a3c/a3c_training_history.csv"
+}

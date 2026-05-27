@@ -30,6 +30,7 @@ from greenran_paths import (
     METRICS_JSON_PATH,
     EXTENDED_METRICS_JSON_PATH,
     STATE_DIR,
+    ARTICLE00_SCENARIO_CONTROL_PATH,
     CARLA_STATE_DIR,
     CARLA_VEHICLES_PATH,
     CARLA_VEHICLE_MAP_PATH,
@@ -87,6 +88,7 @@ class ExtendedMetricsCollector:
         self.app2_sensors_dir = self.app2_state_dir / "sensors"
         self.app2_sensors_file = self.app2_sensors_dir / "latest.json"
         self.app2_snapshot_file = self.app2_state_dir / "monitoring_snapshot.json"
+        self.scenario_control_path = ARTICLE00_SCENARIO_CONTROL_PATH
         self.carla_state_dir = CARLA_STATE_DIR
         self.carla_vehicles_path = CARLA_VEHICLES_PATH
         self.carla_vehicle_map_path = CARLA_VEHICLE_MAP_PATH
@@ -235,6 +237,79 @@ class ExtendedMetricsCollector:
             return {}
         state = self.carla_vehicle_state.get(str(vehicle_id), {})
         return state if isinstance(state, dict) else {}
+
+    def _load_app2_sensor_override(self):
+        try:
+            if not self.scenario_control_path.exists():
+                return {}
+            with open(self.scenario_control_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            override = payload.get("app2_sensor_override", {}) if isinstance(payload, dict) else {}
+            if not isinstance(override, dict) or not override.get("enabled", False):
+                return {}
+            return override
+        except Exception as e:
+            print(f"[CSV_METRICS] Error loading App2 scenario control override: {e}")
+            return {}
+
+    def _apply_app2_sensor_override(self, sensor_entries, snapshot, override):
+        if not override or not sensor_entries or not snapshot:
+            return sensor_entries, snapshot
+
+        total = len(sensor_entries)
+        connected_target = int(override.get("connected_sensors", total) or total)
+        connected_target = max(0, min(total, connected_target))
+        error_target = total - connected_target
+        low_battery_target = int(override.get("low_battery_sensors", 0) or 0)
+        low_battery_target = max(0, min(total, low_battery_target))
+
+        packet_loss_target = max(0.0, min(100.0, float(override.get("packet_loss_percent", 0.0) or 0.0)))
+        avg_latency_target = max(0.0, float(override.get("avg_latency_ms", 120.0) or 120.0))
+        avg_rssi_target = float(override.get("avg_rssi_dbm", -92.0) or -92.0)
+        avg_battery_target = max(0.0, min(100.0, float(override.get("avg_battery_percent", 75.0) or 75.0)))
+        avg_power_target = max(0.0, float(override.get("avg_power_mw", 180.0) or 180.0))
+        utilization_target = max(0.0, min(100.0, float(override.get("network_utilization_percent", 60.0) or 60.0)))
+        delivery_target = max(0.0, min(100.0, float(override.get("delivery_success_percent", 100.0) or 100.0)))
+
+        total_packets_tx = 0
+        for idx, sensor in enumerate(sensor_entries):
+            connected = idx < connected_target
+            packets_tx = max(2, int(utilization_target / 5.0))
+            if not connected:
+                packets_tx = max(2, packets_tx - max(1, error_target))
+
+            sensor["status"] = "ok" if connected else "error"
+            sensor["packet_loss_percent"] = round(packet_loss_target, 2)
+            sensor["latency_ms"] = round(avg_latency_target, 2)
+            sensor["rssi_dbm"] = round(avg_rssi_target, 1)
+            sensor["battery_percent"] = round(12.0 if idx < low_battery_target else avg_battery_target, 1)
+            sensor["power_mw"] = round(avg_power_target, 1)
+            sensor["packets_tx"] = packets_tx
+            sensor["source"] = "ns3_ue_proxy_override"
+            total_packets_tx += packets_tx
+
+        packets_rx = int(round(total_packets_tx * (delivery_target / 100.0)))
+        packets_lost = max(total_packets_tx - packets_rx, 0)
+
+        snapshot["sensors"]["active"] = connected_target
+        snapshot["sensors"]["connected"] = connected_target
+        snapshot["sensors"]["error"] = error_target
+        snapshot["sensors"]["low_battery"] = low_battery_target
+        snapshot["readings"]["avg_battery_percent"] = round(avg_battery_target, 2)
+        snapshot["readings"]["avg_power_mw"] = round(avg_power_target, 2)
+        snapshot["network"]["packet_loss_percent"] = round(packet_loss_target, 2)
+        snapshot["network"]["tx_packets"] = total_packets_tx
+        snapshot["network"]["rx_packets"] = packets_rx
+        snapshot["network"]["lost_packets"] = packets_lost
+        snapshot["network"]["avg_latency_ms"] = round(avg_latency_target, 2)
+        snapshot["network"]["avg_rssi_dbm"] = round(avg_rssi_target, 2)
+        snapshot["network"]["network_utilization_percent"] = round(utilization_target, 2)
+        snapshot["network"]["delivery_success_percent"] = round(delivery_target, 2)
+        snapshot["simulation"] = {
+            "mode": str(override.get("mode", "scenario_control_override") or "scenario_control_override"),
+            "simulated_hour": None,
+        }
+        return sensor_entries, snapshot
 
     def get_device_meta(self, imsi):
         """Return explicit metadata for an IMSI when available."""
@@ -423,6 +498,14 @@ class ExtendedMetricsCollector:
                 "simulated_hour": None,
             },
         }
+
+        app2_override = self._load_app2_sensor_override()
+        if app2_override:
+            sensor_entries, snapshot = self._apply_app2_sensor_override(
+                sensor_entries,
+                snapshot,
+                app2_override,
+            )
 
         self.write_metrics(sensor_entries, self.app2_sensors_file)
         self.write_metrics(snapshot, self.app2_snapshot_file)
@@ -701,17 +784,19 @@ class ExtendedMetricsCollector:
         """Process cu-up-cell-*.txt and extract the latest per-UE throughput snapshot.
 
         The CU-UP file is not perfectly aligned with its header in all scenarios, so this
-        parser intentionally uses positional access for the fields that are consistently
-        present in the generated rows:
-            0: timestamp
-            1: IMSI
-            2: cell average latency (ms)
-            7: PDCP throughput (Mbps)
-            8: PDCP latency (ms)
+        parser intentionally supports two observed layouts:
+            - legacy layout with PDCP throughput/latency in columns 7/8
+            - current qos-only layout where only columns 9/10 are populated
+
+        In the qos-only layout we do not treat the CU-UP file as a reliable
+        throughput source, because those columns no longer represent the same
+        semantics expected by the old parser.
         """
         latest_rows = []
         source_files = []
         file_snapshots = []
+        format_variants = set()
+        has_throughput_signal = False
 
         for filepath in sorted(filepaths):
             if not filepath.exists():
@@ -724,23 +809,48 @@ class ExtendedMetricsCollector:
 
             try:
                 with open(filepath, "r") as f:
+                    header = None
                     for raw_line in f:
                         line = raw_line.strip()
-                        if not line or line.startswith("timestamp"):
+                        if not line:
+                            continue
+                        if line.startswith("timestamp"):
+                            header = [part.strip() for part in line.split(",")]
                             continue
 
                         parts = [part.strip() for part in line.split(",")]
-                        if len(parts) < 9:
+                        if len(parts) < 11:
                             continue
 
                         try:
                             timestamp = int(parts[0])
                             imsi = str(int(parts[1]))
-                            cell_average_latency_ms = float(parts[2] or 0.0)
-                            pdcp_throughput_mbps = float(parts[7] or 0.0)
-                            pdcp_latency_ms = float(parts[8] or 0.0)
                         except ValueError:
                             continue
+
+                        populated_slots = [idx for idx, value in enumerate(parts) if value]
+                        legacy_throughput_present = len(parts) > 8 and bool(parts[7] or parts[8])
+                        qos_only_variant = populated_slots == [0, 1, 9, 10]
+
+                        if legacy_throughput_present:
+                            format_variants.add("legacy_pdcp_throughput")
+                        elif qos_only_variant:
+                            format_variants.add("qos_only_no_throughput")
+                        else:
+                            format_variants.add("unknown_sparse_layout")
+
+                        cell_average_latency_ms = float(parts[2] or 0.0) if len(parts) > 2 and parts[2] else 0.0
+                        pdcp_throughput_mbps = 0.0
+                        pdcp_latency_ms = 0.0
+
+                        if legacy_throughput_present:
+                            try:
+                                pdcp_throughput_mbps = float(parts[7] or 0.0)
+                                pdcp_latency_ms = float(parts[8] or 0.0)
+                                has_throughput_signal = has_throughput_signal or pdcp_throughput_mbps > 0.0
+                            except ValueError:
+                                pdcp_throughput_mbps = 0.0
+                                pdcp_latency_ms = 0.0
 
                         row = {
                             "timestamp": timestamp,
@@ -800,6 +910,8 @@ class ExtendedMetricsCollector:
             "total_throughput_kbps": total_throughput_kbps,
             "per_ue": per_ue,
             "row_count": len(latest_rows),
+            "format_variants": sorted(format_variants),
+            "has_throughput_signal": has_throughput_signal,
         }
     
     def percentile(self, data, p):
@@ -845,13 +957,36 @@ class ExtendedMetricsCollector:
     def aggregate_metrics_without_pdcp(self, mac_metrics, rlc_metrics=None, cu_up_metrics=None, mmwave_sched_metrics=None):
         """Build a degraded-but-usable metric snapshot when PDCP stats are absent."""
 
+        fallback_time_samples = []
+        if mac_metrics:
+            fallback_time_samples.extend(
+                float(item.get('time', 0.0) or 0.0)
+                for item in mac_metrics[-5000:]
+                if float(item.get('time', 0.0) or 0.0) >= 0.0
+            )
+        if rlc_metrics:
+            fallback_time_samples.extend(
+                float(item.get('time_end', item.get('time_start', 0.0)) or 0.0)
+                for item in rlc_metrics[-5000:]
+                if float(item.get('time_end', item.get('time_start', 0.0)) or 0.0) >= 0.0
+            )
+
+        if fallback_time_samples:
+            fallback_start = min(fallback_time_samples)
+            fallback_end = max(fallback_time_samples)
+            fallback_window_s = max(fallback_end - fallback_start, max(self.poll_interval, 1.0))
+        else:
+            fallback_end = max(float(self.last_sim_time or 0.0), 0.0)
+            fallback_start = fallback_end
+            fallback_window_s = max(self.poll_interval, 1.0)
+
         result = {
             'timestamp': int(time.time() * 1000),
             'timestamp_iso': time.strftime('%Y-%m-%d %H:%M:%S'),
             'sim_time_range': {
-                'start': 0,
-                'end': float((cu_up_metrics or {}).get('latest_timestamp', 0) or 0),
-                'window_s': max(self.poll_interval, 1.0),
+                'start': fallback_start,
+                'end': fallback_end,
+                'window_s': fallback_window_s,
             },
             'ue_metrics': {},
             'cell_metrics': {},
@@ -909,7 +1044,16 @@ class ExtendedMetricsCollector:
 
         latencies = []
         rlc_latest_by_imsi = {}
-        mac_by_imsi = defaultdict(lambda: {'mcs': [], 'tb_sizes': [], 'last_cell_id': 0})
+        mac_by_imsi = defaultdict(lambda: {
+            'mcs': [],
+            'tb_sizes': [],
+            'last_cell_id': 0,
+            'time_min': float('inf'),
+            'time_max': 0.0,
+            'tb_bytes_total': 0,
+        })
+        mac_window_start = float('inf')
+        mac_window_end = 0.0
 
         if rlc_metrics:
             result['global_metrics']['rlc_record_count'] = len(rlc_metrics)
@@ -921,11 +1065,18 @@ class ExtendedMetricsCollector:
             all_tb_sizes = []
             for item in mac_metrics[-5000:]:
                 data = mac_by_imsi[item['imsi']]
+                tb_total = max(0, int(item['size_tb1']) + int(item['size_tb2']))
+                time_val = float(item.get('time', 0.0) or 0.0)
                 data['mcs'].append(item['mcs_tb1'])
-                data['tb_sizes'].append(item['size_tb1'] + item['size_tb2'])
+                data['tb_sizes'].append(tb_total)
                 data['last_cell_id'] = item.get('cell_id', 0)
+                data['tb_bytes_total'] += tb_total
+                data['time_min'] = min(data['time_min'], time_val)
+                data['time_max'] = max(data['time_max'], time_val)
+                mac_window_start = min(mac_window_start, time_val)
+                mac_window_end = max(mac_window_end, time_val)
                 all_mcs.append(item['mcs_tb1'])
-                all_tb_sizes.append(item['size_tb1'] + item['size_tb2'])
+                all_tb_sizes.append(tb_total)
 
             result['global_metrics']['lte_mac_observed_ues'] = len(mac_by_imsi)
             if all_mcs:
@@ -967,6 +1118,17 @@ class ExtendedMetricsCollector:
             latency_us = max(0.0, float(cu_up_entry.get('pdcp_latency_ms', 0.0) or 0.0) * 1000.0)
             has_latency_samples = latency_us > 0
             throughput_kbps = float(cu_up_entry.get('throughput_kbps', 0.0) or 0.0)
+            throughput_source = 'cu_up'
+            mac_throughput_kbps = 0.0
+            if mac_entry and mac_entry.get('tb_bytes_total', 0) > 0:
+                mac_window_s = max(
+                    float(mac_entry.get('time_max', 0.0) or 0.0) - float(mac_entry.get('time_min', 0.0) or 0.0),
+                    max(self.poll_interval, 1.0),
+                )
+                mac_throughput_kbps = (float(mac_entry.get('tb_bytes_total', 0) or 0) * 8.0) / (mac_window_s * 1000.0)
+                if throughput_kbps <= 0.0:
+                    throughput_kbps = mac_throughput_kbps
+                    throughput_source = 'mac_tb_window'
             is_critical = has_latency_samples and latency_us >= SLA_THRESHOLD_US
 
             if has_latency_samples:
@@ -992,19 +1154,19 @@ class ExtendedMetricsCollector:
                 'latency_max_us': latency_us if has_latency_samples else 0,
                 'jitter_us': 0,
                 'pdu_size_avg': 0,
-                'tx_bytes': 0,
-                'rx_bytes': 0,
-                'tx_pdus': 0,
-                'rx_pdus': 0,
+                'tx_bytes': int(mac_entry.get('tb_bytes_total', 0) or 0),
+                'rx_bytes': int(mac_entry.get('tb_bytes_total', 0) or 0),
+                'tx_pdus': len(mac_entry.get('tb_sizes', [])),
+                'rx_pdus': len(mac_entry.get('tb_sizes', [])),
                 'throughput_kbps': throughput_kbps,
-                'tx_throughput_kbps': 0,
+                'tx_throughput_kbps': mac_throughput_kbps,
                 'rx_throughput_kbps': throughput_kbps,
                 'total_pdcp_throughput_kbps': throughput_kbps,
-                'packet_count': 1 if has_latency_samples else 0,
+                'packet_count': (1 if has_latency_samples else 0) + len(mac_entry.get('tb_sizes', [])),
                 'has_latency_samples': has_latency_samples,
                 'is_critical': is_critical,
-                'throughput_source': 'cu_up',
-                'cu_up_throughput_kbps': throughput_kbps,
+                'throughput_source': throughput_source,
+                'cu_up_throughput_kbps': float(cu_up_entry.get('throughput_kbps', 0.0) or 0.0),
                 'cu_up_pdcp_latency_ms': float(cu_up_entry.get('pdcp_latency_ms', 0.0) or 0.0),
                 'rlc_records': 1 if rlc_entry else 0,
             }
@@ -1026,7 +1188,19 @@ class ExtendedMetricsCollector:
         result['global_metrics']['global_min_latency_us'] = min(latencies) if latencies else 0.0
         result['global_metrics']['global_max_latency_us'] = worst_latency
         result['global_metrics']['global_packet_loss_rate'] = self._calculate_packet_loss(worst_latency, critical_count, camera_count)
-        result['global_metrics']['throughput_kbps'] = float((cu_up_metrics or {}).get('total_throughput_kbps', 0) or 0)
+        mac_total_tb_bytes = sum(int(data.get('tb_bytes_total', 0) or 0) for data in mac_by_imsi.values())
+        mac_window_s = max(mac_window_end - mac_window_start, max(self.poll_interval, 1.0)) if mac_window_end > 0.0 and mac_window_start != float('inf') else max(self.poll_interval, 1.0)
+        mac_total_throughput_kbps = (mac_total_tb_bytes * 8.0) / (mac_window_s * 1000.0) if mac_total_tb_bytes > 0 else 0.0
+        cu_up_total_throughput_kbps = float((cu_up_metrics or {}).get('total_throughput_kbps', 0) or 0)
+        result['global_metrics']['throughput_kbps'] = cu_up_total_throughput_kbps if cu_up_total_throughput_kbps > 0 else mac_total_throughput_kbps
+        result['global_metrics']['throughput_source'] = 'cu_up_fallback' if cu_up_total_throughput_kbps > 0 else 'mac_tb_window_fallback'
+        result['global_metrics']['pdcp_delta_throughput_kbps'] = 0.0
+        result['global_metrics']['cu_up_total_throughput_kbps'] = cu_up_total_throughput_kbps
+        result['global_metrics']['mac_total_throughput_kbps'] = mac_total_throughput_kbps
+        result['global_metrics']['total_tx_bytes'] = mac_total_tb_bytes
+        result['global_metrics']['total_rx_bytes'] = mac_total_tb_bytes
+        result['global_metrics']['total_tx_pdus'] = sum(len(data.get('tb_sizes', [])) for data in mac_by_imsi.values())
+        result['global_metrics']['total_rx_pdus'] = result['global_metrics']['total_tx_pdus']
         result['global_metrics']['total_active_ues'] = len(result['ue_metrics'])
         result['global_metrics']['total_active_cameras'] = camera_count
         result['global_metrics']['total_active_sensors'] = sensor_count
@@ -1350,10 +1524,55 @@ class ExtendedMetricsCollector:
         self.last_total_rx_bytes = total_rx_bytes
         self.last_sim_time = current_sim_time
 
+        pdcp_window_throughput_kbps = sum(
+            float(ue.get('throughput_kbps', 0) or 0)
+            for ue in result['ue_metrics'].values()
+        )
         cu_up_total_throughput_kbps = float((cu_up_metrics or {}).get('total_throughput_kbps', 0) or 0)
         throughput_kbps = pdcp_delta_throughput_kbps
         throughput_source = 'pdcp_delta'
-        
+        pdcp_cu_up_ratio = (
+            pdcp_delta_throughput_kbps / cu_up_total_throughput_kbps
+            if cu_up_total_throughput_kbps > 0
+            else 1.0
+        )
+        pdcp_window_ratio = (
+            pdcp_delta_throughput_kbps / pdcp_window_throughput_kbps
+            if pdcp_window_throughput_kbps > 0
+            else 1.0
+        )
+
+        # The PDCP delta is sensitive to asynchronous file flushes. When the
+        # delta collapses but the per-UE PDCP window throughput is still high,
+        # prefer the window view to avoid publishing false near-zero spikes.
+        pdcp_delta_stale_vs_window = (
+            pdcp_window_throughput_kbps >= 10_000.0
+            and (
+                pdcp_delta_throughput_kbps <= 1_000.0
+                or pdcp_window_ratio < 0.2
+            )
+        )
+        if pdcp_delta_stale_vs_window:
+            throughput_kbps = pdcp_window_throughput_kbps
+            throughput_source = 'pdcp_rx_window_fallback'
+
+        # When PDCP/RLC snapshots lag behind the fresher CU-UP files, the PDCP
+        # delta can briefly collapse to near-zero even though the real cell
+        # throughput is still healthy. Prefer CU-UP only if the PDCP window is
+        # also unavailable and CU-UP is the only healthy signal left.
+        pdcp_stale_vs_cu_up = (
+            not pdcp_delta_stale_vs_window
+            and
+            cu_up_total_throughput_kbps >= 10_000.0
+            and (
+                pdcp_delta_throughput_kbps <= 1_000.0
+                or pdcp_cu_up_ratio < 0.2
+            )
+        )
+        if pdcp_stale_vs_cu_up:
+            throughput_kbps = cu_up_total_throughput_kbps
+            throughput_source = 'cu_up_stale_pdcp_fallback'
+
         result['global_metrics'] = {
             'global_worst_latency_us': worst_latency,
             'global_worst_camera_latency_us': worst_camera_latency,
@@ -1374,7 +1593,12 @@ class ExtendedMetricsCollector:
             'throughput_kbps': throughput_kbps,
             'throughput_source': throughput_source,
             'pdcp_delta_throughput_kbps': pdcp_delta_throughput_kbps,
+            'pdcp_window_throughput_kbps': pdcp_window_throughput_kbps,
             'cu_up_total_throughput_kbps': cu_up_total_throughput_kbps,
+            'pdcp_cu_up_ratio': pdcp_cu_up_ratio,
+            'pdcp_window_ratio': pdcp_window_ratio,
+            'pdcp_delta_stale_vs_window': pdcp_delta_stale_vs_window,
+            'pdcp_stale_vs_cu_up': pdcp_stale_vs_cu_up,
             'latency_p5_us': latency_p5,
             'latency_p95_us': latency_p95,
             'latency_min_nonzero_us': latency_min_nonzero,

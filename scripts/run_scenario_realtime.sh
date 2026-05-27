@@ -3,13 +3,8 @@
 # =============================================================================
 # GreenRAN Scenario Base - Script de Execução com Logs em Tempo Real
 # =============================================================================
-# Cenário: 5 Torres + 10 UEs + 3 Câmaras
-# 
-# Parâmetros:
-# - 5 torres mmWave (distribuição hexagonal)
-# - 3 câmaras fixas (25 Mbps cada, latência < 100ms)
-# - 10 UEs com mobilidade (50% parados, 40% andando, 10% veículos)
-# - Tempo de simulação: 900s (15 minutos)
+# Launcher legado com logs em tempo real.
+# O baseline canônico do cenário vem de config/greenran_fixed_scenario.json.
 #
 # Uso: ./run_scenario_realtime.sh [opções]
 #   -s, --short    Rodar simulação curta (60s) para teste
@@ -53,6 +48,8 @@ echo "=========================================="
 echo "  GreenRAN Scenario Base - UFPA"
 echo "  Modo Tempo Real"
 echo "=========================================="
+echo ""
+print_greenran_fixed_scenario_summary
 echo ""
 
 # Diretórios

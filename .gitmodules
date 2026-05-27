@@ -1,0 +1,19 @@
+[submodule "flexric"]
+	path = flexric
+	url = https://gitlab.eurecom.fr/mosaic5g/flexric.git
+	branch = oie-ric-taap-xapps
+
+[submodule "ns-O-RAN-flexric"]
+	path = ns-O-RAN-flexric
+	url = https://github.com/Orange-OpenSource/ns-O-RAN-flexric
+	branch = main
+
+[submodule "ns-O-RAN-flexric-broken"]
+	path = ns-O-RAN-flexric-broken
+	url = https://github.com/Robertwanzeler/ns-O-RAN-flexric.git
+	branch = main
+
+[submodule "ns3-base"]
+	path = ns3-base
+	url = https://gitlab.com/nsnam/ns-3-dev.git
+	branch = master

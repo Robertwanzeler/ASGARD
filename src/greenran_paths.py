@@ -7,8 +7,10 @@ os paths em um único ponto para facilitar portabilidade,
 reprodutibilidade e futura configuração por ambiente.
 """
 
-from pathlib import Path
+import json
 import os
+from functools import lru_cache
+from pathlib import Path
 
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -23,6 +25,9 @@ MODELS_DIR = PROJECT_ROOT / "models"
 CONFIG_DIR = PROJECT_ROOT / "config"
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
 DOCS_DIR = PROJECT_ROOT / "docs"
+FIXED_SCENARIO_CONFIG_PATH = Path(
+    os.environ.get("GREENRAN_FIXED_SCENARIO_CONFIG", CONFIG_DIR / "greenran_fixed_scenario.json")
+).resolve()
 
 FLEXRIC_DIR = PROJECT_ROOT / "flexric"
 FLEXRIC_LIB_DIR = PROJECT_ROOT / "flexric_lib"
@@ -45,6 +50,7 @@ ARTICLE00_SCENARIO_CONTROL_PATH = STATE_DIR / "article00_scenario_control.json"
 
 SLICER_INTENT_PATH = XAPP_INTENTS_DIR / "slicer.txt"
 ENERGY_INTENT_PATH = XAPP_INTENTS_DIR / "energy_saver.txt"
+VEHICLE_INTENT_PATH = XAPP_INTENTS_DIR / "vehicle_control.txt"
 RAPP_DECISION_PATH = XAPP_INTENTS_DIR / "rapp_decision.txt"
 ENERGY_COMMAND_PATH = XAPP_INTENTS_DIR / "energy_command.json"
 
@@ -55,8 +61,10 @@ CARLA_VEHICLE_MAP_PATH = CARLA_STATE_DIR / "vehicle_network_map.json"
 
 XAPP_SLICER_LOG_PATH = STATE_DIR / "xapp_slicer.log"
 XAPP_ENERGY_LOG_PATH = STATE_DIR / "xapp_energy.log"
+XAPP_VEHICLE_LOG_PATH = STATE_DIR / "xapp_vehicle.log"
 XAPP_SLICER_PID_PATH = STATE_DIR / "xapp_slicer.pid"
 XAPP_ENERGY_PID_PATH = STATE_DIR / "xapp_energy.pid"
+XAPP_VEHICLE_PID_PATH = STATE_DIR / "xapp_vehicle.pid"
 
 
 def ensure_runtime_dirs() -> None:
@@ -68,3 +76,45 @@ def ensure_runtime_dirs() -> None:
 def as_str(path: Path) -> str:
     """Converte Path para string normalizada."""
     return str(path)
+
+
+@lru_cache(maxsize=1)
+def load_fixed_scenario_config() -> dict:
+    """Carrega o manifesto do cenario fixo do GreenRAN."""
+    if not FIXED_SCENARIO_CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(FIXED_SCENARIO_CONFIG_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _scenario_int(path: tuple[str, ...], default: int) -> int:
+    payload = load_fixed_scenario_config()
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+    try:
+        return int(current)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_fixed_total_ues(default: int = 12) -> int:
+    return _scenario_int(("ns3", "total_ues"), default)
+
+
+def get_fixed_active_cameras(default: int = 3) -> int:
+    return _scenario_int(("apps", "app1", "active_cameras"), default)
+
+
+def get_fixed_vehicle_base_imsi(default: int = 16) -> int:
+    return _scenario_int(("apps", "app3", "base_imsi"), default)
+
+
+def get_fixed_max_vehicles(default: int = 5) -> int:
+    return _scenario_int(("apps", "app3", "max_vehicles"), default)

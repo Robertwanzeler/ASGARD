@@ -11,7 +11,13 @@ import signal
 import time
 from pathlib import Path
 
-from greenran_paths import CARLA_VEHICLES_PATH, CARLA_VEHICLE_MAP_PATH, ensure_runtime_dirs
+from greenran_paths import (
+    CARLA_VEHICLES_PATH,
+    CARLA_VEHICLE_MAP_PATH,
+    ensure_runtime_dirs,
+    get_fixed_max_vehicles,
+    get_fixed_vehicle_base_imsi,
+)
 
 
 def _read_json(path: Path, fallback):
@@ -124,13 +130,18 @@ class CarlaNs3Mapper:
         print("[CARLA_NS3_MAPPER] shutdown")
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Map CARLA vehicles to GreenRAN IMSIs")
     parser.add_argument("--input", default=str(CARLA_VEHICLES_PATH))
     parser.add_argument("--output", default=str(CARLA_VEHICLE_MAP_PATH))
-    parser.add_argument("--base-imsi", type=int, default=16)
-    parser.add_argument("--max-vehicles", type=int, default=5)
+    parser.add_argument("--base-imsi", type=int, default=get_fixed_vehicle_base_imsi())
+    parser.add_argument("--max-vehicles", type=int, default=get_fixed_max_vehicles())
     parser.add_argument("--poll-interval", type=float, default=0.5)
+    return parser
+
+
+def main() -> None:
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     mapper = CarlaNs3Mapper(

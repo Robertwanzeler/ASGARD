@@ -16,7 +16,7 @@ class ARMDIntegrationTests(unittest.TestCase):
         self.assertEqual(advisor.threshold, 0.5)
         self.assertEqual(advisor.subset_size, 450)
         self.assertIn("vehicle_critical", advisor.scenarios)
-        self.assertEqual(advisor.scenarios["vehicle_critical"].source, "protocol_vehicle_clean")
+        self.assertEqual(advisor.scenarios["vehicle_critical"].source, "protocol")
 
     def test_app1_throughput_is_classified_and_escalates(self):
         advisor = ARMDRuntimeAdvisor(mode="assist")

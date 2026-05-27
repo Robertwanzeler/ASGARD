@@ -16,18 +16,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROTOCOL_ROOT = PROJECT_ROOT / "runs" / "graphsage_article00_protocol"
-DEFAULT_PROTOCOL_VEHICLE_CLEAN_ROOT = PROJECT_ROOT / "runs" / "graphsage_article00_protocol_vehicle_clean"
-DEFAULT_PROTOCOL_CLEAN_REMAINING_ROOT = PROJECT_ROOT / "runs" / "graphsage_article00_protocol_clean_remaining"
-DEFAULT_PROTOCOL_LAST_TWO_ROOT = PROJECT_ROOT / "runs" / "graphsage_article00_protocol_last_two"
 DEFAULT_CALIBRATION_ROOT = PROJECT_ROOT / "runs" / "graphsage_article00_calibration"
 DEFAULT_CALIBRATION_VEHICLE_RECOVERY_ROOT = PROJECT_ROOT / "runs" / "graphsage_article00_calibration_vehicle_recovery"
 DEFAULT_FAMILY_ROOT = PROJECT_ROOT / "runs" / "graphsage_article00_calibration_family"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "runs" / "graphsage_article00_hybrid_final"
 SOURCE_PRIORITY = {
     "calibration_vehicle_recovery": 7,
-    "protocol_last_two": 6,
-    "protocol_clean_remaining": 5,
-    "protocol_vehicle_clean": 4,
     "protocol": 3,
     "calibration_v1": 2,
     "family_v1": 1,
@@ -48,9 +42,6 @@ class AggregateRow:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a hybrid final package from the best observed GraphSAGE runs.")
     parser.add_argument("--protocol-root", default=str(DEFAULT_PROTOCOL_ROOT))
-    parser.add_argument("--protocol-vehicle-clean-root", default=str(DEFAULT_PROTOCOL_VEHICLE_CLEAN_ROOT))
-    parser.add_argument("--protocol-clean-remaining-root", default=str(DEFAULT_PROTOCOL_CLEAN_REMAINING_ROOT))
-    parser.add_argument("--protocol-last-two-root", default=str(DEFAULT_PROTOCOL_LAST_TWO_ROOT))
     parser.add_argument("--calibration-root", default=str(DEFAULT_CALIBRATION_ROOT))
     parser.add_argument("--calibration-vehicle-recovery-root", default=str(DEFAULT_CALIBRATION_VEHICLE_RECOVERY_ROOT))
     parser.add_argument("--family-root", default=str(DEFAULT_FAMILY_ROOT))
@@ -193,9 +184,6 @@ def write_summary(output_root: Path, payload: dict) -> None:
 def main() -> int:
     args = parse_args()
     protocol_root = Path(args.protocol_root).resolve()
-    protocol_vehicle_clean_root = Path(args.protocol_vehicle_clean_root).resolve()
-    protocol_clean_remaining_root = Path(args.protocol_clean_remaining_root).resolve()
-    protocol_last_two_root = Path(args.protocol_last_two_root).resolve()
     calibration_root = Path(args.calibration_root).resolve()
     calibration_vehicle_recovery_root = Path(args.calibration_vehicle_recovery_root).resolve()
     family_root = Path(args.family_root).resolve()
@@ -204,27 +192,6 @@ def main() -> int:
 
     aggregate_rows = []
     aggregate_rows.extend(protocol_aggregate_rows(protocol_root / "protocol_summary.json"))
-    if (protocol_vehicle_clean_root / "protocol_summary.json").exists():
-        aggregate_rows.extend(
-            protocol_aggregate_rows(
-                protocol_vehicle_clean_root / "protocol_summary.json",
-                "protocol_vehicle_clean",
-            )
-        )
-    if (protocol_clean_remaining_root / "protocol_summary.json").exists():
-        aggregate_rows.extend(
-            protocol_aggregate_rows(
-                protocol_clean_remaining_root / "protocol_summary.json",
-                "protocol_clean_remaining",
-            )
-        )
-    if (protocol_last_two_root / "protocol_summary.json").exists():
-        aggregate_rows.extend(
-            protocol_aggregate_rows(
-                protocol_last_two_root / "protocol_summary.json",
-                "protocol_last_two",
-            )
-        )
     aggregate_rows.extend(calibration_aggregate_rows(calibration_root / "calibration_summary.json", "calibration_v1"))
     if (calibration_vehicle_recovery_root / "calibration_summary.json").exists():
         aggregate_rows.extend(
@@ -237,30 +204,6 @@ def main() -> int:
     selected = select_best_source(aggregate_rows, args.threshold)
 
     protocol_records = gather_row_records(protocol_root / "protocol_summary.json", "protocol", args.threshold, args.subset_size)
-    protocol_vehicle_clean_records = []
-    if (protocol_vehicle_clean_root / "protocol_summary.json").exists():
-        protocol_vehicle_clean_records = gather_row_records(
-            protocol_vehicle_clean_root / "protocol_summary.json",
-            "protocol_vehicle_clean",
-            args.threshold,
-            args.subset_size,
-        )
-    protocol_clean_remaining_records = []
-    if (protocol_clean_remaining_root / "protocol_summary.json").exists():
-        protocol_clean_remaining_records = gather_row_records(
-            protocol_clean_remaining_root / "protocol_summary.json",
-            "protocol_clean_remaining",
-            args.threshold,
-            args.subset_size,
-        )
-    protocol_last_two_records = []
-    if (protocol_last_two_root / "protocol_summary.json").exists():
-        protocol_last_two_records = gather_row_records(
-            protocol_last_two_root / "protocol_summary.json",
-            "protocol_last_two",
-            args.threshold,
-            args.subset_size,
-        )
     calibration_records = gather_row_records(calibration_root / "calibration_summary.json", "calibration_v1", args.threshold, args.subset_size)
     calibration_vehicle_recovery_records = []
     if (calibration_vehicle_recovery_root / "calibration_summary.json").exists():
@@ -273,9 +216,6 @@ def main() -> int:
     family_records = gather_row_records(family_root / "calibration_summary.json", "family_v1", args.threshold, args.subset_size)
     all_records = (
         protocol_records
-        + protocol_vehicle_clean_records
-        + protocol_clean_remaining_records
-        + protocol_last_two_records
         + calibration_records
         + calibration_vehicle_recovery_records
         + family_records

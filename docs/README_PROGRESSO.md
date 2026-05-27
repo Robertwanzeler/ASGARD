@@ -41,14 +41,15 @@ A simulação está rodando com sucesso! Ambos os xApps (Slicer e Energy Saver) 
 
 ---
 
-## 📋 Cenário do Projeto (10 UEs + 3 Câmaras)
+## 📋 Cenário do Projeto (12 UEs ns-3 + 3 Câmaras + até 5 Veículos)
 
 ### Topologia
 | Componente | Quantidade |
 |------------|-----------|
 | gNB | 1 (com E2 + Energia) |
 | Câmaras | 3 (25 Mbps cada) |
-| UEs fundo | 7 (mix) |
+| UEs ns-3 | 12 (3 câmeras + 9 background) |
+| Veículos App3 | até 5 (IMSI 16-20) |
 
 ### Arquitetura de Controle
 ```

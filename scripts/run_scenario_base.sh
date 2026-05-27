@@ -3,13 +3,8 @@
 # =============================================================================
 # GreenRAN Scenario Base - Script de Execução
 # =============================================================================
-# Cenário: 5 Torres + 10 UEs + 3 Câmaras
-# 
-# Parâmetros:
-# - 5 torres mmWave (distribuição hexagonal)
-# - 3 câmaras fixas (25 Mbps cada, latência < 100ms)
-# - 10 UEs com mobilidade (50% parados, 40% andando, 10% veículos)
-# - Tempo de simulação: 300s
+# Launcher legado de teste do GreenRAN.
+# O baseline canônico do cenário vem de config/greenran_fixed_scenario.json.
 #
 # Autor: UFPA - GreenRAN Project
 # =============================================================================
@@ -19,8 +14,12 @@ echo "  GreenRAN Scenario Base - UFPA"
 echo "=========================================="
 echo ""
 
+. "$(dirname "$0")/core_runtime.sh"
+load_greenran_runtime
+print_greenran_fixed_scenario_summary
+echo ""
+
 # Diretórios
-BASE_DIR="/home/robert/orange_nuclear"
 NS3_DIR="$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran"
 RESULTS_DIR="$BASE_DIR/results"
 

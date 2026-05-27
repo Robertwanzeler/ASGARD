@@ -1,6 +1,6 @@
-# GreenRAN DRL Configuration
-# =============================
-# Configuration file for EE-DRL-RA implementation
+# GreenRAN DRL Configuration (Legacy)
+# ==================================
+# Legacy configuration file for the EE-DRL-RA implementation.
 # Based on IEEE paper: "Energy-Efficient Deep Reinforcement Learning Assisted Resource Allocation for 5G-RAN Slicing"
 
 # ==========================================

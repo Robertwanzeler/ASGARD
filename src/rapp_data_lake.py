@@ -115,6 +115,19 @@ class DataLake:
                 armd_source TEXT,
                 armd_confidence REAL DEFAULT 0,
                 armd_override_applied INTEGER DEFAULT 0,
+                rl_policy_id TEXT,
+                rl_policy_family TEXT,
+                rl_policy_algorithm TEXT,
+                resource_controller_id TEXT,
+                resource_budget REAL DEFAULT 0,
+                usable_budget REAL DEFAULT 0,
+                ran_demand REAL DEFAULT 0,
+                ai_demand REAL DEFAULT 0,
+                ran_allocation REAL DEFAULT 0,
+                ai_allocation REAL DEFAULT 0,
+                ran_completion_ratio REAL DEFAULT 0,
+                ai_completion_ratio REAL DEFAULT 0,
+                utilization_ratio REAL DEFAULT 0,
                 UNIQUE(timestamp)
             )
         """)
@@ -128,6 +141,19 @@ class DataLake:
             ("armd_source", "TEXT"),
             ("armd_confidence", "REAL DEFAULT 0"),
             ("armd_override_applied", "INTEGER DEFAULT 0"),
+            ("rl_policy_id", "TEXT"),
+            ("rl_policy_family", "TEXT"),
+            ("rl_policy_algorithm", "TEXT"),
+            ("resource_controller_id", "TEXT"),
+            ("resource_budget", "REAL DEFAULT 0"),
+            ("usable_budget", "REAL DEFAULT 0"),
+            ("ran_demand", "REAL DEFAULT 0"),
+            ("ai_demand", "REAL DEFAULT 0"),
+            ("ran_allocation", "REAL DEFAULT 0"),
+            ("ai_allocation", "REAL DEFAULT 0"),
+            ("ran_completion_ratio", "REAL DEFAULT 0"),
+            ("ai_completion_ratio", "REAL DEFAULT 0"),
+            ("utilization_ratio", "REAL DEFAULT 0"),
         ):
             if column_name not in existing_decision_columns:
                 cursor.execute(f"ALTER TABLE decisions_history ADD COLUMN {column_name} {column_def}")
@@ -295,6 +321,43 @@ class DataLake:
             CREATE INDEX IF NOT EXISTS idx_energy_timestamp 
             ON energy_commands(timestamp)
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS resource_allocation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                controller_id TEXT,
+                target_policy_id TEXT,
+                decision_domain TEXT,
+                action_semantics TEXT,
+                resource_budget REAL DEFAULT 0,
+                usable_budget REAL DEFAULT 0,
+                d_ran REAL DEFAULT 0,
+                d_ai REAL DEFAULT 0,
+                r_ran REAL DEFAULT 0,
+                r_ai REAL DEFAULT 0,
+                delta_r_ran REAL DEFAULT 0,
+                delta_r_ai REAL DEFAULT 0,
+                ran_completion_ratio REAL DEFAULT 0,
+                ai_completion_ratio REAL DEFAULT 0,
+                utilization_ratio REAL DEFAULT 0,
+                snapshot_json TEXT,
+                UNIQUE(timestamp)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_resource_alloc_timestamp
+            ON resource_allocation_history(timestamp)
+        """)
+        existing_resource_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(resource_allocation_history)").fetchall()
+        }
+        for column_name, column_def in (
+            ("usable_budget", "REAL DEFAULT 0"),
+        ):
+            if column_name not in existing_resource_columns:
+                cursor.execute(f"ALTER TABLE resource_allocation_history ADD COLUMN {column_name} {column_def}")
 
         # Snapshot agregado da App2-Monitoramento.
         cursor.execute("""
@@ -532,6 +595,21 @@ class DataLake:
         armd_source = decision.get('armd_source', '')
         armd_confidence = decision.get('armd_confidence', 0.0)
         armd_override_applied = 1 if decision.get('armd_override_applied', False) else 0
+        rl_policy_runtime = decision.get('rl_policy_runtime', {}) or {}
+        resource_allocation = decision.get('resource_allocation', {}) or {}
+        rl_policy_id = rl_policy_runtime.get('policy_id', '')
+        rl_policy_family = rl_policy_runtime.get('family', '')
+        rl_policy_algorithm = rl_policy_runtime.get('algorithm', '')
+        resource_controller_id = resource_allocation.get('controller_id', '')
+        resource_budget = float(resource_allocation.get('resource_budget', 0.0) or 0.0)
+        usable_budget = float(resource_allocation.get('usable_budget', resource_budget) or resource_budget)
+        ran_demand = float(resource_allocation.get('d_ran', 0.0) or 0.0)
+        ai_demand = float(resource_allocation.get('d_ai', 0.0) or 0.0)
+        ran_allocation = float(resource_allocation.get('r_ran', 0.0) or 0.0)
+        ai_allocation = float(resource_allocation.get('r_ai', 0.0) or 0.0)
+        ran_completion_ratio = float(resource_allocation.get('ran_completion_ratio', 0.0) or 0.0)
+        ai_completion_ratio = float(resource_allocation.get('ai_completion_ratio', 0.0) or 0.0)
+        utilization_ratio = float(resource_allocation.get('utilization_ratio', 0.0) or 0.0)
 
         # DEBUG: Log dos dados de ML que chegam
         if ml_decision:
@@ -553,16 +631,68 @@ class DataLake:
                 (timestamp, datetime, decision, reason, confidence, pattern,
                  agent_override, energy_state, slicer_state,
                  ml_decision, ml_confidence, ml_predicted_cvar_ms, ml_influenced,
-                 armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied,
+                 rl_policy_id, rl_policy_family, rl_policy_algorithm, resource_controller_id,
+                 resource_budget, usable_budget, ran_demand, ai_demand, ran_allocation, ai_allocation,
+                 ran_completion_ratio, ai_completion_ratio, utilization_ratio)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (timestamp, dt_str, decision_str, reason, confidence, pattern,
                   agent_override, energy_state, slicer_state,
                   ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced,
-                  armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied))
+                  armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied,
+                  rl_policy_id, rl_policy_family, rl_policy_algorithm, resource_controller_id,
+                  resource_budget, usable_budget, ran_demand, ai_demand, ran_allocation, ai_allocation,
+                  ran_completion_ratio, ai_completion_ratio, utilization_ratio))
             self.conn.commit()
+            if resource_allocation:
+                self.record_resource_allocation_snapshot(resource_allocation, timestamp=timestamp)
             self.record_conflict_from_decision(decision, timestamp=timestamp)
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar decisão: {e}")
+
+    def record_resource_allocation_snapshot(self, snapshot, timestamp=None):
+        """Persist the CAORA-style resource-allocation snapshot for SAC training."""
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        dt = datetime.fromtimestamp(timestamp)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO resource_allocation_history
+                (timestamp, datetime, controller_id, target_policy_id, decision_domain,
+                 action_semantics, resource_budget, usable_budget, d_ran, d_ai, r_ran, r_ai,
+                 delta_r_ran, delta_r_ai, ran_completion_ratio, ai_completion_ratio,
+                 utilization_ratio, snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                timestamp,
+                dt_str,
+                snapshot.get('controller_id', ''),
+                snapshot.get('target_policy_id', ''),
+                snapshot.get('decision_domain', ''),
+                snapshot.get('action_semantics', ''),
+                float(snapshot.get('resource_budget', 0.0) or 0.0),
+                float(snapshot.get('usable_budget', snapshot.get('resource_budget', 0.0)) or 0.0),
+                float(snapshot.get('d_ran', 0.0) or 0.0),
+                float(snapshot.get('d_ai', 0.0) or 0.0),
+                float(snapshot.get('r_ran', 0.0) or 0.0),
+                float(snapshot.get('r_ai', 0.0) or 0.0),
+                float(snapshot.get('delta_r_ran', 0.0) or 0.0),
+                float(snapshot.get('delta_r_ai', 0.0) or 0.0),
+                float(snapshot.get('ran_completion_ratio', 0.0) or 0.0),
+                float(snapshot.get('ai_completion_ratio', 0.0) or 0.0),
+                float(snapshot.get('utilization_ratio', 0.0) or 0.0),
+                json.dumps(snapshot, ensure_ascii=False),
+            ))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar snapshot de recursos: {e}")
 
     def record_app3_snapshot(self, snapshot, timestamp=None):
         """Registra snapshot agregado do App3 para fallback histórico do domínio veicular."""

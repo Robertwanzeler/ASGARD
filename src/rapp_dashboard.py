@@ -31,7 +31,13 @@ from greenran_paths import (
     RAPP_POLICIES_DIR,
     RAPP_LOG_PATH,
     XAPP_INTENTS_DIR,
+    ARTICLE00_SCENARIO_CONTROL_PATH,
     as_str,
+    load_fixed_scenario_config,
+    get_fixed_total_ues,
+    get_fixed_active_cameras,
+    get_fixed_max_vehicles,
+    get_fixed_vehicle_base_imsi,
 )
 from greenran_runtime import load_runtime_config
 
@@ -64,6 +70,7 @@ APP3_MONITORING_FILE = as_str(STATE_DIR / "app3_veicular" / "monitoring_snapshot
 DEVICE_ROLES_FILE = as_str(STATE_DIR / "xapp_metrics" / "device_roles.json")
 CONFLICT_LEARNED_REPORT_FILE = as_str(STATE_DIR / "greenran_conflict_report.json")
 CONFLICT_LEARNED_ADJ_FILE = as_str(STATE_DIR / "greenran_conflict_adjacency.json")
+SCENARIO_CONTROL_FILE = as_str(ARTICLE00_SCENARIO_CONTROL_PATH)
 
 APP2_CONNECTED_CRITICAL_RATIO = 0.85
 APP2_CONNECTED_WARNING_RATIO = 0.90
@@ -83,6 +90,27 @@ VEHICLE_LATENCY_CRITICAL_MS = 100.0
 VEHICLE_PACKET_LOSS_WARNING_PERCENT = 2.0
 VEHICLE_PACKET_LOSS_CRITICAL_PERCENT = 5.0
 
+
+
+
+def get_fixed_scenario_metadata():
+    """Resume o baseline canonico do manifesto de cenario fixo."""
+    payload = load_fixed_scenario_config()
+    scenario_id = str(payload.get('scenario_id', 'unknown') or 'unknown')
+    total_ues = int(get_fixed_total_ues())
+    active_cameras = int(get_fixed_active_cameras())
+    max_vehicles = int(get_fixed_max_vehicles())
+    base_imsi = int(get_fixed_vehicle_base_imsi())
+    background_ues = max(0, total_ues - active_cameras)
+    return {
+        'scenario_id': scenario_id,
+        'total_ues': total_ues,
+        'active_cameras': active_cameras,
+        'background_ues': background_ues,
+        'max_vehicles': max_vehicles,
+        'vehicle_base_imsi': base_imsi,
+        'vehicle_imsi_end': base_imsi + max(max_vehicles - 1, 0),
+    }
 
 def get_current_metrics():
     """Obtém métricas atuais."""
@@ -845,6 +873,203 @@ def get_recent_decisions(minutes=60):
         return []
 
 
+def get_latest_resource_allocation():
+    """Obtém a última alocação RAN/AI aplicada no runtime."""
+    try:
+        cursor = DATA_LAKE.conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                datetime,
+                controller_id,
+                target_policy_id,
+                d_ran,
+                d_ai,
+                r_ran,
+                r_ai,
+                ran_completion_ratio,
+                ai_completion_ratio,
+                utilization_ratio
+            FROM resource_allocation_history
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        return {
+            'datetime': row[0],
+            'controller_id': row[1],
+            'target_policy_id': row[2],
+            'd_ran': round(float(row[3] or 0.0), 4),
+            'd_ai': round(float(row[4] or 0.0), 4),
+            'r_ran': round(float(row[5] or 0.0), 4),
+            'r_ai': round(float(row[6] or 0.0), 4),
+            'ran_completion_ratio': round(float(row[7] or 0.0), 4),
+            'ai_completion_ratio': round(float(row[8] or 0.0), 4),
+            'utilization_ratio': round(float(row[9] or 0.0), 4),
+        }
+    except Exception as e:
+        print(f"Erro ao obter alocação mais recente: {e}")
+        return {}
+
+
+def get_latest_decision_snapshot():
+    """Obtém a última decisão operacional do rApp."""
+    try:
+        cursor = DATA_LAKE.conn.cursor()
+        cursor.execute(
+            """
+            SELECT datetime, decision, energy_state, confidence, reason
+            FROM decisions_history
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        return {
+            'datetime': row[0],
+            'decision': row[1],
+            'energy_state': row[2],
+            'confidence': round(float(row[3] or 0.0), 4),
+            'reason': row[4] or '',
+        }
+    except Exception as e:
+        print(f"Erro ao obter última decisão: {e}")
+        return {}
+
+
+def get_collection_health_summary():
+    """Resume a saúde operacional da coleta lenta do cenário real."""
+    summary = {
+        'status': 'unknown',
+        'label': 'Sem dados',
+        'sim_time_latest': 0.0,
+        'sim_time_oldest': 0.0,
+        'sim_time_advance': 0.0,
+        'throughput_latest_kbps': 0.0,
+        'throughput_peak_kbps': 0.0,
+        'throughput_floor_kbps': 0.0,
+        'throughput_low_spikes': 0,
+        'note': 'Ainda não há amostras suficientes.',
+    }
+    try:
+        cursor = DATA_LAKE.conn.cursor()
+        cursor.execute(
+            """
+            SELECT datetime, sim_time_s, throughput_kbps
+            FROM extended_metrics
+            ORDER BY timestamp DESC
+            LIMIT 12
+            """
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return summary
+
+        sim_times = [float(row[1] or 0.0) for row in rows]
+        throughputs = [float(row[2] or 0.0) for row in rows]
+        latest_sim = sim_times[0]
+        oldest_sim = sim_times[-1]
+        sim_advance = latest_sim - oldest_sim
+        peak_tp = max(throughputs) if throughputs else 0.0
+        floor_tp = min(throughputs) if throughputs else 0.0
+        low_spikes = sum(
+            1 for value in throughputs
+            if value > 0.0 and value < 5000.0
+        )
+        zeroish_spikes = sum(1 for value in throughputs if value <= 0.0)
+
+        summary.update({
+            'sim_time_latest': round(latest_sim, 3),
+            'sim_time_oldest': round(oldest_sim, 3),
+            'sim_time_advance': round(sim_advance, 3),
+            'throughput_latest_kbps': round(throughputs[0], 3) if throughputs else 0.0,
+            'throughput_peak_kbps': round(peak_tp, 3),
+            'throughput_floor_kbps': round(floor_tp, 3),
+            'throughput_low_spikes': int(low_spikes + zeroish_spikes),
+        })
+
+        if sim_advance <= 0.0:
+            summary.update({
+                'status': 'stalled',
+                'label': 'Coleta parada',
+                'note': 'O sim_time não avançou nas amostras recentes.',
+            })
+        elif sim_advance < 0.5:
+            summary.update({
+                'status': 'slow',
+                'label': 'Coleta lenta',
+                'note': 'O sim_time está avançando muito pouco por janela.',
+            })
+        else:
+            summary.update({
+                'status': 'collecting',
+                'label': 'Coleta ativa',
+                'note': 'O cenário segue coletando no regime real.',
+            })
+
+        if peak_tp >= 50000.0 and (low_spikes + zeroish_spikes) > 0:
+            summary['note'] += ' Há jitter de throughput no coletor, mas sem evidência de queda total do cenário.'
+
+        return summary
+    except Exception as e:
+        print(f"Erro ao obter resumo da coleta: {e}")
+        summary['note'] = 'Erro ao ler a saúde da coleta.'
+        return summary
+
+
+def build_mobile_ops_snapshot():
+    """Monta um resumo curto para operação móvel do cenário."""
+    metrics = get_current_metrics() or {}
+    global_metrics = metrics.get('global_metrics', {}) if isinstance(metrics, dict) else {}
+    scenario_control = _safe_read_json(SCENARIO_CONTROL_FILE, {})
+    service_slas = get_service_sla_status()
+    latest_decision = get_latest_decision_snapshot()
+    latest_alloc = get_latest_resource_allocation()
+    collection = get_collection_health_summary()
+    xapp_status = get_xapp_status()
+    fixed_scenario = get_fixed_scenario_metadata()
+
+    return {
+        'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'sim_time_range': metrics.get('sim_time_range', {}),
+        'global_metrics': {
+            'throughput_kbps': round(float(global_metrics.get('throughput_kbps', 0.0) or 0.0), 3),
+            'throughput_source': global_metrics.get('throughput_source', 'unknown'),
+            'cvar_ms': round(float(global_metrics.get('cvar_per_ue_us', 0.0) or 0.0) / 1000.0, 3),
+            'p95_ms': round(float(global_metrics.get('latency_p95_us', 0.0) or 0.0) / 1000.0, 3),
+            'active_ues': int(global_metrics.get('total_active_ues', 0) or 0),
+            'active_cameras': int(global_metrics.get('total_active_cameras', 0) or 0),
+            'active_sensors': int(global_metrics.get('total_active_sensors', 0) or 0),
+            'active_vehicles': int(global_metrics.get('total_active_vehicles', 0) or 0),
+        },
+        'scenario': {
+            'profile': scenario_control.get('collection_event_profile', ''),
+            'cycle': int(scenario_control.get('collection_event_cycle', 0) or 0),
+            'stage': scenario_control.get('collection_event_stage_name', 'unknown'),
+            'generated_at_iso': scenario_control.get('generated_at_iso', ''),
+            'fixed_scenario': fixed_scenario,
+        },
+        'service_slas': service_slas,
+        'latest_decision': latest_decision,
+        'latest_allocation': latest_alloc,
+        'collection': collection,
+        'xapps': {
+            name: {
+                'status': payload.get('status', 'UNKNOWN'),
+                'pid': payload.get('pid'),
+                'last_cycle': payload.get('last_cycle'),
+            }
+            for name, payload in (xapp_status or {}).items()
+            if name in {'SLICER', 'ENERGY', 'VEHICLE'}
+        },
+    }
+
+
 def get_recent_conflicts(minutes=60):
     """Obtém conflitos O-RAN recentes derivados das decisões do rApp."""
     try:
@@ -940,6 +1165,7 @@ def index():
     recent_alerts = ALERT_MANAGER.get_recent_alerts(5)
     vehicle_history = get_vehicle_history(60, limit=50)
     scenario_counts = get_scenario_actor_counts()
+    fixed_scenario = get_fixed_scenario_metadata()
     
     # Métricas para gráficos
     recent = get_recent_metrics(120)  # 2 horas para incluir dados antigos
@@ -1010,6 +1236,7 @@ def index():
         vehicle_history=vehicle_history,
         scenario_counts=scenario_counts,
         service_slas=service_slas,
+        fixed_scenario=fixed_scenario,
     )
 
 
@@ -1247,11 +1474,28 @@ def ml_page():
     )
 
 
+@app.route('/ops')
+def ops_mobile_page():
+    """Página móvel de operação do cenário real."""
+    snapshot = build_mobile_ops_snapshot()
+    return render_template(
+        'ops_mobile.html',
+        snapshot=snapshot,
+        timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    )
+
+
 @app.route('/api/metrics')
 def api_metrics():
     """API: Métricas atuais."""
     metrics = get_current_metrics()
     return jsonify(metrics or {})
+
+
+@app.route('/api/ops')
+def api_ops():
+    """API: Resumo curto para operação móvel."""
+    return jsonify(build_mobile_ops_snapshot())
 
 
 @app.route('/api/extended')

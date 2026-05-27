@@ -28,33 +28,33 @@ class GreenRANGraphSAGEHybridFinalTests(unittest.TestCase):
         selected = select_best_source(rows, 0.5)
         self.assertEqual(selected["app2_degradado_critico"].source, "protocol")
 
-    def test_select_best_source_prefers_clean_protocol_when_it_improves(self):
+    def test_select_best_source_prefers_protocol_when_it_improves(self):
         rows = [
-            AggregateRow("protocol", "vehicle_critical", 0.5, 5, 0, 0.664706, 0.682353),
-            AggregateRow("protocol_vehicle_clean", "vehicle_critical", 0.5, 5, 5, 1.0, 1.0),
+            AggregateRow("family_v1", "vehicle_critical", 0.5, 5, 0, 0.664706, 0.682353),
+            AggregateRow("protocol", "vehicle_critical", 0.5, 5, 5, 1.0, 1.0),
         ]
         selected = select_best_source(rows, 0.5)
-        self.assertEqual(selected["vehicle_critical"].source, "protocol_vehicle_clean")
+        self.assertEqual(selected["vehicle_critical"].source, "protocol")
 
-    def test_select_best_source_prefers_clean_remaining_protocol_when_it_improves(self):
+    def test_select_best_source_prefers_protocol_for_promoted_app12_scenarios(self):
         rows = [
             AggregateRow("family_v1", "app1_latencia", 0.5, 5, 0, 0.842105, 0.842105),
-            AggregateRow("protocol_clean_remaining", "app1_latencia", 0.5, 5, 5, 1.0, 1.0),
+            AggregateRow("protocol", "app1_latencia", 0.5, 5, 5, 1.0, 1.0),
         ]
         selected = select_best_source(rows, 0.5)
-        self.assertEqual(selected["app1_latencia"].source, "protocol_clean_remaining")
+        self.assertEqual(selected["app1_latencia"].source, "protocol")
 
-    def test_select_best_source_prefers_last_two_protocol_when_it_improves(self):
+    def test_select_best_source_prefers_protocol_for_promoted_app1_throughput(self):
         rows = [
             AggregateRow("family_v1", "app1_throughput", 0.5, 5, 3, 0.929524, 0.929524),
-            AggregateRow("protocol_last_two", "app1_throughput", 0.5, 5, 5, 1.0, 1.0),
+            AggregateRow("protocol", "app1_throughput", 0.5, 5, 5, 1.0, 1.0),
         ]
         selected = select_best_source(rows, 0.5)
-        self.assertEqual(selected["app1_throughput"].source, "protocol_last_two")
+        self.assertEqual(selected["app1_throughput"].source, "protocol")
 
     def test_select_best_source_prefers_vehicle_recovery_calibration_when_it_closes_gap(self):
         rows = [
-            AggregateRow("protocol_last_two", "vehicle_recovery", 0.5, 5, 4, 0.945455, 0.96),
+            AggregateRow("protocol", "vehicle_recovery", 0.5, 5, 4, 0.945455, 0.96),
             AggregateRow("calibration_vehicle_recovery", "vehicle_recovery", 0.5, 5, 5, 1.0, 1.0),
         ]
         selected = select_best_source(rows, 0.5)

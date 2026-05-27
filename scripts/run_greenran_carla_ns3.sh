@@ -69,8 +69,6 @@ sleep 1
 
 echo "=== [CARLA 2/3] Iniciando mapeador vehicle_id -> IMSI ==="
 nohup python3 ./src/carla_ns3_mapper.py \
-  --base-imsi 16 \
-  --max-vehicles 5 \
   --poll-interval "$CARLA_MAPPER_POLL_INTERVAL" \
   > "$CARLA_MAPPER_LOG" 2>&1 &
 echo $! > "$CARLA_MAPPER_PID"

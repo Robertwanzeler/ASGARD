@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATE_DIR="${GREENRAN_STATE_DIR:-/tmp}"
 RUNTIME_JSON="$PROJECT_DIR/config/core/runtime.json"
+FIXED_SCENARIO_JSON="$PROJECT_DIR/config/greenran_fixed_scenario.json"
 
 export GREENRAN_PROJECT_DIR="$PROJECT_DIR"
 export GREENRAN_STATE_DIR="$STATE_DIR"
@@ -16,6 +17,33 @@ export GREENRAN_PORT_OFFSET="${GREENRAN_PORT_OFFSET:-0}"
 runtime_json_get() {
     local dotted_key="$1"
     python3 - "$RUNTIME_JSON" "$dotted_key" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+json_path = Path(sys.argv[1])
+dotted_key = sys.argv[2]
+
+if not json_path.exists():
+    raise SystemExit(1)
+
+with open(json_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+value = data
+for part in dotted_key.split("."):
+    value = value[part]
+
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+}
+
+fixed_scenario_json_get() {
+    local dotted_key="$1"
+    python3 - "${GREENRAN_FIXED_SCENARIO_CONFIG:-$FIXED_SCENARIO_JSON}" "$dotted_key" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -59,6 +87,13 @@ load_greenran_runtime() {
     export GREENRAN_COLLECTOR_POLL_INTERVAL="${GREENRAN_COLLECTOR_POLL_INTERVAL:-$(runtime_json_get collector.poll_interval_seconds)}"
     export GREENRAN_SIM_TIME="${GREENRAN_SIM_TIME:-$(runtime_json_get simulation.default_sim_time_seconds)}"
 
+    export GREENRAN_FIXED_SCENARIO_CONFIG="${GREENRAN_FIXED_SCENARIO_CONFIG:-$FIXED_SCENARIO_JSON}"
+    export GREENRAN_FIXED_TOTAL_UES="${GREENRAN_FIXED_TOTAL_UES:-$(fixed_scenario_json_get ns3.total_ues)}"
+    export GREENRAN_FIXED_ACTIVE_CAMERAS="${GREENRAN_FIXED_ACTIVE_CAMERAS:-$(fixed_scenario_json_get apps.app1.active_cameras)}"
+    export GREENRAN_FIXED_VEHICLE_BASE_IMSI="${GREENRAN_FIXED_VEHICLE_BASE_IMSI:-$(fixed_scenario_json_get apps.app3.base_imsi)}"
+    export GREENRAN_FIXED_MAX_VEHICLES="${GREENRAN_FIXED_MAX_VEHICLES:-$(fixed_scenario_json_get apps.app3.max_vehicles)}"
+    export GREENRAN_FIXED_BACKGROUND_UES="${GREENRAN_FIXED_BACKGROUND_UES:-$((GREENRAN_FIXED_TOTAL_UES - GREENRAN_FIXED_ACTIVE_CAMERAS))}"
+
     export GREENRAN_DB_PATH="$STATE_DIR/rapp_data_lake.db"
     export GREENRAN_RAPP_LOG="$STATE_DIR/rapp.log"
     export GREENRAN_DASHBOARD_LOG="$STATE_DIR/dashboard.log"
@@ -67,11 +102,13 @@ load_greenran_runtime() {
     export GREENRAN_NS3_LOG="$STATE_DIR/ns3.log"
     export GREENRAN_XAPP_SLICER_LOG="$STATE_DIR/xapp_slicer.log"
     export GREENRAN_XAPP_ENERGY_LOG="$STATE_DIR/xapp_energy.log"
+    export GREENRAN_XAPP_VEHICLE_LOG="$STATE_DIR/xapp_vehicle.log"
     export GREENRAN_CSV_LOG="$STATE_DIR/csv_metrics.log"
     export GREENRAN_PUSH_STATS_LOG="$STATE_DIR/push_stats.log"
     export GREENRAN_PUSH_CVAR_LOG="$STATE_DIR/push_cvar.log"
     export GREENRAN_PUSH_APP1_LOG="$STATE_DIR/push_app1.log"
     export GREENRAN_PUSH_APP2_LOG="$STATE_DIR/push_app2.log"
+    export GREENRAN_PUSH_APP3_LOG="$STATE_DIR/push_app3.log"
     export GREENRAN_APP1_LOG="$STATE_DIR/app1_vigilancia.log"
     export GREENRAN_APP1_SIMULATOR_LOG="$STATE_DIR/app1_camera_simulator.log"
     export GREENRAN_APP2_LOG="$STATE_DIR/app2_monitoramento.log"
@@ -109,10 +146,12 @@ load_greenran_runtime() {
     export GREENRAN_NS3_PID="$STATE_DIR/ns3.pid"
     export GREENRAN_XAPP_SLICER_PID="$STATE_DIR/xapp_slicer.pid"
     export GREENRAN_XAPP_ENERGY_PID="$STATE_DIR/xapp_energy.pid"
+    export GREENRAN_XAPP_VEHICLE_PID="$STATE_DIR/xapp_vehicle.pid"
     export GREENRAN_CSV_PID="$STATE_DIR/csv_metrics.pid"
     export GREENRAN_RAPP_PID="$STATE_DIR/rapp.pid"
     export GREENRAN_PUSH_APP1_PID="$STATE_DIR/push_app1.pid"
     export GREENRAN_PUSH_APP2_PID="$STATE_DIR/push_app2.pid"
+    export GREENRAN_PUSH_APP3_PID="$STATE_DIR/push_app3.pid"
     export GREENRAN_APP1_PID="$STATE_DIR/app1_vigilancia.pid"
     export GREENRAN_APP1_SIMULATOR_PID="$STATE_DIR/app1_camera_simulator.pid"
     export GREENRAN_APP2_PID="$STATE_DIR/app2_monitoramento.pid"
@@ -199,11 +238,13 @@ snapshot_greenran_state() {
         "$GREENRAN_NS3_LOG"
         "$GREENRAN_XAPP_SLICER_LOG"
         "$GREENRAN_XAPP_ENERGY_LOG"
+        "$GREENRAN_XAPP_VEHICLE_LOG"
         "$GREENRAN_CSV_LOG"
         "$GREENRAN_PUSH_STATS_LOG"
         "$GREENRAN_PUSH_CVAR_LOG"
         "$GREENRAN_PUSH_APP1_LOG"
         "$GREENRAN_PUSH_APP2_LOG"
+        "$GREENRAN_PUSH_APP3_LOG"
         "$GREENRAN_APP1_LOG"
         "$GREENRAN_APP2_LOG"
         "$GREENRAN_APP3_LOG"
@@ -231,4 +272,11 @@ snapshot_greenran_state() {
             cp -f "$file" "$GREENRAN_RUN_STATE_DIR/$(basename "$file")" 2>/dev/null || true
         fi
     done
+}
+
+
+print_greenran_fixed_scenario_summary() {
+    echo "Cenario fixo ativo:"
+    echo "  - ns-3 UEs: ${GREENRAN_FIXED_TOTAL_UES} (${GREENRAN_FIXED_ACTIVE_CAMERAS} cameras + ${GREENRAN_FIXED_BACKGROUND_UES} background)"
+    echo "  - App3 veiculos: ate ${GREENRAN_FIXED_MAX_VEHICLES} (IMSI base ${GREENRAN_FIXED_VEHICLE_BASE_IMSI})"
 }

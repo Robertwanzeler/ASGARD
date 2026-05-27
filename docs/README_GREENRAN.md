@@ -146,8 +146,8 @@ Resultado Esperado:
          ┌──────────────────┴──────────────────┐
          │    ns-3 (scenario-greenran)        │
          │  3 Câmaras (rajadas 120Mbps)      │
-         │  6 UEs extras (rajadas 30-55Mbps) │
-         │  3 UEs background (bursty)         │
+         │  9 UEs background (bursty)         │
+         │  Faixa App3: IMSI 16-20 (5 veic.)  │
          │  S1-U: 15Mbps (gargalo)           │
          │  Buffer: 20MB                      │
          └───────────────────────────────────┘

@@ -18,6 +18,14 @@ create_greenran_run "greenran_v2" >/dev/null
 
 GREENRAN_CLEAN_SCOPE="${GREENRAN_CLEAN_SCOPE:-global}"
 GREENRAN_ENABLE_MONITORING_STACK="${GREENRAN_ENABLE_MONITORING_STACK:-1}"
+GREENRAN_REQUIRE_REAL_APP2_SENSORS="${GREENRAN_REQUIRE_REAL_APP2_SENSORS:-1}"
+GREENRAN_APP2_REAL_SENSOR_WAIT_SECONDS="${GREENRAN_APP2_REAL_SENSOR_WAIT_SECONDS:-60}"
+GREENRAN_COLLECTION_EVENT_PROFILE="${GREENRAN_COLLECTION_EVENT_PROFILE:-none}"
+GREENRAN_RAN_PRESSURE_PROFILE="${GREENRAN_RAN_PRESSURE_PROFILE:-$GREENRAN_COLLECTION_EVENT_PROFILE}"
+GREENRAN_COLLECTION_EVENT_CYCLES="${GREENRAN_COLLECTION_EVENT_CYCLES:-0}"
+GREENRAN_COLLECTION_EVENT_TICK_S="${GREENRAN_COLLECTION_EVENT_TICK_S:-1.0}"
+GREENRAN_COLLECTION_EVENT_LOG="${GREENRAN_COLLECTION_EVENT_LOG:-$STATE_DIR/collection_event_alternator.log}"
+GREENRAN_COLLECTION_EVENT_PID="${GREENRAN_COLLECTION_EVENT_PID:-$STATE_DIR/collection_event_alternator.pid}"
 
 register_app2_dashboard_when_ready() {
     local attempts=20
@@ -34,6 +42,24 @@ register_app2_dashboard_when_ready() {
 
     echo -e "${RED}    Aviso: falha ao registrar dashboard App2 no Grafana${NC}"
     echo -e "${RED}    Verifique: $STATE_DIR/create_grafana_app2.log${NC}"
+    return 1
+}
+
+register_app3_dashboard_when_ready() {
+    local attempts=20
+    local sleep_s=5
+    local i
+
+    for ((i=1; i<=attempts; i++)); do
+        if python3 ./push/create_grafana_app3.py > "$STATE_DIR/create_grafana_app3.log" 2>&1; then
+            echo -e "${GREEN}    Dashboard App3 registrado no Grafana${NC}"
+            return 0
+        fi
+        sleep "$sleep_s"
+    done
+
+    echo -e "${RED}    Aviso: falha ao registrar dashboard App3 no Grafana${NC}"
+    echo -e "${RED}    Verifique: $STATE_DIR/create_grafana_app3.log${NC}"
     return 1
 }
 
@@ -55,14 +81,27 @@ resolve_ric_binary() {
 }
 
 resolve_ns3_binary() {
-    local candidates=(
-        "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-optimized"
-        "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-default"
-        "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-debug"
-        "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-zero-with_parallel_loging-default"
-        "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-zero-default"
-        "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-zero-debug"
-    )
+    local candidates=()
+    if [ "$GREENRAN_REQUIRE_REAL_APP2_SENSORS" = "1" ]; then
+        candidates=(
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario-default"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-Energy_Saving_with_load_balancing_scenario-default"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-optimized"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-default"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-debug"
+        )
+    else
+        candidates=(
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario-default"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-Energy_Saving_with_load_balancing_scenario-default"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-optimized"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-default"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-greenran-debug"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-zero-with_parallel_loging-default"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-zero-default"
+            "$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-scenario-zero-debug"
+        )
+    fi
     local candidate
     for candidate in "${candidates[@]}"; do
         if [ -x "$candidate" ]; then
@@ -77,11 +116,27 @@ ns3_binary_supports_real_app2_sensors() {
     local binary_name
     binary_name="$(basename "$1")"
     case "$binary_name" in
+        ns3.42-Energy_saving_with_cell_utilization_scenario-*|ns3.42-Energy_Saving_with_load_balancing_scenario-*)
+            return 0
+            ;;
         ns3.42-scenario-greenran-*)
             return 0
             ;;
         *)
             return 1
+            ;;
+    esac
+}
+
+ns3_binary_max_sim_time() {
+    local binary_name
+    binary_name="$(basename "$1")"
+    case "$binary_name" in
+        ns3.42-Energy_saving_with_cell_utilization_scenario-*|ns3.42-Energy_Saving_with_load_balancing_scenario-*)
+            echo "100000"
+            ;;
+        *)
+            echo ""
             ;;
     esac
 }
@@ -93,6 +148,7 @@ has_e2_assoc() {
 app2_has_real_sensor_ues() {
     python3 - "$STATE_DIR" <<'PY'
 import json
+import time
 import sys
 from pathlib import Path
 
@@ -105,9 +161,36 @@ try:
 except Exception:
     raise SystemExit(1)
 
-total = int((data.get("global_metrics", {}) or {}).get("total_active_sensors", 0) or 0)
-raise SystemExit(0 if total > 0 else 1)
+try:
+    file_age_s = max(0.0, time.time() - path.stat().st_mtime)
+except OSError:
+    file_age_s = None
+
+global_metrics = data.get("global_metrics", {}) or {}
+ue_metrics = data.get("ue_metrics", {}) or {}
+total = int(global_metrics.get("total_active_sensors", 0) or 0)
+sensor_ues = sum(1 for ue in ue_metrics.values() if (ue or {}).get("device_type") == "sensor")
+
+if file_age_s is not None and file_age_s > 90:
+    raise SystemExit(1)
+
+raise SystemExit(0 if total > 0 or sensor_ues > 0 else 1)
 PY
+}
+
+wait_for_app2_real_sensor_ues() {
+    local attempts="${1:-25}"
+    local sleep_s="${2:-1}"
+    local i
+
+    for ((i=1; i<=attempts; i++)); do
+        if app2_has_real_sensor_ues; then
+            return 0
+        fi
+        sleep "$sleep_s"
+    done
+
+    return 1
 }
 
 wait_for_armd_artifacts() {
@@ -268,6 +351,7 @@ cleanup_instance_processes() {
     echo -e "${BLUE}    Limpando apenas processos desta instância (${GREENRAN_INSTANCE_NAME})...${NC}"
     kill_pid_if_running "$GREENRAN_XAPP_SLICER_PID"
     kill_pid_if_running "$GREENRAN_XAPP_ENERGY_PID"
+    kill_pid_if_running "$GREENRAN_XAPP_VEHICLE_PID"
     kill_pid_if_running "$GREENRAN_NS3_PID"
     if [ "${GREENRAN_DISABLE_RIC:-0}" != "1" ]; then
         kill_pid_if_running "$GREENRAN_RIC_PID"
@@ -283,9 +367,29 @@ cleanup_instance_processes() {
     kill_pid_if_running "$GREENRAN_APP3_PID"
     kill_pid_if_running "$GREENRAN_PUSH_APP1_PID"
     kill_pid_if_running "$GREENRAN_PUSH_APP2_PID"
+    kill_pid_if_running "$GREENRAN_PUSH_APP3_PID"
     kill_pid_if_running "$GREENRAN_CARLA_BRIDGE_PID"
     kill_pid_if_running "$GREENRAN_CARLA_MAPPER_PID"
     kill_pid_if_running "$GREENRAN_STAGE_CONTROLLER_PID"
+    kill_pid_if_running "$GREENRAN_COLLECTION_EVENT_PID"
+}
+
+cleanup_ns3_runtime_artifacts() {
+    local ns3_runtime_dir="$BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran"
+    local patterns=(
+        "DlPdcpStats.txt"
+        "DlMacStats.txt"
+        "DlRlcStats.txt"
+        "cu-up-cell-*.txt"
+        "cu-cp-cell-*.txt"
+        "du-cell-*.txt"
+    )
+    local pattern
+
+    echo -e "${BLUE}    Limpando artefatos de métricas do ns-3 antes da nova rodada...${NC}"
+    for pattern in "${patterns[@]}"; do
+        rm -f "$ns3_runtime_dir"/$pattern
+    done
 }
 
 start_runtime_stage_controller() {
@@ -295,7 +399,7 @@ start_runtime_stage_controller() {
         return 0
     fi
 
-    nohup python3 ./scripts/runtime_stage_controller.py \
+    setsid python3 ./scripts/runtime_stage_controller.py \
         --required-streak "$GREENRAN_STAGE_REQUIRED_STREAK" \
         > "$GREENRAN_STAGE_CONTROLLER_LOG" 2>&1 &
     echo $! > "$GREENRAN_STAGE_CONTROLLER_PID"
@@ -310,7 +414,7 @@ start_app2_simulator() {
         "$STATE_DIR/app2_monitoramento/simulator_state.json" \
         "$STATE_DIR/app2_monitoramento/sensors/latest.json" \
         "$STATE_DIR/app2_monitoramento/monitoring_snapshot.json"
-    nohup python3 ./apps/app2_monitoramento/backend/simulate_sensors.py --num-sensors 17 --interval 5.0 > "$GREENRAN_APP2_SIMULATOR_LOG" 2>&1 &
+    setsid python3 ./apps/app2_monitoramento/backend/simulate_sensors.py --num-sensors 17 --interval 5.0 > "$GREENRAN_APP2_SIMULATOR_LOG" 2>&1 &
     echo $! > "$GREENRAN_APP2_SIMULATOR_PID"
     sleep 2
 }
@@ -337,7 +441,7 @@ start_carla_support_stack() {
     fi
 
     mkdir -p "$STATE_DIR/carla_state"
-    nohup python3 ./src/carla_bridge.py \
+    setsid python3 ./src/carla_bridge.py \
         --mode "$effective_mode" \
         --host "$GREENRAN_CARLA_HOST" \
         --port "$GREENRAN_CARLA_PORT" \
@@ -346,9 +450,7 @@ start_carla_support_stack() {
     echo $! > "$GREENRAN_CARLA_BRIDGE_PID"
     sleep 1
 
-    nohup python3 ./src/carla_ns3_mapper.py \
-        --base-imsi 16 \
-        --max-vehicles 5 \
+    setsid python3 ./src/carla_ns3_mapper.py \
         --poll-interval "$GREENRAN_CARLA_MAPPER_POLL_INTERVAL" \
         > "$GREENRAN_CARLA_MAPPER_LOG" 2>&1 &
     echo $! > "$GREENRAN_CARLA_MAPPER_PID"
@@ -356,6 +458,25 @@ start_carla_support_stack() {
 
     echo -e "${GREEN}    Bridge CARLA ativo em modo ${effective_mode}${NC}"
     echo -e "${GREEN}    Mapper CARLA->IMSI ativo${NC}"
+}
+
+start_collection_event_alternator() {
+    if [ "${GREENRAN_COLLECTION_EVENT_PROFILE}" = "none" ]; then
+        rm -f "$GREENRAN_COLLECTION_EVENT_PID"
+        echo -e "${YELLOW}    Alternador de eventos de coleta desabilitado${NC}"
+        return 0
+    fi
+
+    setsid python3 ./scripts/collection_event_alternator.py \
+        --profile "$GREENRAN_COLLECTION_EVENT_PROFILE" \
+        --cycles "$GREENRAN_COLLECTION_EVENT_CYCLES" \
+        --tick-s "$GREENRAN_COLLECTION_EVENT_TICK_S" \
+        --time-source sim \
+        > "$GREENRAN_COLLECTION_EVENT_LOG" 2>&1 &
+    echo $! > "$GREENRAN_COLLECTION_EVENT_PID"
+    sleep 1
+    echo -e "${GREEN}    Alternador de eventos ativo: ${GREENRAN_COLLECTION_EVENT_PROFILE}${NC}"
+    echo -e "${GREEN}    Log: ${GREENRAN_COLLECTION_EVENT_LOG}${NC}"
 }
 
 RIC_BIN="$(resolve_ric_binary)" || {
@@ -366,7 +487,16 @@ RIC_BIN="$(resolve_ric_binary)" || {
 
 NS3_BIN="$(resolve_ns3_binary)" || {
     echo -e "${RED}ERRO: binário do cenário ns-3 não encontrado.${NC}"
-    echo -e "${RED}Esperado em build/scratch como scenario-greenran-* ou scenario-zero-*.${NC}"
+    if [ "$GREENRAN_REQUIRE_REAL_APP2_SENSORS" = "1" ]; then
+        echo -e "${RED}Você pediu App2 com dados reais do ns-3; por isso o launcher exige um binário com mMTC real.${NC}"
+        echo -e "${RED}Procure/compile um destes alvos em build/scratch:${NC}"
+        echo -e "${RED}  - ns3.42-Energy_saving_with_cell_utilization_scenario-default${NC}"
+        echo -e "${RED}  - ns3.42-Energy_Saving_with_load_balancing_scenario-default${NC}"
+        echo -e "${RED}  - ou um scenario-greenran-* equivalente${NC}"
+        echo -e "${RED}Com o estado atual, o scenario-zero-* só entrega App1 real (câmeras) e força App2 em fallback.${NC}"
+    else
+        echo -e "${RED}Esperado em build/scratch como scenario-greenran-* ou scenario-zero-*.${NC}"
+    fi
     exit 1
 }
 
@@ -374,6 +504,7 @@ GREENRAN_DISABLE_RIC="${GREENRAN_DISABLE_RIC:-0}"
 
 # Tempo de simulacao configuravel
 SIM_TIME="$GREENRAN_SIM_TIME"
+REQUESTED_SIM_TIME="$SIM_TIME"
 
 # Cores para o terminal
 GREEN='\033[0;32m'
@@ -403,9 +534,11 @@ else
     pkill -9 -f "push_cvar_to_influx.py" 2>/dev/null || true
     pkill -9 -f "push_app1_to_influx.py" 2>/dev/null || true
     pkill -9 -f "push_app2_to_influx.py" 2>/dev/null || true
+    pkill -9 -f "push_app3_to_influx.py" 2>/dev/null || true
     pkill -9 -f "python3 ./src/carla_bridge.py" 2>/dev/null || true
     pkill -9 -f "python3 ./src/carla_ns3_mapper.py" 2>/dev/null || true
     pkill -9 -f "python3 ./scripts/runtime_stage_controller.py" 2>/dev/null || true
+    pkill -9 -f "python3 ./scripts/collection_event_alternator.py" 2>/dev/null || true
 fi
 
 if [ "$GREENRAN_CLEAN_SCOPE" != "instance" ]; then
@@ -422,6 +555,7 @@ echo -e "${BLUE}    Limpando arquivos PID antigos...${NC}"
 rm -f "$GREENRAN_XAPP_SLICER_PID"
 rm -f "$STATE_DIR/xapp_energy_saver.pid"
 rm -f "$GREENRAN_XAPP_ENERGY_PID"
+rm -f "$GREENRAN_XAPP_VEHICLE_PID"
 rm -f "$GREENRAN_NS3_PID"
 rm -f "$GREENRAN_RIC_PID"
 rm -f "$GREENRAN_CSV_PID"
@@ -435,6 +569,7 @@ rm -f "$GREENRAN_APP2_SIMULATOR_PID"
 rm -f "$GREENRAN_APP3_PID"
 rm -f "$GREENRAN_PUSH_APP1_PID"
 rm -f "$GREENRAN_PUSH_APP2_PID"
+rm -f "$GREENRAN_PUSH_APP3_PID"
 rm -f "$GREENRAN_CARLA_BRIDGE_PID"
 rm -f "$GREENRAN_CARLA_MAPPER_PID"
 rm -f "$GREENRAN_STAGE_CONTROLLER_PID"
@@ -474,6 +609,7 @@ else
         pkill -9 -f "push_cvar_to_influx.py" 2>/dev/null || true
         pkill -9 -f "push_app1_to_influx.py" 2>/dev/null || true
         pkill -9 -f "push_app2_to_influx.py" 2>/dev/null || true
+        pkill -9 -f "push_app3_to_influx.py" 2>/dev/null || true
         pkill -9 -f "python3 ./src/carla_bridge.py" 2>/dev/null || true
         pkill -9 -f "python3 ./src/carla_ns3_mapper.py" 2>/dev/null || true
         sleep 2
@@ -491,8 +627,10 @@ rm -f "$STATE_DIR"/article00_scenario_control.json
 mkdir -p "$STATE_DIR/xapp_intents" "$STATE_DIR/xapp_metrics" "$STATE_DIR/app1_vigilancia" "$STATE_DIR/app2_monitoramento/sensors" "$STATE_DIR/app3_veicular/vehicles" "$STATE_DIR/app3_veicular/events"
 sleep 2
 
+cleanup_ns3_runtime_artifacts
+
 if ns3_binary_supports_real_app2_sensors "$NS3_BIN"; then
-    NS3_RUNTIME_PROFILE_MSG="GreenRAN completo (câmeras + sensores mMTC esperados)"
+    NS3_RUNTIME_PROFILE_MSG="cenário com câmeras + sensores mMTC reais esperados"
 else
     NS3_RUNTIME_PROFILE_MSG="cenário sem sensores mMTC reais exportados para App2"
 fi
@@ -504,7 +642,7 @@ if [ "$GREENRAN_DISABLE_RIC" = "1" ]; then
     echo -e "${YELLOW}    RIC desabilitado por GREENRAN_DISABLE_RIC=1; seguindo em modo coleta sem E2.${NC}"
     : > "$GREENRAN_RIC_LOG"
 else
-    nohup "$RIC_BIN" -c $BASE_DIR/flexric/flexric.conf -p $BASE_DIR/flexric_lib/ > "$GREENRAN_RIC_LOG" 2>&1 &
+    setsid "$RIC_BIN" -c $BASE_DIR/flexric/flexric.conf -p $BASE_DIR/flexric_lib/ > "$GREENRAN_RIC_LOG" 2>&1 &
     echo $! > "$GREENRAN_RIC_PID"
     sleep 3
     if ! ps -p "$(cat "$GREENRAN_RIC_PID" 2>/dev/null)" >/dev/null 2>&1; then
@@ -515,13 +653,38 @@ else
 fi
 
 echo -e "${BLUE}=== [4/9] Iniciando ns-3 (Scenario GreenRAN - 1 hora) ===${NC}"
+NS3_MAX_SIM_TIME="$(ns3_binary_max_sim_time "$NS3_BIN")"
+if [ -n "$NS3_MAX_SIM_TIME" ] && [ "$SIM_TIME" -gt "$NS3_MAX_SIM_TIME" ]; then
+    echo -e "${YELLOW}    Aviso: binario $(basename "$NS3_BIN") rejeita simTime > $NS3_MAX_SIM_TIME; ajustando ${REQUESTED_SIM_TIME}s -> ${NS3_MAX_SIM_TIME}s${NC}"
+    SIM_TIME="$NS3_MAX_SIM_TIME"
+fi
 echo -e "${GREEN}    Binário ns-3: $NS3_BIN${NC}"
 echo -e "${GREEN}    Perfil ns-3: $NS3_RUNTIME_PROFILE_MSG${NC}"
+GREENRAN_NS3_ENABLE_TRACES="${GREENRAN_NS3_ENABLE_TRACES:-0}"
+echo -e "${GREEN}    Pressao RAN: $GREENRAN_RAN_PRESSURE_PROFILE${NC}"
+echo -e "${GREEN}    Traces ns-3: $GREENRAN_NS3_ENABLE_TRACES${NC}"
+echo -e "${GREEN}    simTime efetivo: $SIM_TIME s${NC}"
 cd $BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran
 # Forçamos o LD_LIBRARY_PATH aqui também para o ns-3
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH
-    nohup "$NS3_BIN" --e2TermIp=127.0.0.1 --simTime=$SIM_TIME > "$GREENRAN_NS3_LOG" 2>&1 &
+setsid "$NS3_BIN" --e2TermIp=127.0.0.1 --simTime="$SIM_TIME" --ranPressureProfile="$GREENRAN_RAN_PRESSURE_PROFILE" --enableTraces="$GREENRAN_NS3_ENABLE_TRACES" > "$GREENRAN_NS3_LOG" 2>&1 &
+echo $! > "$GREENRAN_NS3_PID"
 cd $BASE_DIR
+sleep 2
+
+if ! ps -p "$(cat "$GREENRAN_NS3_PID" 2>/dev/null)" >/dev/null 2>&1; then
+    echo -e "${RED}    ERRO: o ns-3 encerrou logo após o startup.${NC}"
+    echo -e "${RED}    Verifique: $GREENRAN_NS3_LOG${NC}"
+    tail -n 20 "$GREENRAN_NS3_LOG" 2>/dev/null || true
+    exit 1
+fi
+
+if grep -q "Invalid command-line argument" "$GREENRAN_NS3_LOG" 2>/dev/null; then
+    echo -e "${RED}    ERRO: o ns-3 rejeitou a linha de comando de inicializacao.${NC}"
+    echo -e "${RED}    Verifique: $GREENRAN_NS3_LOG${NC}"
+    tail -n 20 "$GREENRAN_NS3_LOG" 2>/dev/null || true
+    exit 1
+fi
 
 # Aguarda o ns-3 estabelecer conexão E2
 if [ "$RIC_ACTIVE" = "1" ]; then
@@ -544,6 +707,12 @@ if [ "$RIC_ACTIVE" = "1" ]; then
             RIC_ACTIVE=0
             break
         fi
+        if [ -f "$GREENRAN_NS3_PID" ] && ! ps -p "$(cat "$GREENRAN_NS3_PID" 2>/dev/null)" >/dev/null 2>&1; then
+            echo -e "${RED}    ERRO: o ns-3 encerrou durante o handshake E2.${NC}"
+            echo -e "${RED}    Verifique: $GREENRAN_NS3_LOG${NC}"
+            tail -n 20 "$GREENRAN_NS3_LOG" 2>/dev/null || true
+            exit 1
+        fi
         if [ -f "$GREENRAN_RIC_PID" ] && ! ps -p "$(cat "$GREENRAN_RIC_PID" 2>/dev/null)" >/dev/null 2>&1; then
             echo -e "${YELLOW}    nearRT-RIC encerrou durante o handshake; seguindo em modo coleta sem E2.${NC}"
             echo -e "${YELLOW}    Verifique: $GREENRAN_RIC_LOG${NC}"
@@ -560,20 +729,33 @@ else
 fi
 
 echo -e "${BLUE}=== [5/9] Iniciando Leitor de Métricas ===${NC}"
-nohup /bin/bash -lc "cd '$BASE_DIR' && while true; do python3 ./src/csv_to_metrics.py --input-dir ./ns-O-RAN-flexric/mmwave-LENA-oran --output '$STATE_DIR/xapp_metrics/metrics.json' --poll-interval '$GREENRAN_COLLECTOR_POLL_INTERVAL'; code=\$?; echo \"[CSV_METRICS_SUPERVISOR] collector exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_CSV_LOG" 2>&1 &
+setsid /bin/bash -lc "cd '$BASE_DIR' && while true; do python3 ./src/csv_to_metrics.py --input-dir ./ns-O-RAN-flexric/mmwave-LENA-oran --output '$STATE_DIR/xapp_metrics/metrics.json' --poll-interval '$GREENRAN_COLLECTOR_POLL_INTERVAL'; code=\$?; echo \"[CSV_METRICS_SUPERVISOR] collector exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_CSV_LOG" 2>&1 &
 echo $! > "$GREENRAN_CSV_PID"
 sleep 2
 
 # NÃO INICIAMOS xApps DIRETAMENTE!
 # O rApp controla o ciclo de vida dos xApps:
 #   - SLICER: iniciado automaticamente pelo rApp (prioridade)
+#   - VEHICLE: iniciado automaticamente pelo rApp (App3)
 #   - ENERGY: iniciado pelo rApp quando condições permitirem
 echo -e "${BLUE}=== [6/9] xApps serao iniciados pelo rApp ===${NC}"
 echo -e "${BLUE}    - xApp SLICER: iniciado com rApp (prioridade) ===${NC}"
+echo -e "${BLUE}    - xApp VEHICLE: iniciado com rApp (App3) ===${NC}"
 echo -e "${BLUE}    - xApp ENERGY: ativado pelo rApp quando permitido ===${NC}"
 
 echo -e "${BLUE}=== [7/9] Initiating rApp Orchestrator (ML TRAINING) ===${NC}"
-nohup python3 ./src/rapp_orchestrator.py --synthetic "$GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS" --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" > "$GREENRAN_RAPP_LOG" 2>&1 &
+RAPP_PYTHON_BIN="python3"
+case "${GREENRAN_RL_POLICY:-legacy_a3c}" in
+    sac|caora_sac|resource_sac|awac|caora_awac|resource_awac)
+        if [ -x "$BASE_DIR/drlexp/.venv/bin/python" ]; then
+            RAPP_PYTHON_BIN="$BASE_DIR/drlexp/.venv/bin/python"
+            echo -e "${GREEN}    rApp usando virtualenv RL: $RAPP_PYTHON_BIN${NC}"
+        else
+            echo -e "${YELLOW}    Aviso: virtualenv RL nao encontrado; usando python3 do sistema${NC}"
+        fi
+        ;;
+esac
+setsid "$RAPP_PYTHON_BIN" ./src/rapp_orchestrator.py --synthetic "$GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS" --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" > "$GREENRAN_RAPP_LOG" 2>&1 &
 echo $! > "$GREENRAN_RAPP_PID"
 sleep 3
 
@@ -598,14 +780,14 @@ if [ "$GREENRAN_APP1_CAMERA_SOURCE_MODE" = "real" ]; then
 else
     mkdir -p "$STATE_DIR/app1_vigilancia/camera_sources"
     rm -f "$STATE_DIR/app1_vigilancia/camera_sources/simulator_state.json"
-    nohup python3 ./apps/app1_vigilancia/backend/simulate_cameras.py --interval "$GREENRAN_APP1_SIMULATOR_INTERVAL" --duration 2 --resolution 3840x2160 > "$GREENRAN_APP1_SIMULATOR_LOG" 2>&1 &
+    setsid python3 ./apps/app1_vigilancia/backend/simulate_cameras.py --interval "$GREENRAN_APP1_SIMULATOR_INTERVAL" --duration 2 --resolution 3840x2160 > "$GREENRAN_APP1_SIMULATOR_LOG" 2>&1 &
     echo $! > "$GREENRAN_APP1_SIMULATOR_PID"
     sleep 2
     echo -e "${GREEN}    Simulador App1 iniciado; fontes em $STATE_DIR/app1_vigilancia/camera_sources${NC}"
 fi
 
 echo -e "${BLUE}=== [9/11] Iniciando App1-Vigilancia ===${NC}"
-nohup env GREENRAN_APP1_CAMERAS_BOOTSTRAP="$GREENRAN_APP1_CAMERAS_BOOTSTRAP" python3 ./apps/app1_vigilancia/backend/app.py --host "$APP1_HOST" --port "$APP1_PORT" > "$GREENRAN_APP1_LOG" 2>&1 &
+setsid env GREENRAN_APP1_CAMERAS_BOOTSTRAP="$GREENRAN_APP1_CAMERAS_BOOTSTRAP" python3 ./apps/app1_vigilancia/backend/app.py --host "$APP1_HOST" --port "$APP1_PORT" > "$GREENRAN_APP1_LOG" 2>&1 &
 echo $! > "$GREENRAN_APP1_PID"
 sleep 2
 echo -e "${GREEN}    App1 disponível em http://localhost:${APP1_PORT}${NC}"
@@ -619,19 +801,36 @@ if [ "$APP2_SENSOR_SOURCE" = "mock" ]; then
 else
     rm -f "$GREENRAN_APP2_SIMULATOR_PID"
     if ! ns3_binary_supports_real_app2_sensors "$NS3_BIN"; then
-        echo -e "${YELLOW}    Binário ns-3 atual não exporta sensores mMTC reais; ativando fallback do simulador App2${NC}"
-        start_app2_simulator
-        APP2_SENSOR_SOURCE="mock-fallback"
+        if [ "$GREENRAN_REQUIRE_REAL_APP2_SENSORS" = "1" ]; then
+            echo -e "${RED}    ERRO: o binário ns-3 selecionado não exporta sensores mMTC reais para o App2.${NC}"
+            echo -e "${RED}    Desative GREENRAN_REQUIRE_REAL_APP2_SENSORS=0 apenas se você aceitar rodar com fallback.${NC}"
+            exit 1
+        else
+            echo -e "${YELLOW}    Binário ns-3 atual não exporta sensores mMTC reais; ativando fallback do simulador App2${NC}"
+            start_app2_simulator
+            APP2_SENSOR_SOURCE="mock-fallback"
+        fi
     elif app2_has_real_sensor_ues; then
         APP2_REAL_SENSOR_UES_DETECTED="1"
         echo -e "${GREEN}    App2 usando sensores reais exportados do ns-3${NC}"
     else
-        echo -e "${YELLOW}    ns-3 não expôs sensores mMTC; ativando fallback do simulador App2${NC}"
-        start_app2_simulator
-        APP2_SENSOR_SOURCE="mock-fallback"
+        echo -e "${BLUE}    Aguardando o csv_to_metrics publicar sensores mMTC reais...${NC}"
+        if wait_for_app2_real_sensor_ues "$GREENRAN_APP2_REAL_SENSOR_WAIT_SECONDS" 1; then
+            APP2_REAL_SENSOR_UES_DETECTED="1"
+            echo -e "${GREEN}    App2 usando sensores reais exportados do ns-3${NC}"
+        elif [ "$GREENRAN_REQUIRE_REAL_APP2_SENSORS" = "1" ]; then
+            echo -e "${RED}    ERRO: o ns-3 subiu, mas não expôs sensores mMTC reais no extended_metrics.${NC}"
+            echo -e "${RED}    Tempo de espera configurado: ${GREENRAN_APP2_REAL_SENSOR_WAIT_SECONDS}s.${NC}"
+            echo -e "${RED}    Verifique o cenário GreenRAN e a instrumentação dos UEs sensor antes de prosseguir.${NC}"
+            exit 1
+        else
+            echo -e "${YELLOW}    ns-3 não expôs sensores mMTC; ativando fallback do simulador App2${NC}"
+            start_app2_simulator
+            APP2_SENSOR_SOURCE="mock-fallback"
+        fi
     fi
 fi
-nohup env \
+setsid env \
     GREENRAN_APP2_SENSOR_SOURCE="$GREENRAN_APP2_SENSOR_SOURCE" \
     GREENRAN_APP2_SENSOR_SOURCE_EFFECTIVE="$APP2_SENSOR_SOURCE" \
     GREENRAN_APP2_REAL_SENSOR_UES_DETECTED="$APP2_REAL_SENSOR_UES_DETECTED" \
@@ -644,10 +843,13 @@ echo -e "${BLUE}=== [11/13] Iniciando Stack CARLA/App3 ===${NC}"
 start_carla_support_stack
 
 echo -e "${BLUE}=== [12/13] Iniciando App3-Veicular ===${NC}"
-nohup python3 ./apps/app3_veicular/backend/app.py --host "$APP3_HOST" --port "$APP3_PORT" > "$GREENRAN_APP3_LOG" 2>&1 &
+setsid python3 ./apps/app3_veicular/backend/app.py --host "$APP3_HOST" --port "$APP3_PORT" > "$GREENRAN_APP3_LOG" 2>&1 &
 echo $! > "$GREENRAN_APP3_PID"
 sleep 2
 echo -e "${GREEN}    App3 disponível em http://localhost:${APP3_PORT}${NC}"
+
+echo -e "${BLUE}=== [12.1/13] Alternando eventos da coleta ===${NC}"
+start_collection_event_alternator
 
 echo -e "${BLUE}=== [13/13] Iniciando Monitoramento (Grafana + InfluxDB) ===${NC}"
 # Verificar se Docker está disponível
@@ -705,28 +907,35 @@ elif command -v docker-compose &> /dev/null || docker compose version &> /dev/nu
     # Iniciar push de stats para InfluxDB
     sleep 5
     echo -e "${BLUE}    Iniciando Push Stats para InfluxDB...${NC}"
-    nohup python3 ./push/push_stats_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" --host "$GREENRAN_INFLUXDB_HOST" --port "$GREENRAN_INFLUXDB_PORT" --db "$GREENRAN_INFLUXDB_DB" > "$GREENRAN_PUSH_STATS_LOG" 2>&1 &
+    setsid python3 ./push/push_stats_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" --host "$GREENRAN_INFLUXDB_HOST" --port "$GREENRAN_INFLUXDB_PORT" --db "$GREENRAN_INFLUXDB_DB" > "$GREENRAN_PUSH_STATS_LOG" 2>&1 &
     echo -e "${GREEN}    Push Stats iniciado (logs: $GREENRAN_PUSH_STATS_LOG)${NC}"
     
     # Iniciar push de CVaR para InfluxDB
     sleep 2
     echo -e "${BLUE}    Iniciando Push CVaR para InfluxDB...${NC}"
-    nohup python3 ./push/push_cvar_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" > "$GREENRAN_PUSH_CVAR_LOG" 2>&1 &
+    setsid python3 ./push/push_cvar_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" > "$GREENRAN_PUSH_CVAR_LOG" 2>&1 &
     echo -e "${GREEN}    Push CVaR iniciado (logs: $GREENRAN_PUSH_CVAR_LOG)${NC}"
 
     # Iniciar push da App1 para InfluxDB
     sleep 2
     echo -e "${BLUE}    Iniciando Push App1 para InfluxDB...${NC}"
-    nohup python3 ./push/push_app1_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" --host "$GREENRAN_INFLUXDB_HOST" --port "$GREENRAN_INFLUXDB_PORT" --db "$GREENRAN_INFLUXDB_DB" > "$GREENRAN_PUSH_APP1_LOG" 2>&1 &
+    setsid python3 ./push/push_app1_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" --host "$GREENRAN_INFLUXDB_HOST" --port "$GREENRAN_INFLUXDB_PORT" --db "$GREENRAN_INFLUXDB_DB" > "$GREENRAN_PUSH_APP1_LOG" 2>&1 &
     echo $! > "$GREENRAN_PUSH_APP1_PID"
     echo -e "${GREEN}    Push App1 iniciado (logs: $GREENRAN_PUSH_APP1_LOG)${NC}"
 
     # Iniciar push da App2 para InfluxDB
     sleep 2
     echo -e "${BLUE}    Iniciando Push App2 para InfluxDB...${NC}"
-    nohup python3 ./push/push_app2_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" --host "$GREENRAN_INFLUXDB_HOST" --port "$GREENRAN_INFLUXDB_PORT" --db "$GREENRAN_INFLUXDB_DB" > "$GREENRAN_PUSH_APP2_LOG" 2>&1 &
+    setsid python3 ./push/push_app2_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" --host "$GREENRAN_INFLUXDB_HOST" --port "$GREENRAN_INFLUXDB_PORT" --db "$GREENRAN_INFLUXDB_DB" > "$GREENRAN_PUSH_APP2_LOG" 2>&1 &
     echo $! > "$GREENRAN_PUSH_APP2_PID"
     echo -e "${GREEN}    Push App2 iniciado (logs: $GREENRAN_PUSH_APP2_LOG)${NC}"
+
+    # Iniciar push da App3 para InfluxDB
+    sleep 2
+    echo -e "${BLUE}    Iniciando Push App3 para InfluxDB...${NC}"
+    setsid python3 ./push/push_app3_to_influx.py --interval "$GREENRAN_PUSH_INTERVAL" --host "$GREENRAN_INFLUXDB_HOST" --port "$GREENRAN_INFLUXDB_PORT" --db "$GREENRAN_INFLUXDB_DB" > "$GREENRAN_PUSH_APP3_LOG" 2>&1 &
+    echo $! > "$GREENRAN_PUSH_APP3_PID"
+    echo -e "${GREEN}    Push App3 iniciado (logs: $GREENRAN_PUSH_APP3_LOG)${NC}"
 
     # Criar/atualizar dashboard App1 no Grafana
     sleep 3
@@ -742,13 +951,18 @@ elif command -v docker-compose &> /dev/null || docker compose version &> /dev/nu
     sleep 1
     echo -e "${BLUE}    Registrando dashboard App2 no Grafana...${NC}"
     register_app2_dashboard_when_ready
+
+    # Criar/atualizar dashboard App3 no Grafana
+    sleep 1
+    echo -e "${BLUE}    Registrando dashboard App3 no Grafana...${NC}"
+    register_app3_dashboard_when_ready
 else
     echo -e "${RED}    AVISO: Docker-compose não encontrado. Execute:${NC}"
     echo -e "${RED}    sudo apt install docker-compose${NC}"
 fi
 
 echo -e "${BLUE}=== [13/13] Iniciando Dashboard Python ===${NC}"
-nohup python3 ./src/rapp_dashboard.py --host "$GREENRAN_DASHBOARD_HOST" --port "$GREENRAN_DASHBOARD_PORT" > "$GREENRAN_DASHBOARD_LOG" 2>&1 &
+setsid python3 ./src/rapp_dashboard.py --host "$GREENRAN_DASHBOARD_HOST" --port "$GREENRAN_DASHBOARD_PORT" > "$GREENRAN_DASHBOARD_LOG" 2>&1 &
 echo $! > "$GREENRAN_DASHBOARD_PID"
 sleep 2
 echo -e "${GREEN}    Dashboard disponível em http://localhost:${GREENRAN_DASHBOARD_PORT}${NC}"
@@ -779,6 +993,7 @@ echo -e "  - Etapas:    staged_control=${GREENRAN_STAGED_CONTROL} required_strea
 echo -e ""
 echo -e "O rApp controla automaticamente os xApps:"
 echo -e "  - SLICER: sempre ativo (prioridade)"
+echo -e "  - VEHICLE: sempre ativo (App3)"
 echo -e "  - ENERGY: ativado quando permitido"
 echo -e "O observador de etapas nao injeta scenario_control:"
 echo -e "  - Etapa 1: detecta ALLOWED natural"

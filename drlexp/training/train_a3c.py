@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-A3C Training Script
-====================
-Training script for A3C (Asynchronous Advantage Actor-Critic) algorithm.
-Based on the IEEE paper's approach for resource allocation in network slicing.
+Legacy A3C Training Script
+==========================
+Training script for the legacy A3C (Asynchronous Advantage Actor-Critic) line.
+Kept for reproducibility while the platform migrates to SAC for AI/RAN shared
+resource allocation.
 
 This script:
 1. Creates the Gymnasium environment
@@ -17,6 +18,7 @@ Author: GreenRAN Team - UFPA
 import os
 import sys
 import time
+import json
 import threading
 import multiprocessing as mp
 from datetime import datetime
@@ -36,6 +38,12 @@ from drl.gym_environment import GreenRANGymEnv
 from drl.models.actor import ActorNetwork
 from drl.models.critic import CriticNetwork
 from drl.replay_buffer import ReplayBuffer
+
+
+def write_json(path: str, payload: dict | list) -> None:
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=True)
+        f.write('\n')
 
 
 # Global configuration
@@ -360,6 +368,32 @@ def train_a3c(config: dict = None):
     
     # Result queue
     result_queue = mp.Queue()
+    history_records = []
+
+    def persist_history() -> None:
+        history_json = os.path.join(config['model_dir'], 'a3c_training_history.json')
+        history_csv = os.path.join(config['model_dir'], 'a3c_training_history.csv')
+        summary_json = os.path.join(config['model_dir'], 'a3c_training_summary.json')
+        write_json(history_json, history_records)
+        if history_records:
+            import pandas as pd
+            pd.DataFrame(history_records).to_csv(history_csv, index=False)
+            mean_reward = float(np.mean([row['reward'] for row in history_records]))
+            max_reward = float(np.max([row['reward'] for row in history_records]))
+            min_reward = float(np.min([row['reward'] for row in history_records]))
+        else:
+            open(history_csv, 'w', encoding='utf-8').write('episode,worker,reward,mean_reward_10,elapsed_s\n')
+            mean_reward = max_reward = min_reward = 0.0
+        write_json(summary_json, {
+            'model': 'A3C',
+            'episodes_requested': int(config['num_episodes']),
+            'logged_points': len(history_records),
+            'mean_logged_reward': mean_reward,
+            'max_logged_reward': max_reward,
+            'min_logged_reward': min_reward,
+            'history_json': history_json,
+            'history_csv': history_csv,
+        })
     
     # Create workers
     workers = []
@@ -386,12 +420,20 @@ def train_a3c(config: dict = None):
                     elapsed = time.time() - start_time
                     print(f"[{elapsed:.1f}s] Worker {result['worker']} Episode {result['episode']}: "
                           f"Reward={result['reward']:.2f}, Mean_10={result['mean_reward_10']:.2f}")
+                    history_records.append({
+                        'episode': int(result['episode']),
+                        'worker': int(result['worker']),
+                        'reward': float(result['reward']),
+                        'mean_reward_10': float(result['mean_reward_10']),
+                        'elapsed_s': float(elapsed),
+                    })
                     
                     agent.episode_count += 1
                     
                     # Save periodically
                     if agent.episode_count % config['save_interval'] == 0:
                         agent.save_models()
+                        persist_history()
                         
     except KeyboardInterrupt:
         print("\n[A3C] Training interrupted by user")
@@ -404,6 +446,7 @@ def train_a3c(config: dict = None):
             
         # Save final models
         agent.save_models()
+        persist_history()
         
         elapsed = time.time() - start_time
         print(f"\n[A3C] Training completed in {elapsed:.1f}s")

@@ -1,8 +1,10 @@
-# DRL Runtime - Melhorias no Predictor
+# EE-DRL-GreenRAN Runtime - Melhorias no Predictor
 
-## Escopo
+> ⚠️ **Nota (Maio 2026):** Este documento cobre exclusivamente o **legado A3C/SBiLSTM**. A nova geração **CAORA-SAC** (Seção "Migração SAC" abaixo) reformula o runtime com alocação compartilhada de recursos RAN/AI. O conteúdo A3C abaixo é mantido como referência histórica.
 
-Esta rodada melhorou o comportamento da DRL em runtime sem alterar a politica do `rApp`.
+## Escopo (Legado A3C)
+
+Esta rodada melhorou o comportamento do **EE-DRL-GreenRAN** em runtime sem alterar a politica do `rApp`.
 
 Arquivos principais:
 
@@ -12,6 +14,11 @@ Arquivos principais:
 - `apps/app2_monitoramento/backend/simulate_sensors.py`
 
 O `src/rapp_orchestrator.py` nao foi modificado para estas melhorias.
+
+Referencia metodologica da trilha:
+
+- `SBiLSTM + A3C`
+- artigo base: `Energy-Efficient Deep Reinforcement Learning Assisted Resource Allocation for 5G-RAN Slicing`
 
 ## O que mudou no predictor
 
@@ -218,7 +225,7 @@ GREENRAN_DRL_TRACE_FILE=/tmp/drl_predictor_trace_runtime.jsonl \
 python3 ./src/rapp_orchestrator.py --synthetic 0 --interval 5
 ```
 
-## Conclusao
+## Conclusao (Legado A3C)
 
 A DRL ficou melhor em runtime sem alterar a politica do `rApp`.
 
@@ -232,3 +239,52 @@ O ganho principal foi:
 O limite que permanece intencional:
 
 - camera e App2 continuam podendo sobrescrever a DRL quando entram em guarda ou violacao.
+
+---
+
+## Migração SAC (Nova Geração)
+
+> **Nota:** A partir de Maio 2026, a arquitetura DRL migrou de A3C (energy on/off) para SAC/AWAC (alocação compartilhada de recursos). Esta seção documenta as diferenças de runtime.
+
+### Diferenças Runtime: A3C vs SAC
+
+| Aspecto | A3C (Legado) | SAC (Nova Geração) |
+|---------|-------------|-------------------|
+| **Arquivo policy** | `src/rapp_drl_predictor.py` | `src/rapp_rl_policy.py` + `src/rapp_sac_resource_model.py` |
+| **Ambiente** | Embedido no predictor | `drlexp/src/drl/caora_sac_environment.py` |
+| **Estado** | `cvar_ms`, `packet_loss_pct`, ... (10+ features) | `[d_ran, d_ai, r_ran, r_ai]` (4 floats) |
+| **Ação** | 3 discretas (FULL_POWER, POWER_DOWN, FULL_POWER_GUARD) | 2 contínuas (δ_r_ran, δ_r_ai) |
+| **Orçamento** | Ilimitado | Compartilhado: r_max = r_ran + r_ai |
+| **Seleção** | Fixa no orchestrator | `GREENRAN_RL_POLICY=legacy_a3c\|sac\|awac` |
+| **Treino** | Online A3C | Offline SAC/AWAC (bootstrap com traces) |
+
+### Fluxo Runtime SAC (Alvo)
+
+```
+1. compute_shared_resource_snapshot()  → [d_ran, d_ai, r_ran, r_ai]
+2. SACResourceAllocationPolicy.decide() → [δ_r_ran, δ_r_ai]
+3. Aplica alocação: r_ran += δ_r_ran, r_ai += δ_r_ai (respeitando r_max)
+4. Data Lake registra em resource_allocation_history
+```
+
+### Estado da Migração
+
+| Componente | Status |
+|------------|--------|
+| Ambiente CAORA-SAC | ✅ Pronto |
+| Trainer SAC/AWAC offline | ✅ Pronto |
+| Resource model runtime | ✅ Pronto |
+| Interface genérica `BaseRLPolicy` | ✅ Pronto |
+| Export traces reais | ✅ Pronto |
+| Checkpoints treinados | ✅ offline_sac + offline_awac |
+| Integração runtime completa | 🟡 Pendente (ainda consome energy commands) |
+| Testes unitários | 🔴 Pendente |
+| Figuras CAORA | 🔴 Pendente |
+
+### Arquivos
+
+- `src/rapp_rl_policy.py` — Interface genérica com adaptadores A3C e SAC
+- `src/rapp_sac_resource_model.py` — Modelo de demanda compartilhada
+- `drlexp/src/drl/caora_sac_environment.py` — Ambiente gym
+- `drlexp/training/train_sac.py` — Treino SAC/AWAC
+- `scripts/export_sac_workload_trace.py` — Exporta traces reais do Data Lake

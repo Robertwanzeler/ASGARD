@@ -15,6 +15,9 @@ DEFAULT_OUTPUT = PROJECT_ROOT / "docs" / "Relatorio-GreenRAN-Conflitos.docx"
 RUNS_ROOT = PROJECT_ROOT / "runs" / "experimentos_conflitos"
 HYBRID_SUMMARY = PROJECT_ROOT / "runs" / "graphsage_article00_hybrid_final" / "hybrid_final_summary.json"
 COMPARISON_SUMMARY = PROJECT_ROOT / "runs" / "article00" / "comparison_figures" / "comparison_summary.json"
+EEDRL_SUMMARY = PROJECT_ROOT / "runs" / "eedrl_greenran_final" / "eedrl_greenran_summary.json"
+EEDRL_PAPER_FIGURES = PROJECT_ROOT / "runs" / "eedrl_greenran_final" / "paper_figures" / "paper_figures_summary.json"
+FIXED_SCENARIO_CONFIG = PROJECT_ROOT / "config" / "greenran_fixed_scenario.json"
 STATE_DIR = Path("/tmp")
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -63,13 +66,14 @@ SCENARIO_LABELS = {
 }
 
 SOURCE_LABELS = {
-    "protocol": "Protocolo base",
+    "protocol": "Protocolo canônico",
     "protocol_vehicle_clean": "Protocolo limpo veicular",
     "protocol_clean_remaining": "Protocolo limpo App1/App2",
     "protocol_last_two": "Protocolo limpo final",
     "calibration_v1": "Calibracao multiapp",
     "calibration_vehicle_recovery": "Calibracao cirurgica vehicle_recovery",
 }
+
 
 
 def latest_conflict_run() -> Path | None:
@@ -86,6 +90,33 @@ def load_json(path: Path, fallback):
             return json.load(f)
     except Exception:
         return fallback
+
+
+def load_fixed_scenario_manifest() -> dict:
+    payload = load_json(FIXED_SCENARIO_CONFIG, {})
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def build_fixed_scenario_summary(manifest: dict) -> dict:
+    ns3 = manifest.get('ns3', {}) if isinstance(manifest.get('ns3'), dict) else {}
+    apps = manifest.get('apps', {}) if isinstance(manifest.get('apps'), dict) else {}
+    app1 = apps.get('app1', {}) if isinstance(apps.get('app1'), dict) else {}
+    app3 = apps.get('app3', {}) if isinstance(apps.get('app3'), dict) else {}
+    total_ues = int(ns3.get('total_ues', 0) or 0)
+    active_cameras = int(app1.get('active_cameras', 0) or 0)
+    max_vehicles = int(app3.get('max_vehicles', 0) or 0)
+    base_imsi = int(app3.get('base_imsi', 0) or 0)
+    return {
+        'scenario_id': str(manifest.get('scenario_id', 'unknown') or 'unknown'),
+        'total_ues': total_ues,
+        'active_cameras': active_cameras,
+        'background_ues': max(0, total_ues - active_cameras),
+        'max_vehicles': max_vehicles,
+        'vehicle_base_imsi': base_imsi,
+        'vehicle_imsi_end': base_imsi + max(max_vehicles - 1, 0),
+    }
 
 
 def read_round_summaries(run_dir: Path, scenario: str) -> list[dict]:
@@ -183,6 +214,9 @@ def build_paragraphs() -> list[str]:
         ]
 
     comparison = load_json(COMPARISON_SUMMARY, {})
+    eedrl = load_json(EEDRL_SUMMARY, {})
+    eedrl_figures = load_json(EEDRL_PAPER_FIGURES, {})
+    fixed_scenario = build_fixed_scenario_summary(load_fixed_scenario_manifest())
     selected = hybrid.get("selected", [])
     scenario_reports = {name: load_scenario_report(path) for name, path in FINAL_SCENARIO_REPORTS.items()}
     total_rows = sum(report.get("rows_full", 0) for report in scenario_reports.values())
@@ -197,17 +231,19 @@ def build_paragraphs() -> list[str]:
         source_counts[row.get("selected_source", "unknown")] = source_counts.get(row.get("selected_source", "unknown"), 0) + 1
 
     paragraphs = [
-        "# RELATORIO FINAL - GreenRAN: Conflitos Multi-xApp em O-RAN usando GraphSAGE",
-        "## Fechamento experimental com protocolo alinhado ao ARTICLE00 e pacote hibrido final 10/10",
+        "# RELATORIO FINAL - GreenRAN: Conflitos Multi-xApp em O-RAN usando EE-DRL-GreenRAN e ARMD-GreenRAN",
+        "## Fechamento experimental com protocolo DRL proprio, alinhamento ao ARTICLE00 e pacote hibrido final 10/10",
         "**Autor:** OpenAI Codex + Projeto GreenRAN",
         f"**Data:** {now}",
         "**Instituicao:** Ambiente experimental Orange Nuclear / GreenRAN",
         "**Versao:** 2.0 (Fechamento final com 10/10 cenarios em 1.0)",
+        f"**Scenario ID:** `{fixed_scenario.get('scenario_id', 'unknown')}`",
         "---",
         "## 1. RESUMO EXECUTIVO",
         "Este relatorio consolida a fase final do GreenRAN para coleta, curadoria, treino e comparacao de conflitos multi-xApp em O-RAN. O projeto saiu de uma fase inicial com cenarios contaminados e fechou um pacote final reproduzivel, alinhado ao protocolo do `ARTICLE00`, mas usando o dataset real do GreenRAN.",
         "O resultado final foi a obtencao de `10/10` cenarios com `F1 = 1.0` no `target_epoch = 200`, `threshold = 0.5`, `subset = 450`, usando `5 seeds (42-46)` e um seletor hibrido por cenario.",
         "### 1.1 Parametros oficiais do fechamento",
+        f"- Baseline fixo do runtime: `{fixed_scenario.get('scenario_id', 'unknown')}` com `{fixed_scenario.get('total_ues', 0)}` UEs ns-3 (`{fixed_scenario.get('active_cameras', 0)}` câmeras + `{fixed_scenario.get('background_ues', 0)}` background) e App3 até `{fixed_scenario.get('max_vehicles', 0)}` veículos na faixa IMSI `{fixed_scenario.get('vehicle_base_imsi', 0)}-{fixed_scenario.get('vehicle_imsi_end', 0)}`.",
         "| Item | Valor final |",
         "|------|-------------|",
         f"| Total de cenarios no pacote final | {len(selected)} |",
@@ -283,9 +319,18 @@ def build_paragraphs() -> list[str]:
         "- `runs/graphsage_article00_hybrid_final/hybrid_final_summary.md`",
         "- `runs/article00/comparison_figures/comparison_summary.json`",
         "- `config/armd_greenran_series.json`",
+        "### 6.3 Pacote oficial EE-DRL-GreenRAN",
+        f"- Nome oficial da trilha DRL: `{eedrl.get('display_name', 'EE-DRL-GreenRAN')}`.",
+        f"- Total de figuras organizadas no pacote DRL: `{eedrl.get('figure_count', 0)}`.",
+        f"- Total de artefatos organizados no pacote DRL: `{eedrl.get('artifact_count', 0)}`.",
+        f"- Figuras equivalentes ao paper DRL: arquitetura `{eedrl_figures.get('architecture_count', 0)}` e quantitativas `{eedrl_figures.get('quantitative_count', 0)}`.",
+        "- `runs/eedrl_greenran_final/eedrl_greenran_summary.json`",
+        "- `runs/eedrl_greenran_final/eedrl_greenran_summary.md`",
+        "- `runs/eedrl_greenran_final/paper_figures/paper_figures_summary.json`",
+        "- `runs/eedrl_greenran_final/paper_figures/paper_figures_summary.md`",
         "---",
         "## 7. CONCLUSAO",
-        "O GreenRAN encerrou esta fase com uma base experimental limpa, um pacote hibrido reproduzivel e compatibilidade metodologica com o `ARTICLE00`. O resultado final relevante para o projeto e que os conflitos diretos, implicitos, indiretos e de reconstrucao puderam ser aprendidos e validados com `F1 = 1.0` em todos os dez cenarios finais no `epoch 200`.",
+        "O GreenRAN encerrou esta fase com uma base experimental limpa, um pacote hibrido reproduzivel e compatibilidade metodologica com o `ARTICLE00`, alem de uma trilha DRL organizada como `EE-DRL-GreenRAN`. O resultado final relevante para o projeto e que os conflitos diretos, implicitos, indiretos e de reconstrucao puderam ser aprendidos e validados com `F1 = 1.0` em todos os dez cenarios finais no `epoch 200`.",
         "Em termos práticos, o projeto saiu de uma fase de coleta instavel para um estado de fechamento metodologico: datasets limpos por cenario, treino multi-seed, comparacao com o artigo base e artefatos finais prontos para defesa, relatorio e consolidacao cientifica.",
     ]
 
