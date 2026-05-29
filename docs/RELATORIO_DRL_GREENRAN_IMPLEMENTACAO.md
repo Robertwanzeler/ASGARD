@@ -209,9 +209,280 @@ O artigo foi adaptado ao cenário fixo do GreenRAN sem alterar a arquitetura exi
 
 A confusão entre os dois artigos é comum no repositório porque o nome `article00` aparece em scripts, documentos e diretórios. Mas a **DRL em runtime** segue exclusivamente o **Lotfi et al. 2025 (TA-SAM MARL)**.
 
+### 3.4 Fórmulas do artigo e sua função
+
+O artigo usa um conjunto de fórmulas matemáticas que formam a base do algoritmo TA-SAM MARL. Abaixo,
+cada fórmula é explicada individualmente: o que representa, por que existe e onde está implementada no
+GreenRAN.
+
 ---
 
-## 4. Cenário fixo preservado
+#### 3.4.1 Problema de otimização mestre (seção III, eq. 7)
+
+```
+arg max  Ψ({Q_l(b,e) | ∀l ∈ L})
+  b,e
+
+sujeito a:
+  Σ RB_usados ≤ K_m      (limite de recursos)
+  Q_l(b,e) ≥ Q_l_min     (QoS mínima por slice)
+```
+
+**O que representa:** A função objetivo que o sistema de alocação deve maximizar. `Ψ` é uma função de
+agregação da QoS de todas as slices `L`. As restrições garantem que não se aloque mais RBs que o
+disponível (`K_m`) e que cada slice mantenha QoS acima do mínimo (`Q_l_min`).
+
+**Por que existe:** Formaliza o problema de engenharia (alocar recurso compartilhado entre slices)
+como um problema de otimização matemática com restrições. Sem essa formulação, o agente não teria
+um objetivo claro.
+
+**Onde implementamos:** As restrições aparecem como:
+- Limite de recursos → `r_ran + r_ai <= usable_budget` (via scaling proporcional no `step()`)
+- QoS mínima → penalidade `P_minQ` na recompensa (seção 28.4)
+- A função `Ψ` é substituída pela recompensa sigmoid `σ(α·Q)` no lugar da agregação direta
+
+---
+
+#### 3.4.2 Métrica de QoS por slice (seção III)
+
+```
+Q_l = (1/N_u) · Σ C_i
+
+onde:
+  C_i = 1 se UE i atingiu os KPIs da slice l
+  C_i = 0 caso contrário
+```
+
+**O que representa:** A QoS de uma slice `l` é a fração de UEs naquela slice que estão satisfeitos
+com seus KPIs.
+
+**Por que existe:** Medir QoS em 0~1 permite comparar slices diferentes na mesma escala.
+
+**Onde implementamos:** `ran_completion = served_ran / d_ran` e `ai_completion = served_ai / d_ai`
+no `step()`. É a mesma ideia — fração da demanda atendida.
+
+---
+
+#### 3.4.3 Função de recompensa (seção IV-A3)
+
+```
+r_t = σ(α_l · Q_l) + P_res + P_minQ
+
+σ(x) = 1 / (1 + e^(-x))   ← sigmoid
+P_res = -ζ · max(0, Σ K_ml - K_m)
+P_minQ = -ζ · Σ max(0, Q_l_min - min(Q_l))
+```
+
+**O que representa:** A recompensa que o agente recebe a cada passo. Três componentes:
+
+1. **`σ(α_l · Q_l)`** — Satisfação de QoS via sigmoid:
+   - Mapeia a QoS de cada slice para 0~1 de forma não-linear
+   - Se QoS=0 → σ≈0.5 (neutro, não penaliza nem recompensa)
+   - Se QoS=1 → σ≈0.73 (bom, recompensa positiva)
+   - Se QoS<0 → σ<0.5 (ruim, penaliza)
+   - O parâmetro `α_l` controla a inclinação da curva
+
+2. **`P_res`** — Penalidade por excesso de recurso:
+   - Só ativa quando `Σ K_ml > K_m` (usou mais que o budget)
+   - É proporcional ao excesso (quanto mais estourou, maior a penalidade)
+
+3. **`P_minQ`** — Penalidade por QoS mínima não atingida:
+   - Ativa quando alguma slice fica abaixo de `Q_l_min`
+   - Soma o deficit de todas as slices abaixo do limiar
+
+**Por que existe:** A sigmoid introduz não-linearidade (diferente de uma simples média ponderada),
+tornando o agente mais sensível a QoS baixas. As penalidades `P_res` e `P_minQ` codificam as
+restrições do problema de otimização (eq. 7) como termos de recompensa, para que o agente aprenda
+a respeitá-las.
+
+**Por que sigmoid em vez de linear:** Numa função linear, passar de QoS=0.8 para 0.9 tem o mesmo
+ganho que passar de 0.1 para 0.2. Na sigmoid, passar de 0.1 para 0.2 tem impacto maior (região
+íngrime da curva), enquanto 0.8→0.9 já está na saturação. Isso faz o agente priorizar **recuperar
+QoS baixas** antes de otimizar QoS já altas.
+
+**Onde implementamos:** `caora_sac_environment.py` (linhas 132-150, `reward_fn="article"`) e
+`online_marl_env.py` (linhas 150-170). Usamos `α_RAN=4.0, α_AI=2.5, β=2.0, γ=5.0`,
+`Q_min_RAN=0.7, Q_min_AI=0.5`.
+
+---
+
+#### 3.4.4 Retorno acumulado (seção IV-A)
+
+```
+R(t) = Σ γ^i · r_(t+i)
+      i=0
+
+onde γ ∈ [0,1] é o fator de desconto
+```
+
+**O que representa:** A soma das recompensas futuras, descontadas por `γ`. O agente não maximiza
+apenas a recompensa imediata `r_t`, mas o retorno acumulado ao longo do tempo.
+
+**Por que existe:** Se o agente maximizasse só `r_t`, ele seria míope — pegaria o melhor agora sem
+pensar no futuro. O fator `γ` controla o horizonte: `γ=0.99` dá peso quase igual a recompensas
+futuras; `γ=0.9` foca mais no curto prazo.
+
+**Onde implementamos:** `gamma=0.99` no `train_sac.py` e `train_online_sam.py`.
+
+---
+
+#### 3.4.5 Gradiente da política SAC (seção IV-C, eq. 9)
+
+```
+∇J(π_θ) = E[ ∇log(π_θ(a|s)) · (-β · log(π_θ(a|s)) + Q_v(s,a)) ]
+
+onde:
+  π_θ        = política parametrizada por θ
+  β          = temperatura de entropia
+  Q_v(s,a)   = valor da ação estimado pelo crítico
+  ∇log(π_θ)  = direção que aumenta a probabilidade da ação
+```
+
+**O que representa:** A direção e intensidade da atualização do ator no SAC. Tem dois fatores:
+
+- **`∇log(π_θ(a|s))`**: Direção que aumenta a log-probabilidade da ação `a` no estado `s`
+- **`(-β·log(π_θ) + Q_v(s,a))`**: Pondera a atualização — ações com Q alto (boas) são reforçadas;
+  ações com Q baixo (ruins) são desencorajadas. O termo `-β·log(π)` (entropia) incentiva exploração
+
+**Por que existe:** É a fórmula que permite ao SAC aprender políticas estocásticas (com exploração
+controlada) em vez de determinísticas. A entropia evita que o agente convirja prematuramente para
+uma política sub-ótima.
+
+**Onde implementamos:** `train_online_sam.py` (linhas 233-235) e `train_sac.py` (linhas que calculam
+`actor_loss` dentro de `run_offline_sac()`).
+
+---
+
+#### 3.4.6 Soft-update do crítico-alvo (seção IV-C)
+
+```
+θ_v_target = τ · θ_v + (1 - τ) · θ_v_target
+onde τ ∈ [0,1] é o fator de soft-update
+```
+
+**O que representa:** O crítico-alvo não é copiado diretamente do crítico atual, mas suavemente
+misturado: uma fração `τ` do crítico atual + `(1-τ)` do alvo antigo.
+
+**Por que existe:** Evita instabilidade no treino. Sem target networks, o crítico perseguiria
+um alvo que muda a cada passo (seu próprio valor), criando um loop de realimentação positiva que
+explode o gradiente.
+
+**Onde implementamos:** `tau=0.005` no `train_online_sam.py` e `tau=0.01` no `train_sac.py`.
+
+---
+
+#### 3.4.7 SAM — Perturbação do gradiente (seção IV-C, eq. 10)
+
+```
+θ_adv = θ + ρ · ∇L(θ) / ||∇L(θ)||               ← passo 1: sobe o gradiente
+θ_new = θ - η · ∇L(θ_adv)                       ← passo 2: desce usando gradiente avançado
+
+onde:
+  θ         = parâmetros do ator
+  ρ         = raio de perturbação (hyperparâmetro)
+  L(θ)      = loss na posição atual
+  ∇L(θ_adv) = gradiente calculado na posição perturbada
+  η         = learning rate
+```
+
+**O que representa:** O SAM é um **wrapper** em volta do otimizador padrão (Adam). Em vez de:
+```
+θ_new = θ - η · ∇L(θ)    ← Adam normal (só desce o gradiente)
+```
+
+O SAM faz:
+1. Sobe o gradiente para `θ_adv`: `θ + ρ·∇L/||∇L||`
+2. Calcula o gradiente nessa posição avançada: `∇L(θ_adv)`
+3. Usa `∇L(θ_adv)` para atualizar `θ`: `θ - η·∇L(θ_adv)`
+
+**Por que existe:** O Adam normal pode convergir para **mínimos pontiagudos** — vales estreitos
+onde uma pequena mudança nos parâmetros causa grande aumento no loss. O SAM força convergência
+para **mínimos planos** — regiões largas onde perturbações não afetam muito o loss. Mínimos
+planos generalizam melhor para dados não vistos.
+
+**Analogia:** É como colocar uma bola numa bacia. Mínimo pontiagudo = funil (bola sai fácil).
+Mínimo plano = prato raso (bola fica estável mesmo com empurrões).
+
+**Onde implementamos:**
+- `train_sac.py` — bloco SAM dentro de `run_offline_sac()` (Fase 2)
+- `train_online_sam.py` — loop SAC + SAM integrado (Fase 4)
+
+---
+
+#### 3.4.8 SAM seletivo por variância do TD-error (seção IV-C)
+
+```
+σ²(δ_TD) = Var({ |Q(s_i,a_i) - r_i|  |  i ∈ batch })
+
+Se σ²(δ_TD) >= λ_TD:
+    aplica SAM (perturbação completa)
+Senão:
+    atualização SAC padrão sem SAM
+
+onde:
+  δ_TD = |Q(s,a) - r|     = TD-error (erro temporal-difference)
+  λ_TD                      = limiar de variância (hyperparâmetro)
+```
+
+**O que representa:** Uma **comporta** que decide quando aplicar o SAM. A variância do TD-error
+mede o quão inconsistente o crítico está em relação à recompensa observada. Alta variância =
+agente incerto = momento de aplicar SAM para regularizar. Baixa variância = agente confiante =
+SAM é computação desnecessária.
+
+**Por que existe:** SAM é caro computacionalmente (requer 2 forward+backward em vez de 1). Aplicar
+SAM em todo passo dobra o custo de treino. O seletor foca o SAM apenas nos momentos de maior
+incerteza, economizando ~40-60% do custo extra sem perder os benefícios.
+
+**Onde implementamos:** `ta_sam_marl.py` — `train_epoch()` coleta `td_error = |value - reward|`
+para todos os registros, calcula `td_var = np.var(td_errors)`, e usa no lugar da antiga
+variância da ação (Fase 3).
+
+---
+
+#### 3.4.9 ρ dinâmico (seção IV-C)
+
+```
+ρ(t) = ρ_inicial · (1 - t/T) + ρ_final · (t/T)
+
+onde:
+  t           = episódio atual
+  T           = total de episódios
+  ρ_inicial   = 0.05 (exploratório)
+  ρ_final     = 0.005 (conservador)
+```
+
+**O que representa:** O raio de perturbação `ρ` não é fixo — começa grande e diminui gradualmente
+com o progresso do treino.
+
+**Por que existe:** No início do treino, o agente precisa explorar a paisagem de loss para
+encontrar regiões promissoras → ρ grande. No fim do treino, o agente está próximo do ótimo e
+precisa refinar sem se afastar demais → ρ pequeno. Isso segue o princípio clássico de
+**exploration → exploitation**, agora aplicado ao espaço de parâmetros em vez do espaço de ações.
+
+**Onde implementamos:**
+- `train_sac.py`: `--sam-rho-decay` (Fase 2) — `rho = max(rho_min, rho_init * (1 - epoch/total))`
+- `train_online_sam.py`: `--sam-rho-init` / `--sam-rho-final` (Fase 4)
+- `ta_sam_marl.py`: O `SAMOptimizer` usa `rho` passado pelo `train_epoch()`
+
+---
+
+#### 3.4.10 Função de perda do crítico (seção IV-C)
+
+```
+L(θ_v) = E[ (Q_v(s,a) - R(t))² ]
+
+onde:
+  Q_v(s,a)  = valor estimado pelo crítico
+  R(t)      = retorno alvo (recompensa + γ · V(s'))
+```
+
+**O que representa:** Erro quadrático médio (MSE) entre o valor estimado pelo crítico e o retorno
+observado. É a função de perda padrão para aprender a função Q-value.
+
+**Por que existe:** O crítico precisa aprender a prever o retorno esperado de cada par
+(estado, ação). Minimizar o MSE faz o crítico convergir para o valor verdadeiro.
+
+**Onde implementamos:** `F.mse_loss(q, target_q)` no `train_sac.py` e `train_online_sam.py`. ---
 
 A implementação atual não muda o cenário GreenRAN. Ela adapta o artigo ao cenário fixo do projeto.
 
