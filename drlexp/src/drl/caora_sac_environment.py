@@ -82,6 +82,13 @@ class CAORASACEnv(gym.Env if gym is not None else object):
         w_ai: float = 1.0,
         w_utilization: float = 0.5,
         render_mode: str | None = None,
+        reward_fn: str = "article",
+        alpha_ran: float = 4.0,
+        alpha_ai: float = 2.5,
+        beta_res: float = 2.0,
+        gamma_minqos: float = 5.0,
+        qos_min_ran: float = 0.7,
+        qos_min_ai: float = 0.5,
     ) -> None:
         if _GYM_IMPORT_ERROR is not None:
             raise RuntimeError(
@@ -98,6 +105,13 @@ class CAORASACEnv(gym.Env if gym is not None else object):
         self.w_ai = float(w_ai)
         self.w_utilization = float(w_utilization)
         self.render_mode = render_mode
+        self.reward_fn = str(reward_fn)
+        self.alpha_ran = float(alpha_ran)
+        self.alpha_ai = float(alpha_ai)
+        self.beta_res = float(beta_res)
+        self.gamma_minqos = float(gamma_minqos)
+        self.qos_min_ran = float(qos_min_ran)
+        self.qos_min_ai = float(qos_min_ai)
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(low=0.0, high=np.inf, shape=(5,), dtype=np.float32)
@@ -129,13 +143,25 @@ class CAORASACEnv(gym.Env if gym is not None else object):
         ai_completion = served_ai / max(point.d_ai, 1e-6)
         utilization = float(candidate.sum()) / max(self.r_max, 1e-6)
 
-        reward = (
-            (self.w_ran * ran_completion)
-            + (self.w_ai * ai_completion)
-            + (self.w_utilization * utilization)
-        )
-        if served_ran + 1e-9 < min(point.d_ran, self.r_max):
-            reward -= 1.0
+        if self.reward_fn == "article":
+            sig_ran = 1.0 / (1.0 + np.exp(-self.alpha_ran * ran_completion))
+            sig_ai = 1.0 / (1.0 + np.exp(-self.alpha_ai * ai_completion))
+            qos_term = (sig_ran + sig_ai) / 2.0
+            usado = float(candidate.sum())
+            excesso = max(0.0, usado - usable_budget)
+            res_penalty = -self.beta_res * excesso
+            abaixo = (max(0.0, self.qos_min_ran - ran_completion)
+                      + max(0.0, self.qos_min_ai - ai_completion))
+            min_qos_penalty = -self.gamma_minqos * abaixo
+            reward = qos_term + res_penalty + min_qos_penalty
+        else:
+            reward = (
+                (self.w_ran * ran_completion)
+                + (self.w_ai * ai_completion)
+                + (self.w_utilization * utilization)
+            )
+            if served_ran + 1e-9 < min(point.d_ran, self.r_max):
+                reward -= 1.0
 
         self._prev_alloc = candidate.astype(np.float32)
         self._index += 1

@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--trace-jsonl', required=True, help='Input MARL trace JSONL path')
     parser.add_argument('--output-dir', required=True, help='Output directory')
     parser.add_argument('--epochs', type=int, default=25, help='Training epochs')
-    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate (artigo)')
     parser.add_argument('--sam-rho', type=float, default=0.05, help='Initial SAM rho')
     parser.add_argument('--td-var-threshold', type=float, default=0.01, help='Selective SAM threshold over TD proxy variance')
     parser.add_argument('--min-selected-fraction', type=float, default=0.10, help='Minimum fraction of agent updates selected each epoch')

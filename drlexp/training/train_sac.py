@@ -50,9 +50,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bc-epochs", type=int, default=80, help="Behavior cloning warm-start epochs")
     parser.add_argument("--sac-epochs", type=int, default=140, help="Offline SAC refinement epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size")
-    parser.add_argument("--actor-lr", type=float, default=3e-4, help="Actor optimizer learning rate")
-    parser.add_argument("--critic-lr", type=float, default=3e-4, help="Critic optimizer learning rate")
-    parser.add_argument("--alpha-lr", type=float, default=3e-4, help="Entropy temperature learning rate")
+    parser.add_argument("--actor-lr", type=float, default=1e-4, help="Actor optimizer learning rate (artigo: 1e-4)")
+    parser.add_argument("--critic-lr", type=float, default=1e-4, help="Critic optimizer learning rate (artigo: 1e-4)")
+    parser.add_argument("--alpha-lr", type=float, default=1e-4, help="Entropy temperature learning rate (artigo: 1e-4)")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--tau", type=float, default=0.01, help="Target critic soft-update rate")
     parser.add_argument("--bc-weight", type=float, default=0.15, help="Behavior-cloning regularization during SAC")
@@ -91,16 +91,18 @@ class TransitionDataset:
 
 
 class GaussianActor(nn.Module):
-    def __init__(self, state_size: int = 5, action_size: int = 2, hidden_size: int = 128) -> None:
+    def __init__(self, state_size: int = 5, action_size: int = 2) -> None:
         super().__init__()
         self.backbone = nn.Sequential(
-            nn.Linear(state_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
+            nn.Linear(state_size, 300),
+            nn.Tanh(),
+            nn.Linear(300, 400),
+            nn.Tanh(),
+            nn.Linear(400, 400),
+            nn.Tanh(),
         )
-        self.mean_head = nn.Linear(hidden_size, action_size)
-        self.log_std_head = nn.Linear(hidden_size, action_size)
+        self.mean_head = nn.Linear(400, action_size)
+        self.log_std_head = nn.Linear(400, action_size)
 
     def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self.backbone(states)
@@ -125,14 +127,16 @@ class GaussianActor(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, state_size: int = 5, action_size: int = 2, hidden_size: int = 128) -> None:
+    def __init__(self, state_size: int = 5, action_size: int = 2) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_size + action_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
+            nn.Linear(state_size + action_size, 300),
+            nn.Tanh(),
+            nn.Linear(300, 400),
+            nn.Tanh(),
+            nn.Linear(400, 400),
+            nn.Tanh(),
+            nn.Linear(400, 1),
         )
 
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -145,11 +149,26 @@ def seed_everything(seed: int) -> None:
 
 
 def _reward_from_row(row: dict[str, str]) -> float:
-    return (
-        (2.0 * float(row["ran_completion_ratio"]))
-        + float(row["ai_completion_ratio"])
-        + (0.5 * float(row["utilization_ratio"]))
-    )
+    ran_comp = float(row["ran_completion_ratio"])
+    ai_comp = float(row["ai_completion_ratio"])
+    usable = float(row.get("usable_budget", 1.0) or 1.0)
+    r_ran = float(row["r_ran"])
+    r_ai = float(row["r_ai"])
+    alpha_ran = 4.0
+    alpha_ai = 2.5
+    beta_res = 2.0
+    gamma_minqos = 5.0
+    qos_min_ran = 0.7
+    qos_min_ai = 0.5
+    sig_ran = 1.0 / (1.0 + np.exp(-alpha_ran * ran_comp))
+    sig_ai = 1.0 / (1.0 + np.exp(-alpha_ai * ai_comp))
+    qos_term = (sig_ran + sig_ai) / 2.0
+    usado = r_ran + r_ai
+    excesso = max(0.0, usado - usable)
+    res_penalty = -beta_res * excesso
+    abaixo = max(0.0, qos_min_ran - ran_comp) + max(0.0, qos_min_ai - ai_comp)
+    min_qos_penalty = -gamma_minqos * abaixo
+    return qos_term + res_penalty + min_qos_penalty
 
 
 def _state_action_from_row(row: dict[str, str], delta_step: float) -> tuple[list[float], list[float]]:

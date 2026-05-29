@@ -172,8 +172,8 @@ O artigo combina:
 |---------|----------------------|----------|
 | **DUs** | 6 | 3 |
 | **UEs** | 200 | 12 + 5 veículos |
-| **Rede ator** | 300→400→400 (tanh) | 64→64 (ReLU) ou 128→128 |
-| **Learning rate** | 10⁻⁴ | 3×10⁻⁴ |
+| **Rede ator** | 300→400→400 (tanh) | 300→400→400 (tanh) ✓ |
+| **Learning rate** | 10⁻⁴ | 10⁻⁴ ✓ |
 | **ρ SAM** | Dinâmico (decai no treino) | Fixo (0.05) |
 | **Seletor SAM** | Variância do TD-error | Variância da ação (proxy) |
 | **Recompensa** | `σ(α·Q) + P_res + P_minQ` | Média ponderada completion |
@@ -608,14 +608,24 @@ Cada linha representa um ciclo de decisão completo, formando uma transição `(
 
 - **Estado (5 dims):** `[d_ran(t), d_ai(t), r_ran(t-1), r_ai(t-1), usable_budget(t)]`
 - **Ação (2 contínuas):** `[delta_r_ran, delta_r_ai]` em `[-1.0, 1.0]`, escalado por `delta_step=0.1`
-- **Reward:**
+- **Reward (artigo Lotfi et al. 2025):**
   ```python
-  reward = w_ran * ran_completion
-         + w_ai * ai_completion
-         + w_utilization * utilization
-         - 1.0  # se RAN não for totalmente servido
+  sig_ran = sigmoid(alpha_ran * ran_completion)
+  sig_ai  = sigmoid(alpha_ai  * ai_completion)
+  qos_term = (sig_ran + sig_ai) / 2
+  
+  usado = r_ran + r_ai
+  excesso = max(0, usado - usable_budget)
+  res_penalty = -beta * excesso
+  
+  abaixo = max(0, qos_min_ran - ran_completion)
+         + max(0, qos_min_ai  - ai_completion)
+  min_qos_penalty = -gamma * abaixo
+  
+  reward = qos_term + res_penalty + min_qos_penalty
   ```
-  Com `w_ran=2.0, w_ai=1.0, w_utilization=0.5`
+  Com `alpha_ran=4.0, alpha_ai=2.5, beta=2.0, gamma=5.0, qos_min_ran=0.7, qos_min_ai=0.5`
+  O parâmetro `reward_fn="article"` (default) seleciona esta função; `reward_fn="legacy"` mantém a formulação anterior.
 - **Restrição:** `r_ran + r_ai <= usable_budget` (aplicada via scaling proporcional)
 
 O ambiente carrega pontos de carga reais de um CSV via `WorkloadPoint` dataclass.
@@ -624,16 +634,16 @@ O ambiente carrega pontos de carga reais de um CSV via `WorkloadPoint` dataclass
 
 **GaussianActor:**
 ```python
-backbone = Linear(5 → 128, ReLU) → Linear(128 → 128, ReLU)
-mean_head = Linear(128 → 2)   # ação determinística
-log_std_head = Linear(128 → 2) # log-desvio padrão
+backbone = Linear(5 → 300, Tanh) → Linear(300 → 400, Tanh) → Linear(400 → 400, Tanh)
+mean_head = Linear(400 → 2)   # ação determinística
+log_std_head = Linear(400 → 2) # log-desvio padrão
 # Saída: Tanh squashed para [-1, 1]
 ```
 
 **QNetwork (twin critics):**
 ```python
-backbone = Linear(7 → 128, ReLU) → Linear(128 → 128, ReLU)
-output = Linear(128 → 1)  # Q(s,a)
+backbone = Linear(7 → 300, Tanh) → Linear(300 → 400, Tanh) → Linear(400 → 400, Tanh)
+output = Linear(400 → 1)  # Q(s,a)
 # Duas instâncias: Q1 e Q2 (target networks com soft-update)
 ```
 
@@ -644,9 +654,9 @@ output = Linear(128 → 1)  # Q(s,a)
 | `bc_epochs` | 80 | Behavior Cloning warm-start |
 | `sac_epochs` | 140 | Refinação SAC/AWAC offline |
 | `batch_size` | 32 | Tamanho do mini-batch |
-| `actor_lr` | 3e-4 | Learning rate do ator |
-| `critic_lr` | 3e-4 | Learning rate dos críticos |
-| `alpha_lr` | 3e-4 | Learning rate da temperatura de entropia |
+| `actor_lr` | 1e-4 | Learning rate do ator (artigo) |
+| `critic_lr` | 1e-4 | Learning rate dos críticos (artigo) |
+| `alpha_lr` | 1e-4 | Learning rate da temperatura de entropia (artigo) |
 | `gamma` | 0.99 | Fator de desconto |
 | `tau` | 0.01 | Soft-update dos target networks |
 | `bc_weight` | 0.15 | Peso do BC loss (regularização) |
@@ -1175,8 +1185,8 @@ Do `tasam_marl_config.yaml` e defaults do entry-point:
 | Parâmetro | Default | Descrição |
 |-----------|---------|-----------|
 | `epochs` | 25 | Total de epochs de treino |
-| `lr` | 3e-4 | Learning rate (Adam) |
-| `sam_rho` | 0.05 | Raio de perturbação SAM |
+| `lr` | 1e-4 | Learning rate (Adam, alinhado artigo) |
+| `sam_rho` | 0.05 | Raio de perturbação SAM (artigo: dinâmico) |
 | `td_var_threshold` | 0.01 | Limiar base de variância TD |
 | `min_selected_fraction` | 0.10 | Fração mínima de atores atualizados |
 | `warmup_epochs` | 2 | Épocas iniciais com threshold=0 |
@@ -1890,3 +1900,441 @@ O ponto central da implementação atual é este:
 - e só aceita promoção quando treino, runtime e gate convergirem.
 
 Essa é, hoje, a implementação real da DRL no GreenRAN.
+
+---
+
+## 27. Gerador sintético de workloads com cadeia de Markov + ruído Gaussiano
+
+### 27.1 Motivação
+
+O ambiente atual de treino (`CAORASACEnv`) carrega dados de um CSV real exportado do Data Lake. Com apenas ~1641 pontos e **9 combinações únicas** de demanda, o agente vê pouca variedade e não generaliza bem.
+
+Para seguir o artigo de Lotfi et al. (2025) com **treino online**, precisamos de um ambiente que gere infinitas combinações realistas sem depender do ns-3 ou Data Lake.
+
+### 27.2 Análise dos dados reais
+
+Os 1641 pontos da coleta `greenran_marl_diverse` revelaram:
+
+| Estágio (scenario_stage) | d_ran | d_ai | budget | Decisão | Amostras |
+|--------------------------|-------|------|--------|---------|----------|
+| `baseline_healthy` | 0.225 | 0.171 | 0.682 | ALLOWED | 21 |
+| (transição) | 0.320 | 0.150 | 0.707 | ALLOWED | 3 |
+| `camera_overload` | 0.899 | 0.171 | 0.907 | BLOCKED | 322 |
+| `camera_overload_repeat` | 0.902 | 0.171 | 0.908 | BLOCKED | 316 |
+| `background_overload` | 0.832 | 0.198 | 0.893 | BLOCKED | 369 |
+| `background_overload` (outlier) | 0.832 | 0.215 | 0.899 | BLOCKED | 1 |
+| `mixed_overload` | 0.906 | 0.316 | 0.958 | BLOCKED | 421 |
+| `mixed_overload` (outlier) | 0.906 | 0.272 | 0.943 | BLOCKED | 1 |
+| `recovery_window` | 0.448 | 0.171 | 0.756 | CONDITIONAL | 227 |
+
+**Total: 9 combinações únicas** em 1641 amostras. As transições entre passos consecutivos são muito suaves: 99,8% têm `|Δd_ran| < 0,1` e `|Δd_ai| < 0,004`.
+
+### 27.3 Estrutura do gerador
+
+O gerador proposto é uma **cadeia de Markov** sobre os 6 estágios (mais transição), cada um com um **vetor base** de demandas. A cada passo, pequeno **ruído Gaussiano** é adicionado para criar variação.
+
+#### Estados da cadeia
+
+```
+[baseline_healthy]
+       |
+       ▼
+[camera_overload] ──► [mixed_overload] ──► [background_overload]
+       |                    |                      |
+       ▼                    ▼                      ▼
+[camera_overload_repeat]  [recovery_window] ◄─────┘
+```
+
+#### Matriz de transição (aprendida dos dados)
+
+| De \ Para | healthy | camera | mixed | background | recovery | cam_repeat |
+|-----------|---------|--------|-------|------------|----------|------------|
+| healthy | 0,90 | 0,10 | 0 | 0 | 0 | 0 |
+| camera | 0 | 0,85 | 0,05 | 0 | 0,10 | 0 |
+| mixed | 0 | 0 | 0,90 | 0,05 | 0,05 | 0 |
+| background | 0 | 0 | 0 | 0,88 | 0,10 | 0,02 |
+| recovery | 0 | 0 | 0 | 0 | 0,80 | 0,20 |
+| cam_repeat | 0 | 0,10 | 0 | 0 | 0,10 | 0,80 |
+
+#### Valores base por estágio
+
+```python
+STAGE_BASES = {
+    "baseline_healthy":   (0.225, 0.171, 0.682),
+    "transition":         (0.320, 0.150, 0.707),
+    "recovery_window":    (0.448, 0.171, 0.756),
+    "background_overload":(0.832, 0.198, 0.893),
+    "camera_overload":    (0.899, 0.171, 0.907),
+    "camera_overload_repeat": (0.902, 0.171, 0.908),
+    "mixed_overload":     (0.906, 0.316, 0.958),
+}
+```
+
+#### Algoritmo de geração
+
+```python
+class MarkovWorkloadGenerator:
+    """
+    Gera workloads sintéticos realistas usando cadeia de Markov + ruído.
+    Cada reset() inicia em baseline_healthy.
+    Cada step() pode transicionar para outro estágio conforme a matriz.
+    Ruído Gaussiano N(0, σ) é adicionado aos valores base.
+    """
+
+    def __init__(self, sigma_ran=0.03, sigma_ai=0.02, sigma_budget=0.01):
+        self.sigma_ran = sigma_ran
+        self.sigma_ai = sigma_ai
+        self.sigma_budget = sigma_budget
+        self.stage = "baseline_healthy"
+        self.transition_matrix = {...}  # matriz acima
+
+    def reset(self):
+        self.stage = "baseline_healthy"
+        return self._sample()
+
+    def step(self):
+        # Transiciona probabilisticamente
+        probs = self.transition_matrix[self.stage]
+        stages = list(probs.keys())
+        self.stage = np.random.choice(stages, p=list(probs.values()))
+        return self._sample()
+
+    def _sample(self):
+        base_ran, base_ai, base_budget = STAGE_BASES[self.stage]
+        d_ran = base_ran + np.random.normal(0, self.sigma_ran)
+        d_ai = base_ai + np.random.normal(0, self.sigma_ai)
+        budget = base_budget + np.random.normal(0, self.sigma_budget)
+        # Clip para valores válidos
+        return (
+            np.clip(d_ran, 0.0, 1.0),
+            np.clip(d_ai, 0.0, 1.0),
+            np.clip(budget, 0.0, 1.0),
+        )
+```
+
+### 27.4 O que é ruído Gaussiano
+
+Ruído Gaussiano (ou ruído branco) é uma perturbação aleatória seguindo uma **distribuição normal** (curva de sino) com:
+
+- **Média (μ) = 0**: o ruído não desloca o valor médio
+- **Desvio padrão (σ)**: controla a intensidade do ruído
+
+```python
+# Exemplo: d_ran base = 0.899, σ = 0.03
+d_ran_final = 0.899 + np.random.normal(0, 0.03)
+# Possíveis resultados: 0.912, 0.887, 0.903, 0.869, 0.924...
+# 68% das amostras ficam entre 0.899 ± 0.03
+# 95% das amostras ficam entre 0.899 ± 0.06
+```
+
+Sem ruído, a IA decora os 9 valores fixos e falha se encontrar algo diferente. Com ruído, ela aprende a **função contínua** e generaliza para qualquer valor dentro da faixa.
+
+### 27.5 Resultado esperado
+
+| Métrica | Sem ruído (9 estados) | Com ruído Markov + Gaussiano |
+|---------|-----------------------|------------------------------|
+| Estados únicos vistos | 9 | ~10⁶+ combinações |
+| Generalização | Nenhuma fora dos 9 | Toda faixa 0,2-0,9 (d_ran) |
+| Overfitting | Alto (decora valores) | Baixo (aprende função) |
+| Performance em produção | Frágil | Robusta |
+
+---
+
+## 28. Função de recompensa do artigo (Lotfi et al. 2025)
+
+### 28.1 Definição original
+
+A recompensa proposta no artigo (seção IV-A) é:
+
+```
+r_t = σ(α_l · Q_l) + P_res + P_minQ
+```
+
+Onde:
+
+- `σ(x) = 1 / (1 + e^(-x))` — função sigmoid
+- `Q_l` — QoS atual da slice `l` (eMBB, MTC, URLLC)
+- `α_l` — parâmetro de sensibilidade adaptativo por slice
+- `P_res` — penalidade por exceder recursos disponíveis
+- `P_minQ` — penalidade por não atingir QoS mínima
+
+### 28.2 Componente 1: Satisfação de QoS com sigmoid
+
+A sigmoid mapeia a QoS medida para uma recompensa entre 0 e 1:
+
+```python
+α_embb   = 4.0    # prioridade máxima (câmeras)
+α_mtc    = 2.0    # sensores
+α_urllc  = 3.0    # veículos
+
+qos_embb  = alocacao_embb / max(demanda_embb, 1e-6)
+qos_mtc   = alocacao_mtc  / max(demanda_mtc, 1e-6)
+qos_urllc = alocacao_urllc / max(demanda_urllc, 1e-6)
+
+sig_embb  = 1 / (1 + exp(-α_embb  * qos_embb))
+sig_mtc   = 1 / (1 + exp(-α_mtc   * qos_mtc))
+sig_urllc = 1 / (1 + exp(-α_urllc * qos_urllc))
+
+qos_termo = (sig_embb + sig_mtc + sig_urllc) / 3
+```
+
+Características da sigmoid:
+- **QoS = 0** → σ ≈ 0,5 (neutro, não penaliza nem recompensa)
+- **QoS = 0,5** → σ ≈ 0,73 (começa a recompensar)
+- **QoS = 1,0** → σ ≈ 0,98 (saturado, recompensa máxima)
+- **QoS negativo** → σ < 0,5 (penaliza)
+
+O α controla a inclinação: α maior = resposta mais abrupta.
+
+### 28.3 Componente 2: Penalidade por excesso de recurso
+
+```python
+r_used = alocacao_embb + alocacao_mtc + alocacao_urllc
+excesso = max(0, r_used - budget)
+P_res = -β * excesso    # β = 2.0
+```
+
+Só é ativada quando a alocação total excede o budget disponível. É proporcional ao excesso.
+
+### 28.4 Componente 3: Penalidade por QoS mínima
+
+```python
+Qmin_embb  = 0.7   # câmeras: mínimo 70%
+Qmin_mtc   = 0.5   # sensores: mínimo 50%
+Qmin_urllc = 0.8   # veículos: mínimo 80%
+
+P_minQ = -γ * (
+    max(0, Qmin_embb  - qos_embb)
+    + max(0, Qmin_mtc   - qos_mtc)
+    + max(0, Qmin_urllc - qos_urllc)
+)   # γ = 5.0
+```
+
+Penaliza fortemente QoS abaixo do mínimo aceitável. É zero quando todas as slices estão acima do limiar.
+
+### 28.5 Implementação completa
+
+```python
+def recompensa_artigo(self, alocacao, demandas):
+    EPS = 1e-6
+
+    # QoS por slice
+    qos_embb  = alocacao[0] / max(demandas[0], EPS)
+    qos_mtc   = alocacao[1] / max(demandas[1], EPS)
+    qos_urllc = alocacao[2] / max(demandas[2], EPS)
+
+    # 1. Sigmoid de satisfação
+    alpha = [4.0, 2.0, 3.0]
+    sigmas = [1/(1+np.exp(-a*q)) for a, q in zip(alpha, [qos_embb, qos_mtc, qos_urllc])]
+    qos_termo = np.mean(sigmas)
+
+    # 2. Penalidade de recurso
+    usado = sum(alocacao)
+    excesso = max(0, usado - self.budget)
+    res_penalty = -2.0 * excesso
+
+    # 3. Penalidade de QoS mínima
+    qos_min = [0.7, 0.5, 0.8]
+    abaixo = sum(max(0, qmin - q) for qmin, q in zip(qos_min, [qos_embb, qos_mtc, qos_urllc]))
+    min_qos_penalty = -5.0 * abaixo
+
+    return qos_termo + res_penalty + min_qos_penalty
+```
+
+### 28.6 Diferença para a recompensa atual
+
+| Aspecto | Atual (média ponderada) | Artigo (sigmoid + penalidades) |
+|---------|------------------------|-------------------------------|
+| Faixa | ~0 a 3,5 | ~-5 a +1 |
+| Formato | Linear | Não-linear (sigmoidal) |
+| QoS mínima | Sem proteção | Penalidade forte abaixo do limiar |
+| Excesso recurso | Penalidade fixa -1 | Proporcional ao excesso |
+| Prioridade por slice | Peso único 2x RAN | α separado por slice (4, 2, 3) |
+| Sensibilidade a QoS baixa | Baixa | Alta (sigmoid + penalidade mínima) |
+
+---
+
+## 29. Plano de treino online SAC + SAM
+
+### 29.1 Arquitetura do novo pipeline
+
+Será criada uma trilha paralela que não interfere no pipeline offline existente:
+
+```
+drlexp/
+├── training/
+│   ├── train_sac.py              ← intocado (offline atual)
+│   └── train_online_sam.py       ← NOVO: treino online SAC+SAM
+└── src/drl/
+    ├── caora_sac_environment.py   ← intocado
+    ├── ta_sam_marl.py             ← intocado
+    └── online_marl_env.py         ← NOVO: ambiente com gerador Markov
+```
+
+### 29.2 Ambiente online (`online_marl_env.py`)
+
+```python
+class OnlineMARLEnv(gym.Env):
+    """
+    Ambiente de treino online com gerador sintético Markov + ruído.
+    Não depende de Data Lake, ns-3 ou CSV.
+    """
+
+    def __init__(self, n_du=3, n_slices=3):
+        self.workload_gen = MarkovWorkloadGenerator()
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(n_du * n_slices,))
+        self.observation_space = spaces.Box(low=0.0, high=np.inf, shape=(10,))
+```
+
+### 29.3 Loop de treino online SAC + SAM
+
+```python
+def train_online_sac_sam(args):
+    env = OnlineMARLEnv()
+    actor = GaussianActor(state_dim, action_dim)
+    critic1, critic2 = QNetwork(...), QNetwork(...)
+    replay_buffer = ReplayBuffer(capacity=100000)
+
+    rho = args.sam_rho_init  # 0.05
+
+    for episode in range(args.num_episodes):
+        state, _ = env.reset()
+        episode_reward = 0
+
+        while not terminated:
+            action = actor.sample(state)
+            next_state, reward, terminated, ... = env.step(action)
+            replay_buffer.push(state, action, reward, next_state, terminated)
+            state = next_state
+            episode_reward += reward
+
+        # Treino com batch do replay buffer
+        batch = replay_buffer.sample(args.batch_size)
+
+        # 1. Atualiza críticos (SAC twin-Q, sem SAM)
+        critic_loss = atualiza_criticos(batch, actor, critic1, critic2)
+
+        # 2. Atualiza ator COM SAM (sharpness-aware)
+        # 2a. Forward pass
+        actions_pred = actor(batch.states)
+        q1 = critic1(batch.states, actions_pred)
+        q2 = critic2(batch.states, actions_pred)
+        min_q = torch.min(q1, q2)
+        actor_loss = (alpha * log_prob - min_q).mean()
+
+        # 2b. SAM: perturba gradientes
+        actor_loss.backward()
+        grad_norm = calcula_norma_gradientes(actor)
+        if grad_norm > 0:
+            with torch.no_grad():
+                for p in actor.parameters():
+                    if p.grad is not None:
+                        p.add_(rho * p.grad / grad_norm)  # sobe
+            # 2c. Recalcula loss na posição perturbada
+            actor_loss_adv = calcula_loss_ator(actor, batch, critic1, critic2)
+            actor_opt.zero_grad()
+            actor_loss_adv.backward()  # gradiente na posição avançada
+            # 2d. Restaura parâmetros e aplica gradiente corrigido
+            with torch.no_grad():
+                for p in actor.parameters():
+                    p.sub_(rho * p.grad / grad_norm)  # desce
+            optimizer.step()
+
+        # 3. Decaimento de ρ
+        rho = max(args.rho_min, rho * args.rho_decay)
+```
+
+### 29.4 SAM integrado — detalhe do algoritmo
+
+O SAM (Sharpness-Aware Minimization) do artigo funciona em 3 passos:
+
+```
+1. Calcular gradiente ∇L(θ) na posição atual
+2. Avançar para θ_adv = θ + ρ · ∇L(θ) / ||∇L(θ)||
+3. Calcular gradiente em θ_adv e usar esse gradiente para atualizar θ
+```
+
+Isso encontra **mínimos planos** (flat minima) que generalizam melhor que mínimos pontiagudos (sharp minima). O ρ controla o "raio" de perturbação.
+
+### 29.5 ρ dinâmico
+
+O artigo usa ρ que decai durante o treino:
+
+```python
+# Estratégia de decaimento
+rho_inicial = 0.05    # exploratório no começo
+rho_final   = 0.005   # conservador no fim
+rho = rho_inicial * (1 - episode / total_episodes) + rho_final * (episode / total_episodes)
+```
+
+- **Começo (ρ ≈ 0.05)**: SAM força o ator a explorar regiões planas
+- **Meio (ρ ≈ 0.025)**: equilíbrio entre exploração e refinamento
+- **Final (ρ ≈ 0.005)**: refino fino, quase SAC vanilla
+
+### 29.6 Seletor SAM (opcional pós-implementação)
+
+O artigo aplica SAM **seletivamente**: só atualiza atores onde a variância do TD-error excede um limiar `λ_TD`. Isso reduz custo computacional e foca as atualizações nos agentes mais incertos.
+
+```python
+td_errors = [abs(q - reward) for q, reward in zip(q_values, batch_rewards)]
+td_variance = np.var(td_errors)
+if td_variance >= lambda_td:
+    aplicar_sam = True
+else:
+    aplicar_sam = False  # só atualização vanilla
+```
+
+---
+
+## 30. Comparação completa: GreenRAN vs Artigo Lotfi et al. 2025
+
+### 30.1 Tabela geral
+
+| Aspecto | Artigo (Lotfi et al.) | GreenRAN hoje | Alvo pós-alinhamento |
+|---------|----------------------|---------------|---------------------|
+| **Nº DUs** | 6 | 3 | 3 (manter) |
+| **Nº UEs** | 200 | 12 + 5 veículos | 12 + 5 (manter) |
+| **Slices** | eMBB, MTC, URLLC | eMBB, mMTC, URLLC | ✓ igual |
+| **Rede ator** | 300→400→400 tanh | **300→400→400 tanh** ✓ | ✓ |
+| **Rede crítico** | 300→400→400 tanh | **300→400→400 tanh** ✓ | ✓ |
+| **Learning rate** | 1e-4 | **1e-4** ✓ | ✓ |
+| **Otimizador** | Adam | Adam | Adam + SAM pendente |
+| **Algoritmo** | SAC + SAM integrado | SAC vanilla + TA-SAM separado | SAC + SAM integrado |
+| **ρ SAM** | Dinâmico (decai) | Fixo 0.05 | Dinâmico |
+| **Seletor SAM** | Variância TD-error | Variância da ação | Variância TD-error |
+| **Recompensa** | `σ(α·Q) + P_res + P_minQ` | **`σ(α·Q) + P_res + P_minQ`** ✓ | ✓ |
+| **Treino** | Online (iteração ambiente) | Offline (BC + SAC/AWAC) | Online (ambiente Markov) |
+| **Ambiente** | Sintético próprio | CSV real Data Lake | Gerador Markov + ruído |
+| **Crítico** | Global centralizado | Twin-Q SAC | Twin-Q SAC + SAM |
+| **Fonte de dados** | UEs virtuais | ns-3 com xApps reais | Distribuições dos traços |
+
+### 30.2 Status de implementação
+
+| Item | Status | Prioridade |
+|------|--------|------------|
+| Ambiente Markov + ruído | Não implementado | Alta |
+| Recompensa sigmoid + penalidades | **Implementado** ✓ | Alta |
+| SAC + SAM integrado | Não implementado | Alta |
+| ρ dinâmico | Não implementado | Média |
+| Seletor por variância TD-error | Não implementado | Média |
+| Rede 300→400→400 tanh | **Implementado** ✓ | Média |
+| Learning rate 1e-4 | **Implementado** ✓ | Baixa |
+| Treino online | Não implementado | Alta |
+
+### 30.3 Arquivos novos necessários
+
+| Arquivo | Descrição |
+|---------|-----------|
+| `drlexp/src/drl/online_marl_env.py` | Ambiente Gymnasium com gerador Markov + ruído e recompensa do artigo |
+| `drlexp/training/train_online_sam.py` | Loop de treino online SAC + SAM com ρ dinâmico |
+| `drlexp/src/drl/sam_optimizer.py` | Otimizador SAM reutilizável (separado do TA-SAM) |
+
+### 30.4 Benefício esperado
+
+Completar o alinhamento com o artigo trará:
+
+1. **Generalização**: agente treinado em milhões de estados sintéticos vs 9 fixos
+2. **Qualidade**: recompensa sigmoid + penalidades alinhada com QoS real
+3. **Exploração**: treino online permite que o agente descubra estratégias não observadas
+4. **Platôs**: SAM força mínimos planos, reduzindo overfitting
+5. **Shadow consistente**: checkpoint mais robusto deve manter positive_rate > 60% mesmo em sobrecarga

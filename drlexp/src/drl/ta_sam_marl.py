@@ -143,7 +143,7 @@ def calibrate_td_variance_threshold(
 
 
 class TASAMMultiAgentTrainer:
-    def __init__(self, du_count: int, du_state_dim: int, global_state_dim: int, lr: float = 3e-4, rho: float = 0.05) -> None:
+    def __init__(self, du_count: int, du_state_dim: int, global_state_dim: int, lr: float = 1e-4, rho: float = 0.05) -> None:
         self.actors = nn.ModuleList([ActorNetwork(du_state_dim) for _ in range(du_count)])
         self.critic = GlobalCritic(global_state_dim + (du_count * 3))
         self.actor_opt = SAMOptimizer(self.actors.parameters(), torch.optim.Adam, lr=lr, rho=rho)
