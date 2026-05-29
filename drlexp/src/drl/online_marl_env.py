@@ -116,6 +116,7 @@ class OnlineMARLEnv(gym.Env):
         delta_step: float = 0.1,
         alpha_ran: float = 4.0,
         alpha_ai: float = 2.5,
+        alpha_adapt_beta: float = 2.0,
         beta_res: float = 2.0,
         gamma_minqos: float = 5.0,
         qos_min_ran: float = 0.7,
@@ -131,6 +132,7 @@ class OnlineMARLEnv(gym.Env):
         self.delta_step = float(delta_step)
         self.alpha_ran = float(alpha_ran)
         self.alpha_ai = float(alpha_ai)
+        self.alpha_adapt_beta = float(alpha_adapt_beta)
         self.beta_res = float(beta_res)
         self.gamma_minqos = float(gamma_minqos)
         self.qos_min_ran = float(qos_min_ran)
@@ -179,8 +181,14 @@ class OnlineMARLEnv(gym.Env):
         ran_completion = served_ran / max(d_ran, 1e-6)
         ai_completion = served_ai / max(d_ai, 1e-6)
 
-        sig_ran = 1.0 / (1.0 + np.exp(-self.alpha_ran * ran_completion))
-        sig_ai = 1.0 / (1.0 + np.exp(-self.alpha_ai * ai_completion))
+        alpha_ran_eff = self.alpha_ran * (
+            1.0 + self.alpha_adapt_beta * max(0.0, self.qos_min_ran - ran_completion)
+        )
+        alpha_ai_eff = self.alpha_ai * (
+            1.0 + self.alpha_adapt_beta * max(0.0, self.qos_min_ai - ai_completion)
+        )
+        sig_ran = 1.0 / (1.0 + np.exp(-alpha_ran_eff * ran_completion))
+        sig_ai = 1.0 / (1.0 + np.exp(-alpha_ai_eff * ai_completion))
         qos_term = (sig_ran + sig_ai) / 2.0
 
         usado = float(candidate.sum())
@@ -212,6 +220,9 @@ class OnlineMARLEnv(gym.Env):
             "ran_completion": ran_completion,
             "ai_completion": ai_completion,
             "stage": self.generator.stage,
+            "qos_term": float(qos_term),
+            "res_penalty": float(res_penalty),
+            "min_qos_penalty": float(min_qos_penalty),
         }
         return next_obs, float(reward), terminated, False, info
 

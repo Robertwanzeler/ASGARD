@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--awac-max-weight", type=float, default=12.0, help="Maximum importance weight for AWAC-style actor updates")
     parser.add_argument("--sam-rho", type=float, default=0.05, help="SAM perturbation radius (artigo: 0.05, 0 = desliga)")
     parser.add_argument("--sam-rho-decay", action="store_true", default=True, help="Aplica decaimento linear ao rho durante o treino (artigo: dinamico)")
+    parser.add_argument("--sam-td-var-threshold", type=float, default=0.01, help="Limiar de variancia TD para aplicar SAM seletivamente (artigo)")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
     parser.add_argument("--alpha-init", type=float, default=0.03, help="Initial entropy temperature")
     parser.add_argument("--alpha-min", type=float, default=1e-4, help="Minimum entropy temperature")
@@ -491,7 +492,19 @@ def run_offline_sac(
                 actor_opt.zero_grad()
                 actor_loss.backward()
 
-                if current_rho > 0:
+                apply_sam = current_rho > 0
+                if apply_sam and args.sam_td_var_threshold > 0:
+                    with torch.no_grad():
+                        td_errors = []
+                        for s, a, r in zip(states, actions, rewards):
+                            q1_v = critic1(s.unsqueeze(0), a.unsqueeze(0))
+                            q2_v = critic2(s.unsqueeze(0), a.unsqueeze(0))
+                            q_v = torch.min(q1_v, q2_v)
+                            td_errors.append(float(abs(q_v.item() - r.item())))
+                        td_var = float(np.var(td_errors)) if len(td_errors) > 1 else 0.0
+                        apply_sam = td_var >= args.sam_td_var_threshold
+
+                if apply_sam:
                     grad_norm = 0.0
                     for p in actor.parameters():
                         if p.grad is not None:

@@ -39,22 +39,32 @@ class Transition:
 
 
 class ReplayBuffer:
-    """Replay buffer simples para acoes continuas."""
+    """Replay buffer com suporte opcional a amostragem priorizada por TD-error."""
 
-    def __init__(self, capacity: int = 100_000):
+    def __init__(self, capacity: int = 100_000, prioritized: bool = False):
         self.capacity = capacity
+        self.prioritized = prioritized
         self.buffer: list[Transition] = []
+        self.priorities: list[float] = []
         self._idx = 0
 
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action, reward, next_state, done, priority: float = 1.0):
         if len(self.buffer) < self.capacity:
             self.buffer.append(Transition(state, action, reward, next_state, done))
+            self.priorities.append(priority)
         else:
             self.buffer[self._idx] = Transition(state, action, reward, next_state, done)
+            self.priorities[self._idx] = priority
         self._idx = (self._idx + 1) % self.capacity
 
     def sample(self, batch_size: int):
-        indices = np.random.randint(0, len(self.buffer), size=batch_size)
+        n = len(self.buffer)
+        if self.prioritized and n > 1:
+            probs = np.array(self.priorities[:n]) ** 0.6
+            probs = probs / probs.sum()
+            indices = np.random.choice(n, size=batch_size, p=probs, replace=False)
+        else:
+            indices = np.random.randint(0, n, size=batch_size)
         states = np.array([self.buffer[i].state for i in indices])
         actions = np.array([self.buffer[i].action for i in indices])
         rewards = np.array([self.buffer[i].reward for i in indices])
@@ -66,7 +76,12 @@ class ReplayBuffer:
             torch.tensor(rewards, dtype=torch.float32).unsqueeze(1),
             torch.tensor(next_states, dtype=torch.float32),
             torch.tensor(dones, dtype=torch.float32).unsqueeze(1),
-        )
+        ), indices
+
+    def update_priorities(self, indices: list[int], td_errors: list[float]) -> None:
+        for idx, td in zip(indices, td_errors):
+            if 0 <= idx < len(self.priorities):
+                self.priorities[idx] = max(0.01, abs(td))
 
     def __len__(self):
         return len(self.buffer)
@@ -159,6 +174,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-episodes", type=int, default=5, help="Episodios de avaliacao")
     p.add_argument("--seed", type=int, default=42, help="Semente aleatoria")
     p.add_argument("--device", default="auto", help="Dispositivo (auto, cpu, cuda)")
+    p.add_argument("--prioritized-replay", action="store_true", default=False, help="Usa amostragem priorizada por TD-error (artigo)")
     p.add_argument("--save-replay", action="store_true", default=False, help="Salvar replay apos treino")
     return p.parse_args()
 
@@ -168,6 +184,9 @@ def evaluate(actor: GaussianActor, env: OnlineMARLEnv, episodes: int, device: to
     rewards = []
     ran_comps = []
     ai_comps = []
+    qos_terms = []
+    res_penalties = []
+    min_qos_penalties = []
     for _ in range(episodes):
         obs, _ = env.reset()
         ep_rew = 0.0
@@ -178,6 +197,9 @@ def evaluate(actor: GaussianActor, env: OnlineMARLEnv, episodes: int, device: to
             next_obs, reward, term, trunc, info = env.step(action)
             ep_rew += reward
             obs = next_obs
+            qos_terms.append(info.get("qos_term", 0.0))
+            res_penalties.append(info.get("res_penalty", 0.0))
+            min_qos_penalties.append(info.get("min_qos_penalty", 0.0))
             if term or trunc:
                 break
         rewards.append(ep_rew)
@@ -189,6 +211,9 @@ def evaluate(actor: GaussianActor, env: OnlineMARLEnv, episodes: int, device: to
         "std_return": float(np.std(rewards)),
         "mean_ran_completion": float(np.mean(ran_comps)),
         "mean_ai_completion": float(np.mean(ai_comps)),
+        "avg_qos_term": float(np.mean(qos_terms)) if qos_terms else 0.0,
+        "avg_res_penalty": float(np.mean(res_penalties)) if res_penalties else 0.0,
+        "avg_min_qos_penalty": float(np.mean(min_qos_penalties)) if min_qos_penalties else 0.0,
     }
 
 
@@ -224,7 +249,7 @@ def main() -> int:
     alpha_opt = torch.optim.Adam([log_alpha], lr=args.alpha_lr)
     target_entropy = -(float(action_size) * float(args.target_entropy_scale))
 
-    replay = ReplayBuffer(capacity=args.replay_capacity)
+    replay = ReplayBuffer(capacity=args.replay_capacity, prioritized=args.prioritized_replay)
 
     episode_returns = []
     episode_losses = []
@@ -259,7 +284,7 @@ def main() -> int:
             # Treino SAC + SAM
             if len(replay) >= args.warmup_steps and global_step % args.train_freq == 0:
                 for _ in range(args.gradient_steps):
-                    states, actions, rewards, next_states, dones = replay.sample(args.batch_size)
+                    (states, actions, rewards, next_states, dones), batch_indices = replay.sample(args.batch_size)
                     states = states.to(device)
                     actions = actions.to(device)
                     rewards = rewards.to(device)
@@ -286,6 +311,17 @@ def main() -> int:
                     critic1_opt.step()
                     critic2_opt.step()
                     ep_critic_losses.append(float(critic_loss.item()))
+
+                    # --- Atualiza prioridades do replay buffer ---
+                    if args.prioritized_replay:
+                        with torch.no_grad():
+                            td_errors = []
+                            for s, a, r in zip(states, actions, rewards):
+                                q1_v = critic1(s.unsqueeze(0), a.unsqueeze(0))
+                                q2_v = critic2(s.unsqueeze(0), a.unsqueeze(0))
+                                q_v = torch.min(q1_v, q2_v)
+                                td_errors.append(float(abs(q_v.item() - r.item())))
+                            replay.update_priorities(list(batch_indices), td_errors)
 
                     # --- Actor update with SAM ---
                     sampled_actions, log_prob, _ = actor.sample(states)
@@ -361,6 +397,9 @@ def main() -> int:
             print(
                 f"ep={ep:>6d}  return={ep_return:>7.2f}  "
                 f"eval_ret={eval_metrics['mean_return']:>7.2f}  "
+                f"qos={eval_metrics['avg_qos_term']:+.3f}  "
+                f"pres={eval_metrics['avg_res_penalty']:+.3f}  "
+                f"pmin={eval_metrics['avg_min_qos_penalty']:+.3f}  "
                 f"actor_loss={episode_losses[-1]['actor']:>6.3f}  "
                 f"rho={rho_val:.4f}  "
                 f"alpha={float(log_alpha.exp().item()):.3f}"
@@ -377,6 +416,8 @@ def main() -> int:
     torch.save({"state_dict": critic1.state_dict()}, critic1_path)
     torch.save({"state_dict": critic2.state_dict()}, critic2_path)
 
+    mean_ep_actor_loss = float(np.mean([l["actor"] for l in episode_losses[-100:]])) if episode_losses else 0.0
+    mean_ep_critic_loss = float(np.mean([l["critic"] for l in episode_losses[-100:]])) if episode_losses else 0.0
     summary = {
         "output_dir": str(out_dir.resolve()),
         "args": vars(args),
@@ -388,6 +429,8 @@ def main() -> int:
         "critic1_checkpoint": str(critic1_path.resolve()),
         "critic2_checkpoint": str(critic2_path.resolve()),
         "mean_return_last_100": float(np.mean(episode_returns[-100:])) if len(episode_returns) >= 100 else float(np.mean(episode_returns)),
+        "mean_actor_loss_last_100": mean_ep_actor_loss,
+        "mean_critic_loss_last_100": mean_ep_critic_loss,
     }
     (out_dir / "online_sam_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))

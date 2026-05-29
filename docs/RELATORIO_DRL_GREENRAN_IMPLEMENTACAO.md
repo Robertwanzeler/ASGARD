@@ -2591,6 +2591,10 @@ else:
 | Rede 300→400→400 tanh | **Implementado** ✓ | Média |
 | Learning rate 1e-4 | **Implementado** ✓ | Baixa |
 | Treino online | **Implementado** ✓ (`train_online_sam.py` + `online_marl_env.py`) | Alta |
+| Seletor TD-error no SAC offline | **Implementado** ✓ | Média |
+| α adaptativo por QoS | **Implementado** ✓ | Média |
+| Prioritized Replay | **Implementado** ✓ | Baixa |
+| Monitoramento componentes recompensa | **Implementado** ✓ | Baixa |
 
 ### 30.3 Arquivos novos necessários
 
