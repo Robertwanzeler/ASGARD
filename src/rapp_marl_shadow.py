@@ -9,6 +9,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+try:
+    from greenran_paths import ARTICLE00_SCENARIO_CONTROL_PATH
+except ModuleNotFoundError:
+    from src.greenran_paths import ARTICLE00_SCENARIO_CONTROL_PATH
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -26,6 +31,173 @@ def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return value
 
 
+def _completion_estimate(allocation: float, demand: float) -> float:
+    demand = _safe_float(demand, 0.0)
+    if demand <= 1e-9:
+        return 1.0
+    return _clamp(_safe_float(allocation, 0.0) / demand, 0.0, 1.0)
+
+
+def _shortfall(allocation: float, demand: float) -> float:
+    return max(_safe_float(demand, 0.0) - _safe_float(allocation, 0.0), 0.0)
+
+
+def _surplus(allocation: float, demand: float) -> float:
+    return max(_safe_float(allocation, 0.0) - _safe_float(demand, 0.0), 0.0)
+
+
+def _safe_read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def _scenario_priority(resource_snapshot: Dict[str, Any] | None, marl_shadow: Dict[str, Any] | None) -> str:
+    marl_shadow = marl_shadow or {}
+    stage_name = str(marl_shadow.get('scenario_stage') or '').strip().lower()
+    if 'camera_overload' in stage_name or 'app1' in stage_name:
+        return 'ran_camera'
+    if 'background_overload' in stage_name:
+        return 'ran_balanced'
+    if 'mixed_overload' in stage_name:
+        return 'mixed'
+
+    resource_snapshot = resource_snapshot or {}
+    d_ran = _safe_float(resource_snapshot.get('d_ran', 0.0), 0.0)
+    d_ai = _safe_float(resource_snapshot.get('d_ai', 0.0), 0.0)
+    if d_ran >= 0.75 and d_ran >= (d_ai + 0.10):
+        return 'ran_camera'
+    if d_ai >= 0.60 and d_ai > d_ran:
+        return 'ai_guarded'
+    return 'mixed'
+
+
+def _load_scenario_control() -> dict:
+    return _safe_read_json(ARTICLE00_SCENARIO_CONTROL_PATH)
+
+
+def _share_of(value: float, total: float, default: float = 0.5) -> float:
+    total = _safe_float(total, 0.0)
+    if total <= 1e-9:
+        return default
+    return _clamp(_safe_float(value, 0.0) / total, 0.0, 1.0)
+
+
+def _desired_ran_share(resource_snapshot: Dict[str, Any] | None, mean_embb: float, mean_mmtc: float, mean_urllc: float, embb_pressure: float, ai_pressure: float, priority: str) -> float:
+    resource_snapshot = resource_snapshot or {}
+    usable_budget = _safe_float(resource_snapshot.get('usable_budget', resource_snapshot.get('resource_budget', 1.0)), 1.0)
+    current_r_ran = _safe_float(resource_snapshot.get('r_ran', 0.0), 0.0)
+    d_ran = _safe_float(resource_snapshot.get('d_ran', 0.0), 0.0)
+    d_ai = _safe_float(resource_snapshot.get('d_ai', 0.0), 0.0)
+    live_share = _share_of(current_r_ran, usable_budget, default=0.5)
+    demand_share = _share_of(d_ran, d_ran + d_ai, default=live_share)
+    action_share = _clamp((0.78 * mean_embb) + (0.10 * embb_pressure) - (0.03 * mean_mmtc) - (0.05 * mean_urllc), 0.10, 0.98)
+    ai_dominance = max(0.0, d_ai - d_ran)
+    ran_dominance = max(0.0, d_ran - d_ai)
+
+    if priority == 'ran_camera':
+        share = (0.48 * live_share) + (0.30 * demand_share) + (0.22 * action_share)
+        share += 0.05 * max(0.0, embb_pressure - 0.30)
+        share += 0.03 * max(0.0, ran_dominance)
+        lower, upper = 0.45, 0.94
+    elif priority == 'ai_guarded':
+        share = (0.42 * live_share) + (0.30 * demand_share) + (0.28 * action_share)
+        share -= 0.12 * max(0.0, ai_pressure - 0.45)
+        share -= 0.08 * ai_dominance
+        lower, upper = 0.12, 0.74
+    else:
+        share = (0.50 * live_share) + (0.32 * demand_share) + (0.18 * action_share)
+        share += 0.02 * max(0.0, embb_pressure - 0.30)
+        share += 0.015 * max(0.0, ran_dominance)
+        share -= 0.08 * max(0.0, ai_pressure - 0.25)
+        share -= 0.05 * ai_dominance
+        lower, upper = 0.22, 0.86
+    return _clamp(share, lower, upper)
+
+
+def _score_proxy(ran_completion: float, ai_completion: float, total_shortfall: float, total_surplus: float, budget_gap: float, priority: str = 'mixed') -> float:
+    if priority == 'ran_camera':
+        ran_weight, ai_weight = 0.55, 0.20
+        shortfall_weight, surplus_weight, budget_weight = 0.17, 0.04, 0.04
+    elif priority == 'ai_guarded':
+        ran_weight, ai_weight = 0.30, 0.45
+        shortfall_weight, surplus_weight, budget_weight = 0.15, 0.05, 0.05
+    else:
+        ran_weight, ai_weight = 0.40, 0.38
+        shortfall_weight, surplus_weight, budget_weight = 0.14, 0.04, 0.04
+    return (
+        (ran_weight * _clamp(ran_completion))
+        + (ai_weight * _clamp(ai_completion))
+        - (shortfall_weight * max(total_shortfall, 0.0))
+        - (surplus_weight * max(total_surplus, 0.0))
+        - (budget_weight * max(budget_gap, 0.0))
+    )
+
+
+def build_shadow_comparison(resource_snapshot: Dict[str, Any] | None, marl_shadow: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Build a proxy comparison between live allocation and shadow allocation.
+
+    This does not actuate the MARL policy. It estimates how the current shadow
+    allocation would compare against the live allocator under the same observed
+    demand snapshot.
+    """
+    resource_snapshot = resource_snapshot or {}
+    marl_shadow = marl_shadow or {}
+    if not marl_shadow or not marl_shadow.get('available'):
+        return {}
+
+    usable_budget = _safe_float(resource_snapshot.get('usable_budget', resource_snapshot.get('resource_budget', 1.0)), 1.0)
+    d_ran = _safe_float(resource_snapshot.get('d_ran', 0.0), 0.0)
+    d_ai = _safe_float(resource_snapshot.get('d_ai', 0.0), 0.0)
+
+    live_r_ran = _safe_float(resource_snapshot.get('r_ran', 0.0), 0.0)
+    live_r_ai = _safe_float(resource_snapshot.get('r_ai', 0.0), 0.0)
+    shadow_r_ran = _safe_float(marl_shadow.get('shadow_r_ran', live_r_ran), live_r_ran)
+    shadow_r_ai = _safe_float(marl_shadow.get('shadow_r_ai', live_r_ai), live_r_ai)
+
+    live_ran_completion = _completion_estimate(live_r_ran, d_ran)
+    live_ai_completion = _completion_estimate(live_r_ai, d_ai)
+    shadow_ran_completion = _completion_estimate(shadow_r_ran, d_ran)
+    shadow_ai_completion = _completion_estimate(shadow_r_ai, d_ai)
+
+    live_shortfall = _shortfall(live_r_ran, d_ran) + _shortfall(live_r_ai, d_ai)
+    shadow_shortfall = _shortfall(shadow_r_ran, d_ran) + _shortfall(shadow_r_ai, d_ai)
+    live_surplus = _surplus(live_r_ran, d_ran) + _surplus(live_r_ai, d_ai)
+    shadow_surplus = _surplus(shadow_r_ran, d_ran) + _surplus(shadow_r_ai, d_ai)
+    live_budget_gap = abs((live_r_ran + live_r_ai) - usable_budget)
+    shadow_budget_gap = abs((shadow_r_ran + shadow_r_ai) - usable_budget)
+
+    priority = _scenario_priority(resource_snapshot, marl_shadow)
+    live_score = _score_proxy(live_ran_completion, live_ai_completion, live_shortfall, live_surplus, live_budget_gap, priority=priority)
+    shadow_score = _score_proxy(shadow_ran_completion, shadow_ai_completion, shadow_shortfall, shadow_surplus, shadow_budget_gap, priority=priority)
+    score_delta = shadow_score - live_score
+
+    recommend_shadow = bool(
+        marl_shadow.get('source') in {'checkpoint', 'mixed'}
+        and marl_shadow.get('checkpoint_readiness') in {'shadow_ready', 'control_candidate'}
+        and score_delta > 0.01
+    )
+
+    return {
+        'live_score': round(live_score, 6),
+        'shadow_score': round(shadow_score, 6),
+        'score_delta': round(score_delta, 6),
+        'live_ran_completion_est': round(live_ran_completion, 4),
+        'shadow_ran_completion_est': round(shadow_ran_completion, 4),
+        'live_ai_completion_est': round(live_ai_completion, 4),
+        'shadow_ai_completion_est': round(shadow_ai_completion, 4),
+        'live_total_shortfall': round(live_shortfall, 4),
+        'shadow_total_shortfall': round(shadow_shortfall, 4),
+        'live_total_surplus': round(live_surplus, 4),
+        'shadow_total_surplus': round(shadow_surplus, 4),
+        'live_budget_gap': round(live_budget_gap, 4),
+        'shadow_budget_gap': round(shadow_budget_gap, 4),
+        'priority': priority,
+        'recommend_shadow': recommend_shadow,
+    }
+
+
 class MARLShadowRuntimeEvaluator:
     def __init__(self) -> None:
         self.enabled = str(os.environ.get('GREENRAN_MARL_SHADOW_ENABLE', '1')).strip().lower() not in {'0', 'false', 'no'}
@@ -36,6 +208,12 @@ class MARLShadowRuntimeEvaluator:
             os.environ.get(
                 'GREENRAN_TASAM_EVAL_MANIFEST',
                 self.project_root / 'runs' / 'sac_bootstrap' / 'tasam_candidate_evaluation_latest.json',
+            )
+        )
+        self.control_gate_manifest_path = Path(
+            os.environ.get(
+                'GREENRAN_MARL_CONTROL_GATE_MANIFEST',
+                self.project_root / 'runs' / 'sac_bootstrap' / 'marl_control_gate_latest.json',
             )
         )
         self.checkpoint_source = 'heuristic'
@@ -53,6 +231,11 @@ class MARLShadowRuntimeEvaluator:
             return json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             return {}
+
+    def _load_control_gate(self) -> dict:
+        payload = self._load_json(self.control_gate_manifest_path)
+        gate = (payload or {}).get('gate') or {}
+        return gate if isinstance(gate, dict) else {}
 
     def _ensure_local_torch_importable(self) -> None:
         venv_site = self.project_root / 'drlexp' / '.venv' / 'lib'
@@ -114,7 +297,9 @@ class MARLShadowRuntimeEvaluator:
                 )
 
             def forward(self, x):
-                return self.net(x)
+                out = self.net(x)
+                total = torch.clamp(out.sum(dim=-1, keepdim=True), min=1e-9)
+                return out / total
 
         actors = nn.ModuleList([_ActorNetwork(du_state_dim) for _ in range(du_count)])
         state_dict = torch.load(ckpt_path, map_location='cpu')
@@ -170,6 +355,7 @@ class MARLShadowRuntimeEvaluator:
             return {'enabled': False, 'policy_id': self.policy_id, 'mode': self.mode}
         marl_state = marl_state or {}
         resource_snapshot = resource_snapshot or {}
+        scenario_control = _load_scenario_control()
         du_states = marl_state.get('du_states', []) or []
         slice_state = marl_state.get('slice_state', {}) or {}
         if not du_states:
@@ -181,6 +367,7 @@ class MARLShadowRuntimeEvaluator:
                 'source': self.checkpoint_source,
                 'checkpoint_readiness': self.checkpoint_readiness,
                 'checkpoint_error': self._checkpoint_error,
+                'control_gate': self._load_control_gate(),
             }
 
         du_recommendations = []
@@ -212,14 +399,24 @@ class MARLShadowRuntimeEvaluator:
             _safe_float((slice_state.get('mMTC') or {}).get('qos_pressure', 0.0), 0.0),
             _safe_float((slice_state.get('URLLC') or {}).get('qos_pressure', 0.0), 0.0),
         )
-        shadow_ran_share = _clamp(0.4 + (0.35 * mean_embb) + (0.15 * embb_pressure) - (0.10 * ai_pressure), 0.15, 0.9)
+        scenario_stage = str((scenario_control or {}).get('collection_event_stage_name') or (scenario_control or {}).get('scenario') or '').strip()
+        priority = _scenario_priority(resource_snapshot, {'scenario_stage': scenario_stage})
+        shadow_ran_share = _desired_ran_share(
+            resource_snapshot,
+            mean_embb=mean_embb,
+            mean_mmtc=mean_mmtc,
+            mean_urllc=mean_urllc,
+            embb_pressure=embb_pressure,
+            ai_pressure=ai_pressure,
+            priority=priority,
+        )
         shadow_r_ran = usable_budget * shadow_ran_share
         shadow_r_ai = max(0.0, usable_budget - shadow_r_ran)
         final_source = 'checkpoint' if used_checkpoint == len(du_recommendations) and du_recommendations else 'heuristic'
         if used_checkpoint and used_checkpoint < len(du_recommendations):
             final_source = 'mixed'
 
-        return {
+        result = {
             'enabled': True,
             'available': True,
             'policy_id': self.policy_id,
@@ -228,6 +425,8 @@ class MARLShadowRuntimeEvaluator:
             'checkpoint_readiness': self.checkpoint_readiness,
             'checkpoint_run_dir': self.checkpoint_run_dir,
             'checkpoint_error': self._checkpoint_error,
+            'control_gate': self._load_control_gate(),
+            'scenario_stage': scenario_stage,
             'topology_id': marl_state.get('topology_id', 'unknown'),
             'du_count': len(du_recommendations),
             'du_recommendations': du_recommendations,
@@ -237,3 +436,5 @@ class MARLShadowRuntimeEvaluator:
             'delta_r_ai_vs_live': round(shadow_r_ai - current_r_ai, 4),
             'mean_action_vector': [round(mean_embb, 4), round(mean_mmtc, 4), round(mean_urllc, 4)],
         }
+        result['comparison'] = build_shadow_comparison(resource_snapshot, result)
+        return result

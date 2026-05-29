@@ -297,6 +297,8 @@ class RappResourceOptimizer:
         
         # INICIA xApps CONTROLADOS PELO RAPP
         # Slicer SEMPRE inicia com rApp (prioridade)
+        self._energy_xapp_disabled = False
+        self._vehicle_xapp_disabled = False
         self._start_slicer()
         self._start_vehicle_control()
 
@@ -326,7 +328,13 @@ class RappResourceOptimizer:
         """Inicia o xApp ENERGY SAVER (se condições permitirem)."""
         if self._energy_active:
             return True
-        
+        if self._energy_xapp_disabled:
+            return False
+        if not self.xapp_manager.is_available("energy_saver"):
+            self._energy_xapp_disabled = True
+            print("[rApp] xApp ENERGY SAVER indisponível neste build; novas tentativas serão ignoradas")
+            return False
+
         print("[rApp] Iniciando xApp ENERGY SAVER...")
         if self.xapp_manager.start("energy_saver"):
             if self.xapp_manager.wait_for_ready("energy_saver", timeout=10):
@@ -338,11 +346,22 @@ class RappResourceOptimizer:
                 self._energy_active = True
                 return True
         else:
-            print("[rApp] ERRO: Não foi possível iniciar xApp ENERGY SAVER")
+            if not self.xapp_manager.is_available("energy_saver"):
+                self._energy_xapp_disabled = True
+                print("[rApp] xApp ENERGY SAVER indisponível após tentativa; novas tentativas serão ignoradas")
+            else:
+                print("[rApp] ERRO: Não foi possível iniciar xApp ENERGY SAVER")
             return False
 
     def _start_vehicle_control(self):
         """Inicia o xApp VEHICLE CONTROL (sempre ativo para o App3)."""
+        if self._vehicle_xapp_disabled:
+            return False
+        if not self.xapp_manager.is_available("vehicle_control"):
+            self._vehicle_xapp_disabled = True
+            print("[rApp] xApp VEHICLE CONTROL indisponível neste build; novas tentativas serão ignoradas")
+            return False
+
         print("[rApp] Iniciando xApp VEHICLE CONTROL (App3)...")
         if self.xapp_manager.start("vehicle_control"):
             if self.xapp_manager.wait_for_ready("vehicle_control", timeout=10):
@@ -353,7 +372,11 @@ class RappResourceOptimizer:
                 print("[rApp] AVISO: xApp VEHICLE CONTROL pode não estar pronto")
         else:
             self._vehicle_active = False
-            print("[rApp] ERRO: Não foi possível iniciar xApp VEHICLE CONTROL")
+            if not self.xapp_manager.is_available("vehicle_control"):
+                self._vehicle_xapp_disabled = True
+                print("[rApp] xApp VEHICLE CONTROL indisponível após tentativa; novas tentativas serão ignoradas")
+            else:
+                print("[rApp] ERRO: Não foi possível iniciar xApp VEHICLE CONTROL")
     
     def _stop_energy_saver(self):
         """Para o xApp ENERGY SAVER (se estiver ativo)."""

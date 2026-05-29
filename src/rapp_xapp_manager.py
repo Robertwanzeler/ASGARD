@@ -55,6 +55,11 @@ XAPP_PATHS = {
     "vehicle_control": f"{BASE_DIR}/src/xapp_vehicle_control.py",
 }
 
+XAPP_BUILD_DIR_CANDIDATES = [
+    Path(FLEXRIC_BUILD),
+    Path(FLEXRIC_DIR) / "build",
+]
+
 XAPP_LOG_PATHS = {
     "slicer": as_str(XAPP_SLICER_LOG_PATH),
     "energy_saver": as_str(XAPP_ENERGY_LOG_PATH),
@@ -92,6 +97,7 @@ class XAppManager:
         self.flexric_build = f"{self.flexric_dir}/build_e2ap_v1"
         
         self.processes = {}
+        self.unavailable_xapps = set()
         self.ld_library_path = f"{self.flexric_build}/src/ric:{self.flexric_lib}:{self.flexric_build}/src/xApp"
         
         self.config_file = f"{base_dir}/flexric/flexric.conf"
@@ -105,6 +111,40 @@ class XAppManager:
         env = os.environ.copy()
         env['LD_LIBRARY_PATH'] = self.ld_library_path
         return env
+
+    def _candidate_binary_paths(self, xapp_name):
+        if xapp_name == "vehicle_control":
+            return [Path(XAPP_PATHS[xapp_name])]
+
+        binary_name = Path(XAPP_PATHS[xapp_name]).name
+        candidates = []
+        for build_dir in XAPP_BUILD_DIR_CANDIDATES:
+            candidates.extend([
+                build_dir / 'examples' / 'xApp' / 'c' / binary_name,
+                build_dir / 'examples' / 'xApp' / 'c' / xapp_name / binary_name,
+                build_dir / 'examples' / 'xApp' / 'c' / ('slicer' if xapp_name == 'slicer' else 'energy_saver') / binary_name,
+            ])
+        candidates.append(Path(XAPP_PATHS[xapp_name]))
+        unique = []
+        seen = set()
+        for candidate in candidates:
+            candidate = candidate.resolve() if candidate.is_absolute() else candidate
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                unique.append(candidate)
+        return unique
+
+    def _resolve_binary_path(self, xapp_name):
+        for candidate in self._candidate_binary_paths(xapp_name):
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return None
+
+    def is_available(self, xapp_name):
+        if xapp_name in self.unavailable_xapps:
+            return False
+        return self._resolve_binary_path(xapp_name) is not None
     
     def start(self, xapp_name):
         """
@@ -120,16 +160,21 @@ class XAppManager:
             print(f"[XAppManager] ERRO: xApp desconhecido '{xapp_name}'")
             return False
         
+        if xapp_name in self.unavailable_xapps:
+            return False
+
         if self.is_running(xapp_name):
             print(f"[XAppManager] {xapp_name} já está rodando (PID: {self.get_pid(xapp_name)})")
             return True
         
-        binary_path = XAPP_PATHS[xapp_name]
+        binary_path = self._resolve_binary_path(xapp_name)
         log_path = XAPP_LOG_PATHS[xapp_name]
         pid_path = XAPP_PID_PATHS[xapp_name]
         
-        if not os.path.exists(binary_path):
-            print(f"[XAppManager] ERRO: Binary não encontrado: {binary_path}")
+        if not binary_path:
+            self.unavailable_xapps.add(xapp_name)
+            tried = ', '.join(str(p) for p in self._candidate_binary_paths(xapp_name))
+            print(f"[XAppManager] AVISO: xApp '{xapp_name}' indisponível neste build; candidatos verificados: {tried}")
             return False
         
         try:
@@ -193,7 +238,7 @@ class XAppManager:
                 os.killpg(os.getpgid(pid), signal.SIGTERM)
             
             time.sleep(0.2)
-            
+
             if self.is_running(xapp_name):
                 print(f"[XAppManager] SIGTERM não funcionou, enviando SIGKILL...")
                 if process:

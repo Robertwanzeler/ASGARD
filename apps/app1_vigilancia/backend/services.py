@@ -1150,6 +1150,13 @@ class VideoAnalysisStore:
         network = dict(network_context.get("network", {}) or {})
         camera_sla = dict(network.get("camera_sla", {}) or {})
 
+        observed_camera_metrics = int(network.get("observed_camera_metrics", 0) or 0)
+        configured_camera_count = len(cameras)
+        if observed_camera_metrics > 0 and int(network.get("active_cameras", 0) or 0) <= 0:
+            network["active_cameras"] = max(configured_camera_count, observed_camera_metrics)
+        if observed_camera_metrics > 0 and int(network.get("active_ues", 0) or 0) <= 0:
+            network["active_ues"] = max(int(network.get("active_cameras", 0) or 0), observed_camera_metrics)
+
         if camera_mode == "simulated":
             simulated_profile = latest_analysis.get("network_profile", {}) or {}
             simulated_camera_sla = latest_analysis.get("simulated_camera_sla", {}) or {}
@@ -1173,6 +1180,11 @@ class VideoAnalysisStore:
                     }
                 )
                 camera_sla = simulated_camera_sla
+
+        if not camera_sla and (int(network.get("active_cameras", 0) or 0) > 0 or int(network.get("observed_camera_metrics", 0) or 0) > 0):
+            camera_sla = _evaluate_camera_sla(network)
+        elif camera_sla and int(camera_sla.get("active_cameras", 0) or 0) <= 0 and int(network.get("active_cameras", 0) or 0) > 0:
+            camera_sla = _evaluate_camera_sla(network)
 
         snapshot = {
             "app": "app1_vigilancia",

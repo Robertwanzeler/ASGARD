@@ -479,6 +479,29 @@ start_collection_event_alternator() {
     echo -e "${GREEN}    Log: ${GREENRAN_COLLECTION_EVENT_LOG}${NC}"
 }
 
+start_marl_runtime_gate_watcher() {
+    if [ "${GREENRAN_ENABLE_MARL_GATE_WATCHER}" != "1" ]; then
+        rm -f "$GREENRAN_MARL_GATE_WATCH_PID"
+        echo -e "${YELLOW}    Watcher do MARL gate desabilitado${NC}"
+        return 0
+    fi
+
+    local watcher_pid
+    watcher_pid=$(env \
+        GREENRAN_STATE_DIR="$STATE_DIR" \
+        MARL_GATE_WATCH_LOG="$GREENRAN_MARL_GATE_WATCH_LOG" \
+        MARL_GATE_WATCH_REFRESH="$GREENRAN_MARL_GATE_WATCH_REFRESH" \
+        MARL_GATE_WATCH_WINDOW="$GREENRAN_MARL_GATE_WATCH_WINDOW" \
+        MARL_GATE_WATCH_MIN_SAMPLES="$GREENRAN_MARL_GATE_WATCH_MIN_SAMPLES" \
+        MARL_GATE_WATCH_MIN_CHECKPOINT_COVERAGE="$GREENRAN_MARL_GATE_WATCH_MIN_CHECKPOINT_COVERAGE" \
+        MARL_GATE_WATCH_DB="$GREENRAN_DB_PATH" \
+        bash ./scripts/run_marl_runtime_gate_watcher.sh)
+    echo "$watcher_pid" > "$GREENRAN_MARL_GATE_WATCH_PID"
+    sleep 1
+    echo -e "${GREEN}    Watcher do MARL gate ativo (PID: ${watcher_pid})${NC}"
+    echo -e "${GREEN}    Log: ${GREENRAN_MARL_GATE_WATCH_LOG}${NC}"
+}
+
 RIC_BIN="$(resolve_ric_binary)" || {
     echo -e "${RED}ERRO: nearRT-RIC não encontrado em build_e2ap_v1 nem em build padrão.${NC}"
     echo -e "${RED}Verifique os binários em flexric/build*/examples/ric/nearRT-RIC${NC}"
@@ -538,6 +561,7 @@ else
     pkill -9 -f "python3 ./src/carla_bridge.py" 2>/dev/null || true
     pkill -9 -f "python3 ./src/carla_ns3_mapper.py" 2>/dev/null || true
     pkill -9 -f "python3 ./scripts/runtime_stage_controller.py" 2>/dev/null || true
+    pkill -9 -f "python3 ./scripts/watch_marl_runtime_gate.py" 2>/dev/null || true
     pkill -9 -f "python3 ./scripts/collection_event_alternator.py" 2>/dev/null || true
 fi
 
@@ -573,6 +597,7 @@ rm -f "$GREENRAN_PUSH_APP3_PID"
 rm -f "$GREENRAN_CARLA_BRIDGE_PID"
 rm -f "$GREENRAN_CARLA_MAPPER_PID"
 rm -f "$GREENRAN_STAGE_CONTROLLER_PID"
+rm -f "$GREENRAN_MARL_GATE_WATCH_PID"
 
 if [ "$GREENRAN_CLEAN_SCOPE" != "instance" ]; then
     tmux kill-session -t greenran 2>/dev/null || true
@@ -612,6 +637,7 @@ else
         pkill -9 -f "push_app3_to_influx.py" 2>/dev/null || true
         pkill -9 -f "python3 ./src/carla_bridge.py" 2>/dev/null || true
         pkill -9 -f "python3 ./src/carla_ns3_mapper.py" 2>/dev/null || true
+    pkill -9 -f "python3 ./scripts/watch_marl_runtime_gate.py" 2>/dev/null || true
         sleep 2
     else
         echo -e "${GREEN}    Todos os processos foram eliminados!${NC}"
@@ -664,10 +690,21 @@ GREENRAN_NS3_ENABLE_TRACES="${GREENRAN_NS3_ENABLE_TRACES:-0}"
 echo -e "${GREEN}    Pressao RAN: $GREENRAN_RAN_PRESSURE_PROFILE${NC}"
 echo -e "${GREEN}    Traces ns-3: $GREENRAN_NS3_ENABLE_TRACES${NC}"
 echo -e "${GREEN}    simTime efetivo: $SIM_TIME s${NC}"
+NS3_E2_ARGS=()
+if [ "$RIC_ACTIVE" = "0" ]; then
+    echo -e "${YELLOW}    ns-3 em modo no-RIC: desabilitando E2 LTE/NR/DU/CU-CP/CU-UP${NC}"
+    NS3_E2_ARGS=(
+        --e2lteEnabled=false
+        --e2nrEnabled=false
+        --e2du=false
+        --e2cuUp=false
+        --e2cuCp=false
+    )
+fi
 cd $BASE_DIR/ns-O-RAN-flexric/mmwave-LENA-oran
 # Forçamos o LD_LIBRARY_PATH aqui também para o ns-3
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH
-setsid "$NS3_BIN" --e2TermIp=127.0.0.1 --simTime="$SIM_TIME" --ranPressureProfile="$GREENRAN_RAN_PRESSURE_PROFILE" --enableTraces="$GREENRAN_NS3_ENABLE_TRACES" > "$GREENRAN_NS3_LOG" 2>&1 &
+setsid "$NS3_BIN" --e2TermIp=127.0.0.1 --simTime="$SIM_TIME" --ranPressureProfile="$GREENRAN_RAN_PRESSURE_PROFILE" --enableTraces="$GREENRAN_NS3_ENABLE_TRACES" "${NS3_E2_ARGS[@]}" > "$GREENRAN_NS3_LOG" 2>&1 &
 echo $! > "$GREENRAN_NS3_PID"
 cd $BASE_DIR
 sleep 2
@@ -967,6 +1004,9 @@ echo $! > "$GREENRAN_DASHBOARD_PID"
 sleep 2
 echo -e "${GREEN}    Dashboard disponível em http://localhost:${GREENRAN_DASHBOARD_PORT}${NC}"
 
+echo -e "${BLUE}=== [13.1/13] Iniciando Watcher do MARL Gate ===${NC}"
+start_marl_runtime_gate_watcher
+
 if wait_for_armd_artifacts 15 2; then
     echo -e "${GREEN}    ARMD-GreenRAN respondeu nas políticas A1${NC}"
 else
@@ -990,6 +1030,7 @@ echo -e "  - GUI:       http://localhost:${GREENRAN_GUI_PORT}"
 echo -e "  - Run Dir:   ${GREENRAN_RUN_DIR}"
 echo -e "  - ARMD:      mode=${GREENRAN_ARMD_MODE} min_conf=${GREENRAN_ARMD_MIN_CONFIDENCE}"
 echo -e "  - Etapas:    staged_control=${GREENRAN_STAGED_CONTROL} required_streak=${GREENRAN_STAGE_REQUIRED_STREAK}"
+echo -e "  - MARL Gate: watcher=${GREENRAN_ENABLE_MARL_GATE_WATCHER} refresh=${GREENRAN_MARL_GATE_WATCH_REFRESH}s"
 echo -e ""
 echo -e "O rApp controla automaticamente os xApps:"
 echo -e "  - SLICER: sempre ativo (prioridade)"

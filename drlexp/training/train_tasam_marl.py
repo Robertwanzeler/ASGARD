@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train an initial TA-SAM-style MARL scaffold on exported GreenRAN DU traces."""
+"""Train an article-aligned TA-SAM MARL scaffold on exported GreenRAN DU traces."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from drl.ta_sam_marl import TASAMMultiAgentTrainer, load_marl_trace
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Train initial TA-SAM MARL scaffold for GreenRAN')
+    parser = argparse.ArgumentParser(description='Train TA-SAM MARL scaffold for GreenRAN')
     parser.add_argument('--trace-jsonl', required=True, help='Input MARL trace JSONL path')
     parser.add_argument('--output-dir', required=True, help='Output directory')
     parser.add_argument('--epochs', type=int, default=25, help='Training epochs')
@@ -25,6 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--td-var-threshold', type=float, default=0.01, help='Selective SAM threshold over TD proxy variance')
     parser.add_argument('--min-selected-fraction', type=float, default=0.10, help='Minimum fraction of agent updates selected each epoch')
     parser.add_argument('--warmup-epochs', type=int, default=2, help='Force actor updates during early epochs before selective SAM takes over')
+    parser.add_argument('--bc-weight', type=float, default=1.0, help='Behavior cloning weight against live allocation targets')
+    parser.add_argument('--value-weight', type=float, default=0.10, help='Critic-guided actor weight')
     return parser
 
 
@@ -54,6 +56,8 @@ def main() -> int:
             td_var_threshold=args.td_var_threshold,
             min_selected_fraction=args.min_selected_fraction,
             warmup=epoch <= args.warmup_epochs,
+            bc_weight=args.bc_weight,
+            value_weight=args.value_weight,
         )
         metrics['epoch'] = epoch
         metrics['warmup'] = epoch <= args.warmup_epochs
@@ -69,6 +73,8 @@ def main() -> int:
         'requested_td_var_threshold': args.td_var_threshold,
         'min_selected_fraction': args.min_selected_fraction,
         'warmup_epochs': args.warmup_epochs,
+        'bc_weight': args.bc_weight,
+        'value_weight': args.value_weight,
         'final_metrics': history[-1],
         'history': history,
     }

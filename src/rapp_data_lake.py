@@ -427,6 +427,38 @@ class DataLake:
             ON marl_du_state_history(timestamp)
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS marl_shadow_comparison_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                datetime TEXT NOT NULL,
+                policy_id TEXT,
+                source TEXT,
+                checkpoint_readiness TEXT,
+                available INTEGER DEFAULT 0,
+                recommend_shadow INTEGER DEFAULT 0,
+                live_score REAL DEFAULT 0,
+                shadow_score REAL DEFAULT 0,
+                score_delta REAL DEFAULT 0,
+                live_ran_completion_est REAL DEFAULT 0,
+                shadow_ran_completion_est REAL DEFAULT 0,
+                live_ai_completion_est REAL DEFAULT 0,
+                shadow_ai_completion_est REAL DEFAULT 0,
+                live_total_shortfall REAL DEFAULT 0,
+                shadow_total_shortfall REAL DEFAULT 0,
+                live_budget_gap REAL DEFAULT 0,
+                shadow_budget_gap REAL DEFAULT 0,
+                delta_r_ran REAL DEFAULT 0,
+                delta_r_ai REAL DEFAULT 0,
+                snapshot_json TEXT,
+                UNIQUE(timestamp)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_marl_shadow_comparison_timestamp
+            ON marl_shadow_comparison_history(timestamp)
+        """)
+
         # Snapshot agregado da App2-Monitoramento.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS app2_snapshots (
@@ -760,8 +792,66 @@ class DataLake:
             ))
             self.conn.commit()
             self.record_article_marl_state(snapshot, timestamp=timestamp)
+            self.record_marl_shadow_comparison(snapshot, timestamp=timestamp)
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar snapshot de recursos: {e}")
+
+    def record_marl_shadow_comparison(self, snapshot, timestamp=None):
+        """Persist runtime comparison between live allocator and MARL shadow allocator."""
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+
+        marl_shadow = snapshot.get('marl_shadow') or {}
+        if not isinstance(marl_shadow, dict) or not marl_shadow:
+            return
+        comparison = marl_shadow.get('comparison') or {}
+        if not isinstance(comparison, dict) or not comparison:
+            return
+
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        dt = datetime.fromtimestamp(timestamp)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO marl_shadow_comparison_history
+                (timestamp, datetime, policy_id, source, checkpoint_readiness, available, recommend_shadow,
+                 live_score, shadow_score, score_delta,
+                 live_ran_completion_est, shadow_ran_completion_est,
+                 live_ai_completion_est, shadow_ai_completion_est,
+                 live_total_shortfall, shadow_total_shortfall,
+                 live_budget_gap, shadow_budget_gap,
+                 delta_r_ran, delta_r_ai, snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                timestamp,
+                dt_str,
+                str(marl_shadow.get('policy_id', '') or ''),
+                str(marl_shadow.get('source', '') or ''),
+                str(marl_shadow.get('checkpoint_readiness', '') or ''),
+                1 if marl_shadow.get('available', False) else 0,
+                1 if comparison.get('recommend_shadow', False) else 0,
+                float(comparison.get('live_score', 0.0) or 0.0),
+                float(comparison.get('shadow_score', 0.0) or 0.0),
+                float(comparison.get('score_delta', 0.0) or 0.0),
+                float(comparison.get('live_ran_completion_est', 0.0) or 0.0),
+                float(comparison.get('shadow_ran_completion_est', 0.0) or 0.0),
+                float(comparison.get('live_ai_completion_est', 0.0) or 0.0),
+                float(comparison.get('shadow_ai_completion_est', 0.0) or 0.0),
+                float(comparison.get('live_total_shortfall', 0.0) or 0.0),
+                float(comparison.get('shadow_total_shortfall', 0.0) or 0.0),
+                float(comparison.get('live_budget_gap', 0.0) or 0.0),
+                float(comparison.get('shadow_budget_gap', 0.0) or 0.0),
+                float(marl_shadow.get('delta_r_ran_vs_live', 0.0) or 0.0),
+                float(marl_shadow.get('delta_r_ai_vs_live', 0.0) or 0.0),
+                json.dumps({'marl_shadow': marl_shadow, 'comparison': comparison}, ensure_ascii=False),
+            ))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar comparação MARL shadow: {e}")
 
     def record_article_marl_state(self, snapshot, timestamp=None):
         """Persist article-aligned MARL state for global, slice and DU views."""

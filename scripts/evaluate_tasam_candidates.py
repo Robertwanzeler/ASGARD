@@ -20,6 +20,8 @@ def classify(summary: dict) -> dict:
     final = summary.get('final_metrics', {}) or {}
     critic_loss = float(final.get('critic_loss', 1.0) or 1.0)
     selected_fraction = float(final.get('selected_fraction', 0.0) or 0.0)
+    bc_loss = float(final.get('bc_loss', 1.0) or 1.0)
+    action_var_mean = float(final.get('action_var_mean', 0.0) or 0.0)
     nonzero_epochs = sum(1 for h in history if float(h.get('selected_agents', 0.0) or 0.0) > 0.0)
     post_warmup = [h for h in history if not bool(h.get('warmup', False))]
     post_warmup_nonzero = sum(1 for h in post_warmup if float(h.get('selected_agents', 0.0) or 0.0) > 0.0)
@@ -31,19 +33,29 @@ def classify(summary: dict) -> dict:
     reasons = []
     if nonzero_epochs == 0:
         reasons.append('sem atualizacao de atores')
-    if all_post_warmup_full:
-        reasons.append('seletor ainda em modo sempre-seleciona')
+    selector_still_full = all_post_warmup_full
     if critic_loss > 5e-4:
         reasons.append('critic_loss acima do alvo de shadow')
     if post_warmup_nonzero == 0:
         reasons.append('sem atualizacao apos warmup')
+    if bc_loss > 0.08:
+        reasons.append('bc_loss alto; ator ainda nao imita a alocacao viva')
+    if action_var_mean < 0.002:
+        reasons.append('ator colapsado para acoes quase uniformes')
 
-    if not reasons:
-        if critic_loss <= 3e-4 and 0.05 <= selected_fraction <= 0.25 and dynamic_threshold_active and len(history) >= 5:
+    hard_reasons = [r for r in reasons if r != 'seletor ainda em modo sempre-seleciona']
+    if not hard_reasons and selector_still_full:
+        if critic_loss <= 5e-4 and bc_loss <= 0.02 and action_var_mean >= 0.01 and len(history) >= 5:
+            readiness = 'shadow_ready'
+            reasons = ['seletor ainda em modo sempre-seleciona']
+        else:
+            reasons = hard_reasons + ['seletor ainda em modo sempre-seleciona']
+    elif not reasons:
+        if critic_loss <= 3e-4 and bc_loss <= 0.04 and 0.05 <= selected_fraction <= 0.25 and action_var_mean >= 0.005 and dynamic_threshold_active and len(history) >= 5:
             readiness = 'control_candidate'
         else:
             readiness = 'shadow_ready'
-    elif nonzero_epochs > 0 and post_warmup_nonzero > 0:
+    elif nonzero_epochs > 0 and post_warmup_nonzero > 0 and bc_loss <= 0.12:
         readiness = 'bootstrap_partial'
 
     return {
@@ -89,7 +101,8 @@ def main() -> int:
         elif ev['readiness'] == 'bootstrap_partial':
             score += 1.0
         score += max(0.0, 0.001 - float(final.get('critic_loss', 1.0) or 1.0))
-        score += float(final.get('selected_fraction', 0.0) or 0.0)
+        score += max(0.0, 0.10 - float(final.get('bc_loss', 1.0) or 1.0))
+        score += float(final.get('action_var_mean', 0.0) or 0.0)
         scored.append((score, ev))
     if scored:
         scored.sort(key=lambda item: item[0], reverse=True)

@@ -1,6 +1,6 @@
 import unittest
 
-from src.rapp_marl_shadow import MARLShadowRuntimeEvaluator
+from src.rapp_marl_shadow import MARLShadowRuntimeEvaluator, build_shadow_comparison
 
 
 class TestMARLShadow(unittest.TestCase):
@@ -19,7 +19,14 @@ class TestMARLShadow(unittest.TestCase):
                 'URLLC': {'qos_pressure': 0.9},
             },
         }
-        resource_snapshot = {'usable_budget': 0.95, 'resource_budget': 1.0, 'r_ran': 0.7, 'r_ai': 0.25}
+        resource_snapshot = {
+            'usable_budget': 0.95,
+            'resource_budget': 1.0,
+            'd_ran': 0.9,
+            'd_ai': 0.4,
+            'r_ran': 0.7,
+            'r_ai': 0.25,
+        }
         out = evaluator.evaluate(marl_state, resource_snapshot=resource_snapshot)
         self.assertTrue(out['enabled'])
         self.assertTrue(out['available'])
@@ -27,6 +34,30 @@ class TestMARLShadow(unittest.TestCase):
         self.assertEqual(len(out['du_recommendations']), 3)
         self.assertIn('shadow_r_ran', out)
         self.assertIn('delta_r_ran_vs_live', out)
+        self.assertIn('comparison', out)
+        self.assertIn('score_delta', out['comparison'])
+        self.assertIn('recommend_shadow', out['comparison'])
+
+    def test_build_shadow_comparison_detects_score_improvement(self):
+        resource_snapshot = {
+            'usable_budget': 0.95,
+            'resource_budget': 1.0,
+            'd_ran': 0.9,
+            'd_ai': 0.15,
+            'r_ran': 0.62,
+            'r_ai': 0.33,
+        }
+        marl_shadow = {
+            'available': True,
+            'source': 'checkpoint',
+            'checkpoint_readiness': 'control_candidate',
+            'shadow_r_ran': 0.78,
+            'shadow_r_ai': 0.17,
+        }
+        comparison = build_shadow_comparison(resource_snapshot, marl_shadow)
+        self.assertGreater(comparison['score_delta'], 0.0)
+        self.assertGreaterEqual(comparison['shadow_ran_completion_est'], comparison['live_ran_completion_est'])
+        self.assertIn('recommend_shadow', comparison)
 
 
 if __name__ == '__main__':

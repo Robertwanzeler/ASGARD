@@ -73,6 +73,8 @@ CONFLICT_LEARNED_REPORT_FILE = as_str(STATE_DIR / "greenran_conflict_report.json
 CONFLICT_LEARNED_ADJ_FILE = as_str(STATE_DIR / "greenran_conflict_adjacency.json")
 SCENARIO_CONTROL_FILE = as_str(ARTICLE00_SCENARIO_CONTROL_PATH)
 TASAM_EVAL_FILE = as_str(Path(PROJECT_DIR) / 'runs' / 'sac_bootstrap' / 'tasam_candidate_evaluation_latest.json')
+MARL_CONTROL_GATE_FILE = as_str(Path(PROJECT_DIR) / 'runs' / 'sac_bootstrap' / 'marl_control_gate_latest.json')
+MARL_GATE_WATCH_STATUS_FILE = as_str(Path(PROJECT_DIR) / 'runs' / 'sac_bootstrap' / 'marl_runtime_gate_watch_status.json')
 
 APP2_CONNECTED_CRITICAL_RATIO = 0.85
 APP2_CONNECTED_WARNING_RATIO = 0.90
@@ -907,6 +909,7 @@ def get_latest_resource_allocation():
             shadow = (payload.get('marl_shadow') or {}) if isinstance(payload, dict) else {}
         except (TypeError, ValueError, json.JSONDecodeError):
             shadow = {}
+        comparison = (shadow.get('comparison') or {}) if isinstance(shadow, dict) else {}
         return {
             'datetime': row[0],
             'controller_id': row[1],
@@ -921,13 +924,84 @@ def get_latest_resource_allocation():
             'marl_shadow': {
                 'policy_id': shadow.get('policy_id', ''),
                 'available': bool(shadow.get('available', False)),
+                'source': shadow.get('source', ''),
+                'checkpoint_readiness': shadow.get('checkpoint_readiness', ''),
+                'checkpoint_error': shadow.get('checkpoint_error', ''),
                 'delta_r_ran_vs_live': round(float(shadow.get('delta_r_ran_vs_live', 0.0) or 0.0), 4),
                 'delta_r_ai_vs_live': round(float(shadow.get('delta_r_ai_vs_live', 0.0) or 0.0), 4),
                 'mean_action_vector': shadow.get('mean_action_vector', []),
+                'comparison': {
+                    'live_score': round(float(comparison.get('live_score', 0.0) or 0.0), 6),
+                    'shadow_score': round(float(comparison.get('shadow_score', 0.0) or 0.0), 6),
+                    'score_delta': round(float(comparison.get('score_delta', 0.0) or 0.0), 6),
+                    'recommend_shadow': bool(comparison.get('recommend_shadow', False)),
+                    'live_ran_completion_est': round(float(comparison.get('live_ran_completion_est', 0.0) or 0.0), 4),
+                    'shadow_ran_completion_est': round(float(comparison.get('shadow_ran_completion_est', 0.0) or 0.0), 4),
+                    'live_ai_completion_est': round(float(comparison.get('live_ai_completion_est', 0.0) or 0.0), 4),
+                    'shadow_ai_completion_est': round(float(comparison.get('shadow_ai_completion_est', 0.0) or 0.0), 4),
+                },
             },
         }
     except Exception as e:
         print(f"Erro ao obter alocação mais recente: {e}")
+        return {}
+
+
+def get_marl_shadow_runtime_summary(window=200):
+    """Aggregate recent live-vs-shadow proxy comparisons for ops visibility."""
+    try:
+        cursor = DATA_LAKE.conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                timestamp,
+                datetime,
+                policy_id,
+                source,
+                checkpoint_readiness,
+                available,
+                recommend_shadow,
+                live_score,
+                shadow_score,
+                score_delta,
+                live_ran_completion_est,
+                shadow_ran_completion_est,
+                live_ai_completion_est,
+                shadow_ai_completion_est
+            FROM marl_shadow_comparison_history
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (int(window),),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return {}
+        sample_count = len(rows)
+        checkpoint_rows = [row for row in rows if (row[3] or '') in {'checkpoint', 'mixed'}]
+        positive_rows = [row for row in rows if float(row[9] or 0.0) > 0.01]
+        recommend_rows = [row for row in rows if int(row[6] or 0) == 1]
+        latest = rows[0]
+        avg_score_delta = sum(float(row[9] or 0.0) for row in rows) / sample_count
+        avg_ran_delta = sum(float(row[11] or 0.0) - float(row[10] or 0.0) for row in rows) / sample_count
+        avg_ai_delta = sum(float(row[13] or 0.0) - float(row[12] or 0.0) for row in rows) / sample_count
+        return {
+            'sample_count': sample_count,
+            'checkpoint_coverage': round(len(checkpoint_rows) / sample_count, 4),
+            'positive_score_rate': round(len(positive_rows) / sample_count, 4),
+            'recommend_rate': round(len(recommend_rows) / sample_count, 4),
+            'avg_score_delta': round(avg_score_delta, 6),
+            'avg_ran_completion_delta': round(avg_ran_delta, 4),
+            'avg_ai_completion_delta': round(avg_ai_delta, 4),
+            'latest_policy_id': latest[2] or '',
+            'latest_source': latest[3] or '',
+            'latest_readiness': latest[4] or '',
+            'latest_score_delta': round(float(latest[9] or 0.0), 6),
+            'latest_recommend_shadow': bool(latest[6]),
+            'latest_datetime': latest[1],
+        }
+    except Exception as e:
+        print(f"Erro ao obter resumo MARL shadow runtime: {e}")
         return {}
 
 
@@ -1040,6 +1114,46 @@ def get_collection_health_summary():
 
 
 
+def get_marl_gate_watch_status():
+    """Return status for the periodic MARL runtime gate watcher."""
+    try:
+        payload = _safe_read_json(MARL_GATE_WATCH_STATUS_FILE, {})
+        return {
+            'updated_at': int((payload or {}).get('updated_at', 0) or 0),
+            'db': (payload or {}).get('db', ''),
+            'runtime_readiness': (payload or {}).get('runtime_readiness', 'unknown'),
+            'gate_status': (payload or {}).get('gate_status', 'unknown'),
+            'allow_control_trial': bool((payload or {}).get('allow_control_trial', False)),
+            'sample_count': int((payload or {}).get('sample_count', 0) or 0),
+            'latest_policy_id': (payload or {}).get('latest_policy_id', ''),
+        }
+    except Exception as e:
+        print(f"Erro ao obter status do watcher MARL: {e}")
+        return {}
+
+
+def get_latest_marl_control_gate():
+    """Return consolidated MARL control-gate manifest."""
+    try:
+        payload = _safe_read_json(MARL_CONTROL_GATE_FILE, {})
+        gate = (payload or {}).get('gate') or {}
+        return {
+            'status': gate.get('status', 'unknown'),
+            'allow_shadow': bool(gate.get('allow_shadow', False)),
+            'allow_control_trial': bool(gate.get('allow_control_trial', False)),
+            'manual_approval_required': bool(gate.get('manual_approval_required', True)),
+            'manual_approval_valid': bool(gate.get('manual_approval_valid', False)),
+            'training_readiness': gate.get('training_readiness', 'unknown'),
+            'runtime_readiness': gate.get('runtime_readiness', 'unknown'),
+            'policy_id': gate.get('policy_id', ''),
+            'run_dir': gate.get('run_dir', ''),
+            'reasons': gate.get('reasons', []),
+        }
+    except Exception as e:
+        print(f"Erro ao obter gate MARL: {e}")
+        return {}
+
+
 def get_latest_tasam_evaluation():
     """Return latest TA-SAM checkpoint evaluation manifest."""
     try:
@@ -1071,6 +1185,9 @@ def build_mobile_ops_snapshot():
     xapp_status = get_xapp_status()
     fixed_scenario = get_fixed_scenario_metadata()
     tasam_eval = get_latest_tasam_evaluation()
+    marl_shadow_runtime = get_marl_shadow_runtime_summary()
+    marl_control_gate = get_latest_marl_control_gate()
+    marl_gate_watch = get_marl_gate_watch_status()
 
     return {
         'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1096,6 +1213,9 @@ def build_mobile_ops_snapshot():
         'latest_decision': latest_decision,
         'latest_allocation': latest_alloc,
         'tasam_evaluation': tasam_eval,
+        'marl_shadow_runtime': marl_shadow_runtime,
+        'marl_control_gate': marl_control_gate,
+        'marl_gate_watch': marl_gate_watch,
         'collection': collection,
         'xapps': {
             name: {

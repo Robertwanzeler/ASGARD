@@ -116,6 +116,7 @@ load_greenran_runtime() {
     export GREENRAN_APP3_LOG="$STATE_DIR/app3_veicular.log"
     export GREENRAN_CARLA_BRIDGE_LOG="$STATE_DIR/carla_bridge.log"
     export GREENRAN_CARLA_MAPPER_LOG="$STATE_DIR/carla_ns3_mapper.log"
+    export GREENRAN_MARL_GATE_WATCH_LOG="$STATE_DIR/marl_runtime_gate_watch.log"
 
     local port_offset="${GREENRAN_PORT_OFFSET:-0}"
     export APP1_HOST="${APP1_HOST:-0.0.0.0}"
@@ -139,6 +140,11 @@ load_greenran_runtime() {
     export GREENRAN_ARMD_MIN_CONFIDENCE="${GREENRAN_ARMD_MIN_CONFIDENCE:-0.85}"
     export GREENRAN_STAGED_CONTROL="${GREENRAN_STAGED_CONTROL:-1}"
     export GREENRAN_STAGE_REQUIRED_STREAK="${GREENRAN_STAGE_REQUIRED_STREAK:-3}"
+    export GREENRAN_ENABLE_MARL_GATE_WATCHER="${GREENRAN_ENABLE_MARL_GATE_WATCHER:-1}"
+    export GREENRAN_MARL_GATE_WATCH_REFRESH="${GREENRAN_MARL_GATE_WATCH_REFRESH:-15}"
+    export GREENRAN_MARL_GATE_WATCH_WINDOW="${GREENRAN_MARL_GATE_WATCH_WINDOW:-300}"
+    export GREENRAN_MARL_GATE_WATCH_MIN_SAMPLES="${GREENRAN_MARL_GATE_WATCH_MIN_SAMPLES:-120}"
+    export GREENRAN_MARL_GATE_WATCH_MIN_CHECKPOINT_COVERAGE="${GREENRAN_MARL_GATE_WATCH_MIN_CHECKPOINT_COVERAGE:-0.90}"
 
     export GREENRAN_DASHBOARD_PID="$STATE_DIR/dashboard.pid"
     export GREENRAN_WATCHDOG_PID="$STATE_DIR/watchdog.pid"
@@ -160,6 +166,7 @@ load_greenran_runtime() {
     export GREENRAN_CARLA_BRIDGE_PID="$STATE_DIR/carla_bridge.pid"
     export GREENRAN_CARLA_MAPPER_PID="$STATE_DIR/carla_ns3_mapper.pid"
     export GREENRAN_STAGE_CONTROLLER_PID="$STATE_DIR/runtime_stage_controller.pid"
+    export GREENRAN_MARL_GATE_WATCH_PID="$STATE_DIR/marl_runtime_gate_watch.pid"
 
     export GREENRAN_STAGE_CONTROLLER_LOG="$STATE_DIR/runtime_stage_controller.log"
 

@@ -158,6 +158,9 @@
 {% set scenario = snapshot.scenario or {} %}
 {% set slas = snapshot.service_slas or {} %}
 {% set tasam_eval = snapshot.tasam_evaluation or {} %}
+{% set shadow_runtime = snapshot.marl_shadow_runtime or {} %}
+{% set marl_gate = snapshot.marl_control_gate or {} %}
+{% set marl_gate_watch = snapshot.marl_gate_watch or {} %}
 
 <div class="ops-shell">
     <div class="ops-hero">
@@ -221,10 +224,51 @@
             <div class="ops-line"><span class="k">Disponível</span><span class="v">{{ 'sim' if latest_allocation.marl_shadow and latest_allocation.marl_shadow.available else 'não' }}</span></div>
             <div class="ops-line"><span class="k">Source</span><span class="v">{{ latest_allocation.marl_shadow.source if latest_allocation.marl_shadow else 'N/A' }}</span></div>
             <div class="ops-line"><span class="k">Readiness</span><span class="v">{{ latest_allocation.marl_shadow.checkpoint_readiness if latest_allocation.marl_shadow else 'unknown' }}</span></div>
+            <div class="ops-line"><span class="k">Score delta</span><span class="v">{{ latest_allocation.marl_shadow.comparison.score_delta if latest_allocation.marl_shadow and latest_allocation.marl_shadow.comparison else 0 }}</span></div>
+            <div class="ops-line"><span class="k">Recomenda shadow</span><span class="v">{{ 'sim' if latest_allocation.marl_shadow and latest_allocation.marl_shadow.comparison and latest_allocation.marl_shadow.comparison.recommend_shadow else 'não' }}</span></div>
             <div class="ops-line"><span class="k">Delta RAN</span><span class="v">{{ latest_allocation.marl_shadow.delta_r_ran_vs_live if latest_allocation.marl_shadow else 0 }}</span></div>
             <div class="ops-line"><span class="k">Delta AI</span><span class="v">{{ latest_allocation.marl_shadow.delta_r_ai_vs_live if latest_allocation.marl_shadow else 0 }}</span></div>
             <div class="ops-line"><span class="k">Ação média</span><span class="v">{{ latest_allocation.marl_shadow.mean_action_vector if latest_allocation.marl_shadow else [] }}</span></div>
             <div class="ops-line"><span class="k">Erro</span><span class="v">{{ latest_allocation.marl_shadow.checkpoint_error if latest_allocation.marl_shadow else '' }}</span></div>
+        </div>
+    </div>
+
+    <div class="ops-section ops-card">
+        <div class="ops-card-title">Runtime Shadow Eval</div>
+        <div class="ops-list">
+            <div class="ops-line"><span class="k">Samples</span><span class="v">{{ shadow_runtime.sample_count or 0 }}</span></div>
+            <div class="ops-line"><span class="k">Checkpoint cov.</span><span class="v">{{ shadow_runtime.checkpoint_coverage if shadow_runtime else 0 }}</span></div>
+            <div class="ops-line"><span class="k">Positive rate</span><span class="v">{{ shadow_runtime.positive_score_rate if shadow_runtime else 0 }}</span></div>
+            <div class="ops-line"><span class="k">Recommend rate</span><span class="v">{{ shadow_runtime.recommend_rate if shadow_runtime else 0 }}</span></div>
+            <div class="ops-line"><span class="k">Avg score delta</span><span class="v">{{ shadow_runtime.avg_score_delta if shadow_runtime else 0 }}</span></div>
+            <div class="ops-line"><span class="k">Avg RAN delta</span><span class="v">{{ shadow_runtime.avg_ran_completion_delta if shadow_runtime else 0 }}</span></div>
+            <div class="ops-line"><span class="k">Avg AI delta</span><span class="v">{{ shadow_runtime.avg_ai_completion_delta if shadow_runtime else 0 }}</span></div>
+            <div class="ops-line"><span class="k">Latest score delta</span><span class="v">{{ shadow_runtime.latest_score_delta if shadow_runtime else 0 }}</span></div>
+        </div>
+    </div>
+
+    <div class="ops-section ops-card">
+        <div class="ops-card-title">Gate Watcher</div>
+        <div class="ops-list">
+            <div class="ops-line"><span class="k">Updated</span><span class="v">{{ marl_gate_watch.updated_at or 0 }}</span></div>
+            <div class="ops-line"><span class="k">Runtime readiness</span><span class="v">{{ marl_gate_watch.runtime_readiness or 'unknown' }}</span></div>
+            <div class="ops-line"><span class="k">Gate status</span><span class="v">{{ marl_gate_watch.gate_status or 'unknown' }}</span></div>
+            <div class="ops-line"><span class="k">Samples</span><span class="v">{{ marl_gate_watch.sample_count or 0 }}</span></div>
+            <div class="ops-line"><span class="k">Policy</span><span class="v">{{ marl_gate_watch.latest_policy_id or '' }}</span></div>
+        </div>
+    </div>
+
+    <div class="ops-section ops-card">
+        <div class="ops-card-title">Control Gate</div>
+        <div class="ops-list">
+            <div class="ops-line"><span class="k">Status</span><span class="v">{{ marl_gate.status or 'unknown' }}</span></div>
+            <div class="ops-line"><span class="k">Shadow liberado</span><span class="v">{{ 'sim' if marl_gate.allow_shadow else 'não' }}</span></div>
+            <div class="ops-line"><span class="k">Trial liberado</span><span class="v">{{ 'sim' if marl_gate.allow_control_trial else 'não' }}</span></div>
+            <div class="ops-line"><span class="k">Aprovação manual</span><span class="v">{{ 'válida' if marl_gate.manual_approval_valid else 'pendente' }}</span></div>
+            <div class="ops-line"><span class="k">Train readiness</span><span class="v">{{ marl_gate.training_readiness or 'unknown' }}</span></div>
+            <div class="ops-line"><span class="k">Runtime readiness</span><span class="v">{{ marl_gate.runtime_readiness or 'unknown' }}</span></div>
+            <div class="ops-line"><span class="k">Policy</span><span class="v">{{ marl_gate.policy_id or '' }}</span></div>
+            <div class="ops-line"><span class="k">Motivos</span><span class="v">{{ marl_gate.reasons if marl_gate else [] }}</span></div>
         </div>
     </div>
 

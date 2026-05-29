@@ -1,11 +1,11 @@
-# RELATÓRIO COMPLETO - Sistema GreenRAN: Detecção de Conflitos em O-RAN usando EE-DRL-GreenRAN e ARMD-GreenRAN
+# RELATÓRIO COMPLETO - Sistema GreenRAN: Detecção de Conflitos em O-RAN usando TA-SAM-GreenRAN e ARMD-GreenRAN
 
 ## Sistema Inteligente de Gerenciamento de Conflitos em Arquitetura O-RAN para Otimização de Redes 5G/6G
 
-**Autor:** Robert Freitas
+**Autor:** Robert Wanzeler de Freitas
 **Data:** Maio 2026
-**Instituição:** UTFPR - Universidade Tecnológica Federal do Paraná
-**Versão:** 3.1 (Completa - A3C → SAC Migration)
+**Instituição:** UFPA - Universidade Federal do Pará
+**Versão:** 4.0 (Atualizada - TA-SAM MARL + Shadow Runtime)
 
 ---
 
@@ -19,8 +19,7 @@
 6. [Regras de Decisão](#6-regras-de-decisão)
 7. [Pipeline de Conflitos](#7-pipeline-de-conflitos)
 8. [Sistema de Machine Learning](#8-sistema-de-machine-learning)
-9. [EE-DRL-GreenRAN (Legado SBiLSTM + A3C)](#9-ee-drl-greenran-legado-sbilstm--a3c)
-9A. [CAORA-SAC/AWAC (Nova Geração)](#9a-caora-sacawac-nova-geração)
+9. [TA-SAM-GreenRAN (Arquitetura Atual Alinhada ao Artigo)](#9-ta-sam-greenran-arquitetura-atual-alinhada-ao-artigo)
 10. [ARMD-GreenRAN (GraphSAGE)](#10-armd-greenran-graphsage)
 11. [Data Lake](#11-data-lake)
 12. [Protocolo de Energia](#12-protocolo-de-energia)
@@ -47,12 +46,11 @@ O sistema GreenRAN implementa uma arquitetura completa de gerenciamento intelige
 
 - **Simuladores:** ns-3 para rede móvel e CARLA para cenários veiculares
 - **Machine Learning:** RF/XGBoost com 89.3% de acurácia, 3 classes (ALLOWED, BLOCKED, CONDITIONAL)
-- **EE-DRL-GreenRAN (Legado):** Trilha DRL baseada em SBiLSTM + A3C para arbitragem operacional (substituída)
-- **CAORA-SAC (Nova Geração):** Alocação compartilhada de recursos RAN/AI com SAC/AWAC, estado [d_ran, d_ai, r_ran, r_ai], baseado em Lotfi et al. (2025) [arXiv:2511.15002]
+- **TA-SAM-GreenRAN (Atual):** Implementação alinhada ao artigo de Lotfi et al. (2025), com topologia MARL por DUs lógicos, crítico global, checkpoints TA-SAM e avaliação em shadow mode
 - **ARMD-GreenRAN:** GraphSAGE para aprendizado de padrões de conflito (F1=1.0)
-- **Pipeline Automático:** Coleta, exportação, treinamento e inferência
-- **Data Lake:** SQLite com 7 tabelas, 13.703 eventos de conflito
-- **Dashboard:** Interface web (Flask) + Grafana para monitoramento em tempo real
+- **Pipeline Automático:** Coleta, backfill do estado MARL, exportação de treino, avaliação de candidatos, shadow runtime e control gate
+- **Data Lake:** SQLite com histórico operacional, estados MARL e comparação `live vs shadow`
+- **Dashboard:** Interface web (Flask) + visão operacional `/ops` com status do shadow e do control gate
 
 ### 1.2 Problema
 
@@ -79,35 +77,25 @@ O sistema GreenRAN propõe uma arquitetura multi-camada completa com 6 estágios
 3. **CVaR/Variance** - Conditional Value at Risk por UE
 4. **ML Predictor** - Random Forest (89.3%) + XGBoost (90.1%)
 5. **Agent-AL** - Interface de intenções OpenRAN
-6. **Arbiter Final** - Consolida todas as decisões + DRL
+6. **Arbiter Final** - Consolida todas as decisões + ML + MARL Shadow
 
 ### 1.4 Principais Resultados
 
-| Métrica | Baseline (Sem IA) | Heurístico | EE-DRL-GreenRAN | ARMD-GreenRAN (GraphSAGE) |
-|---------|-------------------|------------|---------------|---------------------------|
-| **F1-Score** | N/A | 0.45 | 0.65 | **1.0** |
-| **Precision** | N/A | 0.45 | 0.70 | **1.0** |
-| **Recall** | N/A | 0.77 | 0.60 | **1.0** |
-| **Conflitos Coletados** | 0 | 600 | 2.000 | **2.896** |
-| **Eventos no Data Lake** | 0 | 600 | 10.000 | **13.703** |
-| **Cenários Implementados** | 0 | 2 | 5 | **10** |
-| **Latência Decisão (rApp)** | N/A | N/A | **1.3ms** | **<10ms** |
-| **Tempo Treino (GraphSAGE)** | N/A | N/A | 2h | **1min** |
-| **Conformidade O-RAN** | N/A | N/A | ✅ | ✅ (<10ms) |
+- **Cenário fixo consolidado:** baseline GreenRAN congelado com 12 UEs ns-3, 3 câmeras, App2 mantido e até 5 veículos.
+- **Coleta controlada de conflito:** o pipeline passou a induzir conflitos RAN reais por `sim_time`, com fases reproduzíveis (`camera_overload`, `mixed_overload`, `background_overload`, recuperação).
+- **TA-SAM MARL operacional:** topologia por 3 DUs lógicos, estado global persistido no Data Lake, exportação de traços MARL e treino bootstrap concluído.
+- **Shadow runtime ativo:** o checkpoint TA-SAM já produz recomendações em paralelo à política viva, sem assumir controle do cenário.
+- **Control gate operacional:** o sistema já mede `runtime_readiness`, cobertura do checkpoint e recomendação de promoção para futuro `control_trial`.
+- **ARMD-GreenRAN preservado:** continua como camada estável de aprendizado e interpretação de conflitos.
 
-### 1.5 Destaques da Versão 3.0
+### 1.5 Destaques da Versão 4.0
 
-- **Arquitetura Completa:** ns-3.42 + CARLA 0.9.16 integrados
-- **3 Aplicações:** App1 (Vigilância), App2 (Monitoramento), App3 (Veicular)
-- **xApps Funcionais:** RANSlicer, EnergySaver, VehicleControl
-- **EE-DRL-GreenRAN (Legado):** DRL com SBiLSTM + A3C, runtime improvements (warmup, confidence, trace) — congelado
-- **CAORA-SAC (Migração):** Interface RL genérica (`rapp_rl_policy.py`), ambiente SAC inspirado em Lotfi et al. (2025) [arXiv:2511.15002], trainer SAC/AWAC offline, modelo de recursos compartilhados (`rapp_sac_resource_model.py`), checkpoints treinados (offline SAC + AWAC). Divergências conhecidas: single-agent (vs MARL), SAM não implementado, AWAC como extensão própria.
-- **ML Predictor:** RF/XGBoost com 89.3%, split temporal, poda de features enviesadas
-- **ARMD-GreenRAN:** GraphSAGE com F1=1.0, multiseed (5 seeds), 10 cenários
-- **Pipeline Automático:** Coleta → Export → Treino → Inferência
-- **Data Lake:** 13.703 eventos de conflito, 7 tabelas SQL
-- **Dashboard:** Flask (14 rotas) + Grafana (7 painéis)
-- **Conformidade O-RAN:** Latência Near-RT RIC 1.3ms (requer 10ms-1000ms)
+- **Arquitetura principal atualizada:** a linha oficial do projeto deixou de ser a migração `A3C -> SAC/AWAC` e passou a ser a implementação alinhada ao artigo de Lotfi et al. (2025).
+- **Treino article-aligned:** `TA-SAM MARL` com topologia por DUs lógicos, crítico global, seleção dinâmica de agentes e checkpoints exportados.
+- **Runtime article-aligned:** `marl_shadow` acoplado ao `rApp`, sem alterar a decisão aplicada, apenas observando e comparando.
+- **Avaliação operacional contínua:** `marl_shadow_comparison_history`, `marl_shadow_runtime_eval_latest.json` e `marl_control_gate_latest.json`.
+- **Caminho estável desta máquina:** execução `no-RIC` validada para o cenário GreenRAN atual, com watcher do gate iniciado junto da stack.
+- **Legado DRL removido da trilha principal:** A3C/SBiLSTM e SAC/AWAC single-agent deixam de ser a narrativa central deste relatório.
 
 ---
 
@@ -241,7 +229,7 @@ Recomendação: manter ambas as trilhas para evitar regressão e permitir compar
 │  ┌──────────────────────────────────────────────────────────────────┐        │
 │  │   Non-RT RIC Layer - rApp Orchestrator (6 estágios)             │       │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐ │       │
-│  │  │  Trend   │ │ Pattern  │ │  CVaR/   │ │  ML/DRL  │ │Agent │ │       │
+│  │  │  Trend   │ │ Pattern  │ │  CVaR/   │ │ ML/MARL  │ │Agent │ │       │
 │  │  │ Analysis │ │ Engine   │ │ Variance │ │ Predictor│ │-AL   │ │       │
 │  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────┘ │       │
 │  │                         │ Arbiter Final                          │       │
@@ -279,25 +267,23 @@ Recomendação: manter ambas as trilhas para evitar regressão e permitir compar
 ### 3.2 Fluxo de Dados
 
 ```
-1. ns-3 Stats Files (DlPdcpStats.txt, DlMacStats.txt, etc.)
+1. ns-3 / CARLA / snapshots das apps
    ↓
-2. csv_to_metrics.py (parseia arquivos .txt)
+2. csv_to_metrics.py (parseia arquivos .txt e consolida métricas)
    ↓
-3. /tmp/xapp_metrics/extended_metrics.json
+3. extended_metrics.json + snapshots App1/App2/App3
    ↓
-4. rapp_orchestrator.py (lê métricas)
+4. rapp_orchestrator.py (lê métricas e decide)
    ↓
-5. make_decision() (6 estágios de decisão)
+5. Resource Allocation Snapshot + Article MARL State
    ↓
-6. Data Lake (grava no SQLite)
+6. Data Lake (grava histórico operacional + estado MARL)
    ↓
-7. ML Predictor (consulta banco + modelo)
+7. marl_shadow_comparison_history
    ↓
-8. Energy Command (envia para xApp)
+8. Runtime Eval + Control Gate
    ↓
-9. A1 Policy (envia para Near-RT RIC)
-   ↓
-10. xApp Energy Saver (executa comando)
+9. Dashboard /ops + manifests de runtime
 ```
 
 ### 3.3 Cadeia de Inicialização do rApp
@@ -315,11 +301,11 @@ self.trend_analysis = TrendAnalysis(self.data_lake)
 # 4. ML Predictor (Random Forest + XGBoost com acesso DB)
 self.ml_predictor = MLPredictor(data_lake=self.data_lake)
 
-# 5. RL Policy Interface (genérica: legado A3C ou SAC/AWAC)
-self.rl_policy = build_runtime_rl_policy()  # GREENRAN_RL_POLICY=legacy_a3c|sac|awac
-
-# 6. SAC Resource Model (modelo de demanda compartilhada RAN/AI)
+# 5. Shared Resource Snapshot + Estado MARL article-aligned
 self.sac_resource_model = compute_shared_resource_snapshot
+
+# 6. MARL Shadow Evaluator (checkpoint TA-SAM em paralelo)
+self.marl_shadow = build_shadow_evaluator()
 
 # 7. Agent-Al (Tradução de intenções)
 self.agent = AgentOpenRAN()
@@ -792,251 +778,119 @@ def predict_with_db_context(self, metrics):
 
 ---
 
-## 9. EE-DRL-GreenRAN (Legado SBiLSTM + A3C)
+## 9. TA-SAM-GreenRAN (Arquitetura Atual Alinhada ao Artigo)
 
-> ⚠️ **Nota de Migração (versão 3.1):** A arquitetão original SBiLSTM+A3C está **congelada como legado**. Toda evolução em DRL migrou para o **CAORA-SAC/AWAC** (Seção 9A), que reformula o problema como alocação compartilhada de recursos RAN/AI. O conteúdo abaixo documenta o estado funcional da trilha A3C, mantida por compatibilidade e referência histórica.
+### 9.1 Referência Metodológica
 
-### 9.1 Arquitetura
+A linha principal atual do GreenRAN segue o artigo:
 
-A trilha DRL original do GreenRAN, baseada no artigo "Energy-Efficient Deep Reinforcement Learning Assisted Resource Allocation for 5G-RAN Slicing", foi consolidada como **EE-DRL-GreenRAN (Legado A3C)**.
+> **Lotfi, F., Rajoli, H. & Afghah, F.** "Task-Specific Sharpness-Aware O-RAN Resource Management using Multi-Agent Reinforcement Learning". IEEE TMLCN, 2025. arXiv:2511.15002.
 
-| Elemento | Descrição | Status |
-|----------|-----------|--------|
-| Preditor temporal | SBiLSTM (Stacked Bidirectional LSTM) | 🟢 Funcional (legado) |
-| Agente DRL | A3C (Asynchronous Advantage Actor-Critic) | 🟡 Congelado |
-| Ações | FULL_POWER, POWER_DOWN, FULL_POWER_GUARD | 🔵 Original |
-| Latência decisão | 1.3ms | 🟢 |
-| Reward médio | 85.3 | 🟡 |
-| Episódios treino | 10.000 | 🟡 |
-| Taxa convergência | 95% | 🟡 |
-| CVaR/P95 Latência | 15.000 µs | 🟡 |
+O ponto central deixou de ser a migração `A3C -> SAC/AWAC`. A arquitetura oficial agora é:
 
-### 9.2 Estado Enriquecido
+- **múltiplos agentes por DU lógico**
+- **crítico global**
+- **SAC com SAM seletivo**
+- **treino orientado por estado por slice**
+- **avaliação em shadow mode antes de qualquer controle real**
 
-O predictor deriva localmente campos que antes chegavam zerados:
-- `hour_sin`, `hour_cos`
-- `camera_ratio`, `critical_ue_ratio`
-- `cvar_trend`, `cvar_acceleration`
-- `variance_ms2`
+### 9.2 Mapeamento do Artigo para o Cenário GreenRAN
 
-### 9.3 Warmup
+O cenário experimental foi mantido, mas a metodologia de decisão foi realinhada ao paper:
 
-Nos primeiros ciclos:
-- Predição da SBiLSTM passa por blend com `cvar_ms` atual
-- Decisão não fica sensível a histórico curto
-- Relaxamento explícito para o caso `healthy warmup`
+| Elemento do artigo | GreenRAN atual |
+|--------------------|----------------|
+| `eMBB` | App1-Vigilância |
+| `mMTC` | App2-Monitoramento |
+| `URLLC` | App3-Veicular |
+| Agente por DU | 3 DUs lógicos definidos no manifesto do cenário |
+| Crítico global | Estado agregado no `rApp` / pipeline MARL |
+| Treino com SAM | `TA-SAM MARL` no pipeline `drlexp` |
+| Avaliação antes do controle | `shadow mode` + `control gate` |
 
-### 9.4 Confiança e Estabilidade
+O cenário não foi alterado:
+- 12 UEs no ns-3
+- 3 câmeras
+- App2 mantido
+- até 5 veículos
+- ARMD-GreenRAN preservado
 
-A confiança da A3C combina:
-- Probabilidade da melhor ação
-- Margem entre primeira e segunda ação
-- Entropia
-- Valor do crítico
-- Fator de warmup
+### 9.3 Estado MARL Implementado
 
-Adicionados: suavização temporal de `predicted_cvar_ms`, histerese leve, memória local de predições.
+Arquivos principais:
 
-### 9.5 Score Contínuo de Risco
+| Arquivo | Função |
+|---------|--------|
+| `src/greenran_marl_topology.py` | Traduz o cenário fixo para slices, DUs lógicos e estado global |
+| `src/rapp_sac_resource_model.py` | Enriquecimento do snapshot com `article_marl_state` |
+| `src/rapp_data_lake.py` | Persistência de `marl_global_state_history`, `marl_slice_state_history`, `marl_du_state_history` |
+| `scripts/backfill_marl_state_history.py` | Reprocessa coletas antigas para preencher estado MARL |
+| `scripts/export_marl_training_trace.py` | Exporta traço MARL real em `jsonl` |
+| `drlexp/src/drl/ta_sam_marl.py` | Trainer `TA-SAM MARL` |
+| `drlexp/training/train_tasam_marl.py` | Entry point de treino |
+| `scripts/evaluate_tasam_candidates.py` | Avalia candidatos treinados |
 
-O predictor calcula `risk_score` e `risk_band` usando:
-- `predicted_cvar_ms`, `cvar_ms`, `latency_p95_ms`
-- `cvar_trend`, `packet_loss_pct`, `critical_ue_ratio`, `variance_ms2`
+Estado atual do pipeline:
+- topologia MARL por 3 DUs lógicos implementada
+- persistência dedicada no Data Lake implementada
+- export real do traço MARL implementado
+- treino bootstrap `TA-SAM MARL` concluído
+- checkpoints exportados e avaliados
 
-Influencia: calibração da decisão final, transição entre ALLOWED/CONDITIONAL/BLOCKED, seleção da política de energia.
+### 9.4 Shadow Runtime
 
-### 9.6 Trace de Runtime
+O checkpoint TA-SAM não assume o controle do cenário diretamente. Ele opera em **shadow mode**.
 
-Ativado por ambiente:
+Arquivos principais:
 
-```bash
-GREENRAN_DRL_TRACE=1 GREENRAN_DRL_TRACE_FILE=/tmp/drl_predictor_trace.jsonl
-```
+| Arquivo | Função |
+|---------|--------|
+| `src/rapp_marl_shadow.py` | Executa o checkpoint em paralelo e gera recomendação de shadow |
+| `src/rapp_marl_control_gate.py` | Consolida treino, runtime e aprovação manual |
+| `scripts/evaluate_marl_shadow_runtime.py` | Mede `live vs shadow` no histórico do Data Lake |
+| `scripts/evaluate_marl_control_gate.py` | Gera o estado consolidado do gate |
+| `scripts/watch_marl_runtime_gate.py` | Atualiza manifests de runtime/gate periodicamente |
 
-Campos do trace JSONL:
-- `raw_predicted_cvar_ms`, `predicted_cvar_ms`
-- `a3c_decision_raw`, `a3c_decision`, `final_decision`, `policy_action`
-- `actor_confidence`, `actor_entropy`, `actor_margin`, `critic_value`
-- `warmup_factor`, `stability_factor`, `risk_score`, `risk_band`
-- `hysteresis_applied`, `calibrated`
+O payload atual do shadow inclui:
+- `du_recommendations`
+- `mean_action_vector`
+- `shadow_r_ran`
+- `shadow_r_ai`
+- `live_score`
+- `shadow_score`
+- `score_delta`
+- `recommend_shadow`
+- `control_gate`
 
-### 9.7 Quando a DRL Aparece
+### 9.5 Situação Atual do Runtime
 
-A DRL só influencia a política quando:
-- `CAMERA_GUARD` não está ativo
-- `APP2_GUARD` não está ativo
-- As regras de prioridade deixam a hierarquia passar para ML/DRL
-
-### 9.8 Resultados em Runtime
-
-- Rede saudável: Decision ALLOWED, Power REDUCE, política POWER_DOWN_ECO
-- Primeiro ciclo saudável: predictor deixou de sair CONDITIONAL por warmup inseguro
-- Fase ruim de câmera: câmera domina com FULL_POWER
-- Fase ruim do App2: rApp aplica APP2_GUARD
-
----
-
-## 9A. CAORA-SAC/AWAC (Nova Geração)
-
-### 9A.1 Motivação
-
-O legado A3C opera sobre ações discretas de energia (FULL_POWER, POWER_DOWN...), sem modelar a disputa por recursos compartilhados entre aplicações RAN e AI. O **CAORA-SAC** (Constrained Asymmetric Offline Resource Allocator) reformula o problema como alocação orçamentária contínua, inspirado no artigo de Lotfi et al. (2025) [5], que propõe SAC com Sharpness-Aware Minimization (SAM) em framework MARL para gerenciamento de recursos O-RAN.
-
-> **Referência:** Lotfi, F., Rajoli, H. & Afghah, F. "Task-Specific Sharpness-Aware O-RAN Resource Management using Multi-Agent Reinforcement Learning". IEEE TMLCN, 2025. arXiv:2511.15002.
-
-| Aspecto | A3C (Legado) | SAC (Nova Geração) |
-|---------|-------------|-------------------|
-| Formulação | Controle de energia on/off | Alocação compartilhada contínua |
-| Ações | 3 discretas (FULL_POWER, POWER_DOWN, FULL_POWER_GUARD) | Contínuas: δ_r_ran, δ_r_ai ∈ ℝ⁺ |
-| Estado | Métricas de rede + câmeras | [d_ran, d_ai, r_ran, r_ai] |
-| Orçamento | Ilimitado por ação | Compartilhado: r_max = r_ran + r_ai |
-| Treino | Online (A3C) | Offline bootstrap (SAC + AWAC) |
-| Preditor temporal | SBiLSTM embutido | Ambiente já recebe demanda prevista |
-| Alinhamento artigo | Zhang et al. (2022) [3] | Lotfi et al. (2025) [5] — adaptado |
-
-**Divergências conhecidas vs. artigo [5]:**
-
-| Aspecto | Artigo (Lotfi et al.) | Implementação CAORA | Motivo |
-|---------|----------------------|-------------------|--------|
-| Framework | **MARL** (múltiplos agentes distribuídos) | **Single-agent** (um policy por rApp) | Simplificação para runtime real |
-| Algoritmo | SAC + **SAM** (Sharpness-Aware Minimization) | SAC/AWAC sem SAM | SAM não implementado |
-| Regularização | **Dynamic ρ scheduling** (exploration-exploitation adaptativo) | Apenas entropia fixa (SAC padrão) | Complexidade adicional não crítica |
-| Treino | Online com SAM | **Offline bootstrap** (BC + SAC/AWAC offline) | Adaptação para traces reais |
-| Ação | Alocação contínua por agente | δ_r_ran, δ_r_ai com budget compartilhado | Alinhado |
-| Reward | QoS por slice | ran_completion + ai_completion + utilization | Simplificado |
-
-> **Nota:** A implementação CAORA usa o **ambiente de recursos compartilhados** e o **algoritmo SAC** do artigo, mas adapta o framework MARL para single-agent e substitui SAM por AWAC offline. Estas simplificações são documentadas como pontos de melhoria futura (Seção 21).
-
-| Aspecto | A3C (Legado) | SAC (Nova Geração) |
-|---------|-------------|-------------------|
-| Formulação | Controle de energia on/off | Alocação compartilhada contínua |
-| Ações | 3 discretas (FULL_POWER, POWER_DOWN, FULL_POWER_GUARD) | Contínuas: δ_r_ran, δ_r_ai ∈ ℝ⁺ |
-| Estado | Métricas de rede + câmeras | [d_ran, d_ai, r_ran, r_ai] |
-| Orçamento | Ilimitado por ação | Compartilhado: r_max = r_ran + r_ai |
-| Treino | Online (A3C) | Offline bootstrap (SAC + AWAC) |
-| Preditor temporal | SBiLSTM embutido | Ambiente já recebe demanda prevista |
-| Alinhamento artigo | Original (2022) | Reformulação própria |
-
-### 9A.2 Ambiente CAORA
-
-**Arquivo:** `drlexp/src/drl/caora_sac_environment.py`
-
-```python
-class CaoraSacEnvironment(gym.Env):
-    """
-    Shared Resource Allocation Environment.
-
-    State:  [d_ran, d_ai, r_ran, r_ai]  (4 floats)
-    Action: [delta_r_ran, delta_r_ai]   (2 floats, continuous)
-    Budget: r_max (recurso máximo compartilhado)
-    """
-```
-
-| Parâmetro | Valor |
-|-----------|-------|
-| Dimensão estado | 4 (d_ran, d_ai, r_ran, r_ai) |
-| Dimensão ação | 2 (δ_r_ran, δ_r_ai), contínua |
-| Orçamento rₘₐₓ | 100.0 (padrão) |
-| d_ran/d_ai range | [0, 100] |
-| r_ran/r_ai range | [0, r_max] |
-| Reward | r = -(α·δ_ran² + β·δ_ai²) − γ·violation² |
-
-### 9A.3 Agente SAC/AWAC
-
-**Arquivo:** `drlexp/training/train_sac.py`
-
-Dois regimes de treino:
-
-| Regime | Descrição | Checkpoint |
-|--------|-----------|------------|
-| **offline_sac** | SAC padrão (Soft Actor-Critic) com replay buffer offline | `runs/sac_bootstrap/offline_sac/` |
-| **offline_awac** | AWAC (Advantage Weighted Actor-Critic) para aprendido offline mais estável | `runs/sac_bootstrap/offline_awac/` |
+Na máquina de desenvolvimento atual, o caminho operacional estável ficou consolidado em:
 
 ```bash
-# Treino SAC offline
-GREENRAN_ENV=prod python drlexp/training/train_sac.py \
-    --algo sac \
-    --total-timesteps 100000 \
-    --offline
-
-# Treino AWAC offline
-GREENRAN_ENV=prod python drlexp/training/train_sac.py \
-    --algo awac \
-    --total-timesteps 100000 \
-    --offline
+env GREENRAN_STATE_DIR=/tmp/greenran_marl_stable_ready \
+  bash scripts/run_greenran_scenario_stable.sh
 ```
 
-### 9A.4 Modelo de Recursos Compartilhados (Runtime)
+Características desse caminho:
+- execução em **no-RIC**
+- `ns-3` com E2 desligado no launcher para evitar abortos locais
+- watcher do `MARL gate` iniciado junto da stack
+- `shadow mode` ativo
+- avaliação de `live vs shadow` acumulando no Data Lake
 
-**Arquivo:** `src/rapp_sac_resource_model.py`
+Estado operacional esperado nesta fase:
+- `training_readiness = control_candidate`
+- `runtime_readiness` evolui conforme amostras reais
+- `gate_status = shadow_only` até o shadow demonstrar vantagem consistente
 
-No runtime, o **SAC Resource Model** calcula o instantâneo de demanda compartilhada:
+### 9.6 O que Saiu da Linha Principal
 
-```python
-def compute_shared_resource_snapshot(d_lake):
-    """
-    Consulta Data Lake e retorna:
-    - d_ran: demanda acumulada RAN (soma SLAs throughput)
-    - d_ai:  demanda acumulada AI (soma SLAs latência crítica)
-    - r_ran: recurso alocado no ciclo anterior
-    - r_ai:  recurso alocado no ciclo anterior
-    """
-```
+Os itens abaixo deixam de ser a trilha central deste relatório:
 
-### 9A.5 Interface de Política Genérica
+- **EE-DRL-GreenRAN (A3C/SBiLSTM)**: mantido apenas como legado/histórico de código
+- **CAORA-SAC/AWAC single-agent**: mantido como ponte experimental e baseline intermediário
 
-**Arquivo:** `src/rapp_rl_policy.py`
-
-Ambos os agentes (A3C legado e SAC/AWAC) compartilham a interface `BaseRLPolicy`:
-
-```python
-class BaseRLPolicy(ABC):
-    @abstractmethod
-    def decide(params: RlInput) -> RlOutput: ...
-
-class LegacyA3CPolicyAdapter(BaseRLPolicy):   # A3C original
-class SACResourceAllocationPolicy(BaseRLPolicy):  # SAC/AWAC
-```
-
-Seleção via variável de ambiente:
-
-```bash
-# Legado A3C
-GREENRAN_RL_POLICY=legacy_a3c python -m src.rapp
-
-# SAC/AWAC
-GREENRAN_RL_POLICY=sac python -m src.rapp
-GREENRAN_RL_POLICY=awac python -m src.rapp
-```
-
-### 9A.6 Exportação de Traces Reais
-
-**Arquivo:** `scripts/export_sac_workload_trace.py`
-
-Exporta séries reais de workload do Data Lake para alimentar o treino SAC:
-
-```bash
-GREENRAN_ENV=prod python scripts/export_sac_workload_trace.py \
-    --days 7 \
-    --output data/traces/sac_workload.csv
-```
-
-O script consulta a tabela `resource_allocation_history` e gera um CSV com colunas `[d_ran, d_ai, r_ran, r_ai, timestamp]`.
-
-### 9A.7 Estado da Migração
-
-| Componente | Status | Próximo Passo |
-|------------|--------|---------------|
-| Ambiente CAORA (env) | ✅ Implementado | Adicionar constraints realísticas |
-| Trainer SAC offline | ✅ Implementado | Sweep de hyperparams |
-| Trainer AWAC offline | ✅ Implementado | Integrar traces reais |
-| Resource Model (runtime) | ✅ Implementado | Validar com dados prod |
-| Interface RL genérica | ✅ Implementado | Adicionar fallback automático |
-| Export traces reais | ✅ Implementado | Criar pipeline periódico |
-| Checkpoints treinados | ✅ offline_sac + offline_awac | Avaliar em env real |
-| Integração rApp completa | 🟡 Parcial | Runtime ainda consome energy commands |
-| Documentação figuras | 🔴 Pendente | Criar diagrama CAORA, comparative table |
-| Testes unitários | 🔴 Pendente | Adicionar tests para sac env, resource model |
+Eles podem continuar no repositório por compatibilidade, comparação e fallback experimental, mas **não** representam mais a arquitetura principal descrita aqui.
 
 ---
 
@@ -1577,13 +1431,13 @@ runs/article00/
 
 ### 17.1 Comparação entre Abordagens
 
-| Aspecto | Heurístico | EE-DRL-GreenRAN | ARMD-GreenRAN (GraphSAGE) |
-|---------|------------|---------------|---------------------------|
-| **F1-Score** | 0.45 | 0.65 | **1.0** |
-| **Generalização** | Baixa | Alta | **Alta** |
-| **Tempo Treino** | N/A | 2h | **1min** |
-| **Tempo Inferência** | <1ms | 1.3ms | **<10ms** |
-| **Dados Necessários** | N/A | 2.000 | **150** |
+| Aspecto | Heurístico/ML | TA-SAM Shadow | ARMD-GreenRAN (GraphSAGE) |
+|---------|----------------|---------------|---------------------------|
+| **Papel atual** | Política viva aplicada | Política observada em paralelo | Aprendizado de conflito |
+| **Modo de operação** | Produção | `shadow_only` / candidato a trial | Offline + análise |
+| **Treino** | Não aplicável | Bootstrap article-aligned | Supervisionado em grafo |
+| **Tempo de inferência** | Baixo | Baixo o suficiente para shadow runtime | **<10ms** |
+| **Objetivo** | Estabilidade operacional | Superar a política viva com evidência de runtime | Explicar e prever conflitos |
 
 ### 17.2 Eventos por Tipo
 
@@ -1616,9 +1470,11 @@ runs/article00/
     "rf_accuracy": 0.893, "xgb_accuracy": 0.901,
     "cv_mean": 0.911, "regressor_r2": 0.99995
   },
-  "drl_training": {
-    "episodes": 10000, "avg_reward": 85.3,
-    "convergence_rate": 0.95, "decision_latency_ms": 1.3
+  "ta_sam_marl": {
+    "mode": "article_aligned_shadow",
+    "du_count": 3,
+    "checkpoint_status": "control_candidate",
+    "runtime_gate": "shadow_only"
   },
   "graphsage": {
     "implicit_f1": 1.0, "reconstruction_f1": 1.0,
@@ -1652,7 +1508,7 @@ cd orange_nuclear
 ### 18.3 Iniciar Sistema Completo
 
 ```bash
-./run_greenran_v2.sh
+env GREENRAN_STATE_DIR=/tmp/greenran_marl_stable_ready bash scripts/run_greenran_scenario_stable.sh
 ```
 
 ### 18.4 Acessar Dashboards
@@ -1687,7 +1543,7 @@ python3 scripts/run_conflict_experiments.py --rounds 10 --duration 120 --auto --
 python3 scripts/run_article00_experiments.py --samples 600 --seeds 42,43,44,45,46
 ```
 
-**DRL Smoke Test:**
+**TA-SAM Candidate Evaluation:**
 ```bash
 GREENRAN_DRL_TRACE=1 GREENRAN_DRL_TRACE_FILE=/tmp/drl_predictor_trace.jsonl \
 ./drlexp/.venv/bin/python scripts/smoke_drl_sequence.py
@@ -1719,63 +1575,58 @@ python3 monitoring/watchdog_xapps.py
 
 | Componente | Status | Detalhes |
 |------------|--------|----------|
-| rApp Orchestrator | ✅ Funcionando | Ciclo 1s, 6 estágios operacionais |
+| rApp Orchestrator | ✅ Funcionando | Ciclo operacional ativo, estado MARL anexado ao snapshot |
 | ML Predictor | ✅ Funcionando | 89.3% accuracy, 3 classes, DB tempo real |
-| DRL Predictor (A3C Legacy) | ✅ Funcionando (legado) | SBiLSTM + A3C, warmup, trace — congelado |
-| CAORA-SAC/AWAC (Nova Geração) | 🟡 Parcial | Ambiente SAC, trainer offline, resource model, checkpoints — integração runtime pendente |
-| RL Policy Interface | ✅ Funcionando | `BaseRLPolicy` genérica, switch via `GREENRAN_RL_POLICY` |
-| Data Lake | ✅ Funcionando | SQLite WAL, 7 tabelas, 9 índices |
-| Dashboard | ✅ Funcionando | Flask porta 5000, 14 rotas |
+| TA-SAM MARL Training Pipeline | ✅ Funcionando | Topologia por DUs, export `jsonl`, treino bootstrap, checkpoints |
+| MARL Shadow Runtime | ✅ Funcionando | Checkpoint executa em paralelo sem assumir controle |
+| MARL Control Gate | ✅ Funcionando | Consolida treino + runtime + aprovação manual |
+| Data Lake | ✅ Funcionando | SQLite WAL com histórico operacional, estado MARL e comparação shadow |
+| Dashboard | ✅ Funcionando | Flask porta 5000 + `/ops` com estado do shadow e do gate |
 | Pattern Engine | ✅ Funcionando | SMA, EMA, detecção sazonal |
 | Trend Analysis | ✅ Funcionando | Regressão linear, slope, aceleração |
 | Energy Protocol | ✅ Funcionando | Comandos JSON com TTL watchdog |
 | Agent-Al | ✅ Funcionando | 6 templates, janelas de tempo |
-| XApp Manager | ✅ Funcionando | start/stop/restart, cleanup zombies |
+| XApp Manager | ✅ Funcionando | start/stop/restart, degradação limpa quando xApp não existe no build |
 | Scheduler | ✅ Funcionando | 4x/dia, auto-retreinamento |
 | Grafana/InfluxDB | ✅ Funcionando | Métricas em tempo real |
-| nearRT-RIC | ✅ Funcionando | E2AP v1, FlexRIC |
-| ns-3 Simulation | ✅ Funcionando | mmWave + LTE |
+| nearRT-RIC | 🟡 Parcial | Presente no projeto, mas o caminho estável desta máquina hoje é `no-RIC` |
+| ns-3 Simulation | ✅ Funcionando | mmWave + LTE, perfil controlado de conflito RAN |
 | ARMD-GreenRAN (GraphSAGE) | ✅ Funcionando | F1=1.0, 10 cenários |
 | Article00 Trail | ✅ Experimental | F1=1.0, 200 epochs |
 
 ### 19.2 Inventário de Arquivos
 
-| Arquivo | Linhas | Função |
-|---------|--------|--------|
-| `src/rapp_orchestrator.py` | 1290 | Orquestrador principal |
-| `src/rapp_data_lake.py` | 1359 | Persistência de dados |
-| `src/rapp_pattern_engine.py` | 1140 | Detecção de padrões |
-| `src/rapp_dashboard.py` | 505 | Dashboard web |
-| `src/rapp_ml_predictor.py` | 319 | Predição ML |
-| `src/rapp_drl_predictor.py` | ~400 | Predição DRL (legado A3C) |
-| `src/rapp_rl_policy.py` | ~180 | Interface genérica BaseRLPolicy (A3C adaptado + SAC) |
-| `src/rapp_sac_resource_model.py` | ~150 | Modelo de recursos compartilhados (d_ran, d_ai, r_ran, r_ai) |
-| `drlexp/src/drl/caora_sac_environment.py` | ~200 | Ambiente CAORA-SAC (gym.Env) |
-| `drlexp/training/train_sac.py` | ~300 | Treino SAC/AWAC offline |
-| `scripts/export_sac_workload_trace.py` | ~120 | Exporta traces reais do Data Lake |
-| `drlexp/config/sac_config.yaml` | ~40 | Configuração SAC |
-| `src/rapp_trend_analysis.py` | 611 | Análise de tendência |
-| `src/rapp_agent_openran.py` | 516 | Interface agent |
-| `src/rapp_xapp_manager.py` | 384 | Ciclo de vida xApp |
-| `src/rapp_a1_interface.py` | ~150 | Interface A1 |
-| `energy_command_protocol.py` | 298 | Protocolo de energia |
-| `training/train_ml_model.py` | 482 | Treinamento ML |
-| `scripts/export_conflict_dataset.py` | ~300 | Export dataset conflitos |
-| `scripts/learn_conflict_matrix.py` | ~200 | Matriz adjacência |
-| `scripts/run_conflict_experiments.py` | ~400 | Runner experimentos |
-| `training/train_graphsage_conflicts.py` | ~500 | Treino GraphSAGE |
-| `greenran_scheduler.sh` | 108 | Scheduler |
-| `run_greenran_v2.sh` | 431 | Execução completa |
+| Arquivo | Função |
+|---------|--------|
+| `src/rapp_orchestrator.py` | Orquestrador principal |
+| `src/rapp_data_lake.py` | Persistência operacional + estado MARL + comparação shadow |
+| `src/rapp_dashboard.py` | Dashboard web + visão `/ops` |
+| `src/rapp_marl_shadow.py` | Shadow runtime do checkpoint TA-SAM |
+| `src/rapp_marl_control_gate.py` | Gate operacional do shadow |
+| `src/greenran_marl_topology.py` | Mapeamento do cenário fixo para DUs/slices/estado global |
+| `src/rapp_sac_resource_model.py` | Snapshot compartilhado + `article_marl_state` |
+| `src/rapp_xapp_manager.py` | Ciclo de vida de xApps com fallback limpo |
+| `drlexp/src/drl/ta_sam_marl.py` | Trainer TA-SAM MARL |
+| `drlexp/training/train_tasam_marl.py` | Entry point do treino article-aligned |
+| `scripts/export_marl_training_trace.py` | Exporta traço MARL real |
+| `scripts/backfill_marl_state_history.py` | Reprocessa coletas passadas |
+| `scripts/evaluate_tasam_candidates.py` | Avalia candidatos treinados |
+| `scripts/evaluate_marl_shadow_runtime.py` | Avalia `live vs shadow` |
+| `scripts/evaluate_marl_control_gate.py` | Consolida o gate de promoção |
+| `scripts/watch_marl_runtime_gate.py` | Watcher periódico do runtime/gate |
+| `scripts/run_greenran_scenario_stable.sh` | Caminho estável desta máquina |
+| `training/train_graphsage_conflicts.py` | Treino GraphSAGE |
 
 ### 19.3 Issues Conhecidas
 
-1. Conflitos `indirect` ainda não foram gerados (0 registros)
-2. Generalização em cenário `recuperacao` precisa de mais dados (F1=0.57)
-3. Testado com 3 apps (expansibilidade não validada)
-4. Artigo00 ainda não homologado como reprodução metodológica final
-5. Classificação CAMERA/UE depende de `amf_ue_ngap_id` (pode haver inversão)
-6. Timeout do xApp após ~25 ciclos (para uso prolongado, aumentar timeout)
-7. Migração SAC: runtime ainda consome energy commands (não resource allocation); testes unitários do env SAC pendentes; figuras CAORA não criadas
+1. O `TA-SAM shadow` ainda não superou de forma consistente a política viva (`runtime_readiness` ainda pode permanecer em `not_beating_live`)
+2. O caminho estável local hoje é `no-RIC`; a trilha com `nearRT-RIC` ainda exige ajuste adicional nesta máquina
+3. Algumas xApps (`slicer`, `energy_saver`, `vehicle_control`) não estão presentes no build local do FlexRIC; o runtime já degrada de forma limpa, mas sem essas binaries
+4. Conflitos `indirect` ainda não foram gerados (0 registros)
+5. Generalização em cenário `recuperacao` precisa de mais dados (F1=0.57)
+6. Testado com 3 apps (expansibilidade não validada)
+7. Artigo00 ainda não homologado como reprodução metodológica final
+
 
 ---
 
@@ -1783,22 +1634,25 @@ python3 monitoring/watchdog_xapps.py
 
 ### 20.1 Visão Geral
 
-Transformar o repositório em uma entrega completa da proposta UFPA com 4 blocos:
+Transformar o repositório em uma entrega completa do GreenRAN article-aligned com 5 blocos:
 
 1. **GreenRAN Core** - Orquestração, observabilidade e controle da Open RAN
 2. **App1-Vigilância** - Vídeo e IA para segurança
 3. **App2-Monitoramento** - Sensores e ambiente
-4. **Artefato Científico Reprodutível** - Paper, figuras, experimentos auditáveis
+4. **TA-SAM Runtime Path** - Shadow mode, control gate e futura promoção para controle real
+5. **Artefato Científico Reprodutível** - Paper, figuras, experimentos auditáveis
 
 ### 20.2 Roadmap de Implementação
 
 | Fase | Descrição | Status |
 |------|-----------|--------|
-| **Fase 1 - Core** | Centralizar configs, consolidar execução, padronizar resultados | ✅ Parcial |
+| **Fase 1 - Core** | Centralizar configs, consolidar execução, padronizar resultados | ✅ Em operação |
 | **Fase 2 - App1** | Backend, ingestão vídeo, eventos, alertas, integração GreenRAN | ✅ Completo |
 | **Fase 3 - App2** | Backend, sensores, anomalias, alertas, integração GreenRAN | ✅ Completo |
-| **Fase 4 - IA Avançada** | DRL com critério experimental, papel two-tower/conflict | 🔄 Em andamento |
-| **Fase 5 - Paper** | Resultados reproduzíveis, tabelas, figuras, texto alinhado | 🔄 Em andamento |
+| **Fase 4 - TA-SAM MARL** | Topologia por DU, treino, shadow runtime, control gate | ✅ Implementado |
+| **Fase 5 - Trial Control** | Sair de `shadow_only` para `control_trial_candidate` com evidência de runtime | 🔄 Em andamento |
+| **Fase 6 - Paper** | Resultados reproduzíveis, tabelas, figuras, texto alinhado | 🔄 Em andamento |
+
 
 ---
 
@@ -1806,36 +1660,36 @@ Transformar o repositório em uma entrega completa da proposta UFPA com 4 blocos
 
 ### 21.1 Pendências Técnicas
 
-1. Ajustar cenários para gerar conflitos `indirect`
-2. Implementar ensemble de modelos
-3. Adicionar XAI (Explainable AI)
-4. Transfer learning entre cenários
-5. Fortalecer inferência real de vídeo no App1
-6. Enriquecer análise por sensor no App2
-7. Implementar App3-Veicular (backend, snapshot, integração rApp)
-8. Implementar xApp-VehicleSafety (Near-RT actuation)
-9. **Completar migração SAC:** integrar runtime com resource allocation, validar com traces reais, criar figuras CAORA
-10. **SAC hyperparameter sweep:** grid search para α, β, γ da reward, learning rate, buffer size
-11. **Testes unitários SAC:** env, resource model, policy adapter
-12. **Diagrama comparativo:** A3C (energy on/off) vs SAC (resource sharing) para o paper
+1. Fazer o `TA-SAM shadow` superar consistentemente a política viva em janela real de runtime
+2. Promover o gate de `shadow_only` para `trial_candidate` com critérios objetivos
+3. Validar a trilha com `nearRT-RIC` nesta máquina ou em ambiente dedicado
+4. Restaurar/compilar as xApps ausentes no build local do FlexRIC
+5. Ajustar cenários para gerar conflitos `indirect`
+6. Implementar ensemble de modelos
+7. Adicionar XAI (Explainable AI)
+8. Transfer learning entre cenários
+9. Fortalecer inferência real de vídeo no App1
+10. Enriquecer análise por sensor no App2
+11. Implementar App3-Veicular com integração mais profunda ao runtime
+12. Criar figuras e tabela final do paper para a trilha article-aligned
 
 ### 21.2 Melhorias de Curto Prazo
 
 - [ ] Adicionar mais painéis ao Grafana
 - [ ] Implementar log rotation
 - [ ] Otimizar queries do Data Lake
-- [ ] Adicionar mais métricas de ML
-- [ ] Dashboard ML com mais detalhes de predições
+- [ ] Adicionar métricas agregadas do `marl_shadow`
+- [ ] Exibir histórico resumido do `control_gate` no dashboard
 
 ### 21.3 Melhorias de Médio Prazo
 
-- [ ] Implementar A/B testing de modelos
-- [ ] Adicionar suporte a múltiplos cenários
+- [ ] Implementar A/B testing entre política viva e `TA-SAM trial`
+- [ ] Adicionar suporte a múltiplos cenários fixos
 - [ ] Implementar backup automático
 - [ ] Criar interface de administração
-- [ ] Integração CARLA + ns-3 completa
-- [ ] SAC runtime: consumir `resource_allocation` do Data Lake em vez de energy commands
-- [ ] SAC runtime: fallback automático para A3C legado se SAC não convergir
+- [ ] Integração CARLA + ns-3 mais fiel ao App3
+- [ ] Definir caminho de promoção do shadow para controle parcial
+
 
 ---
 
@@ -1861,11 +1715,13 @@ Transformar o repositório em uma entrega completa da proposta UFPA com 4 blocos
 | **DRL** | Deep Reinforcement Learning |
 | **GNN** | Graph Neural Network |
 | **GraphSAGE** | Graph Sample and Aggregate |
-| **A3C** | Asynchronous Advantage Actor-Critic (legado) |
-| **SBiLSTM** | Stacked Bidirectional Long Short-Term Memory (legado) |
 | **SAC** | Soft Actor-Critic — agente DRL contínuo com entropia máxima |
-| **AWAC** | Advantage Weighted Actor-Critic — agente DRL offline estável |
-| **CAORA** | Constrained Asymmetric Offline Resource Allocator — ambiente SAC para alocação compartilhada RAN/AI |
+| **SAM** | Sharpness-Aware Minimization |
+| **TA-SAM** | Task-Specific Sharpness-Aware Minimization |
+| **MARL** | Multi-Agent Reinforcement Learning |
+| **Shadow Mode** | Execução paralela de uma política sem alterar a ação aplicada |
+| **Control Gate** | Mecanismo de promoção do shadow para futuro controle real |
+| **Logical DU** | Partição lógica do cenário usada para mapear agentes do artigo |
 | **Resource Allocation** | Alocação orçamentária contínua de recursos compartilhados (d_ran, d_ai, r_ran, r_ai) |
 | **ARMD** | Autoregressive Model for Decision |
 | **CVaR** | Conditional Value at Risk |
@@ -1884,6 +1740,6 @@ Transformar o repositório em uma entrega completa da proposta UFPA com 4 blocos
 ---
 
 **Documento gerado em:** Maio 2026
-**Última atualização:** 25 de Maio de 2026 (Versão 3.1 — A3C → SAC Migration)
-**Status:** ✅ COMPLETO - TODOS OS COMPONENTES DOCUMENTADOS
-**Cobertura:** 23 seções (9 + 9A), ~1900 linhas, 9 documentos consolidados + migração SAC
+**Última atualização:** 27 de Maio de 2026 (Versão 4.0 — TA-SAM MARL + Shadow Runtime)
+**Status:** ✅ ATUALIZADO PARA A TRILHA ARTICLE-ALIGNED ATUAL
+**Cobertura:** 22 seções, relatório consolidado com foco na arquitetura TA-SAM + ARMD + runtime shadow
