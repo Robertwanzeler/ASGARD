@@ -2303,7 +2303,7 @@ else:
 | **ρ SAM** | Dinâmico (decai) | **Dinâmico (decai)** ✓ | ✓ |
 | **Seletor SAM** | Variância TD-error | **Variância TD-error** ✓ | ✓ |
 | **Recompensa** | `σ(α·Q) + P_res + P_minQ` | **`σ(α·Q) + P_res + P_minQ`** ✓ | ✓ |
-| **Treino** | Online (iteração ambiente) | Offline (BC + SAC/AWAC) | Online (ambiente Markov) |
+| **Treino** | Online (iteração ambiente) | Offline (BC + SAC/AWAC) + Online (Markov) ✓ | ✓ |
 | **Ambiente** | Sintético próprio | CSV real Data Lake | Gerador Markov + ruído |
 | **Crítico** | Global centralizado | Twin-Q SAC | Twin-Q SAC + SAM |
 | **Fonte de dados** | UEs virtuais | ns-3 com xApps reais | Distribuições dos traços |
@@ -2312,22 +2312,21 @@ else:
 
 | Item | Status | Prioridade |
 |------|--------|------------|
-| Ambiente Markov + ruído | Não implementado | Alta |
+| Ambiente Markov + ruído | **Implementado** ✓ | Alta |
 | Recompensa sigmoid + penalidades | **Implementado** ✓ | Alta |
 | SAC + SAM integrado | **Implementado** ✓ | Alta |
 | ρ dinâmico | **Implementado** ✓ | Média |
 | Seletor por variância TD-error | **Implementado** ✓ | Média |
 | Rede 300→400→400 tanh | **Implementado** ✓ | Média |
 | Learning rate 1e-4 | **Implementado** ✓ | Baixa |
-| Treino online | Não implementado | Alta |
+| Treino online | **Implementado** ✓ (`train_online_sam.py` + `online_marl_env.py`) | Alta |
 
 ### 30.3 Arquivos novos necessários
 
 | Arquivo | Descrição |
 |---------|-----------|
-| `drlexp/src/drl/online_marl_env.py` | Ambiente Gymnasium com gerador Markov + ruído e recompensa do artigo |
-| `drlexp/training/train_online_sam.py` | Loop de treino online SAC + SAM com ρ dinâmico |
-| `drlexp/src/drl/sam_optimizer.py` | Otimizador SAM reutilizável (separado do TA-SAM) |
+| `drlexp/src/drl/online_marl_env.py` | Ambiente Gymnasium com gerador Markov + ruído e recompensa do artigo ✅ |
+| `drlexp/training/train_online_sam.py` | Loop de treino online SAC + SAM com ρ dinâmico ✅ |
 
 ### 30.4 Benefício esperado
 
