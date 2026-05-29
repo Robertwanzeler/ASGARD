@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -190,20 +191,33 @@ class TASAMMultiAgentTrainer:
                 'td_var_max': 0.0,
             }
 
-        calibration_vars: List[float] = []
+        mse = nn.MSELoss()
+
+        first_pass_td_errors: List[float] = []
+        first_pass_vals: List[tuple] = []
         for record in records:
-            for actor, du_state in zip(self.actors, record.du_states):
-                du_x = torch.tensor(du_state, dtype=torch.float32)
-                with torch.no_grad():
-                    action = actor(du_x)
-                calibration_vars.append(float(torch.var(action).item()))
+            global_x = torch.tensor(record.global_state, dtype=torch.float32)
+            du_inputs = [torch.tensor(du_state, dtype=torch.float32) for du_state in record.du_states]
+            target_actions = [torch.tensor(target, dtype=torch.float32) for target in record.target_actions]
+            with torch.no_grad():
+                actor_actions = [actor(du_x) for actor, du_x in zip(self.actors, du_inputs)]
+            action_tensor = torch.cat([a.detach() for a in actor_actions], dim=0)
+            critic_in = torch.cat([global_x, action_tensor], dim=0)
+            value = self.critic(critic_in).squeeze(0)
+            reward = torch.tensor(record.reward, dtype=torch.float32)
+            td_error = float(abs(value.item() - record.reward))
+            first_pass_td_errors.append(td_error)
+            n_du = len(du_inputs)
+            first_pass_vals.append((global_x, du_inputs, target_actions, value, reward, n_du))
 
         effective_threshold = calibrate_td_variance_threshold(
-            calibration_vars,
+            first_pass_td_errors,
             requested_threshold=td_var_threshold,
             min_selected_fraction=min_selected_fraction,
             warmup=warmup,
         )
+
+        td_var = float(np.var(first_pass_td_errors)) if len(first_pass_td_errors) > 1 else 0.0
 
         actor_losses = []
         critic_losses = []
@@ -211,45 +225,28 @@ class TASAMMultiAgentTrainer:
         action_vars = []
         selected_agents = 0
         total_agents = 0
-        mse = nn.MSELoss()
 
-        for record in records:
-            global_x = torch.tensor(record.global_state, dtype=torch.float32)
-            du_inputs = [torch.tensor(du_state, dtype=torch.float32) for du_state in record.du_states]
-            target_actions = [torch.tensor(target, dtype=torch.float32) for target in record.target_actions]
-            total_agents += len(du_inputs)
-
-            actor_actions = []
-            td_errors = []
-            for actor, du_x in zip(self.actors, du_inputs):
-                action = actor(du_x)
-                actor_actions.append(action)
-                action_vars.append(float(torch.var(action).item()))
-                td_errors.append(float(torch.var(action).item()))
-
-            action_tensor_detached = torch.cat([action.detach() for action in actor_actions], dim=0)
-            critic_in = torch.cat([global_x, action_tensor_detached], dim=0)
-            value = self.critic(critic_in).squeeze(0)
-            reward = torch.tensor(record.reward, dtype=torch.float32)
+        for (global_x, du_inputs, target_actions, value, reward, n_du) in first_pass_vals:
+            total_agents += n_du
             critic_loss = (value - reward).pow(2)
             self.critic_opt.zero_grad()
             critic_loss.backward()
             self.critic_opt.step()
             critic_losses.append(float(critic_loss.item()))
 
-            td_variance = sum(td_errors) / max(len(td_errors), 1)
-            if td_variance >= effective_threshold:
+            if td_var >= effective_threshold or warmup:
                 actor_actions = [actor(du_x) for actor, du_x in zip(self.actors, du_inputs)]
+                action_vars.extend([float(torch.var(a).item()) for a in actor_actions])
                 actor_in = torch.cat([global_x, torch.cat(actor_actions, dim=0)], dim=0)
                 actor_value = self.critic(actor_in).squeeze(0)
-                bc_loss = sum(mse(action, target) for action, target in zip(actor_actions, target_actions)) / max(len(actor_actions), 1)
-                actor_loss = (bc_weight * bc_loss) + (value_weight * (-actor_value))
+                bc_loss_val = sum(mse(a, t) for a, t in zip(actor_actions, target_actions)) / max(len(actor_actions), 1)
+                actor_loss = (bc_weight * bc_loss_val) + (value_weight * (-actor_value))
                 self.actor_opt.zero_grad()
                 actor_loss.backward()
                 self.actor_opt.step()
                 actor_losses.append(float(actor_loss.item()))
-                bc_losses.append(float(bc_loss.item()))
-                selected_agents += len(record.du_states)
+                bc_losses.append(float(bc_loss_val.item()))
+                selected_agents += n_du
 
         return {
             'actor_loss': sum(actor_losses) / max(len(actor_losses), 1),
@@ -259,6 +256,6 @@ class TASAMMultiAgentTrainer:
             'selected_agents': float(selected_agents),
             'selected_fraction': float(selected_agents / max(total_agents, 1)),
             'effective_td_var_threshold': float(effective_threshold),
-            'td_var_mean': float(sum(calibration_vars) / max(len(calibration_vars), 1)),
-            'td_var_max': float(max(calibration_vars) if calibration_vars else 0.0),
+            'td_var_mean': float(np.mean(first_pass_td_errors)) if first_pass_td_errors else 0.0,
+            'td_var_max': float(max(first_pass_td_errors)) if first_pass_td_errors else 0.0,
         }

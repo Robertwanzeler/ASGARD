@@ -1856,9 +1856,9 @@ Hoje já existe no GreenRAN:
 
 Apesar de funcional, a implementação ainda possui limites claros.
 
-### 25.1 SAM implementado apenas no TA-SAM, não no SAC
+### 25.1 SAM integrado ao SAC offline (implementado)
 
-O `SAMOptimizer` com sharpness-aware minimization só existe no trainer TA-SAM MARL. O SAC/AWAC single-agent usa otimização vanilla (Adam). O artigo prevê SAM integrado ao SAC.
+O `SAMOptimizer` agora roda dentro do `run_offline_sac()` no `train_sac.py`, integrado ao gradiente do ator. O parâmetro `--sam-rho` controla o raio de perturbação (0.05 default, 0 para desligar), e `--sam-rho-decay` ativa o decaimento linear durante o treino. Esta seção está alinhada ao artigo.
 
 ### 25.2 SAC single-agent é simplificação vs MARL do artigo
 
@@ -2298,10 +2298,10 @@ else:
 | **Rede ator** | 300→400→400 tanh | **300→400→400 tanh** ✓ | ✓ |
 | **Rede crítico** | 300→400→400 tanh | **300→400→400 tanh** ✓ | ✓ |
 | **Learning rate** | 1e-4 | **1e-4** ✓ | ✓ |
-| **Otimizador** | Adam | Adam | Adam + SAM pendente |
-| **Algoritmo** | SAC + SAM integrado | SAC vanilla + TA-SAM separado | SAC + SAM integrado |
-| **ρ SAM** | Dinâmico (decai) | Fixo 0.05 | Dinâmico |
-| **Seletor SAM** | Variância TD-error | Variância da ação | Variância TD-error |
+| **Otimizador** | Adam | Adam + SAM ✓ | ✓ |
+| **Algoritmo** | SAC + SAM integrado | **SAC + SAM integrado** ✓ | ✓ |
+| **ρ SAM** | Dinâmico (decai) | **Dinâmico (decai)** ✓ | ✓ |
+| **Seletor SAM** | Variância TD-error | **Variância TD-error** ✓ | ✓ |
 | **Recompensa** | `σ(α·Q) + P_res + P_minQ` | **`σ(α·Q) + P_res + P_minQ`** ✓ | ✓ |
 | **Treino** | Online (iteração ambiente) | Offline (BC + SAC/AWAC) | Online (ambiente Markov) |
 | **Ambiente** | Sintético próprio | CSV real Data Lake | Gerador Markov + ruído |
@@ -2314,9 +2314,9 @@ else:
 |------|--------|------------|
 | Ambiente Markov + ruído | Não implementado | Alta |
 | Recompensa sigmoid + penalidades | **Implementado** ✓ | Alta |
-| SAC + SAM integrado | Não implementado | Alta |
-| ρ dinâmico | Não implementado | Média |
-| Seletor por variância TD-error | Não implementado | Média |
+| SAC + SAM integrado | **Implementado** ✓ | Alta |
+| ρ dinâmico | **Implementado** ✓ | Média |
+| Seletor por variância TD-error | **Implementado** ✓ | Média |
 | Rede 300→400→400 tanh | **Implementado** ✓ | Média |
 | Learning rate 1e-4 | **Implementado** ✓ | Baixa |
 | Treino online | Não implementado | Alta |

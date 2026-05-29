@@ -61,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actor-update-interval", type=int, default=4, help="Update the actor every N critic steps")
     parser.add_argument("--awac-lambda", type=float, default=0.25, help="Advantage temperature for AWAC-style weighted regression")
     parser.add_argument("--awac-max-weight", type=float, default=12.0, help="Maximum importance weight for AWAC-style actor updates")
+    parser.add_argument("--sam-rho", type=float, default=0.05, help="SAM perturbation radius (artigo: 0.05, 0 = desliga)")
+    parser.add_argument("--sam-rho-decay", action="store_true", default=True, help="Aplica decaimento linear ao rho durante o treino (artigo: dinamico)")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
     parser.add_argument("--alpha-init", type=float, default=0.03, help="Initial entropy temperature")
     parser.add_argument("--alpha-min", type=float, default=1e-4, help="Minimum entropy temperature")
@@ -239,6 +241,46 @@ def load_transition_dataset(csv_path: str | Path, delta_step: float) -> Transiti
         all_rewards=rewards_t,
         all_next_states=next_states_t,
         all_dones=dones_t,
+    )
+
+
+def _actor_loss_fn(
+    actor: GaussianActor,
+    critic1: QNetwork,
+    critic2: QNetwork,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    ref_actions: torch.Tensor,
+    log_alpha: torch.Tensor,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    sampled_actions, log_prob, det_actions = actor.sample(states)
+    bc_loss = F.mse_loss(det_actions, actions)
+    anchor_loss = F.mse_loss(det_actions, ref_actions)
+    if args.offline_mode == "awac":
+        q1_data = critic1(states, actions)
+        q2_data = critic2(states, actions)
+        q_data = torch.min(q1_data, q2_data)
+        q1_ref = critic1(states, ref_actions)
+        q2_ref = critic2(states, ref_actions)
+        v_ref = torch.min(q1_ref, q2_ref)
+        advantage = q_data - v_ref
+        weights = torch.exp(advantage / max(args.awac_lambda, 1e-6))
+        weights = torch.clamp(weights, min=0.0, max=args.awac_max_weight).detach()
+        per_sample_bc = torch.mean((det_actions - actions).pow(2), dim=-1, keepdim=True)
+        weighted_bc_loss = (weights * per_sample_bc).mean()
+        return (
+            weighted_bc_loss
+            + (args.bc_weight * bc_loss)
+            + (args.bc_anchor_weight * anchor_loss)
+        )
+    q1_pi = critic1(states, sampled_actions)
+    q2_pi = critic2(states, sampled_actions)
+    min_q_pi = torch.min(q1_pi, q2_pi)
+    return (
+        (log_alpha.exp() * log_prob - min_q_pi).mean()
+        + (args.bc_weight * bc_loss)
+        + (args.bc_anchor_weight * anchor_loss)
     )
 
 
@@ -436,41 +478,44 @@ def run_offline_sac(
                 and (global_step % max(args.actor_update_interval, 1) == 0)
             )
             if should_update_actor:
-                sampled_actions, log_prob, det_actions = actor.sample(states)
                 with torch.no_grad():
                     ref_actions = reference_actor.deterministic(states)
-                bc_loss = F.mse_loss(det_actions, actions)
-                anchor_loss = F.mse_loss(det_actions, ref_actions)
 
-                if args.offline_mode == "awac":
-                    q1_data = critic1(states, actions)
-                    q2_data = critic2(states, actions)
-                    q_data = torch.min(q1_data, q2_data)
-                    q1_ref = critic1(states, ref_actions)
-                    q2_ref = critic2(states, ref_actions)
-                    v_ref = torch.min(q1_ref, q2_ref)
-                    advantage = q_data - v_ref
-                    weights = torch.exp(advantage / max(args.awac_lambda, 1e-6))
-                    weights = torch.clamp(weights, min=0.0, max=args.awac_max_weight).detach()
-                    per_sample_bc = torch.mean((det_actions - actions).pow(2), dim=-1, keepdim=True)
-                    weighted_bc_loss = (weights * per_sample_bc).mean()
-                    actor_loss = (
-                        weighted_bc_loss
-                        + (args.bc_weight * bc_loss)
-                        + (args.bc_anchor_weight * anchor_loss)
-                    )
-                else:
-                    q1_pi = critic1(states, sampled_actions)
-                    q2_pi = critic2(states, sampled_actions)
-                    min_q_pi = torch.min(q1_pi, q2_pi)
-                    actor_loss = (
-                        (log_alpha.exp() * log_prob - min_q_pi).mean()
-                        + (args.bc_weight * bc_loss)
-                        + (args.bc_anchor_weight * anchor_loss)
-                    )
+                current_rho = args.sam_rho
+                if args.sam_rho_decay and args.sam_rho > 0:
+                    progress = float(epoch_idx) / max(float(args.sac_epochs), 1.0)
+                    rho_min = args.sam_rho * 0.1
+                    current_rho = max(rho_min, args.sam_rho * (1.0 - progress))
 
+                actor_loss = _actor_loss_fn(actor, critic1, critic2, states, actions, ref_actions, log_alpha, args)
                 actor_opt.zero_grad()
                 actor_loss.backward()
+
+                if current_rho > 0:
+                    grad_norm = 0.0
+                    for p in actor.parameters():
+                        if p.grad is not None:
+                            grad_norm += p.grad.norm().item() ** 2
+                    grad_norm = math.sqrt(grad_norm) + 1e-12
+
+                    saved_params = [p.data.clone() for p in actor.parameters() if p.grad is not None]
+
+                    with torch.no_grad():
+                        for p in actor.parameters():
+                            if p.grad is not None:
+                                p.data.add_(current_rho * p.grad / grad_norm)
+
+                    actor_loss_adv = _actor_loss_fn(actor, critic1, critic2, states, actions, ref_actions, log_alpha, args)
+                    actor_opt.zero_grad()
+                    actor_loss_adv.backward()
+
+                    idx = 0
+                    with torch.no_grad():
+                        for p in actor.parameters():
+                            if p.grad is not None:
+                                p.data.copy_(saved_params[idx])
+                                idx += 1
+
                 clip_grad_norm_(actor.parameters(), args.grad_clip)
                 actor_opt.step()
 
