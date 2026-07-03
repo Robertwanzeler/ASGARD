@@ -8,6 +8,7 @@ Sources:
     - DlPdcpStats.txt: PDCP layer metrics (ground truth for latency)
     - DlMacStats.txt: MAC layer metrics (MCS, TB size)
     - DlRlcStats.txt: RLC layer metrics
+    - DlE2PdcpStats.txt / DlE2RlcStats.txt: E2-exported bearer stats when classic files are absent
     - cu-up-cell-*.txt: CU-UP metrics (throughput)
 
 Usage:
@@ -34,6 +35,8 @@ from greenran_paths import (
     CARLA_STATE_DIR,
     CARLA_VEHICLES_PATH,
     CARLA_VEHICLE_MAP_PATH,
+    get_fixed_max_vehicles,
+    get_fixed_vehicle_base_imsi,
     as_str,
 )
 from greenran_runtime import load_runtime_config
@@ -43,6 +46,20 @@ DEFAULT_INPUT_DIR = as_str(NS3_DIR)
 DEFAULT_OUTPUT_FILE = as_str(METRICS_JSON_PATH)
 DEFAULT_EXTENDED_OUTPUT_FILE = as_str(EXTENDED_METRICS_JSON_PATH)
 DEFAULT_POLL_INTERVAL = float(RUNTIME_CONFIG["collector"]["poll_interval_seconds"])
+TRACE_FILE_CANDIDATES = {
+    "pdcp": [
+        "DlPdcpStats.txt",
+        "LteDlPdcpStats.txt",
+        "DlE2PdcpStats.txt",
+        "DlE2PdcpStatsLte.txt",
+    ],
+    "rlc": [
+        "DlRlcStats.txt",
+        "LteDlRlcStats.txt",
+        "DlE2RlcStats.txt",
+        "DlE2RlcStatsLte.txt",
+    ],
+}
 
 CAMERA_IMSI_RANGE = (1, 3)
 SENSOR_IMSI_RANGE = (4, 50)
@@ -97,6 +114,13 @@ class ExtendedMetricsCollector:
         self.carla_vehicle_map_mtime = None
         self.carla_vehicle_state_mtime = None
         self._warned_missing_pdcp = False
+        self.trace_stale_threshold_s = float(os.environ.get("GREENRAN_PDCP_STALE_SECONDS", "30"))
+        self.require_real_pdcp = os.environ.get("GREENRAN_REQUIRE_REAL_PDCP", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         os.makedirs(os.path.dirname(extended_output_file), exist_ok=True)
@@ -157,6 +181,70 @@ class ExtendedMetricsCollector:
     
     def _signal_handler(self, signum, frame):
         self.running = False
+
+    def _trace_status(self, path, metrics=None, stale_threshold_s=None):
+        threshold = self.trace_stale_threshold_s if stale_threshold_s is None else float(stale_threshold_s)
+        status = {
+            'path': str(path),
+            'exists': False,
+            'size_bytes': 0,
+            'mtime': 0.0,
+            'age_s': None,
+            'stale_threshold_s': threshold,
+            'stale': False,
+            'latest_sim_time_s': None,
+        }
+        try:
+            path = Path(path)
+            if not path.exists():
+                return status
+            stat = path.stat()
+            age_s = max(0.0, time.time() - stat.st_mtime)
+            status.update({
+                'exists': True,
+                'size_bytes': int(stat.st_size),
+                'mtime': float(stat.st_mtime),
+                'age_s': age_s,
+                'stale': age_s > threshold,
+            })
+            if metrics:
+                latest = max(
+                    (float(m.get('time_end', m.get('time', 0.0)) or 0.0) for m in metrics),
+                    default=None,
+                )
+                status['latest_sim_time_s'] = latest
+        except Exception as e:
+            status['error'] = str(e)
+        return status
+
+    def _attach_trace_status(self, metrics, trace_status, collector_mode=None):
+        gm = metrics.setdefault('global_metrics', {})
+        gm['trace_file_status'] = trace_status
+        pdcp_status = trace_status.get('pdcp', {}) if isinstance(trace_status, dict) else {}
+        rlc_status = trace_status.get('rlc', {}) if isinstance(trace_status, dict) else {}
+        mac_status = trace_status.get('mac', {}) if isinstance(trace_status, dict) else {}
+        gm['pdcp_stale'] = bool(pdcp_status.get('stale'))
+        gm['rlc_stale'] = bool(rlc_status.get('stale'))
+        gm['mac_stale'] = bool(mac_status.get('stale'))
+        gm['pdcp_trace_age_s'] = pdcp_status.get('age_s')
+        gm['rlc_trace_age_s'] = rlc_status.get('age_s')
+        gm['mac_trace_age_s'] = mac_status.get('age_s')
+        gm['pdcp_latest_sim_time_s'] = pdcp_status.get('latest_sim_time_s')
+        if collector_mode:
+            gm['collector_mode'] = collector_mode
+        return metrics
+
+    def _resolve_trace_file(self, trace_kind):
+        candidates = TRACE_FILE_CANDIDATES.get(trace_kind, [])
+        if not candidates:
+            raise KeyError(f"unknown trace kind: {trace_kind}")
+
+        fallback = self.input_dir / candidates[0]
+        for filename in candidates:
+            candidate = self.input_dir / filename
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        return fallback
 
     def _refresh_device_role_map(self):
         """Reload explicit IMSI role metadata when the scenario updates it."""
@@ -238,6 +326,80 @@ class ExtendedMetricsCollector:
         state = self.carla_vehicle_state.get(str(vehicle_id), {})
         return state if isinstance(state, dict) else {}
 
+    def _estimate_proxy_latency_us(self, imsi, device_type, throughput_kbps, mac_entry, rlc_entry, vehicle_state=None):
+        """Estimate explicit proxy latency when ns-3 did not emit PDCP/CU-UP latency."""
+        try:
+            imsi_num = int(imsi)
+        except (TypeError, ValueError):
+            imsi_num = 0
+
+        mcs_values = mac_entry.get('mcs', []) if mac_entry else []
+        tb_values = mac_entry.get('tb_sizes', []) if mac_entry else []
+        avg_mcs = sum(mcs_values) / len(mcs_values) if mcs_values else 10.0
+        avg_tb = sum(tb_values) / len(tb_values) if tb_values else 0.0
+        rlc_penalty_ms = 20.0 if rlc_entry else 0.0
+        jitter_ms = float((imsi_num * 7) % 23)
+
+        if device_type == 'vehicle':
+            if vehicle_state and vehicle_state.get('latency_ms') is not None:
+                return max(1.0, float(vehicle_state.get('latency_ms') or 0.0) * 1000.0), 'vehicle_state_proxy'
+            risk_penalty = 45.0 if (imsi_num % 5) == 0 else 15.0 if (imsi_num % 3) == 0 else 0.0
+            mcs_penalty = max(0.0, 18.0 - avg_mcs) * 2.0
+            throughput_penalty = max(0.0, 1200.0 - float(throughput_kbps or 0.0)) / 40.0
+            latency_ms = 35.0 + risk_penalty + mcs_penalty + throughput_penalty + jitter_ms
+            return max(1.0, latency_ms * 1000.0), 'app3_vehicle_proxy'
+
+        if device_type == 'sensor':
+            mcs_penalty = max(0.0, 15.0 - avg_mcs) * 6.0
+            throughput_penalty = max(0.0, 64.0 - float(throughput_kbps or 0.0)) * 1.6
+            tb_penalty = 35.0 if avg_tb <= 0 else max(0.0, 180.0 - avg_tb) / 4.0
+            latency_ms = 95.0 + mcs_penalty + throughput_penalty + tb_penalty + rlc_penalty_ms + jitter_ms
+            return max(1.0, latency_ms * 1000.0), 'app2_sensor_proxy'
+
+        if device_type == 'camera':
+            mcs_penalty = max(0.0, 20.0 - avg_mcs) * 2.5
+            throughput_penalty = max(0.0, 25000.0 - float(throughput_kbps or 0.0)) / 650.0
+            latency_ms = 28.0 + mcs_penalty + throughput_penalty + rlc_penalty_ms + (jitter_ms / 2.0)
+            return max(1.0, latency_ms * 1000.0), 'embb_mac_proxy'
+
+        mcs_penalty = max(0.0, 16.0 - avg_mcs) * 3.0
+        throughput_penalty = max(0.0, 1000.0 - float(throughput_kbps or 0.0)) / 80.0
+        latency_ms = 55.0 + mcs_penalty + throughput_penalty + rlc_penalty_ms + jitter_ms
+        return max(1.0, latency_ms * 1000.0), 'background_mac_proxy'
+
+    def _build_virtual_vehicle_state(self, imsi, index, fallback_end):
+        phase = int(float(fallback_end or 0.0) // 30.0) % 4
+        risk_state = 'high' if (index + phase) % 5 == 0 else 'medium' if (index + phase) % 3 == 0 else 'low'
+        autonomy_state = 'degraded' if risk_state == 'high' else 'assisted' if risk_state == 'medium' else 'normal'
+        base_latency_ms = 42.0 + (index * 9.0) + (phase * 6.0)
+        if risk_state == 'high':
+            base_latency_ms += 42.0
+        elif risk_state == 'medium':
+            base_latency_ms += 20.0
+        packet_loss = 1.0 + (index * 0.7) + (phase * 0.8)
+        if risk_state == 'high':
+            packet_loss += 5.0
+        elif risk_state == 'medium':
+            packet_loss += 2.0
+        return {
+            'vehicle_id': f'proxy-veh-{index + 1:02d}',
+            'vehicle_role': 'ego' if index == 0 else 'traffic',
+            'connectivity': '5g_native',
+            'gateway_id': 'GW-VEH-PROXY',
+            'domain': 'vehicular',
+            'mobility_profile': 'vehicle',
+            'autonomy_state': autonomy_state,
+            'risk_state': risk_state,
+            'packet_loss_percent': round(packet_loss, 3),
+            'speed_mps': round(max(0.5, 14.0 - (index * 0.8) - (phase * 0.4)), 3),
+            'heading_deg': float((index * 32 + phase * 17) % 360),
+            'lane_id': f'L{(index % 3) + 1}',
+            'waypoint_id': f'proxy-wp-{phase}-{index}',
+            'position': {'x': float(index * 14), 'y': float(phase * 3), 'z': 0.0},
+            'latency_ms': round(base_latency_ms, 3),
+            'source': 'collector_virtual_vehicle_proxy',
+        }
+
     def _load_app2_sensor_override(self):
         try:
             if not self.scenario_control_path.exists():
@@ -250,6 +412,20 @@ class ExtendedMetricsCollector:
             return override
         except Exception as e:
             print(f"[CSV_METRICS] Error loading App2 scenario control override: {e}")
+            return {}
+
+    def _load_app1_camera_override(self):
+        try:
+            if not self.scenario_control_path.exists():
+                return {}
+            with open(self.scenario_control_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            override = payload.get("app1_camera_override", {}) if isinstance(payload, dict) else {}
+            if not isinstance(override, dict) or not override.get("enabled", False):
+                return {}
+            return override
+        except Exception as e:
+            print(f"[CSV_METRICS] Error loading App1 scenario control override: {e}")
             return {}
 
     def _apply_app2_sensor_override(self, sensor_entries, snapshot, override):
@@ -310,6 +486,58 @@ class ExtendedMetricsCollector:
             "simulated_hour": None,
         }
         return sensor_entries, snapshot
+
+    def _load_vehicle_override(self):
+        try:
+            if not self.scenario_control_path.exists():
+                return {}
+            with open(self.scenario_control_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            override = payload.get("vehicle_override", {}) if isinstance(payload, dict) else {}
+            if not isinstance(override, dict) or not override.get("enabled", False):
+                return {}
+            return override
+        except Exception as e:
+            print(f"[CSV_METRICS] Error loading vehicle scenario control override: {e}")
+            return {}
+
+    def _apply_vehicle_override(self, vehicle_payload, override, vehicle_index):
+        if not override:
+            return dict(vehicle_payload or {})
+
+        payload = dict(vehicle_payload or {})
+        role = str(payload.get("vehicle_role", payload.get("role", "ego" if vehicle_index == 0 else "traffic")) or "traffic")
+        is_ego = role == "ego"
+        high_target = max(0, int(override.get("high_risk_vehicles", 0) or 0))
+        medium_target = max(0, int(override.get("medium_risk_vehicles", 0) or 0))
+        degraded_target = max(0, int(override.get("degraded_autonomy_vehicles", 0) or 0))
+        ego_latency_ms = float(override.get("ego_latency_ms", 18.0) or 18.0)
+        traffic_latency_ms = float(override.get("traffic_latency_ms", 14.0) or 14.0)
+        ego_packet_loss = float(override.get("ego_packet_loss_percent", 0.2) or 0.2)
+        traffic_packet_loss = float(override.get("traffic_packet_loss_percent", 0.1) or 0.1)
+        max_speed_mps = float(override.get("max_speed_mps", 7.0) or 7.0)
+
+        if vehicle_index < high_target:
+            risk_state = "high"
+        elif vehicle_index < (high_target + medium_target):
+            risk_state = "medium"
+        else:
+            risk_state = "low"
+
+        payload.update({
+            "vehicle_role": role,
+            "autonomy_state": "degraded" if vehicle_index < degraded_target else "normal",
+            "risk_state": risk_state,
+            "latency_ms": round(ego_latency_ms if is_ego else traffic_latency_ms, 3),
+            "packet_loss_percent": round(ego_packet_loss if is_ego else traffic_packet_loss, 3),
+            "speed_mps": round(max(0.5, max_speed_mps - (vehicle_index * 0.35)), 3),
+            "scenario_mode": str(override.get("mode", "vehicle_controlled") or "vehicle_controlled"),
+        })
+        payload.setdefault("connectivity", "5g_native")
+        payload.setdefault("gateway_id", "GW-VEH-PROXY")
+        payload.setdefault("domain", "vehicular")
+        payload.setdefault("mobility_profile", "vehicle")
+        return payload
 
     def get_device_meta(self, imsi):
         """Return explicit metadata for an IMSI when available."""
@@ -741,43 +969,67 @@ class ExtendedMetricsCollector:
         }
     
     def process_rlc_stats(self, filepath):
-        """Process DlRlcStats.txt - RLC layer metrics"""
+        """Process DlRlcStats.txt - RLC layer metrics."""
         if not filepath.exists():
             return []
-        
+
         metrics = []
-        
+
         try:
             with open(filepath, 'r') as f:
                 for line in f:
                     if line.startswith('%') or line.startswith('start') or not line.strip():
                         continue
-                    
-                    parts = line.strip().split('\t')
-                    if len(parts) < 12:
+
+                    parts = line.strip().split('	')
+                    if len(parts) < 15:
                         continue
-                    
+
                     try:
                         time_start = float(parts[0])
                         time_end = float(parts[1])
                         cell_id = int(parts[2])
                         imsi = parts[3]
                         rnti = int(parts[4])
-                        
+                        lcid = int(parts[5])
+                        n_tx_pdus = int(parts[6])
+                        tx_bytes = int(parts[7])
+                        n_rx_pdus = int(parts[8])
+                        rx_bytes = int(parts[9])
+                        delay_s = float(parts[10])
+                        delay_stddev = float(parts[11])
+                        delay_min = float(parts[12])
+                        delay_max = float(parts[13])
+                        pdu_size = float(parts[14])
+
                         metrics.append({
                             'time_start': time_start,
                             'time_end': time_end,
                             'cell_id': cell_id,
                             'imsi': imsi,
                             'rnti': rnti,
+                            'lcid': lcid,
+                            'n_tx_pdus': n_tx_pdus,
+                            'tx_bytes': tx_bytes,
+                            'n_rx_pdus': n_rx_pdus,
+                            'rx_bytes': rx_bytes,
+                            'delay_s': delay_s,
+                            'delay_us': delay_s * 1_000_000,
+                            'delay_stddev_s': delay_stddev,
+                            'delay_stddev_us': delay_stddev * 1_000_000,
+                            'delay_min_s': delay_min,
+                            'delay_min_us': delay_min * 1_000_000,
+                            'delay_max_s': delay_max,
+                            'delay_max_us': delay_max * 1_000_000,
+                            'pdu_size': pdu_size,
                             'device_type': self.get_device_type(imsi)
                         })
                     except (ValueError, IndexError):
                         continue
-                        
+
         except Exception as e:
             print(f"[CSV_METRICS] Error reading RLC stats: {e}")
-        
+
         return metrics
 
     def process_cu_up_stats(self, filepaths):
@@ -1029,7 +1281,12 @@ class ExtendedMetricsCollector:
                 'mmwave_sched_mapped_ues': 0,
                 'mmwave_sched_window_allocs': 0,
                 'mac_trace_mode': 'unknown',
-                'collector_mode': 'no_pdcp_fallback',
+                'collector_mode': 'no_pdcp_proxy_latency',
+                'latency_sample_source_counts': {},
+                'real_latency_sample_count': 0,
+                'proxy_latency_sample_count': 0,
+                'proxy_expanded_sensors': False,
+                'proxy_virtual_vehicles': False,
             },
             'active_cameras': 0,
             'critical_cameras': 0,
@@ -1097,26 +1354,62 @@ class ExtendedMetricsCollector:
         imsis.update(rlc_latest_by_imsi.keys())
         imsis.update((cu_up_metrics or {}).get('per_ue', {}).keys())
 
+        self._refresh_carla_vehicle_map()
+        carla_vehicle_imsis = {
+            str(imsi) for imsi, meta in self.carla_vehicle_map.items()
+            if isinstance(meta, dict) and meta.get('device_type') == 'vehicle'
+        }
+        imsis.update(carla_vehicle_imsis)
+
+        observed_sensor_imsis = {str(imsi) for imsi in imsis if self.get_device_type(imsi) == 'sensor'}
+        expanded_sensor_imsis = set()
+        target_sensor_count = len(DEFAULT_SENSOR_PROFILES)
+        if len(observed_sensor_imsis) < target_sensor_count:
+            for sensor_imsi in range(SENSOR_IMSI_RANGE[0], SENSOR_IMSI_RANGE[0] + target_sensor_count):
+                imsi_text = str(sensor_imsi)
+                if self.get_device_type(imsi_text) == 'sensor' and imsi_text not in imsis:
+                    expanded_sensor_imsis.add(imsi_text)
+                    imsis.add(imsi_text)
+                if len(observed_sensor_imsis) + len(expanded_sensor_imsis) >= target_sensor_count:
+                    break
+
+        virtual_vehicle_imsis = set()
+        if not carla_vehicle_imsis:
+            vehicle_base = get_fixed_vehicle_base_imsi()
+            vehicle_count_target = max(1, min(get_fixed_max_vehicles(), 5))
+            for offset in range(vehicle_count_target):
+                imsi_text = str(vehicle_base + offset)
+                virtual_vehicle_imsis.add(imsi_text)
+                imsis.add(imsi_text)
+
+        result['global_metrics']['proxy_expanded_sensors'] = bool(expanded_sensor_imsis)
+        result['global_metrics']['proxy_virtual_vehicles'] = bool(virtual_vehicle_imsis)
+
         SLA_THRESHOLD_US = 100000
         critical_count = 0
         camera_count = 0
         camera_critical_count = 0
         sensor_count = 0
         vehicle_count = 0
+        app1_override = self._load_app1_camera_override()
+        app2_override = self._load_app2_sensor_override()
+        vehicle_override = self._load_vehicle_override()
+        vehicle_override_index = 0
+        latency_source_counts = defaultdict(int)
+        real_latency_sample_count = 0
+        proxy_latency_sample_count = 0
 
         for imsi in sorted(imsis, key=lambda value: int(value) if str(value).isdigit() else str(value)):
             cu_up_entry = (cu_up_metrics or {}).get('per_ue', {}).get(imsi, {})
             rlc_entry = rlc_latest_by_imsi.get(imsi, {})
             mac_entry = mac_by_imsi.get(imsi, {})
-            device_type = self.get_device_type(imsi)
+            device_type = 'vehicle' if imsi in virtual_vehicle_imsis else self.get_device_type(imsi)
             cell_id = (
                 rlc_entry.get('cell_id')
                 or mac_entry.get('last_cell_id')
                 or 0
             )
 
-            latency_us = max(0.0, float(cu_up_entry.get('pdcp_latency_ms', 0.0) or 0.0) * 1000.0)
-            has_latency_samples = latency_us > 0
             throughput_kbps = float(cu_up_entry.get('throughput_kbps', 0.0) or 0.0)
             throughput_source = 'cu_up'
             mac_throughput_kbps = 0.0
@@ -1129,10 +1422,67 @@ class ExtendedMetricsCollector:
                 if throughput_kbps <= 0.0:
                     throughput_kbps = mac_throughput_kbps
                     throughput_source = 'mac_tb_window'
+
+            if throughput_kbps <= 0.0 and device_type == 'sensor':
+                throughput_kbps = 12.0 + ((int(imsi) if str(imsi).isdigit() else 0) % 9) * 5.0
+                throughput_source = 'app2_proxy_profile'
+            elif throughput_kbps <= 0.0 and device_type == 'vehicle':
+                throughput_kbps = 900.0 + ((int(imsi) if str(imsi).isdigit() else 0) % 5) * 180.0
+                throughput_source = 'app3_proxy_profile'
+
+            vehicle_state = {}
+            vehicle_meta = self.get_carla_vehicle_binding(imsi)
+            if device_type == 'vehicle':
+                if vehicle_meta:
+                    vehicle_state = self.get_carla_vehicle_state(vehicle_meta.get('vehicle_id'))
+                elif imsi in virtual_vehicle_imsis:
+                    vehicle_index = int(imsi) - get_fixed_vehicle_base_imsi()
+                    vehicle_state = self._build_virtual_vehicle_state(imsi, max(0, vehicle_index), fallback_end)
+                if vehicle_override:
+                    base_vehicle_payload = dict(vehicle_state or {})
+                    if vehicle_meta:
+                        base_vehicle_payload.setdefault('vehicle_id', vehicle_meta.get('vehicle_id'))
+                        base_vehicle_payload.setdefault('vehicle_role', vehicle_meta.get('vehicle_role', 'traffic'))
+                        base_vehicle_payload.setdefault('connectivity', vehicle_meta.get('connectivity', '5g_native'))
+                        base_vehicle_payload.setdefault('gateway_id', vehicle_meta.get('gateway_id', 'GW-VEH-01'))
+                        base_vehicle_payload.setdefault('domain', vehicle_meta.get('domain', 'vehicular'))
+                        base_vehicle_payload.setdefault('mobility_profile', vehicle_meta.get('mobility_profile', 'vehicle'))
+                    vehicle_state = self._apply_vehicle_override(base_vehicle_payload, vehicle_override, vehicle_override_index)
+
+            latency_us = max(0.0, float(cu_up_entry.get('pdcp_latency_ms', 0.0) or 0.0) * 1000.0)
+            latency_source = 'cu_up_real' if latency_us > 0 else ''
+            latency_is_proxy = False
+            if latency_us <= 0.0:
+                latency_us = max(0.0, float(rlc_entry.get('delay_us', 0.0) or 0.0))
+                if latency_us > 0.0:
+                    latency_source = 'rlc_real'
+                else:
+                    latency_us, latency_source = self._estimate_proxy_latency_us(
+                        imsi, device_type, throughput_kbps, mac_entry, rlc_entry, vehicle_state=vehicle_state
+                    )
+                    latency_is_proxy = True
+            if latency_is_proxy and device_type == 'camera' and app1_override and app1_override.get('latency_ms') is not None:
+                latency_us = max(1.0, float(app1_override.get('latency_ms') or 0.0) * 1000.0)
+                latency_source = 'app1_camera_override'
+                latency_is_proxy = True
+            elif latency_is_proxy and device_type == 'sensor' and app2_override and app2_override.get('avg_latency_ms') is not None:
+                latency_us = max(1.0, float(app2_override.get('avg_latency_ms') or 0.0) * 1000.0)
+                latency_source = 'app2_sensor_override'
+                latency_is_proxy = True
+            if latency_is_proxy and device_type == 'vehicle' and vehicle_override and vehicle_state.get('latency_ms') is not None:
+                latency_us = max(1.0, float(vehicle_state.get('latency_ms') or 0.0) * 1000.0)
+                latency_source = 'vehicle_state_proxy'
+                latency_is_proxy = True
+            has_latency_samples = latency_us > 0
             is_critical = has_latency_samples and latency_us >= SLA_THRESHOLD_US
 
             if has_latency_samples:
                 latencies.append(latency_us)
+                latency_source_counts[latency_source] += 1
+                if latency_is_proxy:
+                    proxy_latency_sample_count += 1
+                else:
+                    real_latency_sample_count += 1
             if is_critical:
                 critical_count += 1
 
@@ -1144,6 +1494,7 @@ class ExtendedMetricsCollector:
                 sensor_count += 1
             elif device_type == 'vehicle':
                 vehicle_count += 1
+                vehicle_override_index += 1
 
             result['ue_metrics'][imsi] = {
                 'device_type': device_type,
@@ -1164,12 +1515,41 @@ class ExtendedMetricsCollector:
                 'total_pdcp_throughput_kbps': throughput_kbps,
                 'packet_count': (1 if has_latency_samples else 0) + len(mac_entry.get('tb_sizes', [])),
                 'has_latency_samples': has_latency_samples,
+                'latency_source': latency_source,
+                'latency_is_proxy': latency_is_proxy,
                 'is_critical': is_critical,
                 'throughput_source': throughput_source,
                 'cu_up_throughput_kbps': float(cu_up_entry.get('throughput_kbps', 0.0) or 0.0),
                 'cu_up_pdcp_latency_ms': float(cu_up_entry.get('pdcp_latency_ms', 0.0) or 0.0),
                 'rlc_records': 1 if rlc_entry else 0,
+                'proxy_expanded': imsi in expanded_sensor_imsis or imsi in virtual_vehicle_imsis,
             }
+
+            if device_type == 'vehicle':
+                vehicle_payload = dict(vehicle_state or {})
+                if vehicle_meta:
+                    vehicle_payload.setdefault('vehicle_id', vehicle_meta.get('vehicle_id'))
+                    vehicle_payload.setdefault('vehicle_role', vehicle_meta.get('vehicle_role', 'traffic'))
+                    vehicle_payload.setdefault('connectivity', vehicle_meta.get('connectivity', '5g_native'))
+                    vehicle_payload.setdefault('gateway_id', vehicle_meta.get('gateway_id', 'GW-VEH-01'))
+                    vehicle_payload.setdefault('domain', vehicle_meta.get('domain', 'vehicular'))
+                    vehicle_payload.setdefault('mobility_profile', vehicle_meta.get('mobility_profile', 'vehicle'))
+                result['ue_metrics'][imsi].update({
+                    'vehicle_id': vehicle_payload.get('vehicle_id', f'veh-imsi-{imsi}'),
+                    'vehicle_role': vehicle_payload.get('vehicle_role', vehicle_payload.get('role', 'traffic')),
+                    'connectivity': vehicle_payload.get('connectivity', '5g_native'),
+                    'gateway_id': vehicle_payload.get('gateway_id', 'GW-VEH-PROXY'),
+                    'domain': vehicle_payload.get('domain', 'vehicular'),
+                    'mobility_profile': vehicle_payload.get('mobility_profile', 'vehicle'),
+                    'autonomy_state': vehicle_payload.get('autonomy_state', 'normal'),
+                    'risk_state': vehicle_payload.get('risk_state', 'low'),
+                    'packet_loss_percent': float(vehicle_payload.get('packet_loss_percent', 0.0) or 0.0),
+                    'speed_mps': float(vehicle_payload.get('speed_mps', 0.0) or 0.0),
+                    'heading_deg': float(vehicle_payload.get('heading_deg', 0.0) or 0.0),
+                    'lane_id': vehicle_payload.get('lane_id'),
+                    'waypoint_id': vehicle_payload.get('waypoint_id'),
+                    'position': vehicle_payload.get('position', {'x': 0.0, 'y': 0.0, 'z': 0.0}),
+                })
 
             if mac_entry:
                 if mac_entry['mcs']:
@@ -1216,6 +1596,9 @@ class ExtendedMetricsCollector:
         result['global_metrics']['ue_count'] = len(latencies)
         result['global_metrics']['ues_with_latency_samples'] = len(latencies)
         result['global_metrics']['ues_without_latency_samples'] = max(0, len(result['ue_metrics']) - len(latencies))
+        result['global_metrics']['latency_sample_source_counts'] = dict(latency_source_counts)
+        result['global_metrics']['real_latency_sample_count'] = real_latency_sample_count
+        result['global_metrics']['proxy_latency_sample_count'] = proxy_latency_sample_count
 
         result['active_cameras'] = camera_count
         result['critical_cameras'] = camera_critical_count
@@ -1223,7 +1606,7 @@ class ExtendedMetricsCollector:
 
         return result
     
-    def aggregate_metrics(self, pdcp_metrics, mac_metrics, rlc_metrics=None, cu_up_metrics=None, mmwave_sched_metrics=None):
+    def aggregate_metrics(self, pdcp_metrics, mac_metrics, rlc_metrics=None, cu_up_metrics=None, mmwave_sched_metrics=None, pdcp_file=None, rlc_file=None):
         """Aggregate all metrics into comprehensive JSON"""
         
         result = {
@@ -1296,6 +1679,13 @@ class ExtendedMetricsCollector:
             'window_s': observed_window_s
         }
         
+        result['pdcp_rnti_to_imsi'] = {}
+        for m in pdcp_metrics:
+            rnti = m.get('rnti', 0)
+            imsi = m.get('imsi', '')
+            if rnti > 0 and imsi:
+                result['pdcp_rnti_to_imsi'][rnti] = imsi
+        
         ue_data = defaultdict(lambda: {
             'latencies': [],
             'tx_bytes': 0,
@@ -1344,9 +1734,6 @@ class ExtendedMetricsCollector:
                 ue_data[imsi]['lat_min'] = min(ue_data[imsi]['lat_min'], m['delay_min_us'])
                 ue_data[imsi]['lat_max'] = max(ue_data[imsi]['lat_max'], m['delay_max_us'])
 
-                all_latencies.append(m['delay_us'])
-                all_jitters.append(m['delay_stddev_us'])
-            
         # Garantir que UEs no cache mas sem tráfego recente também sejam processados
         for imsi in active_imsis:
             if imsi not in ue_data:
@@ -1362,6 +1749,13 @@ class ExtendedMetricsCollector:
         total_rx_bytes = 0
         worst_latency = 0
         worst_camera_latency = 0
+        latency_source_counts = defaultdict(int)
+        real_latency_sample_count = 0
+        proxy_latency_sample_count = 0
+        app1_override = self._load_app1_camera_override()
+        app2_override = self._load_app2_sensor_override()
+        vehicle_override = self._load_vehicle_override()
+        vehicle_override_index = 0
         
         SLA_THRESHOLD_US = 100000
         
@@ -1400,64 +1794,221 @@ class ExtendedMetricsCollector:
                 'total_pdcp_throughput_kbps': total_pdcp_throughput_kbps,
                 'packet_count': len(data['latencies']),
                 'has_latency_samples': has_latency_samples,
+                'latency_source': 'pdcp_real' if has_latency_samples else '',
+                'latency_is_proxy': False,
                 'is_critical': has_latency_samples and max_latency >= SLA_THRESHOLD_US,
                 'throughput_source': 'pdcp_rx_window'
             }
 
-            vehicle_meta = self.get_carla_vehicle_binding(imsi)
-            if result['ue_metrics'][imsi]['device_type'] == 'vehicle' and vehicle_meta:
-                vehicle_id = vehicle_meta.get('vehicle_id')
-                vehicle_state = self.get_carla_vehicle_state(vehicle_id)
+            if (
+                not result['ue_metrics'][imsi]['has_latency_samples']
+                and data['device_type'] == 'camera'
+                and app1_override
+                and app1_override.get('latency_ms') is not None
+            ):
+                override_latency_us = max(1.0, float(app1_override.get('latency_ms') or 0.0) * 1000.0)
                 result['ue_metrics'][imsi].update({
-                    'vehicle_id': vehicle_id,
-                    'vehicle_role': vehicle_meta.get('vehicle_role', 'traffic'),
-                    'connectivity': vehicle_meta.get('connectivity', '5g_native'),
-                    'gateway_id': vehicle_meta.get('gateway_id', 'GW-VEH-01'),
-                    'domain': vehicle_meta.get('domain', 'vehicular'),
-                    'mobility_profile': vehicle_meta.get('mobility_profile', 'vehicle'),
-                    'autonomy_state': vehicle_state.get('autonomy_state', vehicle_meta.get('autonomy_state', 'normal')),
-                    'risk_state': vehicle_state.get('risk_state', vehicle_meta.get('risk_state', 'low')),
-                    'packet_loss_percent': float(vehicle_state.get('packet_loss_percent', 0.0) or 0.0),
-                    'speed_mps': float(vehicle_state.get('speed_mps', 0.0) or 0.0),
-                    'heading_deg': float(vehicle_state.get('heading_deg', 0.0) or 0.0),
-                    'lane_id': vehicle_state.get('lane_id'),
-                    'waypoint_id': vehicle_state.get('waypoint_id'),
-                    'position': {
-                        'x': float(vehicle_state.get('x', 0.0) or 0.0),
-                        'y': float(vehicle_state.get('y', 0.0) or 0.0),
-                        'z': float(vehicle_state.get('z', 0.0) or 0.0),
-                    },
+                    'latency_us': override_latency_us,
+                    'latency_avg_us': override_latency_us,
+                    'latency_min_us': override_latency_us,
+                    'latency_max_us': override_latency_us,
+                    'jitter_us': 0.0,
+                    'packet_count': max(int(result['ue_metrics'][imsi].get('packet_count', 0) or 0), 1),
+                    'has_latency_samples': True,
+                    'latency_source': 'app1_camera_override',
+                    'latency_is_proxy': True,
+                    'is_critical': override_latency_us >= SLA_THRESHOLD_US,
                 })
-                override_latency_ms = vehicle_state.get('latency_ms')
-                if override_latency_ms is not None:
-                    override_latency_us = max(0.0, float(override_latency_ms or 0.0) * 1000.0)
-                    result['ue_metrics'][imsi]['latency_us'] = override_latency_us
-                    result['ue_metrics'][imsi]['latency_avg_us'] = override_latency_us
-                    result['ue_metrics'][imsi]['latency_max_us'] = override_latency_us
-                    result['ue_metrics'][imsi]['latency_min_us'] = override_latency_us
-                    result['ue_metrics'][imsi]['has_latency_samples'] = True
-                    result['ue_metrics'][imsi]['is_critical'] = override_latency_us >= SLA_THRESHOLD_US
-                    result['ue_metrics'][imsi]['latency_source'] = 'vehicle_override'
-            
+            elif (
+                not result['ue_metrics'][imsi]['has_latency_samples']
+                and data['device_type'] == 'sensor'
+                and app2_override
+                and app2_override.get('avg_latency_ms') is not None
+            ):
+                override_latency_us = max(1.0, float(app2_override.get('avg_latency_ms') or 0.0) * 1000.0)
+                result['ue_metrics'][imsi].update({
+                    'latency_us': override_latency_us,
+                    'latency_avg_us': override_latency_us,
+                    'latency_min_us': override_latency_us,
+                    'latency_max_us': override_latency_us,
+                    'jitter_us': 0.0,
+                    'packet_count': max(int(result['ue_metrics'][imsi].get('packet_count', 0) or 0), 1),
+                    'has_latency_samples': True,
+                    'latency_source': 'app2_sensor_override',
+                    'latency_is_proxy': True,
+                    'is_critical': override_latency_us >= SLA_THRESHOLD_US,
+                })
+
+            if result['ue_metrics'][imsi]['device_type'] == 'vehicle':
+                vehicle_meta = self.get_carla_vehicle_binding(imsi)
+                vehicle_id = vehicle_meta.get('vehicle_id') if vehicle_meta else None
+                vehicle_state = self.get_carla_vehicle_state(vehicle_id) if vehicle_meta else {}
+                vehicle_payload = dict(vehicle_state or {})
+                if vehicle_meta:
+                    vehicle_payload.setdefault('vehicle_id', vehicle_id)
+                    vehicle_payload.setdefault('vehicle_role', vehicle_meta.get('vehicle_role', 'traffic'))
+                    vehicle_payload.setdefault('connectivity', vehicle_meta.get('connectivity', '5g_native'))
+                    vehicle_payload.setdefault('gateway_id', vehicle_meta.get('gateway_id', 'GW-VEH-01'))
+                    vehicle_payload.setdefault('domain', vehicle_meta.get('domain', 'vehicular'))
+                    vehicle_payload.setdefault('mobility_profile', vehicle_meta.get('mobility_profile', 'vehicle'))
+                elif vehicle_override:
+                    vehicle_payload.setdefault('vehicle_id', f'veh-imsi-{imsi}')
+                    vehicle_payload.setdefault('vehicle_role', 'ego' if vehicle_override_index == 0 else 'traffic')
+                if vehicle_override:
+                    vehicle_payload = self._apply_vehicle_override(vehicle_payload, vehicle_override, vehicle_override_index)
+
+                position = vehicle_payload.get('position')
+                if not isinstance(position, dict):
+                    position = {
+                        'x': float(vehicle_payload.get('x', 0.0) or 0.0),
+                        'y': float(vehicle_payload.get('y', 0.0) or 0.0),
+                        'z': float(vehicle_payload.get('z', 0.0) or 0.0),
+                    }
+                result['ue_metrics'][imsi].update({
+                    'vehicle_id': vehicle_payload.get('vehicle_id', vehicle_id or f'veh-imsi-{imsi}'),
+                    'vehicle_role': vehicle_payload.get('vehicle_role', vehicle_payload.get('role', 'traffic')),
+                    'connectivity': vehicle_payload.get('connectivity', '5g_native'),
+                    'gateway_id': vehicle_payload.get('gateway_id', 'GW-VEH-01'),
+                    'domain': vehicle_payload.get('domain', 'vehicular'),
+                    'mobility_profile': vehicle_payload.get('mobility_profile', 'vehicle'),
+                    'autonomy_state': vehicle_payload.get('autonomy_state', vehicle_meta.get('autonomy_state', 'normal') if vehicle_meta else 'normal'),
+                    'risk_state': vehicle_payload.get('risk_state', vehicle_meta.get('risk_state', 'low') if vehicle_meta else 'low'),
+                    'packet_loss_percent': float(vehicle_payload.get('packet_loss_percent', 0.0) or 0.0),
+                    'speed_mps': float(vehicle_payload.get('speed_mps', 0.0) or 0.0),
+                    'heading_deg': float(vehicle_payload.get('heading_deg', 0.0) or 0.0),
+                    'lane_id': vehicle_payload.get('lane_id'),
+                    'waypoint_id': vehicle_payload.get('waypoint_id'),
+                    'position': position,
+                })
+                override_latency_ms = vehicle_payload.get('latency_ms')
+                if vehicle_override and override_latency_ms is not None and not result['ue_metrics'][imsi].get('has_latency_samples'):
+                    override_latency_us = max(1.0, float(override_latency_ms or 0.0) * 1000.0)
+                    result['ue_metrics'][imsi].update({
+                        'latency_us': override_latency_us,
+                        'latency_avg_us': override_latency_us,
+                        'latency_min_us': override_latency_us,
+                        'latency_max_us': override_latency_us,
+                        'jitter_us': 0.0,
+                        'packet_count': max(int(result['ue_metrics'][imsi].get('packet_count', 0) or 0), 1),
+                        'has_latency_samples': True,
+                        'latency_source': 'vehicle_state_proxy',
+                        'latency_is_proxy': True,
+                        'is_critical': override_latency_us >= SLA_THRESHOLD_US,
+                    })
+                vehicle_override_index += 1
+
+            effective_has_latency_samples = bool(result['ue_metrics'][imsi].get('has_latency_samples'))
+            effective_latency_us = float(result['ue_metrics'][imsi].get('latency_us', 0.0) or 0.0)
+            effective_is_critical = bool(result['ue_metrics'][imsi].get('is_critical'))
+            ue_latency_source = result['ue_metrics'][imsi].get('latency_source', '')
+            if effective_has_latency_samples and ue_latency_source:
+                latency_source_counts[ue_latency_source] += 1
+                if result['ue_metrics'][imsi].get('latency_is_proxy'):
+                    proxy_latency_sample_count += 1
+                else:
+                    real_latency_sample_count += 1
+                all_latencies.append(effective_latency_us)
+                all_jitters.append(float(result['ue_metrics'][imsi].get('jitter_us', 0.0) or 0.0))
+
             total_tx_bytes += data['tx_bytes']
             total_rx_bytes += data['rx_bytes']
             
             if data['device_type'] == 'camera':
                 camera_count += 1
-                if has_latency_samples and max_latency >= SLA_THRESHOLD_US:
+                if effective_has_latency_samples and effective_is_critical:
                     camera_critical_count += 1
-                if has_latency_samples and max_latency > worst_camera_latency:
-                    worst_camera_latency = max_latency
+                if effective_has_latency_samples and effective_latency_us > worst_camera_latency:
+                    worst_camera_latency = effective_latency_us
             elif data['device_type'] == 'sensor':
                 sensor_count += 1
             elif data['device_type'] == 'vehicle':
                 vehicle_count += 1
             
-            if has_latency_samples and max_latency >= SLA_THRESHOLD_US:
+            if effective_has_latency_samples and effective_is_critical:
                 critical_count += 1
             
-            if has_latency_samples and max_latency > worst_latency:
-                worst_latency = max_latency
+            if effective_has_latency_samples and effective_latency_us > worst_latency:
+                worst_latency = effective_latency_us
+
+        self._refresh_carla_vehicle_map()
+        carla_vehicle_imsis = {
+            str(imsi) for imsi, meta in self.carla_vehicle_map.items()
+            if isinstance(meta, dict) and meta.get('device_type') == 'vehicle'
+        }
+        proxy_carla_vehicle_imsis = set()
+
+        for imsi in sorted(carla_vehicle_imsis - set(result['ue_metrics'].keys()), key=lambda value: int(value) if str(value).isdigit() else str(value)):
+            vehicle_meta = self.get_carla_vehicle_binding(imsi)
+            vehicle_id = vehicle_meta.get('vehicle_id')
+            vehicle_state = self.get_carla_vehicle_state(vehicle_id)
+            latency_us, latency_source = self._estimate_proxy_latency_us(
+                imsi,
+                'vehicle',
+                0.0,
+                {},
+                {},
+                vehicle_state=vehicle_state,
+            )
+            has_latency_samples = latency_us > 0
+            is_critical = has_latency_samples and latency_us >= SLA_THRESHOLD_US
+            position = vehicle_state.get('position')
+            if not isinstance(position, dict):
+                position = {
+                    'x': float(vehicle_state.get('x', 0.0) or 0.0),
+                    'y': float(vehicle_state.get('y', 0.0) or 0.0),
+                    'z': float(vehicle_state.get('z', 0.0) or 0.0),
+                }
+
+            result['ue_metrics'][imsi] = {
+                'device_type': 'vehicle',
+                'cell_id': 0,
+                'latency_us': latency_us,
+                'latency_avg_us': latency_us,
+                'latency_min_us': latency_us if has_latency_samples else 0,
+                'latency_max_us': latency_us if has_latency_samples else 0,
+                'jitter_us': 0,
+                'pdu_size_avg': 0,
+                'tx_bytes': 0,
+                'rx_bytes': 0,
+                'tx_pdus': 0,
+                'rx_pdus': 0,
+                'throughput_kbps': 0.0,
+                'tx_throughput_kbps': 0.0,
+                'rx_throughput_kbps': 0.0,
+                'total_pdcp_throughput_kbps': 0.0,
+                'packet_count': 1 if has_latency_samples else 0,
+                'has_latency_samples': has_latency_samples,
+                'latency_source': latency_source,
+                'latency_is_proxy': True,
+                'is_critical': is_critical,
+                'throughput_source': 'carla_context_only',
+                'proxy_expanded': True,
+                'vehicle_id': vehicle_id or f'veh-imsi-{imsi}',
+                'vehicle_role': vehicle_meta.get('vehicle_role', vehicle_state.get('vehicle_role', vehicle_state.get('role', 'traffic'))),
+                'connectivity': vehicle_meta.get('connectivity', '5g_native'),
+                'gateway_id': vehicle_meta.get('gateway_id', 'GW-VEH-01'),
+                'domain': vehicle_meta.get('domain', 'vehicular'),
+                'mobility_profile': vehicle_meta.get('mobility_profile', 'vehicle'),
+                'autonomy_state': vehicle_state.get('autonomy_state', vehicle_meta.get('autonomy_state', 'normal')),
+                'risk_state': vehicle_state.get('risk_state', vehicle_meta.get('risk_state', 'low')),
+                'packet_loss_percent': float(vehicle_state.get('packet_loss_percent', 0.0) or 0.0),
+                'speed_mps': float(vehicle_state.get('speed_mps', 0.0) or 0.0),
+                'heading_deg': float(vehicle_state.get('heading_deg', 0.0) or 0.0),
+                'lane_id': vehicle_state.get('lane_id'),
+                'waypoint_id': vehicle_state.get('waypoint_id'),
+                'position': position,
+            }
+
+            proxy_carla_vehicle_imsis.add(imsi)
+            vehicle_count += 1
+            if is_critical:
+                critical_count += 1
+            if has_latency_samples:
+                all_latencies.append(latency_us)
+                all_jitters.append(0.0)
+                latency_source_counts[latency_source] += 1
+                proxy_latency_sample_count += 1
+                worst_latency = max(worst_latency, latency_us)
         
         global_avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else 0
         global_avg_jitter = sum(all_jitters) / len(all_jitters) if all_jitters else 0
@@ -1487,6 +2038,12 @@ class ExtendedMetricsCollector:
                 # Usar a PIOR latência de cada UE (para CVaR correto)
                 ue_worst = max(valid_latencies)
                 ue_worst_latencies.append(ue_worst)
+
+        for imsi in proxy_carla_vehicle_imsis:
+            latency_us = float(result['ue_metrics'][imsi].get('latency_us', 0.0) or 0.0)
+            if latency_us > 0.0:
+                ue_avg_latencies.append(latency_us)
+                ue_worst_latencies.append(latency_us)
         
         # CVaR e Variância agora usam latência POR UE
         if ue_avg_latencies:
@@ -1581,15 +2138,15 @@ class ExtendedMetricsCollector:
             'global_max_latency_us': global_max_latency,
             'global_jitter_us': global_avg_jitter,
             'global_packet_loss_rate': self._calculate_packet_loss(worst_latency, critical_count, camera_count),
-            'total_active_ues': len(ue_data),
+            'total_active_ues': len(result['ue_metrics']),
             'total_active_cameras': camera_count,
             'total_active_sensors': sensor_count,
             'total_active_vehicles': vehicle_count,
             'total_critical_ues': critical_count,
             'total_tx_bytes': total_tx_bytes,
             'total_rx_bytes': total_rx_bytes,
-            'total_tx_pdus': sum(d['tx_pdus'] for d in ue_data.values()),
-            'total_rx_pdus': sum(d['rx_pdus'] for d in ue_data.values()),
+            'total_tx_pdus': sum(d.get('tx_pdus', 0) for d in result['ue_metrics'].values()),
+            'total_rx_pdus': sum(d.get('rx_pdus', 0) for d in result['ue_metrics'].values()),
             'throughput_kbps': throughput_kbps,
             'throughput_source': throughput_source,
             'pdcp_delta_throughput_kbps': pdcp_delta_throughput_kbps,
@@ -1609,7 +2166,13 @@ class ExtendedMetricsCollector:
             'cvar_tail_count': cvar_tail_count,
             'ue_count': len(ue_avg_latencies),
             'ues_with_latency_samples': len(ue_avg_latencies),
-            'ues_without_latency_samples': max(0, len(ue_data) - len(ue_avg_latencies)),
+            'ues_without_latency_samples': max(0, len(result['ue_metrics']) - len(ue_avg_latencies)),
+            'collector_mode': 'pdcp_real',
+            'latency_sample_source_counts': dict(latency_source_counts),
+            'real_latency_sample_count': real_latency_sample_count,
+            'proxy_latency_sample_count': proxy_latency_sample_count,
+            'proxy_expanded_sensors': False,
+            'proxy_virtual_vehicles': bool(proxy_carla_vehicle_imsis),
             'lte_mac_observed_ues': 0,
             'mmwave_sched_observed_rntis': 0,
             'mmwave_sched_observed_data_rntis': 0,
@@ -1676,12 +2239,18 @@ class ExtendedMetricsCollector:
 
             scheduler_cell_id = 0
             rnti_to_imsi = {}
+            pdcp_rnti_to_imsi = result.get('pdcp_rnti_to_imsi', {})
+            if pdcp_rnti_to_imsi:
+                rnti_to_imsi = dict(pdcp_rnti_to_imsi)
+                scheduler_cell_id = 1
             if rlc_by_cell:
-                scheduler_cell_id, scheduler_cell_data = max(
+                best_cell_id, best_cell_data = max(
                     rlc_by_cell.items(),
                     key=lambda item: len(item[1]['imsis'])
                 )
-                rnti_to_imsi = scheduler_cell_data['rnti_to_imsi']
+                for rnti_val, imsi_val in best_cell_data['rnti_to_imsi'].items():
+                    if rnti_val not in rnti_to_imsi:
+                        rnti_to_imsi[rnti_val] = imsi_val
 
             result['global_metrics']['rlc_record_count'] = len(rlc_metrics)
             result['global_metrics']['rlc_observed_ues'] = len(rlc_by_imsi)
@@ -1742,12 +2311,19 @@ class ExtendedMetricsCollector:
         if cu_up_metrics:
             result['global_metrics']['cu_up_latest_timestamp'] = cu_up_metrics.get('latest_timestamp', 0)
             result['global_metrics']['cu_up_row_count'] = cu_up_metrics.get('row_count', 0)
-            result['source_files'] = {
-                'pdcp': str(self.input_dir / "DlPdcpStats.txt"),
-                'mac': str(self.input_dir / "DlMacStats.txt"),
-                'rlc': str(self.input_dir / "DlRlcStats.txt"),
-                'cu_up': cu_up_metrics.get('source_files', []),
-            }
+
+        if pdcp_file is None:
+            pdcp_file = self.input_dir / "DlPdcpStats.txt"
+        if rlc_file is None:
+            rlc_file = self.input_dir / "DlRlcStats.txt"
+        result.setdefault('source_files', {})
+        result['source_files'].update({
+            'pdcp': str(pdcp_file),
+            'mac': str(self.input_dir / "DlMacStats.txt"),
+            'rlc': str(rlc_file),
+        })
+        if cu_up_metrics:
+            result['source_files']['cu_up'] = cu_up_metrics.get('source_files', [])
 
             for imsi, data in cu_up_metrics.get('per_ue', {}).items():
                 if imsi in result['ue_metrics']:
@@ -1829,9 +2405,9 @@ class ExtendedMetricsCollector:
     
     def run(self):
         """Main loop"""
-        pdcp_file = self.input_dir / "DlPdcpStats.txt"
+        pdcp_file = self._resolve_trace_file("pdcp")
         mac_file = self.input_dir / "DlMacStats.txt"
-        rlc_file = self.input_dir / "DlRlcStats.txt"
+        rlc_file = self._resolve_trace_file("rlc")
         mmwave_sched_file = self.input_dir / "EnbSchedAllocTraces.txt"
         
         print(f"[CSV_METRICS] Starting Extended Metrics Collector")
@@ -1847,6 +2423,16 @@ class ExtendedMetricsCollector:
             iteration += 1
 
             try:
+                current_pdcp_file = self._resolve_trace_file("pdcp")
+                current_rlc_file = self._resolve_trace_file("rlc")
+                if current_pdcp_file != pdcp_file:
+                    print(f"[CSV_METRICS] PDCP source switched: {pdcp_file} -> {current_pdcp_file}")
+                    pdcp_file = current_pdcp_file
+                    self._warned_missing_pdcp = False
+                if current_rlc_file != rlc_file:
+                    print(f"[CSV_METRICS] RLC source switched: {rlc_file} -> {current_rlc_file}")
+                    rlc_file = current_rlc_file
+
                 cu_up_files = sorted(self.input_dir.glob("cu-up-cell-*.txt"))
                 if iteration == 1 or iteration % 60 == 0:
                     print(
@@ -1859,19 +2445,51 @@ class ExtendedMetricsCollector:
                 rlc_metrics = self.process_rlc_stats(rlc_file)
                 mmwave_sched_metrics = self.process_mmwave_sched_stats(mmwave_sched_file)
                 cu_up_metrics = self.process_cu_up_stats(cu_up_files)
+                trace_status = {
+                    'pdcp': self._trace_status(pdcp_file, pdcp_metrics),
+                    'rlc': self._trace_status(rlc_file, rlc_metrics),
+                    'mac': self._trace_status(mac_file, mac_metrics),
+                }
                 has_fallback_data = bool(mac_metrics or rlc_metrics or (cu_up_metrics and cu_up_metrics.get('per_ue')))
+                pdcp_is_stale = bool(pdcp_metrics and trace_status['pdcp'].get('stale') and has_fallback_data)
+
+                if self.require_real_pdcp and (not pdcp_metrics or pdcp_is_stale):
+                    if iteration == 1 or iteration % 5 == 0:
+                        reason = "stale" if pdcp_is_stale else "missing"
+                        print(
+                            f"[CSV_METRICS] Strict real-only mode: skipping snapshot because PDCP is {reason}."
+                        )
+                    time.sleep(self.poll_interval)
+                    continue
                 
                 if pdcp_metrics or has_fallback_data:
                     if not pdcp_metrics and not self._warned_missing_pdcp:
-                        print("[CSV_METRICS] DlPdcpStats.txt ausente; usando fallback com CU-UP/MAC/RLC.")
+                        print("[CSV_METRICS] Nenhum trace PDCP real disponivel; usando fallback com CU-UP/MAC/RLC.")
                         self._warned_missing_pdcp = True
-                    extended = self.aggregate_metrics(
-                        pdcp_metrics,
-                        mac_metrics,
-                        rlc_metrics=rlc_metrics,
-                        cu_up_metrics=cu_up_metrics,
-                        mmwave_sched_metrics=mmwave_sched_metrics,
-                    )
+                    if pdcp_is_stale:
+                        if iteration % 5 == 0:
+                            print(
+                                f"[CSV_METRICS] PDCP stale: age={trace_status['pdcp'].get('age_s', 0):.1f}s; "
+                                "using MAC/RLC/CU-UP fallback for this snapshot."
+                            )
+                        extended = self.aggregate_metrics_without_pdcp(
+                            mac_metrics,
+                            rlc_metrics=rlc_metrics,
+                            cu_up_metrics=cu_up_metrics,
+                            mmwave_sched_metrics=mmwave_sched_metrics,
+                        )
+                        self._attach_trace_status(extended, trace_status, collector_mode='pdcp_stale')
+                    else:
+                        extended = self.aggregate_metrics(
+                            pdcp_metrics,
+                            mac_metrics,
+                            rlc_metrics=rlc_metrics,
+                            cu_up_metrics=cu_up_metrics,
+                            mmwave_sched_metrics=mmwave_sched_metrics,
+                            pdcp_file=pdcp_file,
+                            rlc_file=rlc_file,
+                        )
+                        self._attach_trace_status(extended, trace_status)
                     
                     self.write_metrics(extended, self.extended_output_file)
                     self.export_device_roles_snapshot(extended)

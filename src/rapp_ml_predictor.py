@@ -38,6 +38,63 @@ CVAR_WARNING_THRESHOLD = 60   # ms - CVaR acima disso = CONDITIONAL
 # Novas thresholds para predição
 PREDICTED_CVAR_BLOCKED = 80  # Se regressor prediz > 80ms = BLOCKED
 PREDICTED_CVAR_WARNING = 60  # Se regressor prediz > 60ms = CONDITIONAL
+KNOWN_SCENARIO_STAGES = [
+    'allowed_bootstrap',
+    'allowed_stable',
+    'allowed_recovery',
+    'camera_conditional',
+    'camera_blocked',
+    'vehicle_conditional',
+    'vehicle_blocked',
+    'app2_conditional',
+    'app2_blocked',
+]
+LEGACY_FEATURE_COLS = [
+    'cvar_ms',
+    'cvar_diff',
+    'cvar_rolling_mean',
+    'cvar_rolling_std',
+    'latency_p95_ms',
+    'avg_latency_ms',
+    'variance_ms2',
+    'total_active_cameras',
+    'camera_ratio',
+    'total_critical_ues',
+    'cvar_zone',
+    'throughput_mbps',
+    'packet_loss_rate',
+    'jitter_ms',
+    'tx_rx_ratio',
+    'cvar_trend',
+    'throughput_trend',
+    'packet_loss_trend',
+    'cvar_lag_1',
+    'cvar_lag_2',
+    'cvar_lag_3',
+    'cvar_lag_4',
+    'cvar_lag_5',
+    'throughput_lag_1',
+    'throughput_lag_2',
+    'throughput_lag_3',
+    'packet_loss_lag_1',
+    'packet_loss_lag_2',
+    'packet_loss_lag_3',
+    'latency_lag_1',
+    'latency_lag_2',
+    'cvar_rolling_3',
+    'cvar_rolling_10',
+    'cvar_rolling_std_3',
+    'cvar_acceleration',
+    'latency_acceleration',
+    'jitter_trend',
+    'cvar_momentum',
+    'critical_ue_ratio',
+]
+
+
+def _normalize_stage_name(value):
+    stage = str(value or '').strip()
+    return stage if stage in KNOWN_SCENARIO_STAGES else 'unknown'
 
 
 def _compute_vehicle_pressure(metrics):
@@ -98,55 +155,9 @@ class MLPredictor:
         self._last_cvar_trend = 0  # último trend registrado
         self._critical_zone_count = 0  # Contador de vezes na zona de cautela
         
-        self.feature_cols = [
-            # Features originais
-            'cvar_ms',
-            'cvar_diff',
-            'cvar_rolling_mean',
-            'cvar_rolling_std',
-            'latency_p95_ms',
-            'avg_latency_ms',
-            'variance_ms2',
-            'total_active_cameras',
-            'camera_ratio',
-            'total_critical_ues',
-            'cvar_zone',
-            # Features de rede
-            'throughput_mbps',
-            'packet_loss_rate',
-            'jitter_ms',
-            'tx_rx_ratio',
-            # Features de trend (3)
-            'cvar_trend',
-            'throughput_trend',
-            'packet_loss_trend',
-            # Lag features (13)
-            'cvar_lag_1',
-            'cvar_lag_2',
-            'cvar_lag_3',
-            'cvar_lag_4',
-            'cvar_lag_5',
-            'throughput_lag_1',
-            'throughput_lag_2',
-            'throughput_lag_3',
-            'packet_loss_lag_1',
-            'packet_loss_lag_2',
-            'packet_loss_lag_3',
-            'latency_lag_1',
-            'latency_lag_2',
-            # Rolling e aceleração (5)
-            'cvar_rolling_3',
-            'cvar_rolling_10',
-            'cvar_rolling_std_3',
-            'cvar_acceleration',
-            'latency_acceleration',
-            # Features preditivas finais (3)
-            'jitter_trend',
-            'cvar_momentum',
-            'critical_ue_ratio',
-        ]
+        self.feature_cols = list(LEGACY_FEATURE_COLS)
         
-        # Histórico para cálculo de trend e lag features (PREDITIVO)
+        # Histórico para cálculo de trend e lag features causais
         self._cvar_history = []
         self._prev_throughput = 0
         self._prev_packet_loss = 0
@@ -217,13 +228,35 @@ class MLPredictor:
             self.clf_scaler = joblib.load(os.path.join(self.model_dir, 'rf_scaler.joblib'))
             self.reg_scaler = joblib.load(os.path.join(self.model_dir, 'reg_scaler.joblib'))
             self.label_encoder = joblib.load(os.path.join(self.model_dir, 'label_encoder.joblib'))
+            self.feature_cols = self._load_runtime_feature_cols()
             self.loaded = True
             classes = list(self.label_encoder.classes_)
-            print(f"[ML] Modelos carregados - Classes: {classes} | classifier={os.path.basename(classifier_path)}")
+            print(
+                f"[ML] Modelos carregados - Classes: {classes} | "
+                f"classifier={os.path.basename(classifier_path)} | features={len(self.feature_cols)}"
+            )
         except FileNotFoundError as e:
             print(f"[ML] AVISO: Modelos não encontrados: {e}")
             print(f"[ML] Execute: python3 train_ml_model.py para treinar")
             self.loaded = False
+
+    def _load_runtime_feature_cols(self):
+        """Load the feature schema expected by the active model."""
+        report_path = os.path.join(self.model_dir, 'training_report.json')
+        try:
+            with open(report_path, 'r', encoding='utf-8') as f:
+                report = json.load(f)
+            features = report.get('features')
+            if isinstance(features, list) and features:
+                return [str(feature) for feature in features]
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return list(LEGACY_FEATURE_COLS)
+
+    def _resolve_stage_name(self, metrics):
+        return _normalize_stage_name(
+            metrics.get('scenario_stage') or metrics.get('collection_event_stage_name')
+        )
 
     def query_database_stats(self, window_minutes=None):
         """
@@ -410,29 +443,54 @@ class MLPredictor:
             self._packet_loss_history = self._packet_loss_history[-10:]
             self._latency_history = self._latency_history[-10:]
         
-        # RETURN: features causais alinhadas com o pipeline de treino.
-        features = np.array([[
-            # Features originais
-            cvar_ms, cvar_diff, cvar_rolling_mean, cvar_rolling_std,
-            latency_p95_ms, avg_latency_ms, variance_ms2,
-            total_cameras, camera_ratio, total_critical, cvar_zone,
-            # Features de rede
-            throughput_mbps, packet_loss_rate_pct, jitter_ms_val, tx_rx_ratio_val,
-            # Features de TREND (3)
-            cvar_trend, throughput_trend, packet_loss_trend,
-            # LAG FEATURES (13)
-            cvar_lag_1, cvar_lag_2, cvar_lag_3, cvar_lag_4, cvar_lag_5,
-            throughput_lag_1, throughput_lag_2, throughput_lag_3,
-            packet_loss_lag_1, packet_loss_lag_2, packet_loss_lag_3,
-            latency_lag_1, latency_lag_2,
-            # Rolling e Acceleration (5)
-            cvar_rolling_3, cvar_rolling_10, cvar_rolling_std_3,
-            cvar_acceleration, latency_acceleration,
-            # Novas features PREDITIVAS (3)
-            jitter_trend, cvar_momentum, critical_ue_ratio,
-        ]])
-        
-        return features
+        scenario_stage = self._resolve_stage_name(metrics)
+        feature_values = {
+            'cvar_ms': cvar_ms,
+            'cvar_diff': cvar_diff,
+            'cvar_rolling_mean': cvar_rolling_mean,
+            'cvar_rolling_std': cvar_rolling_std,
+            'latency_p95_ms': latency_p95_ms,
+            'avg_latency_ms': avg_latency_ms,
+            'variance_ms2': variance_ms2,
+            'total_active_cameras': total_cameras,
+            'camera_ratio': camera_ratio,
+            'total_critical_ues': total_critical,
+            'cvar_zone': cvar_zone,
+            'throughput_mbps': throughput_mbps,
+            'packet_loss_rate': packet_loss_rate_pct,
+            'jitter_ms': jitter_ms_val,
+            'tx_rx_ratio': tx_rx_ratio_val,
+            'cvar_trend': cvar_trend,
+            'throughput_trend': throughput_trend,
+            'packet_loss_trend': packet_loss_trend,
+            'cvar_lag_1': cvar_lag_1,
+            'cvar_lag_2': cvar_lag_2,
+            'cvar_lag_3': cvar_lag_3,
+            'cvar_lag_4': cvar_lag_4,
+            'cvar_lag_5': cvar_lag_5,
+            'throughput_lag_1': throughput_lag_1,
+            'throughput_lag_2': throughput_lag_2,
+            'throughput_lag_3': throughput_lag_3,
+            'packet_loss_lag_1': packet_loss_lag_1,
+            'packet_loss_lag_2': packet_loss_lag_2,
+            'packet_loss_lag_3': packet_loss_lag_3,
+            'latency_lag_1': latency_lag_1,
+            'latency_lag_2': latency_lag_2,
+            'cvar_rolling_3': cvar_rolling_3,
+            'cvar_rolling_10': cvar_rolling_10,
+            'cvar_rolling_std_3': cvar_rolling_std_3,
+            'cvar_acceleration': cvar_acceleration,
+            'latency_acceleration': latency_acceleration,
+            'jitter_trend': jitter_trend,
+            'cvar_momentum': cvar_momentum,
+            'critical_ue_ratio': critical_ue_ratio,
+            'stage_unknown': 1.0 if scenario_stage == 'unknown' else 0.0,
+        }
+        for stage_name in KNOWN_SCENARIO_STAGES:
+            feature_values[f'stage_{stage_name}'] = 1.0 if scenario_stage == stage_name else 0.0
+
+        ordered_features = [float(feature_values.get(feature_name, 0.0)) for feature_name in self.feature_cols]
+        return np.array([ordered_features], dtype=float)
 
     def predict(self, metrics):
         """Basic ML prediction without database context."""
@@ -479,13 +537,12 @@ class MLPredictor:
 
     def predict_with_db_context(self, metrics):
         """
-        Predição PREDITIVA combinando ML + contexto.
-        
-        FLUXO NOVO (PREDITIVO):
-        1. Predizer CVaR (regressor) - SE > 80ms = BLOCKED imediato
-        2. Classifier decide baseado nas features
-        3. Consultar banco SÓ para validação, não para override
-        4. Usar predicted_cvar_ms como fator principal
+        Predição combinando ML + contexto.
+
+        Fluxo:
+        1. Estimar o estado atual via regressor/classifier
+        2. Aplicar guardas de saúde/tendência
+        3. Consultar banco só como validação contextual
         
         Args:
             metrics: dict com métricas da rede

@@ -120,6 +120,18 @@ class DataLake:
                 armd_source TEXT,
                 armd_confidence REAL DEFAULT 0,
                 armd_override_applied INTEGER DEFAULT 0,
+                tasam_enabled INTEGER DEFAULT 0,
+                tasam_mode TEXT,
+                tasam_policy_id TEXT,
+                tasam_source TEXT,
+                tasam_confidence REAL DEFAULT 0,
+                tasam_valid INTEGER DEFAULT 0,
+                tasam_would_influence INTEGER DEFAULT 0,
+                tasam_energy_decision TEXT,
+                tasam_energy_action TEXT,
+                advisor_arbitration_mode TEXT,
+                advisor_arbitration_winner TEXT,
+                advisor_arbitration_score REAL DEFAULT 0,
                 rl_policy_id TEXT,
                 rl_policy_family TEXT,
                 rl_policy_algorithm TEXT,
@@ -133,6 +145,13 @@ class DataLake:
                 ran_completion_ratio REAL DEFAULT 0,
                 ai_completion_ratio REAL DEFAULT 0,
                 utilization_ratio REAL DEFAULT 0,
+                network_improvement_pct REAL DEFAULT 0,
+                cvar_improvement_pct REAL DEFAULT 0,
+                p95_improvement_pct REAL DEFAULT 0,
+                baseline_cvar_us REAL DEFAULT 0,
+                baseline_p95_us REAL DEFAULT 0,
+                improvement_source TEXT,
+                improvement_valid INTEGER DEFAULT 0,
                 UNIQUE(timestamp)
             )
         """)
@@ -146,6 +165,18 @@ class DataLake:
             ("armd_source", "TEXT"),
             ("armd_confidence", "REAL DEFAULT 0"),
             ("armd_override_applied", "INTEGER DEFAULT 0"),
+            ("tasam_enabled", "INTEGER DEFAULT 0"),
+            ("tasam_mode", "TEXT"),
+            ("tasam_policy_id", "TEXT"),
+            ("tasam_source", "TEXT"),
+            ("tasam_confidence", "REAL DEFAULT 0"),
+            ("tasam_valid", "INTEGER DEFAULT 0"),
+            ("tasam_would_influence", "INTEGER DEFAULT 0"),
+            ("tasam_energy_decision", "TEXT"),
+            ("tasam_energy_action", "TEXT"),
+            ("advisor_arbitration_mode", "TEXT"),
+            ("advisor_arbitration_winner", "TEXT"),
+            ("advisor_arbitration_score", "REAL DEFAULT 0"),
             ("rl_policy_id", "TEXT"),
             ("rl_policy_family", "TEXT"),
             ("rl_policy_algorithm", "TEXT"),
@@ -159,6 +190,13 @@ class DataLake:
             ("ran_completion_ratio", "REAL DEFAULT 0"),
             ("ai_completion_ratio", "REAL DEFAULT 0"),
             ("utilization_ratio", "REAL DEFAULT 0"),
+            ("network_improvement_pct", "REAL DEFAULT 0"),
+            ("cvar_improvement_pct", "REAL DEFAULT 0"),
+            ("p95_improvement_pct", "REAL DEFAULT 0"),
+            ("baseline_cvar_us", "REAL DEFAULT 0"),
+            ("baseline_p95_us", "REAL DEFAULT 0"),
+            ("improvement_source", "TEXT"),
+            ("improvement_valid", "INTEGER DEFAULT 0"),
         ):
             if column_name not in existing_decision_columns:
                 cursor.execute(f"ALTER TABLE decisions_history ADD COLUMN {column_name} {column_def}")
@@ -241,9 +279,38 @@ class DataLake:
                 variance_per_ue_us2 REAL DEFAULT 0,
                 cvar_per_ue_us REAL DEFAULT 0,
                 ue_count INTEGER DEFAULT 0,
+                collector_mode TEXT DEFAULT '',
+                throughput_source TEXT DEFAULT '',
+                real_latency_sample_count INTEGER DEFAULT 0,
+                proxy_latency_sample_count INTEGER DEFAULT 0,
+                pdcp_stale INTEGER DEFAULT 0,
+                rlc_stale INTEGER DEFAULT 0,
+                mac_stale INTEGER DEFAULT 0,
+                pdcp_trace_age_s REAL DEFAULT 0,
+                rlc_trace_age_s REAL DEFAULT 0,
+                mac_trace_age_s REAL DEFAULT 0,
+                pdcp_latest_sim_time_s REAL DEFAULT 0,
                 UNIQUE(timestamp)
             )
         """)
+        existing_extended_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(extended_metrics)").fetchall()
+        }
+        for column_name, column_def in (
+            ("collector_mode", "TEXT DEFAULT ''"),
+            ("throughput_source", "TEXT DEFAULT ''"),
+            ("real_latency_sample_count", "INTEGER DEFAULT 0"),
+            ("proxy_latency_sample_count", "INTEGER DEFAULT 0"),
+            ("pdcp_stale", "INTEGER DEFAULT 0"),
+            ("rlc_stale", "INTEGER DEFAULT 0"),
+            ("mac_stale", "INTEGER DEFAULT 0"),
+            ("pdcp_trace_age_s", "REAL DEFAULT 0"),
+            ("rlc_trace_age_s", "REAL DEFAULT 0"),
+            ("mac_trace_age_s", "REAL DEFAULT 0"),
+            ("pdcp_latest_sim_time_s", "REAL DEFAULT 0"),
+        ):
+            if column_name not in existing_extended_columns:
+                cursor.execute(f"ALTER TABLE extended_metrics ADD COLUMN {column_name} {column_def}")
         
         # Tabela de métricas por UE (novo)
         cursor.execute("""
@@ -695,6 +762,25 @@ class DataLake:
         armd_source = decision.get('armd_source', '')
         armd_confidence = decision.get('armd_confidence', 0.0)
         armd_override_applied = 1 if decision.get('armd_override_applied', False) else 0
+        tasam_advisor = decision.get('tasam_advisor', {}) or {}
+        advisor_arbitration = decision.get('advisor_arbitration', {}) or {}
+        tasam_enabled = 1 if decision.get('tasam_enabled', tasam_advisor.get('enabled', False)) else 0
+        tasam_mode = decision.get('tasam_mode', tasam_advisor.get('mode', ''))
+        tasam_policy_id = decision.get('tasam_policy_id', tasam_advisor.get('policy_id', ''))
+        tasam_source = decision.get('tasam_source', tasam_advisor.get('source', ''))
+        tasam_confidence = float(decision.get('tasam_confidence', tasam_advisor.get('confidence', 0.0)) or 0.0)
+        tasam_valid = 1 if decision.get('tasam_valid', tasam_advisor.get('valid', False)) else 0
+        tasam_would_influence = 1 if decision.get('tasam_would_influence', tasam_advisor.get('would_influence', False)) else 0
+        tasam_energy_decision = decision.get('tasam_energy_decision', ((tasam_advisor.get('energy_advice') or {}).get('decision', '')))
+        tasam_energy_action = decision.get('tasam_energy_action', ((tasam_advisor.get('energy_advice') or {}).get('action', '')))
+        advisor_arbitration_mode = advisor_arbitration.get('mode', '')
+        advisor_arbitration_winner = advisor_arbitration.get('winner', '')
+        advisor_arbitration_score = float(
+            max(
+                advisor_arbitration.get('armd_score', 0.0) or 0.0,
+                advisor_arbitration.get('tasam_score', 0.0) or 0.0,
+            )
+        )
         rl_policy_runtime = decision.get('rl_policy_runtime', {}) or {}
         resource_allocation = decision.get('resource_allocation', {}) or {}
         rl_policy_id = rl_policy_runtime.get('policy_id', '')
@@ -710,6 +796,14 @@ class DataLake:
         ran_completion_ratio = float(resource_allocation.get('ran_completion_ratio', 0.0) or 0.0)
         ai_completion_ratio = float(resource_allocation.get('ai_completion_ratio', 0.0) or 0.0)
         utilization_ratio = float(resource_allocation.get('utilization_ratio', 0.0) or 0.0)
+        network_health = decision.get('network_health', {}) or {}
+        network_improvement_pct = float(network_health.get('network_improvement_pct', 0.0) or 0.0)
+        cvar_improvement_pct = float(network_health.get('cvar_improvement_pct', 0.0) or 0.0)
+        p95_improvement_pct = float(network_health.get('p95_improvement_pct', 0.0) or 0.0)
+        baseline_cvar_us = float(network_health.get('baseline_cvar_us', 0.0) or 0.0)
+        baseline_p95_us = float(network_health.get('baseline_p95_us', 0.0) or 0.0)
+        improvement_source = str(network_health.get('improvement_source', '') or '')
+        improvement_valid = 1 if network_health.get('improvement_valid', False) else 0
 
         # DEBUG: Log dos dados de ML que chegam
         if ml_decision:
@@ -726,23 +820,39 @@ class DataLake:
 
         try:
             cursor = self.conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO decisions_history
-                (timestamp, datetime, decision, reason, confidence, pattern,
-                 agent_override, energy_state, slicer_state,
-                 ml_decision, ml_confidence, ml_predicted_cvar_ms, ml_influenced,
-                 armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied,
-                 rl_policy_id, rl_policy_family, rl_policy_algorithm, resource_controller_id,
-                 resource_budget, usable_budget, ran_demand, ai_demand, ran_allocation, ai_allocation,
-                 ran_completion_ratio, ai_completion_ratio, utilization_ratio)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (timestamp, dt_str, decision_str, reason, confidence, pattern,
-                  agent_override, energy_state, slicer_state,
-                  ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced,
-                  armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied,
-                  rl_policy_id, rl_policy_family, rl_policy_algorithm, resource_controller_id,
-                  resource_budget, usable_budget, ran_demand, ai_demand, ran_allocation, ai_allocation,
-                  ran_completion_ratio, ai_completion_ratio, utilization_ratio))
+            columns = [
+                'timestamp', 'datetime', 'decision', 'reason', 'confidence', 'pattern',
+                'agent_override', 'energy_state', 'slicer_state',
+                'ml_decision', 'ml_confidence', 'ml_predicted_cvar_ms', 'ml_influenced',
+                'armd_enabled', 'armd_mode', 'armd_scenario', 'armd_source', 'armd_confidence', 'armd_override_applied',
+                'tasam_enabled', 'tasam_mode', 'tasam_policy_id', 'tasam_source', 'tasam_confidence',
+                'tasam_valid', 'tasam_would_influence', 'tasam_energy_decision', 'tasam_energy_action',
+                'advisor_arbitration_mode', 'advisor_arbitration_winner', 'advisor_arbitration_score',
+                'rl_policy_id', 'rl_policy_family', 'rl_policy_algorithm', 'resource_controller_id',
+                'resource_budget', 'usable_budget', 'ran_demand', 'ai_demand', 'ran_allocation', 'ai_allocation',
+                'ran_completion_ratio', 'ai_completion_ratio', 'utilization_ratio',
+                'network_improvement_pct', 'cvar_improvement_pct', 'p95_improvement_pct',
+                'baseline_cvar_us', 'baseline_p95_us', 'improvement_source', 'improvement_valid',
+            ]
+            values = [
+                timestamp, dt_str, decision_str, reason, confidence, pattern,
+                agent_override, energy_state, slicer_state,
+                ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced,
+                armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied,
+                tasam_enabled, tasam_mode, tasam_policy_id, tasam_source, tasam_confidence,
+                tasam_valid, tasam_would_influence, tasam_energy_decision, tasam_energy_action,
+                advisor_arbitration_mode, advisor_arbitration_winner, advisor_arbitration_score,
+                rl_policy_id, rl_policy_family, rl_policy_algorithm, resource_controller_id,
+                resource_budget, usable_budget, ran_demand, ai_demand, ran_allocation, ai_allocation,
+                ran_completion_ratio, ai_completion_ratio, utilization_ratio,
+                network_improvement_pct, cvar_improvement_pct, p95_improvement_pct,
+                baseline_cvar_us, baseline_p95_us, improvement_source, improvement_valid,
+            ]
+            placeholders = ', '.join('?' for _ in columns)
+            cursor.execute(
+                f"INSERT OR REPLACE INTO decisions_history ({', '.join(columns)}) VALUES ({placeholders})",
+                values,
+            )
             self.conn.commit()
             if resource_allocation:
                 self.record_resource_allocation_snapshot(resource_allocation, timestamp=timestamp)
@@ -751,7 +861,7 @@ class DataLake:
             print(f"[DataLake] ERRO ao registrar decisão: {e}")
 
     def record_resource_allocation_snapshot(self, snapshot, timestamp=None):
-        """Persist the CAORA-style resource-allocation snapshot for SAC training."""
+        """Persist the resource-allocation snapshot used by the TA-SAM DRL line."""
         if not isinstance(snapshot, dict) or not snapshot:
             return
 
@@ -1214,6 +1324,17 @@ class DataLake:
         variance_per_ue = extended_metrics.get('variance_per_ue_us2', 0) if extended_metrics else 0
         cvar_per_ue = extended_metrics.get('cvar_per_ue_us', 0) if extended_metrics else 0
         ue_count = extended_metrics.get('ue_count', 0) if extended_metrics else 0
+        collector_mode = extended_metrics.get('collector_mode', '') if extended_metrics else ''
+        throughput_source = extended_metrics.get('throughput_source', '') if extended_metrics else ''
+        real_latency_sample_count = extended_metrics.get('real_latency_sample_count', 0) if extended_metrics else 0
+        proxy_latency_sample_count = extended_metrics.get('proxy_latency_sample_count', 0) if extended_metrics else 0
+        pdcp_stale = int(bool(extended_metrics.get('pdcp_stale', False))) if extended_metrics else 0
+        rlc_stale = int(bool(extended_metrics.get('rlc_stale', False))) if extended_metrics else 0
+        mac_stale = int(bool(extended_metrics.get('mac_stale', False))) if extended_metrics else 0
+        pdcp_trace_age_s = extended_metrics.get('pdcp_trace_age_s', 0) if extended_metrics else 0
+        rlc_trace_age_s = extended_metrics.get('rlc_trace_age_s', 0) if extended_metrics else 0
+        mac_trace_age_s = extended_metrics.get('mac_trace_age_s', 0) if extended_metrics else 0
+        pdcp_latest_sim_time_s = extended_metrics.get('pdcp_latest_sim_time_s', 0) if extended_metrics else 0
         
         MAX_VALID_LATENCY_US = 500000
         
@@ -1236,10 +1357,13 @@ class DataLake:
                  total_active_ues, total_active_cameras, total_critical_ues,
                  total_tx_bytes, total_rx_bytes,
                  total_tx_pdus, total_rx_pdus, throughput_kbps,
-                 energy_state, slicer_state,
+                energy_state, slicer_state,
                  latency_p5_us, latency_p95_us, latency_min_nonzero_us, valid_samples,
-                 latency_p95_per_ue_us, variance_per_ue_us2, cvar_per_ue_us, ue_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 latency_p95_per_ue_us, variance_per_ue_us2, cvar_per_ue_us, ue_count,
+                 collector_mode, throughput_source, real_latency_sample_count, proxy_latency_sample_count,
+                 pdcp_stale, rlc_stale, mac_stale,
+                 pdcp_trace_age_s, rlc_trace_age_s, mac_trace_age_s, pdcp_latest_sim_time_s)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (timestamp, dt_str, sim_time_s, cell_id,
                   global_worst_latency, global_avg_latency,
                   global_min_latency, global_max_latency,
@@ -1249,7 +1373,10 @@ class DataLake:
                   total_tx_pdus, total_rx_pdus, throughput_kbps,
                   energy_state, slicer_state,
                   latency_p5_us, latency_p95_us, latency_min_nonzero_us, valid_samples,
-                  latency_p95_per_ue, variance_per_ue, cvar_per_ue, ue_count))
+                  latency_p95_per_ue, variance_per_ue, cvar_per_ue, ue_count,
+                  collector_mode, throughput_source, real_latency_sample_count, proxy_latency_sample_count,
+                  pdcp_stale, rlc_stale, mac_stale,
+                  pdcp_trace_age_s, rlc_trace_age_s, mac_trace_age_s, pdcp_latest_sim_time_s))
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar métrica estendida: {e}")
@@ -1725,7 +1852,18 @@ class DataLake:
                 'latency_p95_per_ue_us': latency_p95_per_ue,
                 'variance_per_ue_us2': variance_per_ue,
                 'cvar_per_ue_us': cvar_per_ue,
-                'ue_count': ue_count
+                'ue_count': ue_count,
+                'collector_mode': gm.get('collector_mode', ''),
+                'throughput_source': gm.get('throughput_source', ''),
+                'real_latency_sample_count': gm.get('real_latency_sample_count', 0),
+                'proxy_latency_sample_count': gm.get('proxy_latency_sample_count', 0),
+                'pdcp_stale': gm.get('pdcp_stale', False),
+                'rlc_stale': gm.get('rlc_stale', False),
+                'mac_stale': gm.get('mac_stale', False),
+                'pdcp_trace_age_s': gm.get('pdcp_trace_age_s', 0),
+                'rlc_trace_age_s': gm.get('rlc_trace_age_s', 0),
+                'mac_trace_age_s': gm.get('mac_trace_age_s', 0),
+                'pdcp_latest_sim_time_s': gm.get('pdcp_latest_sim_time_s', 0),
             }
         )
         

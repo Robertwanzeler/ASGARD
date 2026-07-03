@@ -73,6 +73,7 @@ from rapp_armd_runtime import ARMDRuntimeAdvisor
 from rapp_rl_policy import build_runtime_rl_policy
 from rapp_sac_resource_model import compute_shared_resource_snapshot
 from rapp_marl_shadow import MARLShadowRuntimeEvaluator
+from rapp_network_improvement import build_network_improvement
 
 # from rapp_synthetic_generator import SyntheticDataGenerator  # Removed - not available
 from rapp_xapp_manager import XAppManager
@@ -128,12 +129,52 @@ def _load_app1_monitoring_snapshot():
     return snapshot if isinstance(snapshot, dict) else {}
 
 
+def _load_app2_sensor_override():
+    control = _safe_read_json_file(ARTICLE00_SCENARIO_CONTROL_PATH)
+    override = control.get("app2_sensor_override", {}) or {}
+    if not override.get("enabled", False):
+        return {}
+    return override
+
+
 def _load_vehicle_override():
     control = _safe_read_json_file(ARTICLE00_SCENARIO_CONTROL_PATH)
     override = control.get("vehicle_override", {}) or {}
     if not override.get("enabled", False):
         return {}
     return override
+
+
+def _load_network_health_override():
+    control = _safe_read_json_file(ARTICLE00_SCENARIO_CONTROL_PATH)
+    override = control.get("network_health_override", {}) or {}
+    if not override.get("enabled", False):
+        return {}
+    slope_ms_per_sec = float(override.get("slope_ms_per_sec", 0.0) or 0.0)
+    current_latency_ms = float(override.get("current_latency_ms", 0.0) or 0.0)
+    time_to_critical_ms = override.get("time_to_critical_ms")
+    time_to_good_ms = override.get("time_to_good_ms")
+    if time_to_critical_ms is None and slope_ms_per_sec > 0.0 and current_latency_ms < 150.0:
+        time_to_critical_ms = round((150.0 - current_latency_ms) / slope_ms_per_sec, 1)
+    if time_to_good_ms is None and slope_ms_per_sec < 0.0 and current_latency_ms > 50.0:
+        time_to_good_ms = round((current_latency_ms - 50.0) / abs(slope_ms_per_sec), 1)
+    normalized = dict(override)
+    normalized.update({
+        "enabled": True,
+        "valid": bool(override.get("valid", True)),
+        "slope_ms_per_sec": slope_ms_per_sec,
+        "slope_us_per_sec": float(override.get("slope_us_per_sec", slope_ms_per_sec * 1000.0) or 0.0),
+        "trend": str(override.get("trend", override.get("mode", "scenario_control")) or "scenario_control"),
+        "confidence": float(override.get("confidence", 1.0) or 0.0),
+        "time_to_critical_ms": time_to_critical_ms,
+        "time_to_good_ms": time_to_good_ms,
+        "current_latency_ms": current_latency_ms,
+        "current_latency_us": float(override.get("current_latency_us", current_latency_ms * 1000.0) or 0.0),
+        "r_squared": float(override.get("r_squared", 1.0) or 0.0),
+        "n_samples": int(override.get("n_samples", 999) or 0),
+        "window_minutes": float(override.get("window_minutes", 5.0) or 0.0),
+    })
+    return normalized
 
 
 def _coerce_intent_value(raw_value):
@@ -214,7 +255,7 @@ class RappResourceOptimizer:
         self.history_display_interval = 1  # Exibir a cada ciclo (mais frequente)
         self.app2_connectivity_history = deque(maxlen=3)
         self._resource_allocation_prev = {'r_ran': 0.5, 'r_ai': 0.5}
-        self.marl_shadow_evaluator = MARLShadowRuntimeEvaluator()
+        self.marl_shadow_evaluator = MARLShadowRuntimeEvaluator(RUNTIME_CONFIG.get('tasam_advisor', {}))
         
         # Inicializa componentes
         print("[rApp] Inicializando componentes...")
@@ -237,13 +278,20 @@ class RappResourceOptimizer:
         # A1 Interface
         self.a1 = A1PolicyInterface()
 
-        # ML Predictor (Random Forest / XGBoost) com acesso ao banco
-        self.ml_predictor = MLPredictor(data_lake=self.data_lake)
+        ml_runtime_cfg = RUNTIME_CONFIG.get('ml', {})
+        self.ml_enabled = bool(ml_runtime_cfg.get('enabled', True))
+        self.ml_retrain_enabled = self.ml_enabled and bool(ml_runtime_cfg.get('retrain_enabled', True))
+        self.ml_predictor = None
         self.ml_invalid_streak = 0
+        if self.ml_enabled:
+            # ML Predictor (Random Forest / XGBoost) com acesso ao banco
+            self.ml_predictor = MLPredictor(data_lake=self.data_lake)
+            print("[rApp] ML runtime enabled")
+        else:
+            print("[rApp] ML runtime disabled by config; DRL/rules only")
 
-        # RL policy selection. The legacy A3C line remains attached to the
-        # current energy-control runtime, while the CAORA SAC/AWAC line can
-        # optionally steer resource-allocation snapshots online.
+        # Runtime RL policy selection. The live allocator remains heuristic while
+        # TA-SAM MARL stays in shadow/control-gated evaluation.
         self.rl_policy = None
         self.drl_predictor = None
         try:
@@ -258,7 +306,7 @@ class RappResourceOptimizer:
                 self.drl_predictor = self.rl_policy
                 print("[rApp] RL policy attached to legacy energy runtime")
             else:
-                print("[rApp] RL policy attached to runtime resource-allocation path")
+                print("[rApp] RL policy attached to heuristic live path with TA-SAM shadow support")
         except Exception as e:
             print(f"[rApp] RL policy load failed: {e}")
             self.rl_policy = None
@@ -736,6 +784,37 @@ class RappResourceOptimizer:
         }
 
         try:
+            override = _load_app2_sensor_override()
+            if override:
+                total_sensors = max(0, int(override.get('total_sensors', 0) or 0))
+                connected_sensors = max(0, min(total_sensors, int(override.get('connected_sensors', total_sensors) or total_sensors)))
+                error_sensors = max(0, min(total_sensors, int(override.get('error_sensors', total_sensors - connected_sensors) or (total_sensors - connected_sensors))))
+                low_battery_sensors = max(0, min(total_sensors, int(override.get('low_battery_sensors', 0) or 0)))
+                connected_ratio = connected_sensors / max(total_sensors, 1)
+                error_ratio = error_sensors / max(total_sensors, 1)
+                metrics.update({
+                    'available': total_sensors > 0,
+                    'stale': False,
+                    'age_seconds': 0.0,
+                    'total_sensors': total_sensors,
+                    'active_sensors': connected_sensors,
+                    'connected_sensors': connected_sensors,
+                    'error_sensors': error_sensors,
+                    'low_battery_sensors': low_battery_sensors,
+                    'connected_ratio': connected_ratio,
+                    'error_ratio': error_ratio,
+                    'packet_loss_percent': float(override.get('packet_loss_percent', 0) or 0),
+                    'delivery_success_percent': float(override.get('delivery_success_percent', 100) or 100),
+                    'avg_latency_ms': float(override.get('avg_latency_ms', 0) or 0),
+                    'avg_battery_percent': float(override.get('avg_battery_percent', 100) or 100),
+                    'avg_rssi_dbm': float(override.get('avg_rssi_dbm', 0) or 0),
+                    'network_utilization_percent': float(override.get('network_utilization_percent', 0) or 0),
+                    'gateways': 1,
+                    'connectivity_modes': 1,
+                    'scenario_mode': str(override.get('mode', 'scenario_control_override') or 'scenario_control_override'),
+                })
+                return metrics
+
             if not os.path.exists(APP2_MONITORING_PATH):
                 return metrics
 
@@ -916,6 +995,8 @@ class RappResourceOptimizer:
             'energy_state': 'UNKNOWN',
             'pattern_analysis': None,
             'ml_decision': None,
+            'ml_rf_prediction': {},
+            'ml_influenced': False,
             'trend_analysis': None,
             'preventive_block': False,
             'camera_metrics': None,
@@ -929,7 +1010,9 @@ class RappResourceOptimizer:
             'drl_policy_applied': False,
             'ml_risk_cap_applied': False,
             'resource_allocation': {},
-            'rl_policy_runtime': {}
+            'rl_policy_runtime': {},
+            'tasam_advisor': {},
+            'advisor_arbitration': {},
         }
 
         if self.rl_policy is not None:
@@ -1200,8 +1283,18 @@ class RappResourceOptimizer:
         # ETAPA 0: TREND ANALYSIS (SLOPE) - PREDITIVA
         # O rApp detecta se latência está SUBINDO antes de bater crítico
         # ========================================
+        network_health_override = _load_network_health_override()
+
         trend_info = self.trend_analysis.calculate_latency_slope(window_minutes=5)
+        if network_health_override:
+            trend_info = dict(network_health_override)
         trend_decision = self.trend_analysis.should_preempt_energy(trend_info)
+        if network_health_override:
+            trend_decision = {
+                'preventive': False,
+                'reason': 'scenario_control override',
+                'confidence': 1.0,
+            }
         decision['trend_analysis'] = {
             'slope_ms_per_sec': trend_info.get('slope_ms_per_sec', 0),
             'trend': trend_info.get('trend', 'unknown'),
@@ -1270,6 +1363,17 @@ class RappResourceOptimizer:
         
         # rApp: Usar métricas avançadas (CVaR, Variância)
         network_health = self.data_lake.get_network_health(window_minutes=5)
+        network_health_source = 'data_lake'
+        if network_health_override:
+            network_health = {
+                'cvar_us': float(network_health_override.get('cvar_us', 0.0) or 0.0),
+                'latest_cvar_us': float(network_health_override.get('latest_cvar_us', network_health_override.get('cvar_us', 0.0)) or 0.0),
+                'p95_us': float(network_health_override.get('p95_us', 0.0) or 0.0),
+                'median_us': float(network_health_override.get('current_latency_ms', 0.0) or 0.0) * 1000.0,
+                'variance_us2': float(network_health_override.get('variance_us2', 0.0) or 0.0),
+                'stability_score': float(network_health_override.get('stability_score', 100.0) or 100.0),
+            }
+            network_health_source = 'scenario_control_override'
         
         # Thresholds recalibrados para o novo CVaR do coletor
         CVAR_ECO_US = 40000          # 40ms - rede muito saudável
@@ -1306,10 +1410,18 @@ class RappResourceOptimizer:
             variance_us2 = 0.0
             stability_score = 100
             decision['network_health'] = {'fallback': True, 'cvar_us': cvar_us}
+            network_health_source = 'fallback_median'
             if cvar_us > 0:
                 print(f"[rApp DEBUG] Fallback CVaR = {cvar_us}us = {cvar_us/1000:.1f}ms")
             else:
                 print(f"[rApp DEBUG] Sem dados de CVaR disponíveis")
+
+        decision['network_health'].update(
+            build_network_improvement(
+                decision.get('network_health'),
+                source=network_health_source,
+            )
+        )
 
         resource_allocation = compute_shared_resource_snapshot(
             camera_metrics=decision.get('camera_metrics'),
@@ -1365,8 +1477,20 @@ class RappResourceOptimizer:
             (resource_allocation or {}).get('article_marl_state'),
             resource_snapshot=resource_allocation,
         )
+        tasam_advisor = marl_shadow.get('advisor', {}) if isinstance(marl_shadow.get('advisor'), dict) else {}
         resource_allocation['marl_shadow'] = marl_shadow
+        resource_allocation['tasam_advisor'] = tasam_advisor
         decision['rl_policy_runtime']['marl_shadow'] = marl_shadow
+        decision['tasam_advisor'] = tasam_advisor
+        decision['tasam_enabled'] = bool(tasam_advisor.get('enabled', marl_shadow.get('enabled', False)))
+        decision['tasam_mode'] = tasam_advisor.get('mode', marl_shadow.get('advisory_mode', 'shadow'))
+        decision['tasam_policy_id'] = tasam_advisor.get('policy_id', marl_shadow.get('policy_id', ''))
+        decision['tasam_source'] = tasam_advisor.get('source', marl_shadow.get('source', ''))
+        decision['tasam_confidence'] = float(tasam_advisor.get('confidence', marl_shadow.get('confidence', 0.0)) or 0.0)
+        decision['tasam_valid'] = bool(tasam_advisor.get('valid', marl_shadow.get('valid', False)))
+        decision['tasam_would_influence'] = bool(tasam_advisor.get('would_influence', marl_shadow.get('would_influence', False)))
+        decision['tasam_energy_decision'] = ((tasam_advisor.get('energy_advice') or {}).get('decision', ''))
+        decision['tasam_energy_action'] = ((tasam_advisor.get('energy_advice') or {}).get('action', ''))
         decision['resource_allocation'] = resource_allocation
         self._resource_allocation_prev = {
             'r_ran': float(resource_allocation.get('r_ran', 0.5) or 0.5),
@@ -1574,9 +1698,15 @@ class RappResourceOptimizer:
         p95_value = network_health.get('p95_us', 0) if network_health else 0
         vehicle_metrics = decision.get('vehicle_metrics') or {}
 
-        print(f"[rApp DEBUG] ML Predictor loaded: {self.ml_predictor.is_loaded()}, preventive_block: {decision['preventive_block']}")
+        ml_loaded = self.ml_enabled and self.ml_predictor is not None and self.ml_predictor.is_loaded()
+        print(f"[rApp DEBUG] ML enabled: {self.ml_enabled}, loaded: {ml_loaded}, preventive_block: {decision['preventive_block']}")
         
-        if self.ml_predictor.is_loaded() and not decision['preventive_block'] and not service_priority_active:
+        if ml_loaded and not decision['preventive_block'] and not service_priority_active:
+            scenario_stage = (
+                (((decision.get('resource_allocation') or {}).get('marl_shadow') or {}).get('scenario_stage'))
+                or (((decision.get('rl_policy_runtime') or {}).get('marl_shadow') or {}).get('scenario_stage'))
+                or ''
+            )
             ml_metrics = {
                 'cvar_per_ue_us': cvar_us if cvar_us else 0,
                 'cvar_p95_us': p95_value,
@@ -1599,6 +1729,7 @@ class RappResourceOptimizer:
                 'vehicle_degraded_autonomy': vehicle_metrics.get('degraded_autonomy_vehicles', 0),
                 'vehicle_max_latency_ms': vehicle_metrics.get('max_latency_ms', 0.0),
                 'vehicle_max_packet_loss_percent': vehicle_metrics.get('max_packet_loss_percent', 0.0),
+                'scenario_stage': scenario_stage,
             }
             
             # DEBUG: Log do P95 que está sendo enviado para ML
@@ -1737,7 +1868,9 @@ class RappResourceOptimizer:
                         print(f"\033[0;33m[rApp ML] ✗ ML desconsiderada - predição inválida\033[0m")
 
         # ========================================
-        # ETAPA 2B: DRL PREDICTOR (SBiLSTM + A3C)
+        # ETAPA 2B: LEGACY DRL PREDICTOR PATH
+        # Mantido apenas como guarda morta; a linha oficial usa
+        # heuristica ao vivo com TA-SAM em shadow/control gate.
         # ========================================
         
         prev_cvar_for_drl = getattr(self, '_prev_cvar_us', 0) or 0
@@ -1860,6 +1993,8 @@ class RappResourceOptimizer:
         # ainda atua como freio de segurança para evitar ECO agressivo com CVaR
         # intermediário. App1/App2 e bloqueios preventivos continuam soberanos.
         if (
+            self.ml_enabled
+            and
             not service_priority_active
             and not decision.get('preventive_block', False)
             and decision.get('energy_saver') == 'ALLOWED'
@@ -1945,8 +2080,68 @@ class RappResourceOptimizer:
         )
         decision['armd_analysis'] = armd_advice
         decision = self.armd_runtime.apply(decision, armd_advice)
+        decision['advisor_arbitration'] = self._build_advisor_arbitration(decision)
         
         return decision
+
+    def _build_advisor_arbitration(self, decision):
+        """Build a shadow-only scoreboard between ARMD and TA-SAM advisors."""
+        severity_rank = {
+            'UNKNOWN': 0,
+            'ALLOWED': 1,
+            'CONDITIONAL': 2,
+            'BLOCKED': 3,
+        }
+        armd = decision.get('armd_analysis') or {}
+        tasam = decision.get('tasam_advisor') or {}
+
+        armd_valid = bool(armd.get('available')) and float(armd.get('confidence', 0.0) or 0.0) >= float(self.armd_runtime.min_confidence)
+        tasam_valid = bool(tasam.get('valid', False))
+
+        armd_target = str(armd.get('expected_energy_saver', '') or decision.get('energy_saver', 'UNKNOWN')).upper()
+        armd_evidence_count = len(armd.get('evidence', []) or [])
+        armd_score = round(
+            (0.65 * float(armd.get('confidence', 0.0) or 0.0))
+            + (0.20 * (severity_rank.get(armd_target, 0) / 3.0))
+            + (0.15 * min(armd_evidence_count / 3.0, 1.0)),
+            4,
+        )
+
+        tasam_target = str(((tasam.get('energy_advice') or {}).get('decision', 'UNKNOWN')) or 'UNKNOWN').upper()
+        tasam_evidence_flags = tasam.get('evidence_flags') or {}
+        tasam_evidence_score = sum(1 for value in tasam_evidence_flags.values() if value)
+        tasam_score = round(
+            (0.50 * float(tasam.get('confidence', 0.0) or 0.0))
+            + (0.30 * float(tasam.get('arbitration_score', 0.0) or 0.0))
+            + (0.20 * min(tasam_evidence_score / max(len(tasam_evidence_flags), 1), 1.0)),
+            4,
+        )
+
+        if not armd_valid and not tasam_valid:
+            winner = 'none'
+        elif armd_valid and not tasam_valid:
+            winner = 'armd'
+        elif tasam_valid and not armd_valid:
+            winner = 'ta_sam'
+        elif abs(armd_score - tasam_score) <= 0.02:
+            winner = 'tie'
+        elif armd_score > tasam_score:
+            winner = 'armd'
+        else:
+            winner = 'ta_sam'
+
+        return {
+            'mode': 'shadow_scoreboard',
+            'winner': winner,
+            'armd_valid': armd_valid,
+            'tasam_valid': tasam_valid,
+            'agreement': armd_target == tasam_target and armd_target != 'UNKNOWN',
+            'armd_score': armd_score,
+            'tasam_score': tasam_score,
+            'armd_target': armd_target,
+            'tasam_target': tasam_target,
+            'would_apply': False,
+        }
     
     def write_decision(self, decision):
         """Escreve decisão no arquivo."""
@@ -1993,6 +2188,8 @@ class RappResourceOptimizer:
                     f.write(f"|  P95: {nh.get('p95_us', 0)/1000:.1f}ms{' '*48}|\n")
                     f.write(f"|  Mediana: {nh.get('median_us', 0)/1000:.1f}ms{' '*43}|\n")
                     f.write(f"|  Estabilidade: {nh.get('stability_score', 0):.0f}%{' '*39}|\n")
+                    if nh.get('improvement_valid'):
+                        f.write(f"|  Melhora rede: {nh.get('network_improvement_pct', 0):.1f}%{' '*36}|\n")
                     f.write("+----------------------------------------------------+\n")
                     f.write("\n")
                 
@@ -2077,6 +2274,13 @@ class RappResourceOptimizer:
                     f.write(f"|  ARMD conf: {float(decision.get('armd_confidence', 0) or 0)*100:.0f}%{' '*47}|\n")
                     if decision.get('armd_override_applied'):
                         f.write("|  ARMD override: escalou protecao                       |\n")
+                if decision.get('tasam_enabled'):
+                    f.write(f"|  TA-SAM: {decision.get('tasam_mode', 'shadow'):<47}|\n")
+                    f.write(f"|  TA-SAM source: {decision.get('tasam_source', ''):<40}|\n")
+                    f.write(f"|  TA-SAM conf: {float(decision.get('tasam_confidence', 0) or 0)*100:.0f}%{' '*45}|\n")
+                    f.write(f"|  TA-SAM energy: {decision.get('tasam_energy_decision', ''):<39}|\n")
+                    if decision.get('advisor_arbitration'):
+                        f.write(f"|  Advisor winner: {decision['advisor_arbitration'].get('winner', 'none'):<38}|\n")
                 
                 f.write("=" * 70 + "\n")
                 f.write("\n")
@@ -2101,6 +2305,14 @@ class RappResourceOptimizer:
                 f.write(f"ARMD_SOURCE={decision.get('armd_source', '')}\n")
                 f.write(f"ARMD_CONFIDENCE={float(decision.get('armd_confidence', 0) or 0):.4f}\n")
                 f.write(f"ARMD_OVERRIDE_APPLIED={str(decision.get('armd_override_applied', False)).lower()}\n")
+                f.write(f"TASAM_ENABLED={str(decision.get('tasam_enabled', False)).lower()}\n")
+                f.write(f"TASAM_MODE={decision.get('tasam_mode', 'shadow')}\n")
+                f.write(f"TASAM_SOURCE={decision.get('tasam_source', '')}\n")
+                f.write(f"TASAM_CONFIDENCE={float(decision.get('tasam_confidence', 0) or 0):.4f}\n")
+                f.write(f"TASAM_VALID={str(decision.get('tasam_valid', False)).lower()}\n")
+                f.write(f"TASAM_ENERGY_DECISION={decision.get('tasam_energy_decision', '')}\n")
+                f.write(f"TASAM_ENERGY_ACTION={decision.get('tasam_energy_action', '')}\n")
+                f.write(f"ADVISOR_WINNER={(decision.get('advisor_arbitration') or {}).get('winner', 'none')}\n")
                 if decision.get('trend_analysis'):
                     ta = decision['trend_analysis']
                     f.write(f"SLOPE_MS_PER_SEC={ta.get('slope_ms_per_sec', 0):.2f}\n")
@@ -2232,6 +2444,13 @@ class RappResourceOptimizer:
                 'reason': decision.get('reason', ''),
                 'confidence': decision.get('confidence', 0),
                 'cvar_ms': decision.get('network_health', {}).get('cvar_us', 0) / 1000,
+                'network_improvement_pct': decision.get('network_health', {}).get('network_improvement_pct', 0),
+                'cvar_improvement_pct': decision.get('network_health', {}).get('cvar_improvement_pct', 0),
+                'p95_improvement_pct': decision.get('network_health', {}).get('p95_improvement_pct', 0),
+                'baseline_cvar_ms': decision.get('network_health', {}).get('baseline_cvar_us', 0) / 1000,
+                'baseline_p95_ms': decision.get('network_health', {}).get('baseline_p95_us', 0) / 1000,
+                'improvement_source': decision.get('network_health', {}).get('improvement_source', ''),
+                'improvement_valid': decision.get('network_health', {}).get('improvement_valid', False),
                 'slope_ms_per_sec': decision.get('trend_analysis', {}).get('slope_ms_per_sec', 0),
                 'pattern': decision.get('pattern', 'unknown'),
                 'ml_influenced': decision.get('ml_influenced', False),
@@ -2270,6 +2489,19 @@ class RappResourceOptimizer:
                 'armd_override_applied': decision.get('armd_override_applied', False),
                 'armd_expected_energy_saver': decision.get('armd_expected_energy_saver', ''),
                 'armd_expected_action': decision.get('armd_expected_action', ''),
+                'tasam_enabled': decision.get('tasam_enabled', False),
+                'tasam_mode': decision.get('tasam_mode', 'shadow'),
+                'tasam_policy_id': decision.get('tasam_policy_id', ''),
+                'tasam_source': decision.get('tasam_source', ''),
+                'tasam_confidence': decision.get('tasam_confidence', 0),
+                'tasam_valid': decision.get('tasam_valid', False),
+                'tasam_would_influence': decision.get('tasam_would_influence', False),
+                'tasam_energy_decision': decision.get('tasam_energy_decision', ''),
+                'tasam_energy_action': decision.get('tasam_energy_action', ''),
+                'advisor_arbitration_mode': (decision.get('advisor_arbitration') or {}).get('mode', ''),
+                'advisor_arbitration_winner': (decision.get('advisor_arbitration') or {}).get('winner', ''),
+                'advisor_arbitration_armd_score': (decision.get('advisor_arbitration') or {}).get('armd_score', 0),
+                'advisor_arbitration_tasam_score': (decision.get('advisor_arbitration') or {}).get('tasam_score', 0),
                 'rl_policy_id': (decision.get('rl_policy_runtime') or {}).get('policy_id', ''),
                 'rl_policy_algorithm': (decision.get('rl_policy_runtime') or {}).get('algorithm', ''),
                 'resource_controller_id': (decision.get('resource_allocation') or {}).get('controller_id', ''),
@@ -2430,6 +2662,9 @@ class RappResourceOptimizer:
 
     def check_ml_retrain(self):
         """Verifica se é hora de retreinar o ML."""
+        if not self.ml_retrain_enabled:
+            return
+
         now = time.time()
         elapsed = now - self.ml_last_retrain
 
@@ -2441,6 +2676,9 @@ class RappResourceOptimizer:
 
     def retrain_ml(self):
         """Retreina o modelo ML com dados recentes do banco."""
+        if not self.ml_retrain_enabled or self.ml_predictor is None:
+            return
+
         try:
             import subprocess
             import sys
@@ -2644,10 +2882,11 @@ class RappResourceOptimizer:
                     self.vehicle_only_mode = False
                     self.stale_sim_cycles = 0
                     self.ml_invalid_streak = 0
-                    self.ml_predictor.reset_history()
+                    if self.ml_predictor is not None:
+                        self.ml_predictor.reset_history()
                     if self.drl_predictor is not None and hasattr(self.drl_predictor, 'reset_history'):
                         self.drl_predictor.reset_history()
-                    print(f"    → Histórico ML/DRL resetado")
+                    print(f"    → Histórico de runtime resetado")
                 else:
                     # Se sim_time não avançou (diff ~= 0), simulação terminou
                     if sim_time_diff <= 0.1:
@@ -2716,10 +2955,11 @@ class RappResourceOptimizer:
             self.print_status(decision, xapp_status)
             
             # 8.5. Armazena predição ML para histórico
-            self._record_ml_history(decision)
+            if self.ml_enabled:
+                self._record_ml_history(decision)
             
             # 8.6. Exibe histórico de predições ML periodicamente
-            if self.cycle % self.history_display_interval == 0 and len(self.ml_history) > 0:
+            if self.ml_enabled and self.cycle % self.history_display_interval == 0 and len(self.ml_history) > 0:
                 self._display_ml_history()
             
             # 9. Verifica se é hora de retreinar ML

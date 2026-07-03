@@ -14,6 +14,21 @@ export GREENRAN_RUNS_DIR="${GREENRAN_RUNS_DIR:-$PROJECT_DIR/runs}"
 export GREENRAN_INSTANCE_NAME="${GREENRAN_INSTANCE_NAME:-default}"
 export GREENRAN_PORT_OFFSET="${GREENRAN_PORT_OFFSET:-0}"
 
+resolve_ric_dir() {
+    local candidates=(
+        "$PROJECT_DIR/flexric/build_e2ap_v1"
+        "$PROJECT_DIR/flexric/build"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [ -d "$candidate/examples" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 runtime_json_get() {
     local dotted_key="$1"
     python3 - "$RUNTIME_JSON" "$dotted_key" <<'PY'
@@ -71,8 +86,14 @@ PY
 load_greenran_runtime() {
     export BASE_DIR="$PROJECT_DIR"
     export NS3_DIR="$PROJECT_DIR/ns-O-RAN-flexric/mmwave-LENA-oran"
-    export RIC_DIR="$PROJECT_DIR/flexric/build_e2ap_v1"
+    export RIC_DIR="${GREENRAN_RIC_DIR:-$(resolve_ric_dir || true)}"
+    if [ -z "$RIC_DIR" ]; then
+        export RIC_DIR="$PROJECT_DIR/flexric/build"
+    fi
     export FLEXRIC_LIB="$PROJECT_DIR/flexric_lib"
+    export GREENRAN_PYTHON_BIN="${GREENRAN_PYTHON_BIN:-python3}"
+    export GREENRAN_PYTHONPATH="${GREENRAN_PYTHONPATH:-$PROJECT_DIR:$PROJECT_DIR/src}"
+    export PYTHONPATH="$GREENRAN_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
 
     export GREENRAN_DASHBOARD_HOST="${GREENRAN_DASHBOARD_HOST:-$(runtime_json_get dashboard.host)}"
     export GREENRAN_DASHBOARD_PORT="${GREENRAN_DASHBOARD_PORT:-$(runtime_json_get dashboard.port)}"
@@ -85,7 +106,21 @@ load_greenran_runtime() {
     export GREENRAN_ORCHESTRATOR_INTERVAL="${GREENRAN_ORCHESTRATOR_INTERVAL:-$(runtime_json_get orchestrator.interval_seconds)}"
     export GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS="${GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS:-$(runtime_json_get orchestrator.synthetic_days)}"
     export GREENRAN_COLLECTOR_POLL_INTERVAL="${GREENRAN_COLLECTOR_POLL_INTERVAL:-$(runtime_json_get collector.poll_interval_seconds)}"
+    export GREENRAN_PDCP_STALE_SECONDS="${GREENRAN_PDCP_STALE_SECONDS:-30}"
+    export GREENRAN_REQUIRE_REAL_PDCP="${GREENRAN_REQUIRE_REAL_PDCP:-0}"
+    export GREENRAN_NS3_BEARER_STATS_EPOCH_MS="${GREENRAN_NS3_BEARER_STATS_EPOCH_MS:-100}"
     export GREENRAN_SIM_TIME="${GREENRAN_SIM_TIME:-$(runtime_json_get simulation.default_sim_time_seconds)}"
+    export GREENRAN_DB_SNAPSHOT_INTERVAL="${GREENRAN_DB_SNAPSHOT_INTERVAL:-1800}"
+    export GREENRAN_DB_SNAPSHOT_RETENTION="${GREENRAN_DB_SNAPSHOT_RETENTION:-48}"
+    export GREENRAN_TASAM_EXPORT_INTERVAL="${GREENRAN_TASAM_EXPORT_INTERVAL:-1800}"
+    export GREENRAN_TASAM_EXPORT_LIMIT="${GREENRAN_TASAM_EXPORT_LIMIT:-0}"
+    export GREENRAN_TASAM_EXPORT_ALLOW_PROXY="${GREENRAN_TASAM_EXPORT_ALLOW_PROXY:-0}"
+    export GREENRAN_RAPP_ONLINE_RETRAIN_INTERVAL="${GREENRAN_RAPP_ONLINE_RETRAIN_INTERVAL:-300}"
+    export GREENRAN_RAPP_ONLINE_RETRAIN_TARGET="${GREENRAN_RAPP_ONLINE_RETRAIN_TARGET:-1000}"
+    export GREENRAN_RAPP_ONLINE_RETRAIN_MIN_NEW_ROWS="${GREENRAN_RAPP_ONLINE_RETRAIN_MIN_NEW_ROWS:-100}"
+    export GREENRAN_RAPP_ONLINE_RETRAIN_MIN_RF_ACCURACY="${GREENRAN_RAPP_ONLINE_RETRAIN_MIN_RF_ACCURACY:-0.95}"
+    export GREENRAN_RAPP_ONLINE_RETRAIN_MIN_R2="${GREENRAN_RAPP_ONLINE_RETRAIN_MIN_R2:-0.80}"
+    export GREENRAN_RAPP_ONLINE_RETRAIN_MIN_HEALTHY_ALLOWED_RECALL="${GREENRAN_RAPP_ONLINE_RETRAIN_MIN_HEALTHY_ALLOWED_RECALL:-0.70}"
 
     export GREENRAN_FIXED_SCENARIO_CONFIG="${GREENRAN_FIXED_SCENARIO_CONFIG:-$FIXED_SCENARIO_JSON}"
     export GREENRAN_FIXED_TOTAL_UES="${GREENRAN_FIXED_TOTAL_UES:-$(fixed_scenario_json_get ns3.total_ues)}"
@@ -117,6 +152,11 @@ load_greenran_runtime() {
     export GREENRAN_CARLA_BRIDGE_LOG="$STATE_DIR/carla_bridge.log"
     export GREENRAN_CARLA_MAPPER_LOG="$STATE_DIR/carla_ns3_mapper.log"
     export GREENRAN_MARL_GATE_WATCH_LOG="$STATE_DIR/marl_runtime_gate_watch.log"
+    export GREENRAN_DB_SNAPSHOT_LOG="$STATE_DIR/db_snapshot.log"
+    export GREENRAN_TASAM_EXPORT_LOG="$STATE_DIR/tasam_article_export.log"
+    export GREENRAN_RAPP_ONLINE_RETRAIN_LOG="$STATE_DIR/rapp_online_retrain.log"
+    export GREENRAN_DB_SNAPSHOT_DIR="${GREENRAN_DB_SNAPSHOT_DIR:-$STATE_DIR/db_snapshots}"
+    export GREENRAN_TASAM_EXPORT_DIR="${GREENRAN_TASAM_EXPORT_DIR:-$STATE_DIR/tasam_article_export}"
 
     local port_offset="${GREENRAN_PORT_OFFSET:-0}"
     export APP1_HOST="${APP1_HOST:-0.0.0.0}"
@@ -150,6 +190,7 @@ load_greenran_runtime() {
     export GREENRAN_WATCHDOG_PID="$STATE_DIR/watchdog.pid"
     export GREENRAN_RIC_PID="$STATE_DIR/ric.pid"
     export GREENRAN_NS3_PID="$STATE_DIR/ns3.pid"
+    export GREENRAN_NS3_SUPERVISOR_PID="$STATE_DIR/ns3_supervisor.pid"
     export GREENRAN_XAPP_SLICER_PID="$STATE_DIR/xapp_slicer.pid"
     export GREENRAN_XAPP_ENERGY_PID="$STATE_DIR/xapp_energy.pid"
     export GREENRAN_XAPP_VEHICLE_PID="$STATE_DIR/xapp_vehicle.pid"
@@ -167,11 +208,14 @@ load_greenran_runtime() {
     export GREENRAN_CARLA_MAPPER_PID="$STATE_DIR/carla_ns3_mapper.pid"
     export GREENRAN_STAGE_CONTROLLER_PID="$STATE_DIR/runtime_stage_controller.pid"
     export GREENRAN_MARL_GATE_WATCH_PID="$STATE_DIR/marl_runtime_gate_watch.pid"
+    export GREENRAN_DB_SNAPSHOT_PID="$STATE_DIR/db_snapshot.pid"
+    export GREENRAN_TASAM_EXPORT_PID="$STATE_DIR/tasam_article_export.pid"
+    export GREENRAN_RAPP_ONLINE_RETRAIN_PID="$STATE_DIR/rapp_online_retrain.pid"
 
     export GREENRAN_STAGE_CONTROLLER_LOG="$STATE_DIR/runtime_stage_controller.log"
 
     mkdir -p "$GREENRAN_RUNS_DIR"
-    mkdir -p "$STATE_DIR/xapp_metrics" "$STATE_DIR/xapp_intents" "$STATE_DIR/rapp_policies" "$STATE_DIR/app3_veicular"
+    mkdir -p "$STATE_DIR/xapp_metrics" "$STATE_DIR/xapp_intents" "$STATE_DIR/rapp_policies" "$STATE_DIR/app3_veicular" "$GREENRAN_DB_SNAPSHOT_DIR" "$GREENRAN_TASAM_EXPORT_DIR"
 }
 
 create_greenran_run() {
@@ -247,6 +291,9 @@ snapshot_greenran_state() {
         "$GREENRAN_XAPP_ENERGY_LOG"
         "$GREENRAN_XAPP_VEHICLE_LOG"
         "$GREENRAN_CSV_LOG"
+        "$GREENRAN_DB_SNAPSHOT_LOG"
+        "$GREENRAN_TASAM_EXPORT_LOG"
+        "$GREENRAN_RAPP_ONLINE_RETRAIN_LOG"
         "$GREENRAN_PUSH_STATS_LOG"
         "$GREENRAN_PUSH_CVAR_LOG"
         "$GREENRAN_PUSH_APP1_LOG"
@@ -259,6 +306,13 @@ snapshot_greenran_state() {
         "$GREENRAN_DASHBOARD_LOG"
         "$GREENRAN_WATCHDOG_LOG"
         "$GREENRAN_DB_PATH"
+        "$GREENRAN_DB_SNAPSHOT_DIR/latest_snapshot.json"
+        "$GREENRAN_TASAM_EXPORT_DIR/latest_export.json"
+        "$GREENRAN_TASAM_EXPORT_DIR/rapp_online_retrain_latest.json"
+        "$GREENRAN_TASAM_EXPORT_DIR/tasam_article_export_summary.json"
+        "$GREENRAN_TASAM_EXPORT_DIR/tasam_article_trace.jsonl"
+        "$GREENRAN_TASAM_EXPORT_DIR/rapp_online_trainable_summary.json"
+        "$GREENRAN_TASAM_EXPORT_DIR/rapp_online_trainable_trace.jsonl"
         "$STATE_DIR/xapp_metrics/extended_metrics.json"
         "$STATE_DIR/xapp_metrics/metrics.json"
         "$STATE_DIR/rapp_policies/energy_policy.json"
