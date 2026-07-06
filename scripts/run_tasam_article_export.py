@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--limit",
         type=int,
-        default=_env_int("GREENRAN_TASAM_EXPORT_LIMIT", 0),
+        default=_env_int("GREENRAN_TASAM_EXPORT_LIMIT", 20000),
         help="Optional transition cap",
     )
     parser.add_argument(
