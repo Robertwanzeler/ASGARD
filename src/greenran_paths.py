@@ -9,6 +9,7 @@ reprodutibilidade e futura configuração por ambiente.
 
 import json
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -34,14 +35,20 @@ FLEXRIC_LIB_DIR = PROJECT_ROOT / "flexric_lib"
 FLEXRIC_BUILD_DIR = FLEXRIC_DIR / "build_e2ap_v1"
 NS3_DIR = PROJECT_ROOT / "ns-O-RAN-flexric" / "mmwave-LENA-oran"
 DRLEXP_DIR = PROJECT_ROOT / "drlexp"
-DRL_VENV_SITE_PACKAGES = DRLEXP_DIR / ".venv" / "lib" / "python3.12" / "site-packages"
+DRL_VENV_SITE_PACKAGES = (
+    DRLEXP_DIR
+    / ".venv"
+    / "lib"
+    / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    / "site-packages"
+)
 
 XAPP_INTENTS_DIR = STATE_DIR / "xapp_intents"
 XAPP_METRICS_DIR = STATE_DIR / "xapp_metrics"
 RAPP_POLICIES_DIR = STATE_DIR / "rapp_policies"
 CARLA_STATE_DIR = STATE_DIR / "carla_state"
 
-RAPP_DB_PATH = STATE_DIR / "rapp_data_lake.db"
+RAPP_DB_PATH = Path(os.environ.get("GREENRAN_DB_PATH", STATE_DIR / "rapp_data_lake.db")).resolve()
 RAPP_LOG_PATH = STATE_DIR / "rapp.log"
 XAPP_HEALTH_PATH = STATE_DIR / "xapp_health.json"
 AGENT_INTENT_PATH = STATE_DIR / "agent_intent.json"

@@ -2,7 +2,7 @@
   "scenario_id": "greenran_fixed_baseline_v1",
   "ns3": {
     "scenario_binary_pattern": "scenario-greenran",
-    "total_ues": 12,
+    "total_ues": 20,
     "camera_imsis": [
       1,
       2,
@@ -10,7 +10,7 @@
     ],
     "background_imsi_range": [
       4,
-      12
+      15
     ],
     "s1u_datarate_mbps": 15,
     "s1u_delay_ms": 5,
@@ -100,7 +100,10 @@
         "background_imsis": [
           10,
           11,
-          12
+          12,
+          13,
+          14,
+          15
         ],
         "vehicle_imsi_range": [
           16,

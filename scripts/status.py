@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
-"""Status em tempo real: coleta GreenRAN ou SAC Online + Shadow TA-SAM v4."""
+"""Status em tempo real: coleta GreenRAN ou TA-SAM online fiel ao artigo."""
 
 import json, os, re, sqlite3, subprocess, sys, time
 from pathlib import Path
 
-DIR = Path("/home/robert/orange_nuclear/runs/sac_bootstrap/online_sam_v1")
-LOG = DIR / "training_log.txt"
-CKPT = DIR / "online_sam_checkpoint.pt"
+from run_rapp_online_retrain import (
+    DEFAULT_REQUIRED_DECISION_TRANSITIONS,
+    DEFAULT_REQUIRED_SCENARIO_FAMILIES,
+    evaluate_collection_quality,
+    evaluate_readiness,
+)
+
+DIR = Path("/home/robert/orange_nuclear/runs/sac_bootstrap/online_tasam_marl")
+LOG = DIR / "online_tasam_marl_history.jsonl"
+SUMMARY = DIR / "online_tasam_marl_summary.json"
+CKPT = DIR / "online_tasam_marl_resume.pt"
 MANIFEST = Path("/home/robert/orange_nuclear/runs/sac_bootstrap/tasam_candidate_evaluation_latest.json")
 SHADOW_DIR = Path("/home/robert/orange_nuclear/runs/sac_bootstrap/tasam_marl_v4")
 TOTAL = 20000
 PROJECT_ROOT = Path("/home/robert/orange_nuclear")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from network_quality import evaluate_network_quality
+
 DEFAULT_COLLECTION_STATE = Path(
     os.environ.get(
         "GREENRAN_TASAM_ACTIVE_STATE_DIR",
@@ -37,80 +50,75 @@ def spark(vals, w=20):
 
 def read_log():
     if not LOG.exists(): return None
-    raw = LOG.read_text().splitlines()
-    ep, step, ret50, eval_ret, qos, alpha, rho, actor_loss = 0, 0, 0, 0, 0, 0, 0, 0
+    raw = LOG.read_text(encoding="utf-8").splitlines()
+    ep, step, ret50, eval_ret, alpha, rho, actor_loss, critic_loss, td_var = 0, 0, 0, 0, 0, 0, 0, 0, 0
     eval_hist = []
-    # First pass: find latest heartbeat and collect eval history
-    last_eval_line = None
+    returns = []
     for line in raw:
         line = line.strip()
         if not line: continue
-        if "return=" in line:
-            last_eval_line = line
-            m = re.search(r"ep=\s*(\d+).*?return=\s*([\d.-]+).*?eval_ret=\s*([\d.-]+).*?qos=([+-]\d\.\d+).*?actor_loss=([\d.-]+).*?rho=([\d.]+).*?alpha=([\d.]+)", line)
-            if m:
-                ep_e, ret, er, q, al, r, a = int(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4)), float(m.group(5)), float(m.group(6)), float(m.group(7))
-                if ep_e > 0:
-                    eval_ret, qos, alpha, rho, actor_loss = er, q, a, r, al
-                    eval_hist.append((ep_e, er, q, a, r))
-        elif "ret_avg50=" in line and "return=" not in line:
-            m = re.search(r"ep=\s*(\d+).*?step=\s*(\d+).*?ret_avg50=\s*([\d.-]+)", line)
-            if m:
-                ep = int(m.group(1))
-                step = int(m.group(2))
-                ret50 = float(m.group(3))
-                for tok in line.split():
-                    if tok.startswith("alpha="): alpha = float(tok.split("=")[1])
-                    if tok.startswith("rho="): rho = float(tok.split("=")[1])
-    return dict(ep=ep, step=step, ret50=ret50, eval_ret=eval_ret, qos=qos,
-                alpha=alpha, rho=rho, actor_loss=actor_loss, eval_hist=eval_hist)
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ep = int(payload.get("episode", 0) or 0)
+        step = int(payload.get("global_step", 0) or 0)
+        returns.append(float(payload.get("episode_return", 0.0) or 0.0))
+        alpha = float(payload.get("alpha", 0.0) or 0.0)
+        rho = float(payload.get("rho_actor", 0.0) or 0.0)
+        actor_loss = float(payload.get("actor_loss", 0.0) or 0.0)
+        critic_loss = float(payload.get("critic_loss", 0.0) or 0.0)
+        td_var = float(payload.get("effective_td_var_threshold", 0.0) or 0.0)
+    if returns:
+        ret50 = sum(returns[-50:]) / len(returns[-50:])
+    if SUMMARY.exists():
+        try:
+            summary = json.loads(SUMMARY.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            summary = {}
+        for item in summary.get("eval_history", []) or []:
+            eval_hist.append((
+                int(item.get("episode", 0) or 0),
+                float(item.get("mean_return", 0.0) or 0.0),
+                float(item.get("mean_embb_completion", 0.0) or 0.0),
+                float(item.get("mean_mmtc_completion", 0.0) or 0.0),
+                float(item.get("mean_urllc_completion", 0.0) or 0.0),
+            ))
+        if eval_hist:
+            eval_ret = float(eval_hist[-1][1])
+    return dict(ep=ep, step=step, ret50=ret50, eval_ret=eval_ret,
+                alpha=alpha, rho=rho, actor_loss=actor_loss, critic_loss=critic_loss,
+                td_var=td_var, eval_hist=eval_hist)
 
 
 def latest_run(hist):
     if not hist:
         return []
     run = []
-    for ep, er, q, a, r in hist:
+    for ep, er, embb, mmtc, urllc in hist:
         if run and ep < run[-1][0] and ep < 5000:
             run = []
-        run.append((ep, er, q, a, r))
+        run.append((ep, er, embb, mmtc, urllc))
     return run
 
 def proc_info():
     try:
-        r = subprocess.run(["ps", "-p", "4123913", "-o", "etime,%cpu,%mem,stat", "--no-headers"],
-                           capture_output=True, text=True, timeout=2)
-        data = r.stdout.strip()
-        if data:
-            parts = data.split()
-            et, cpu, mem, stat = parts[0], parts[1], parts[2], parts[3] if len(parts) == 4 else ("", "", "", parts[0])
-            icon = "\u2713" if "R" in stat else "\u26a0"
-            return f"{icon} PID 4123913  {et}  CPU {cpu}%  MEM {mem}%"
-        return "\u2717 MORTO"
-    except: return "\u2717 MORTO"
+        r = subprocess.run(["pgrep", "-af", "train_online_tasam_marl.py"], capture_output=True, text=True, timeout=2)
+        lines = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+        if not lines:
+            return "\u2717 PARADO"
+        pid = lines[0].split()[0]
+        return f"\u2713 PID {pid}  online_tasam_marl ativo"
+    except: return "\u2717 PARADO"
 
 def eta(ep):
     if ep < 100: return "calculando..."
-    # Use wall-clock rate since process start (from ps etime)
     try:
-        r = subprocess.run(["ps", "-p", "4123913", "-o", "etime", "--no-headers"],
-                           capture_output=True, text=True, timeout=2)
-        et = r.stdout.strip()
-        # Parse etime format: [[dd-]hh:mm:ss or mm:ss]
-        if "-" in et:
-            d, rest = et.split("-")
-            d = int(d)
-        else:
-            d = 0; rest = et
-        parts = rest.split(":")
-        if len(parts) == 3:
-            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-        elif len(parts) == 2:
-            h, m, s = 0, int(parts[0]), int(parts[1])
-        else:
+        if not LOG.exists():
             return "?h"
-        total_sec = d * 86400 + h * 3600 + m * 60 + s
-        if total_sec <= 0: return "?h"
+        total_sec = max(0.0, time.time() - LOG.stat().st_mtime)
+        if total_sec <= 0:
+            return "?h"
         eps_per_sec = ep / total_sec
         rem = TOTAL - ep
         sec = rem / eps_per_sec
@@ -148,21 +156,22 @@ def training_screen():
 
     os.system("clear")
     print("\033[1m" + "=" * 56 + "\033[0m")
-    print("  \033[1mSAC Online + SAM\033[0m          %s" % proc)
+    print("  \033[1mTA-SAM Online MARL\033[0m       %s" % proc)
     print("\033[1m" + "=" * 56 + "\033[0m")
     print("")
     print("  " + bar(pct))
     print("  \033[1m%5d\033[0m / %d episodios      step %s" % (ep, TOTAL, f"{info['step']:,}"))
     print("")
-    print("   ret_avg50   eval_ret    QoS    actor     alpha     rho")
+    print("   ret_avg50   eval_ret    td_var  actor     alpha     rho")
     r50 = info["ret50"]
     er = info["eval_ret"] if info["eval_ret"] else info["ret50"]
-    q = info["qos"] if info["qos"] else 0.94
     a = info["alpha"]
     r = info["rho"]
     al = info["actor_loss"]
-    print("  %s    %s   %.3f   %7.2f   %.3f   %.4f" % (
-        fmt_diff(r50), f"{er:.2f}".rjust(8) if er else "     ?", q, al or 0, a, r))
+    td = info["td_var"]
+    print("  %s    %s   %.4f   %7.2f   %.3f   %.4f" % (
+        fmt_diff(r50), f"{er:.2f}".rjust(8) if er else "     ?", td, al or 0, a, r))
+    print("  critic_loss=%7.4f" % (info["critic_loss"] or 0))
     if latest_ers:
         print("  eval_ret: " + spark(latest_ers))
         print("            " + "".join(f"{x:6.1f}" for x in latest_ers[-8:]))
@@ -371,6 +380,7 @@ def load_online_retrain_status(state):
         "exists": True,
         "status": str(manifest.get("status") or "unknown"),
         "reasons": list(manifest.get("reasons") or []),
+        "raw_manifest": manifest,
         "selected_classifier": str(classifier.get("selected_classifier") or ""),
         "rf_accuracy": classifier.get("random_forest_accuracy"),
         "xgb_accuracy": classifier.get("xgboost_accuracy"),
@@ -383,6 +393,244 @@ def load_online_retrain_status(state):
         "next_retrain_rows": int(manifest.get("next_retrain_rows", 0) or 0),
         "min_new_rows": int(((manifest.get("retrain_cadence") or {}).get("min_new_rows", 0)) or 0),
     }
+
+
+def load_training_readiness(state):
+    training_export = load_online_training_export(state)
+    if not training_export.get("manifest_exists"):
+        return {"exists": False}
+
+    export_dir = state / "tasam_article_export"
+    retrain_manifest = load_json(export_dir / "rapp_online_retrain_latest.json", {})
+    trainable_summary = {
+        "rows_after": int(training_export.get("trainable_rows", 0) or 0),
+        "decision_counts_after": dict(training_export.get("decision_counts") or {}),
+    }
+    min_trainable = 50
+    min_class_count = 5
+    required_classes = ["ALLOWED", "CONDITIONAL", "BLOCKED"]
+    readiness_status, readiness_reasons = evaluate_readiness(
+        trainable_summary,
+        min_trainable=min_trainable,
+        min_class_count=min_class_count,
+        required_classes=list(required_classes),
+    )
+
+    quality_report = {}
+    quality_gate = {}
+    if retrain_manifest:
+        quality_report = dict(retrain_manifest.get("collection_quality") or {})
+        quality_gate = dict(retrain_manifest.get("collection_quality_gate") or {})
+    if not quality_report:
+        quality_report = load_json(export_dir / "rapp_online_collection_quality.json", {})
+    quality_status = "unknown"
+    quality_reasons = []
+    quality_checks = {}
+    if quality_report:
+        quality_status, quality_reasons, quality_checks = evaluate_collection_quality(
+            quality_report,
+            max_class_dominance_ratio=0.55,
+            min_decision_transitions=30,
+            min_decision_transition_ratio=0.05,
+            min_distinct_decision_transitions=4,
+            required_decision_transitions=list(DEFAULT_REQUIRED_DECISION_TRANSITIONS),
+            required_scenario_families=list(DEFAULT_REQUIRED_SCENARIO_FAMILIES),
+            max_constant_feature_ratio=0.25,
+            min_valid_training_ratio=1.0,
+        )
+        if quality_gate:
+            quality_status = str(quality_gate.get("status") or quality_status)
+            quality_reasons = list(quality_gate.get("reasons") or quality_reasons)
+            quality_checks = dict(quality_gate.get("checks") or quality_checks)
+
+    target_trainable = int(retrain_manifest.get("target_trainable", 0) or 0)
+    next_retrain_rows = int(retrain_manifest.get("next_retrain_rows", 0) or 0)
+    min_new_rows = int(((retrain_manifest.get("retrain_cadence") or {}).get("min_new_rows", 0)) or 0)
+    trainable_rows = int(training_export.get("trainable_rows", 0) or 0)
+    last_trigger_rows = int(retrain_manifest.get("last_trigger_rows", 0) or 0)
+    new_rows_since_trigger = max(0, trainable_rows - last_trigger_rows)
+    decision_counts = dict(training_export.get("decision_counts") or {})
+    class_gaps = {
+        cls: max(0, min_class_count - int(decision_counts.get(cls, 0) or 0))
+        for cls in required_classes
+    }
+    rows_to_target = max(0, target_trainable - trainable_rows) if target_trainable > 0 else 0
+    rows_to_cadence = max(0, next_retrain_rows - trainable_rows) if next_retrain_rows > 0 else 0
+
+    final_status = str(retrain_manifest.get("status") or readiness_status)
+    final_reasons = list(retrain_manifest.get("reasons") or readiness_reasons)
+    if readiness_status == "ready" and quality_status == "ready":
+        if final_status == "blocked_new_rows":
+            if rows_to_cadence <= 0:
+                final_status = "ready"
+                final_reasons = []
+            else:
+                final_reasons = [f"new real trainable rows below cadence: {new_rows_since_trigger} < {min_new_rows}"]
+        elif final_status in {"blocked", "blocked_quality"} and not final_reasons:
+            final_status = "ready"
+    elif final_status not in {"blocked_new_rows", "blocked", "blocked_quality"}:
+        final_status = quality_status if quality_status != "ready" else readiness_status
+        final_reasons = quality_reasons if quality_status != "ready" else readiness_reasons
+
+    status_label_map = {
+        "ready": "PRONTA",
+        "blocked_new_rows": "AGUARDANDO_CADENCIA",
+        "blocked_quality": "BLOQUEADA_QUALIDADE",
+        "blocked": "BLOQUEADA_BASE",
+        "trained": "TREINADA",
+        "promoted": "PROMOVIDA",
+        "rejected_metrics": "REJEITADA_METRICAS",
+        "invalid_evaluation": "AVALIACAO_INVALIDA",
+        "failed": "FALHOU",
+    }
+    status_label = status_label_map.get(final_status, str(final_status).upper() or "DESCONHECIDO")
+
+    if final_status == "ready":
+        action = "pode disparar o retrain agora"
+    elif final_status == "blocked_new_rows":
+        action = f"aguardar +{fmt_num(rows_to_cadence)} linhas trainable reais"
+    elif final_reasons:
+        action = str(final_reasons[0])
+    else:
+        action = "continuar a coleta e reavaliar"
+
+    return {
+        "exists": True,
+        "status": final_status,
+        "status_label": status_label,
+        "reasons": final_reasons,
+        "action": action,
+        "trainable_rows": trainable_rows,
+        "target_trainable": target_trainable,
+        "rows_to_target": rows_to_target,
+        "last_trigger_rows": last_trigger_rows,
+        "new_rows_since_trigger": new_rows_since_trigger,
+        "next_retrain_rows": next_retrain_rows,
+        "rows_to_cadence": rows_to_cadence,
+        "min_new_rows": min_new_rows,
+        "min_trainable": min_trainable,
+        "min_class_count": min_class_count,
+        "required_classes": list(required_classes),
+        "decision_counts": decision_counts,
+        "class_gaps": class_gaps,
+        "quality_status": quality_status,
+        "quality_reasons": quality_reasons,
+        "quality_checks": quality_checks,
+        "scenario_family_counts": dict((quality_report.get("scenario_families") or {}).get("counts") or {}),
+        "decision_transition_total": int(((quality_report.get("decision_transitions") or {}).get("total", 0)) or 0),
+        "decision_transition_distinct": int(((quality_report.get("decision_transitions") or {}).get("distinct", 0)) or 0),
+        "decision_transition_ratio": float(((quality_report.get("decision_transitions") or {}).get("ratio", 0.0)) or 0.0),
+        "dominant_class": str(((quality_report.get("class_balance") or {}).get("dominant_class")) or ""),
+        "dominant_ratio": float(((quality_report.get("class_balance") or {}).get("dominant_ratio", 0.0)) or 0.0),
+        "valid_for_training_ratio": float(((quality_report.get("collection_purity") or {}).get("valid_for_training_ratio", 0.0)) or 0.0),
+    }
+
+
+def load_true_online_status(state):
+    online_dir = state / "tasam_true_online_real"
+    status = load_json(online_dir / "true_online_status.json", {})
+    runner_state = load_json(online_dir / "true_online_state.json", {})
+    summary = load_json(online_dir / "tasam_selective" / "tasam_marl_summary.json", {})
+    if not status and not runner_state and not summary:
+        return {"exists": False, "online_dir": str(online_dir)}
+
+    final_metrics = dict(summary.get("final_metrics") or {})
+    return {
+        "exists": True,
+        "online_dir": str(online_dir),
+        "status": str(status.get("status") or "unknown"),
+        "reason": str(status.get("reason") or ""),
+        "written_transitions": int(status.get("written_transitions", 0) or 0),
+        "target_epochs": int(status.get("target_epochs", status.get("target_epochs_next", 0)) or 0),
+        "counts": dict(status.get("counts") or {}),
+        "updates_completed": int(status.get("updates_completed", runner_state.get("updates_completed", 0)) or 0),
+        "completed_epochs": int(summary.get("completed_epochs", 0) or 0),
+        "summary_target_epochs": int(summary.get("target_epochs", 0) or 0),
+        "last_written_transitions": int(runner_state.get("last_written_transitions", 0) or 0),
+        "model_dir": str(status.get("model_dir") or summary.get("checkpoint_root") or (online_dir / "tasam_selective")),
+        "eval_return": final_metrics.get("eval_return"),
+        "cumulative_return": final_metrics.get("cumulative_return"),
+        "summary_exists": bool(summary),
+        "status_exists": bool(status),
+        "state_exists": bool(runner_state),
+    }
+
+
+def parse_bool_env(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_runtime_ml_status():
+    runtime = load_json(PROJECT_ROOT / "config" / "core" / "runtime.json", {})
+    ml = (runtime.get("ml") or {}) if isinstance(runtime, dict) else {}
+    ml_enabled = bool(ml.get("enabled", True))
+    ml_retrain_enabled = bool(ml.get("retrain_enabled", True))
+
+    if "GREENRAN_ML_ENABLED" in os.environ:
+        ml_enabled = parse_bool_env(os.environ.get("GREENRAN_ML_ENABLED"))
+    if "GREENRAN_ML_RETRAIN_ENABLED" in os.environ:
+        ml_retrain_enabled = parse_bool_env(os.environ.get("GREENRAN_ML_RETRAIN_ENABLED"))
+
+    return {
+        "ml_enabled": ml_enabled,
+        "ml_retrain_enabled": ml_retrain_enabled and ml_enabled,
+    }
+
+
+def load_shadow_runtime_status(db_path, window=300):
+    out = {
+        "available": False,
+        "window": int(window),
+        "sample_count": 0,
+        "positive_score_rate": 0.0,
+        "recommend_rate": 0.0,
+        "avg_score_delta": 0.0,
+        "latest_readiness": "",
+        "latest_policy_id": "",
+    }
+    if not db_path.exists():
+        return out
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cur = con.cursor()
+        rows = cur.execute(
+            """
+            SELECT
+                score_delta,
+                recommend_shadow,
+                checkpoint_readiness,
+                policy_id
+            FROM marl_shadow_comparison_history
+            ORDER BY rowid DESC
+            LIMIT ?
+            """,
+            (int(window),),
+        ).fetchall()
+        con.close()
+    except Exception:
+        return out
+
+    if not rows:
+        return out
+
+    sample_count = len(rows)
+    positive_rows = sum(1 for row in rows if float(row[0] or 0.0) > 0.01)
+    recommend_rows = sum(1 for row in rows if int(row[1] or 0) == 1)
+    avg_score_delta = sum(float(row[0] or 0.0) for row in rows) / sample_count
+    latest = rows[0]
+    out.update(
+        {
+            "available": True,
+            "sample_count": sample_count,
+            "positive_score_rate": positive_rows / sample_count,
+            "recommend_rate": recommend_rows / sample_count,
+            "avg_score_delta": avg_score_delta,
+            "latest_readiness": str(latest[2] or ""),
+            "latest_policy_id": str(latest[3] or ""),
+        }
+    )
+    return out
 
 
 def db_snapshot(db_path):
@@ -462,6 +710,10 @@ def collection_screen():
     db = db_snapshot(db_path)
     training_export = load_online_training_export(state)
     retrain_status = load_online_retrain_status(state)
+    training_readiness = load_training_readiness(state)
+    true_online = load_true_online_status(state)
+    runtime_ml = load_runtime_ml_status()
+    shadow_runtime = load_shadow_runtime_status(db_path)
     lines = ps_lines()
 
     ns3 = (
@@ -472,6 +724,7 @@ def collection_screen():
     collector = process_from_pid_file(state / "csv_metrics.pid") or find_process(["csv_to_metrics.py", str(state)], lines) or find_process(["csv_to_metrics.py"], lines)
     rapp = process_from_pid_file(state / "rapp.pid") or find_process(["rapp_orchestrator.py", str(state)], lines) or find_process(["rapp_orchestrator.py"], lines)
     alternator = process_from_pid_file(state / "collection_event_alternator.pid") or find_process(["collection_event_alternator.py"], lines)
+    true_online_proc = process_from_pid_file(state / "tasam_true_online_real.pid") or find_process(["run_tasam_true_online_real.py", str(state / "tasam_true_online_real")], lines) or find_process(["run_tasam_true_online_real.py"], lines)
 
     ext_count = db["counts"].get("extended_metrics", 0)
     decisions = db["decisions"]
@@ -489,6 +742,12 @@ def collection_screen():
     print(f"  coletor:    {alive_text(collector)}")
     print(f"  rApp:       {alive_text(rapp)}")
     print(f"  alternador: {alive_text(alternator)}")
+    if shadow_runtime.get("available"):
+        print(
+            "  Accuracy operacional: "
+            f"{fmt_float(shadow_runtime.get('positive_score_rate', 0.0) * 100.0, 2)}%"
+            f"  (TA-SAM shadow vence live no score, janela={shadow_runtime.get('sample_count', 0)})"
+        )
     print("")
 
     collector_mode = gm.get("collector_mode", "?")
@@ -503,6 +762,21 @@ def collection_screen():
     print(f"    sim_end:         {fmt_float(sim.get('end'), 2)}s  janela={fmt_float(sim.get('window_s'), 2)}s  span_db={fmt_float(sim_span, 2)}s")
     print(f"    throughput:      {fmt_float(gm.get('throughput_kbps'), 1)} kbps  fonte={gm.get('throughput_source', '?')}")
     print(f"    P95/CVaR:        {fmt_float(float(gm.get('latency_p95_us', 0) or 0)/1000, 2)} ms / {fmt_float(float(gm.get('cvar_per_ue_us', 0) or 0)/1000, 2)} ms")
+    network_quality = evaluate_network_quality(metrics)
+    print(
+        "    qualidade rede:  "
+        f"{fmt_float(network_quality.get('score', 0.0), 2)}/100  "
+        f"({network_quality.get('label', 'DESCONHECIDA')})"
+    )
+    print(
+        "    sinais rede:     "
+        f"camera={fmt_float(network_quality.get('camera_score', 0.0), 1)}  "
+        f"sensores={fmt_float(network_quality.get('sensor_score', 0.0), 1)}  "
+        f"veiculos={fmt_float(network_quality.get('vehicle_score', 0.0), 1)}  "
+        f"núcleo={fmt_float(network_quality.get('core_score', 0.0), 1)}"
+    )
+    if network_quality.get("reasons"):
+        print(f"    alertas:          {'; '.join(network_quality.get('reasons', [])[:2])}")
     trace_status = trace_status_from_metrics(state, gm)
     pdcp_status = trace_status.get('pdcp', {}) or {}
     rlc_status = trace_status.get('rlc', {}) or {}
@@ -530,49 +804,34 @@ def collection_screen():
     print(f"    100k: {collection_bar(ext_count, 100_000)}")
     print("")
 
-    if training_export.get("manifest_exists"):
-        train_decisions = training_export.get("decision_counts") or {}
-        print("  \033[1mTreino online\033[0m")
+    if true_online.get("exists"):
+        print("  \033[1mTA-SAM Online Real\033[0m")
+        print(f"    runner:            {alive_text(true_online_proc)}")
         print(
-            "    raw/trainable:     "
-            f"{fmt_num(training_export.get('raw_rows', 0))} / {fmt_num(training_export.get('trainable_rows', 0))}"
+            "    status:            "
+            f"{true_online.get('status', 'unknown')}"
+            + (f"  ({true_online.get('reason')})" if true_online.get("reason") else "")
         )
-        print(
-            "    profile/descarte:  "
-            f"{training_export.get('profile', '?')} / {fmt_float(training_export.get('drop_ratio', 0.0) * 100.0, 1)}%"
-        )
-        print(
-            "    classes trainable: "
-            "ALLOWED={allowed}  BLOCKED={blocked}  CONDITIONAL={conditional}".format(
-                allowed=fmt_num(train_decisions.get("ALLOWED", 0)),
-                blocked=fmt_num(train_decisions.get("BLOCKED", 0)),
-                conditional=fmt_num(train_decisions.get("CONDITIONAL", 0)),
-            )
-        )
-        if retrain_status.get("exists"):
-            if retrain_status.get("target_trainable", 0) > 0:
-                print(
-                    "    meta/coleta:       "
-                    f"{fmt_num(training_export.get('trainable_rows', 0))} / {fmt_num(retrain_status.get('target_trainable', 0))}"
-                )
-            if retrain_status.get("next_retrain_rows", 0) > 0:
-                print(
-                    "    próx checkpoint:   "
-                    f"{fmt_num(retrain_status.get('next_retrain_rows', 0))}"
-                    f"  (+{fmt_num(retrain_status.get('min_new_rows', 0))})"
-                )
+        if true_online.get("written_transitions", 0) > 0 or true_online.get("last_written_transitions", 0) > 0:
             print(
-                "    retrain:           "
-                f"{retrain_status.get('status', 'unknown')}"
-                f"  clf={retrain_status.get('selected_classifier', '') or '-'}"
+                "    transições:        "
+                f"{fmt_num(true_online.get('written_transitions', 0) or true_online.get('last_written_transitions', 0))}"
             )
-            if retrain_status.get("metric_gate_status"):
-                print(
-                    "    gate métricas:     "
-                    f"{retrain_status.get('metric_gate_status')}  "
-                    f"acc={fmt_float(retrain_status.get('rf_accuracy'), 3)}  "
-                    f"r2={fmt_float(retrain_status.get('regressor_r2'), 3)}"
-                )
+        if true_online.get("target_epochs", 0) > 0 or true_online.get("completed_epochs", 0) > 0:
+            target_epochs = int(true_online.get("summary_target_epochs", 0) or true_online.get("target_epochs", 0) or 0)
+            completed_epochs = int(true_online.get("completed_epochs", 0) or 0)
+            print(
+                "    epochs:            "
+                f"{fmt_num(completed_epochs)} / {fmt_num(target_epochs)}"
+            )
+        print(f"    updates:           {fmt_num(true_online.get('updates_completed', 0))}")
+        if true_online.get("summary_exists"):
+            print(
+                "    métricas:          "
+                f"eval={fmt_float(true_online.get('eval_return'), 4)}  "
+                f"cum={fmt_float(true_online.get('cumulative_return'), 2)}"
+            )
+        print(f"    diretório:         {true_online.get('online_dir')}")
         print("")
 
     print("  \033[1mDecisões\033[0m")
@@ -602,13 +861,13 @@ def collection_screen():
     print("")
 
     if collector_mode == "pdcp_stale" or bool(pdcp_status.get('stale')):
-        print("  \033[33mAtenção:\033[0m PDCP travado/stale; snapshot atual deve ser filtrado antes do treino.")
+        print("  \033[33mAtenção:\033[0m PDCP travado/stale; snapshot atual deve ser filtrado antes de operar.")
     elif collector_mode != "pdcp_real" or int(proxy or 0) > 0:
-        print("  \033[33mAtenção:\033[0m dado atual não está 100% PDCP real. Filtrar antes do treino.")
+        print("  \033[33mAtenção:\033[0m dado atual não está 100% PDCP real. Filtrar antes de operar.")
     elif ext_count < 10_000:
-        print("  Leitura: coleta válida, mas ainda pequena para treino forte.")
+        print("  Leitura: coleta válida, mas ainda pequena para operar com mais confiança.")
     else:
-        print("  Leitura: coleta válida para treino inicial; continue para mais diversidade.")
+        print("  Leitura: coleta válida para operação TA-SAM/ARMD; continue monitorando.")
     print("\033[1m" + "=" * 72 + "\033[0m")
     sys.stdout.flush()
 

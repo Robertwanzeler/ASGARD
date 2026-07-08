@@ -20,7 +20,7 @@ Camada responsavel pela infraestrutura de orquestracao, observabilidade e contro
 - Orquestracao `rApp -> xApps`
 - Dashboard operacional
 - Exportacao para Grafana/InfluxDB
-- Predicao e suporte a decisao com RF/DRL
+- Predicao e suporte a decisao com RF e TA-SAM em shadow/control gate
 - Interface de intencoes e politica
 
 ### Modulos atuais
@@ -32,10 +32,12 @@ Camada responsavel pela infraestrutura de orquestracao, observabilidade e contro
 - `src/rapp_a1_interface.py`
 - `src/rapp_xapp_manager.py`
 - `src/rapp_ml_predictor.py`
-- `src/rapp_drl_predictor.py`
+- `src/rapp_marl_shadow.py`
 - `src/rapp_agent_openran.py`
-- `scripts/smoke_drl_sequence.py`
-- `scripts/summarize_drl_trace.py`
+- `scripts/run_tasam_greenran_real.py`
+- `scripts/run_tasam_article_reproduction.py`
+- `scripts/run_tasam_legacy_real.py`
+- `scripts/monitor_training.py`
 
 ### Meta de pronto
 
@@ -44,7 +46,9 @@ Camada responsavel pela infraestrutura de orquestracao, observabilidade e contro
 - Sem caminhos absolutos codificados
 - Logs e resultados por experimento
 - Dashboard consistente para demo
-- DRL com warmup/control loop mais estavel sem alterar a politica do `rApp`
+- Runtime ao vivo preservado com politica heuristica
+- DRL restrita ao artigo `Task-Specific Sharpness-Aware O-RAN Resource Management Using MARL`
+- Tres trilhas oficiais: GreenRAN atual + TA-SAM, cenario do artigo + TA-SAM, base de referencia + TA-SAM
 
 ## 2. App1-Vigilancia
 
@@ -157,8 +161,8 @@ runs/
 ### Fase 4 - IA avancada
 
 - Reposicionar `Agentic AI`
-- Integrar DRL com criterio experimental
-- Decidir o papel da trilha `two-tower/conflict`
+- Integrar TA-SAM com criterio experimental sem alterar a arquitetura do cenario atual
+- Manter GraphSAGE/ARMD fora da trilha DRL do artigo
 
 ### Fase 5 - Paper e demonstracao
 

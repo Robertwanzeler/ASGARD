@@ -341,7 +341,7 @@ class TrendAnalysis:
         slope = trend_info['slope_ms_per_sec']
         current_ms = trend_info['current_latency_ms']
         trend = trend_info['trend']
-        time_to_critical = trend_info['time_to_critical_ms']
+        time_to_critical = trend_info.get('time_to_critical_ms')
         
         decision = 'CONDITIONAL'
         preventive = False

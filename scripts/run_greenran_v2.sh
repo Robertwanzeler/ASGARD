@@ -380,6 +380,10 @@ cleanup_ns3_runtime_artifacts() {
         "DlPdcpStats.txt"
         "DlMacStats.txt"
         "DlRlcStats.txt"
+        "LteDlPdcpStats.txt"
+        "LteUlPdcpStats.txt"
+        "LteDlRlcStats.txt"
+        "LteUlRlcStats.txt"
         "cu-up-cell-*.txt"
         "cu-cp-cell-*.txt"
         "du-cell-*.txt"
@@ -606,7 +610,7 @@ if [ "$GREENRAN_CLEAN_SCOPE" != "instance" ]; then
 fi
 
 # Configura as bibliotecas (CRÍTICO para todos os processos)
-export LD_LIBRARY_PATH=$BASE_DIR/flexric/build_e2ap_v1/src/ric:$BASE_DIR/flexric_lib:$BASE_DIR/flexric/build_e2ap_v1/src/xApp:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$RIC_DIR/src/ric:$BASE_DIR/flexric_lib:$RIC_DIR/src/xApp:${LD_LIBRARY_PATH:-}
 
 echo -e "${BLUE}=== [2/6] Verificando processos restantes ===${NC}"
 
@@ -686,7 +690,16 @@ if [ -n "$NS3_MAX_SIM_TIME" ] && [ "$SIM_TIME" -gt "$NS3_MAX_SIM_TIME" ]; then
 fi
 echo -e "${GREEN}    Binário ns-3: $NS3_BIN${NC}"
 echo -e "${GREEN}    Perfil ns-3: $NS3_RUNTIME_PROFILE_MSG${NC}"
-GREENRAN_NS3_ENABLE_TRACES="${GREENRAN_NS3_ENABLE_TRACES:-0}"
+if [ -z "${GREENRAN_NS3_ENABLE_TRACES+x}" ]; then
+    case "${GREENRAN_COLLECTION_EVENT_PROFILE}:${GREENRAN_RAN_PRESSURE_PROFILE}" in
+        *drl*|*DRL*|*tasam*|*TA-SAM*|*article*|*ARTICLE*)
+            GREENRAN_NS3_ENABLE_TRACES="1"
+            ;;
+        *)
+            GREENRAN_NS3_ENABLE_TRACES="0"
+            ;;
+    esac
+fi
 echo -e "${GREEN}    Pressao RAN: $GREENRAN_RAN_PRESSURE_PROFILE${NC}"
 echo -e "${GREEN}    Traces ns-3: $GREENRAN_NS3_ENABLE_TRACES${NC}"
 echo -e "${GREEN}    simTime efetivo: $SIM_TIME s${NC}"
@@ -766,7 +779,7 @@ else
 fi
 
 echo -e "${BLUE}=== [5/9] Iniciando Leitor de Métricas ===${NC}"
-setsid /bin/bash -lc "cd '$BASE_DIR' && while true; do python3 ./src/csv_to_metrics.py --input-dir ./ns-O-RAN-flexric/mmwave-LENA-oran --output '$STATE_DIR/xapp_metrics/metrics.json' --poll-interval '$GREENRAN_COLLECTOR_POLL_INTERVAL'; code=\$?; echo \"[CSV_METRICS_SUPERVISOR] collector exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_CSV_LOG" 2>&1 &
+setsid /bin/bash -lc "cd '$BASE_DIR' && export GREENRAN_STATE_DIR='$STATE_DIR' GREENRAN_DB_PATH='$GREENRAN_DB_PATH' && while true; do python3 ./src/csv_to_metrics.py --input-dir ./ns-O-RAN-flexric/mmwave-LENA-oran --output '$STATE_DIR/xapp_metrics/metrics.json' --poll-interval '$GREENRAN_COLLECTOR_POLL_INTERVAL'; code=\$?; echo \"[CSV_METRICS_SUPERVISOR] collector exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_CSV_LOG" 2>&1 &
 echo $! > "$GREENRAN_CSV_PID"
 sleep 2
 
@@ -782,8 +795,8 @@ echo -e "${BLUE}    - xApp ENERGY: ativado pelo rApp quando permitido ===${NC}"
 
 echo -e "${BLUE}=== [7/9] Initiating rApp Orchestrator (ML TRAINING) ===${NC}"
 RAPP_PYTHON_BIN="python3"
-case "${GREENRAN_RL_POLICY:-legacy_a3c}" in
-    sac|caora_sac|resource_sac|awac|caora_awac|resource_awac)
+case "${GREENRAN_RL_POLICY:-heuristic}" in
+    ta_sam_shadow|tasam_shadow|ta-sam-shadow|tasam-shadow)
         if [ -x "$BASE_DIR/drlexp/.venv/bin/python" ]; then
             RAPP_PYTHON_BIN="$BASE_DIR/drlexp/.venv/bin/python"
             echo -e "${GREEN}    rApp usando virtualenv RL: $RAPP_PYTHON_BIN${NC}"
@@ -792,7 +805,7 @@ case "${GREENRAN_RL_POLICY:-legacy_a3c}" in
         fi
         ;;
 esac
-setsid "$RAPP_PYTHON_BIN" ./src/rapp_orchestrator.py --synthetic "$GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS" --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" > "$GREENRAN_RAPP_LOG" 2>&1 &
+setsid env GREENRAN_STATE_DIR="$STATE_DIR" GREENRAN_DB_PATH="$GREENRAN_DB_PATH" "$RAPP_PYTHON_BIN" ./src/rapp_orchestrator.py --synthetic "$GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS" --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" > "$GREENRAN_RAPP_LOG" 2>&1 &
 echo $! > "$GREENRAN_RAPP_PID"
 sleep 3
 

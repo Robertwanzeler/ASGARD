@@ -18,6 +18,7 @@ from greenran_paths import EXTENDED_METRICS_JSON_PATH, STATE_DIR, as_str
 
 EXTENDED_METRICS_PATH = as_str(EXTENDED_METRICS_JSON_PATH)
 APP3_MONITORING_PATH = as_str(STATE_DIR / "app3_veicular" / "monitoring_snapshot.json")
+SCENARIO_CONTROL_PATH = as_str(STATE_DIR / "article00_scenario_control.json")
 
 
 def safe_read_json_file(path: str) -> dict[str, Any]:
@@ -29,6 +30,66 @@ def safe_read_json_file(path: str) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _load_vehicle_override(path: str = SCENARIO_CONTROL_PATH) -> dict[str, Any]:
+    payload = safe_read_json_file(path)
+    override = payload.get("vehicle_override", {}) if isinstance(payload, dict) else {}
+    if not isinstance(override, dict) or not override.get("enabled", False):
+        return {}
+    return override
+
+
+def _build_vehicle_metrics_from_override(override: dict[str, Any]) -> dict[str, Any]:
+    total_vehicles = max(0, int(override.get("total_vehicles", 0) or 0))
+    if total_vehicles <= 0:
+        return {}
+
+    high_risk = max(0, min(total_vehicles, int(override.get("high_risk_vehicles", 0) or 0)))
+    medium_risk = max(0, min(total_vehicles, int(override.get("medium_risk_vehicles", 0) or 0)))
+    degraded = max(0, min(total_vehicles, int(override.get("degraded_autonomy_vehicles", 0) or 0)))
+    ego_latency_ms = float(override.get("ego_latency_ms", 0.0) or 0.0)
+    traffic_latency_ms = float(override.get("traffic_latency_ms", ego_latency_ms) or ego_latency_ms)
+    ego_loss = float(override.get("ego_packet_loss_percent", 0.0) or 0.0)
+    traffic_loss = float(override.get("traffic_packet_loss_percent", ego_loss) or ego_loss)
+    max_speed_mps = float(override.get("max_speed_mps", 0.0) or 0.0)
+
+    vehicles = []
+    for index in range(total_vehicles):
+        is_ego = index == 0
+        is_high = index < high_risk
+        is_medium = not is_high and (index - high_risk) < medium_risk
+        autonomy_degraded = index < degraded
+        vehicles.append(
+            {
+                "imsi": str(16 + index),
+                "vehicle_id": f"scenario-veh-{index + 1:03d}",
+                "vehicle_role": "ego" if is_ego else "traffic",
+                "autonomy_state": "degraded" if autonomy_degraded else "normal",
+                "risk_state": "high" if is_high else ("medium" if is_medium else "low"),
+                "latency_ms": ego_latency_ms if is_ego else traffic_latency_ms,
+                "packet_loss_percent": ego_loss if is_ego else traffic_loss,
+                "speed_mps": max_speed_mps,
+                "lane_id": f"L{(index % 3) + 1}",
+                "waypoint_id": f"scenario-wp-{index + 1:03d}",
+            }
+        )
+
+    return {
+        "available": True,
+        "stale": False,
+        "age_seconds": 0.0,
+        "total_vehicles": total_vehicles,
+        "ego_present": total_vehicles > 0,
+        "high_risk_vehicles": high_risk,
+        "medium_risk_vehicles": medium_risk,
+        "degraded_autonomy_vehicles": degraded,
+        "max_latency_ms": max(float(v.get("latency_ms", 0.0) or 0.0) for v in vehicles),
+        "max_packet_loss_percent": max(float(v.get("packet_loss_percent", 0.0) or 0.0) for v in vehicles),
+        "max_speed_mps": max_speed_mps,
+        "vehicles": vehicles,
+        "scenario_mode": str(override.get("mode", "scenario_control_override") or "scenario_control_override"),
+    }
 
 
 def get_vehicle_metrics(
@@ -52,6 +113,12 @@ def get_vehicle_metrics(
     }
 
     try:
+        override = _load_vehicle_override()
+        if override:
+            override_metrics = _build_vehicle_metrics_from_override(override)
+            if override_metrics:
+                return override_metrics
+
         extended = safe_read_json_file(extended_metrics_path)
         ue_metrics = (extended.get("ue_metrics", {}) or {}) if isinstance(extended, dict) else {}
 

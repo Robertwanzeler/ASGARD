@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import sys
 
@@ -249,7 +250,7 @@ class TestCsvToMetricsProxyLatency(unittest.TestCase):
         self.assertEqual(vehicle["latency_us"], 42000.0)
         self.assertEqual(result["global_metrics"]["latency_sample_source_counts"], {"pdcp_real": 1})
 
-    def test_vehicle_scenario_override_forces_safe_vehicle_state_even_with_real_pdcp(self):
+    def test_vehicle_scenario_override_preserves_real_pdcp_latency(self):
         collector = self._collector()
         base = Path(collector.output_file).parent
         collector.scenario_control_path = base / "article00_scenario_control.json"
@@ -298,11 +299,11 @@ class TestCsvToMetricsProxyLatency(unittest.TestCase):
         self.assertEqual(vehicle["vehicle_role"], "ego")
         self.assertEqual(vehicle["risk_state"], "low")
         self.assertEqual(vehicle["autonomy_state"], "normal")
-        self.assertEqual(vehicle["latency_source"], "vehicle_state_proxy")
-        self.assertTrue(vehicle["latency_is_proxy"])
-        self.assertEqual(vehicle["latency_us"], 12000.0)
+        self.assertEqual(vehicle["latency_source"], "pdcp_real")
+        self.assertFalse(vehicle["latency_is_proxy"])
+        self.assertEqual(vehicle["latency_us"], 120000.0)
         self.assertAlmostEqual(vehicle["packet_loss_percent"], 0.05)
-        self.assertEqual(result["global_metrics"]["latency_sample_source_counts"], {"vehicle_state_proxy": 1})
+        self.assertEqual(result["global_metrics"]["latency_sample_source_counts"], {"pdcp_real": 1})
 
     def test_pdcp_path_merges_carla_vehicles_missing_from_pdcp(self):
         collector = self._collector()
@@ -399,6 +400,106 @@ class TestCsvToMetricsProxyLatency(unittest.TestCase):
         self.assertTrue(vehicle["latency_is_proxy"])
         self.assertEqual(vehicle["latency_source"], "vehicle_state_proxy")
         self.assertEqual(vehicle["throughput_source"], "carla_context_only")
+
+    def test_strict_real_only_mode_skips_snapshot_when_proxy_latency_is_present(self):
+        collector = self._collector()
+        collector.require_real_pdcp = True
+        collector.running = True
+        collector._resolve_trace_file = mock.Mock(
+            side_effect=lambda kind: Path("/tmp/DlPdcpStats.txt") if kind == "pdcp" else Path("/tmp/DlRlcStats.txt")
+        )
+        collector.process_pdcp_stats = mock.Mock(side_effect=lambda *_args, **_kwargs: [{"time_start": 1.0, "time_end": 2.0}])
+        collector.process_mac_stats = mock.Mock(return_value=[])
+        collector.process_rlc_stats = mock.Mock(return_value=[])
+        collector.process_mmwave_sched_stats = mock.Mock(return_value={})
+        collector.process_cu_up_stats = mock.Mock(return_value={"per_ue": {}, "total_throughput_kbps": 0.0})
+        collector._trace_status = mock.Mock(return_value={"stale": False, "age_s": 0.1, "latest_sim_time_s": 2.0})
+        collector.aggregate_metrics = mock.Mock(return_value={
+            "timestamp": 1,
+            "sim_time_range": {"start": 1.0, "end": 2.0, "window_s": 1.0},
+            "ue_metrics": {
+                "1": {
+                    "latency_is_proxy": False,
+                    "device_type": "camera",
+                    "latency_us": 42000.0,
+                    "throughput_kbps": 1000.0,
+                    "packet_count": 1,
+                },
+                "2": {
+                    "latency_is_proxy": True,
+                    "device_type": "sensor",
+                    "latency_us": 118000.0,
+                    "throughput_kbps": 32.0,
+                    "packet_count": 1,
+                },
+            },
+            "global_metrics": {
+                "collector_mode": "pdcp_real",
+                "proxy_latency_sample_count": 1,
+                "real_latency_sample_count": 1,
+                "global_worst_latency_us": 118000.0,
+                "global_avg_latency_us": 80000.0,
+                "total_active_ues": 2,
+                "total_active_sensors": 1,
+                "throughput_kbps": 1032.0,
+            },
+            "active_cameras": 1,
+            "critical_cameras": 0,
+        })
+
+        written_targets = []
+
+        def fake_write_metrics(payload, path):
+            written_targets.append(path)
+
+        collector.write_metrics = fake_write_metrics
+        collector.export_device_roles_snapshot = mock.Mock()
+        collector.export_app2_metrics = mock.Mock()
+        collector.write_standard_metrics = mock.Mock(return_value={"timestamp": 1})
+
+        sleep_calls = {"count": 0}
+
+        def fake_sleep(_seconds):
+            sleep_calls["count"] += 1
+            collector.running = False
+
+        with mock.patch("csv_to_metrics.time.sleep", side_effect=fake_sleep):
+            collector.run()
+
+        self.assertEqual(written_targets, [])
+        collector.export_device_roles_snapshot.assert_not_called()
+        collector.export_app2_metrics.assert_not_called()
+        collector.write_standard_metrics.assert_not_called()
+        self.assertEqual(sleep_calls["count"], 1)
+
+    def test_strict_real_only_mode_clears_stale_json_when_pdcp_is_missing(self):
+        collector = self._collector()
+        collector.require_real_pdcp = True
+        collector.running = True
+        Path(collector.output_file).write_text('{"stale": true}\n', encoding="utf-8")
+        Path(collector.extended_output_file).write_text('{"stale": true}\n', encoding="utf-8")
+        collector._resolve_trace_file = mock.Mock(
+            side_effect=lambda kind: Path("/tmp/DlPdcpStats.txt") if kind == "pdcp" else Path("/tmp/DlRlcStats.txt")
+        )
+        collector.process_pdcp_stats = mock.Mock(return_value=[])
+        collector.process_mac_stats = mock.Mock(return_value=[])
+        collector.process_rlc_stats = mock.Mock(return_value=[])
+        collector.process_mmwave_sched_stats = mock.Mock(return_value={})
+        collector.process_cu_up_stats = mock.Mock(return_value={"per_ue": {}, "total_throughput_kbps": 0.0})
+        collector._trace_status = mock.Mock(return_value={"stale": False, "age_s": 0.1, "latest_sim_time_s": 0.0})
+
+        sleep_calls = {"count": 0}
+
+        def fake_sleep(_seconds):
+            sleep_calls["count"] += 1
+            collector.running = False
+
+        with mock.patch("csv_to_metrics.time.sleep", side_effect=fake_sleep):
+            collector.run()
+
+        self.assertFalse(Path(collector.output_file).exists())
+        self.assertFalse(Path(collector.extended_output_file).exists())
+        self.assertEqual(sleep_calls["count"], 1)
 
 
 if __name__ == "__main__":

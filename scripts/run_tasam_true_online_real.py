@@ -6,7 +6,7 @@ This runner is intentionally 100% real-data:
   - exports an article-aligned MARL transition trace from real runtime history
   - performs small resumed TA-SAM updates whenever enough new snapshots arrive
 
-It does NOT use OnlineMARLEnv or any synthetic Markov generator.
+It does NOT use any synthetic online environment or Markov generator.
 """
 
 from __future__ import annotations

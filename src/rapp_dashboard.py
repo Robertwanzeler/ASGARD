@@ -52,6 +52,8 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
+from network_quality import evaluate_network_quality
+
 from apps.app3_veicular.backend.services import VehicleStateStore  # noqa: E402
 
 app = Flask(__name__, template_folder=as_str(TEMPLATES_DIR))
@@ -93,6 +95,10 @@ VEHICLE_LATENCY_WARNING_MS = 50.0
 VEHICLE_LATENCY_CRITICAL_MS = 100.0
 VEHICLE_PACKET_LOSS_WARNING_PERCENT = 2.0
 VEHICLE_PACKET_LOSS_CRITICAL_PERCENT = 5.0
+CAMERA_THROUGHPUT_MIN_MBPS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("camera_throughput_target_mbps", 25.0) or 25.0)
+CAMERA_THROUGHPUT_GUARD_MBPS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("camera_throughput_guard_mbps", 30.0) or 30.0)
+CAMERA_LATENCY_WARNING_MS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("camera_latency_warning_ms", 80.0) or 80.0)
+CAMERA_LATENCY_CRITICAL_MS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("camera_latency_target_ms", 100.0) or 100.0)
 
 
 
@@ -397,6 +403,7 @@ def get_service_sla_status():
     app2_monitoring = get_app2_monitoring()
     app3_monitoring = get_app3_monitoring()
     camera_protection = get_camera_protection()
+    network_quality = evaluate_network_quality(get_current_metrics() or {})
 
     app1_sla = (app1_monitoring.get('camera_sla', {}) if isinstance(app1_monitoring, dict) else {}) or {}
     app1_observed = app1_sla.get('observed', {}) or {}
@@ -451,6 +458,7 @@ def get_service_sla_status():
         'camera': camera_service,
         'app3': app3_service,
         'app2': app2_service,
+        'network_quality': network_quality,
     }
 
 
@@ -498,7 +506,7 @@ def get_decision_stats():
 
 
 def get_drl_stats():
-    """Extrai estatísticas do DRL (SBiLSTM + A3C) do log."""
+    """Extrai estatisticas do caminho DRL visivel no runtime."""
     import re
     from datetime import datetime
     
@@ -751,30 +759,32 @@ def get_camera_protection():
         )
         min_throughput_mbps = min_throughput_kbps / 1000.0
 
-        latency_block_ms = 80.0
-        throughput_min_mbps = 25.0
-        throughput_guard_mbps = 30.0
-
-        if min_throughput_mbps < throughput_min_mbps:
+        if min_throughput_mbps < CAMERA_THROUGHPUT_MIN_MBPS:
             status = 'CRÍTICA'
             sla_compliant = False
             guard_active = False
-            reason = f'Throughput {min_throughput_mbps:.1f}Mbps < 25Mbps'
-        elif max_latency / 1000.0 >= latency_block_ms:
+            reason = f'Throughput {min_throughput_mbps:.1f}Mbps < {CAMERA_THROUGHPUT_MIN_MBPS:.0f}Mbps'
+        elif max_latency / 1000.0 >= CAMERA_LATENCY_CRITICAL_MS:
             status = 'CRÍTICA'
             sla_compliant = False
             guard_active = False
-            reason = f'Latência {max_latency / 1000.0:.1f}ms >= 80ms'
-        elif min_throughput_mbps < throughput_guard_mbps:
+            reason = f'Latência {max_latency / 1000.0:.1f}ms >= {CAMERA_LATENCY_CRITICAL_MS:.0f}ms'
+        elif min_throughput_mbps < CAMERA_THROUGHPUT_GUARD_MBPS:
             status = 'GUARDA'
             sla_compliant = True
             guard_active = True
-            reason = f'Throughput {min_throughput_mbps:.1f}Mbps em [25-30Mbps]'
-        elif max_latency / 1000.0 >= 60.0:
+            reason = (
+                f'Throughput {min_throughput_mbps:.1f}Mbps em '
+                f'[{CAMERA_THROUGHPUT_MIN_MBPS:.0f}-{CAMERA_THROUGHPUT_GUARD_MBPS:.0f}Mbps]'
+            )
+        elif max_latency / 1000.0 >= CAMERA_LATENCY_WARNING_MS:
             status = 'GUARDA'
             sla_compliant = True
             guard_active = True
-            reason = f'Latência {max_latency / 1000.0:.1f}ms em [60-80ms]'
+            reason = (
+                f'Latência {max_latency / 1000.0:.1f}ms em '
+                f'[{CAMERA_LATENCY_WARNING_MS:.0f}-{CAMERA_LATENCY_CRITICAL_MS:.0f}ms]'
+            )
         else:
             status = 'PROTEGIDA'
             sla_compliant = True
@@ -1011,7 +1021,9 @@ def get_latest_decision_snapshot():
         cursor = DATA_LAKE.conn.cursor()
         cursor.execute(
             """
-            SELECT datetime, decision, energy_state, confidence, reason
+            SELECT datetime, decision, energy_state, confidence, reason,
+                   network_improvement_pct, cvar_improvement_pct, p95_improvement_pct,
+                   baseline_cvar_us, baseline_p95_us, improvement_source, improvement_valid
             FROM decisions_history
             ORDER BY timestamp DESC
             LIMIT 1
@@ -1026,6 +1038,13 @@ def get_latest_decision_snapshot():
             'energy_state': row[2],
             'confidence': round(float(row[3] or 0.0), 4),
             'reason': row[4] or '',
+            'network_improvement_pct': round(float(row[5] or 0.0), 3),
+            'cvar_improvement_pct': round(float(row[6] or 0.0), 3),
+            'p95_improvement_pct': round(float(row[7] or 0.0), 3),
+            'baseline_cvar_us': float(row[8] or 0.0),
+            'baseline_p95_us': float(row[9] or 0.0),
+            'improvement_source': row[10] or '',
+            'improvement_valid': bool(row[11] or 0),
         }
     except Exception as e:
         print(f"Erro ao obter última decisão: {e}")
@@ -1333,6 +1352,20 @@ def index():
     
     # Obter métricas de coordenação rApp-xApps
     network_health = DATA_LAKE.get_network_health(window_minutes=5)
+    latest_decision = get_latest_decision_snapshot()
+    if latest_decision:
+        network_health = dict(network_health or {})
+        for field in (
+            'network_improvement_pct',
+            'cvar_improvement_pct',
+            'p95_improvement_pct',
+            'baseline_cvar_us',
+            'baseline_p95_us',
+            'improvement_source',
+            'improvement_valid',
+        ):
+            if field in latest_decision:
+                network_health[field] = latest_decision[field]
     
     # Obter trend analysis (CORRETO!)
     from rapp_trend_analysis import TrendAnalysis
@@ -1345,12 +1378,8 @@ def index():
     
     # Obter última decisão
     try:
-        conn = DATA_LAKE.conn
-        cursor = conn.cursor()
-        cursor.execute("SELECT decision, reason FROM decisions_history ORDER BY timestamp DESC LIMIT 1")
-        row = cursor.fetchone()
-        if row:
-            energy_saver = row[0] if row[0] else 'UNKNOWN'
+        if latest_decision:
+            energy_saver = latest_decision.get('decision') or 'UNKNOWN'
     except:
         pass
     
@@ -1680,7 +1709,7 @@ def api_decisions():
 
 @app.route('/api/drl')
 def api_drl():
-    """API: Estatísticas do DRL (SBiLSTM + A3C)."""
+    """API: Estatisticas do DRL no runtime."""
     stats = get_drl_stats()
     return jsonify(stats)
 

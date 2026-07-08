@@ -8,6 +8,18 @@
     "interval_seconds": 5,
     "synthetic_days": 0
   },
+  "ml": {
+    "enabled": false,
+    "retrain_enabled": false
+  },
+  "tasam_advisor": {
+    "enabled": true,
+    "mode": "shadow",
+    "min_confidence": 0.7,
+    "stability_window": 2,
+    "enable_resource_advice": true,
+    "enable_energy_advice": true
+  },
   "monitoring": {
     "grafana_port": 3000,
     "influxdb_host": "localhost",
@@ -33,7 +45,10 @@
     "target_sensor_capacity": 12.0,
     "target_vehicle_capacity": 5.0,
     "camera_throughput_target_mbps": 25.0,
+    "camera_throughput_guard_mbps": 30.0,
     "camera_headroom_target_mbps": 35.0,
+    "camera_latency_warning_ms": 80.0,
+    "camera_latency_target_ms": 100.0,
     "cvar_target_ms": 120.0,
     "p95_target_ms": 80.0,
     "app2_latency_target_ms": 1000.0,

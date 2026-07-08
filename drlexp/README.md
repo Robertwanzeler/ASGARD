@@ -1,104 +1,54 @@
-# GreenRAN DRL Experiment
-## Implementação de Deep Reinforcement Learning para Alocação de Recursos em Open RAN
+# GreenRAN TA-SAM DRL
 
-Este projeto implementa o algoritmo **EE-DRL-RA** baseado no artigo da IEEE Transactions on Vehicular Technology (2022) para comparação com o sistema atual de Random Forest.
+Pacote DRL consolidado para o eixo `Task-Specific Sharpness-Aware O-RAN Resource Management Using MARL`.
 
----
+## Trilhas oficiais
 
-## 📁 Estrutura do Projeto
+1. `greenran_tasam`
+   Adaptacao TA-SAM sobre o cenario operacional atual do GreenRAN.
 
-```
-drlexp/
-├── src/drl/
-│   ├── __init__.py              # Package init
-│   ├── gym_environment.py       # Gymnasium environment
-│   ├── replay_buffer.py         # Experience replay buffer
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── sbilstm.py          # SBiLSTM (Large time-scale)
-│   │   ├── actor.py            # Actor Network (A3C)
-│   │   └── critic.py           # Critic Network (A3C)
-├── training/
-│   ├── train_sbilstm.py        # Treinar SBiLSTM
-│   └── train_a3c.py            # Treinar A3C
-├── config/
-│   └── drl_config.yaml         # Configuração principal
-├── models/                      # Modelos treinados
-│   ├── sbilstm/
-│   └── a3c/
-├── requirements.txt             # Dependências
-└── README.md                   # Este arquivo
-```
+2. `tasam_article_reproduction`
+   Reproducao do cenario do artigo TA-SAM a partir de coleta real do `ns-3`.
 
----
+3. `tasam_reference_base`
+   Trilha de referencia/base usada para comparacao metodologica dentro do mesmo eixo TA-SAM.
 
-## 🎯 Objetivos
+## Escopo do pacote
 
-1. **Comparar Random Forest vs DRL** para alocação de recursos
-2. **Implementar estado da arte** (SBiLSTM + A3C + EE-PA)
-3. **Otimizar eficiência energética** mantendo SLA de latência
+- treino TA-SAM scaffold: `drlexp/src/drl/ta_sam_marl.py`
+- treino TA-SAM article-SAC/MARL: `drlexp/src/drl/ta_sam_marl_sac.py`
+- coleta oficial da linha 2: `scripts/run_tasam_article_ns3_collection.sh`
+- runners principais:
+  - `drlexp/training/train_tasam_marl.py`
+  - `drlexp/training/train_online_tasam_marl.py`
+  - `scripts/run_tasam_article_reproduction.py`
 
----
+## Runner online fiel ao artigo no cenario GreenRAN
 
-## 🧠 Arquitetura DRL
+Para manter o cenario atual do GreenRAN (`cameras`, `sensores`, `UEs/veiculos`)
+mas trocar o regime de treino para o formato do artigo (`atores por DU`,
+`critico global`, `replay buffer`, `SAM seletivo`, `rho` dinamico), use:
 
-### 1. SBiLSTM (Large Time-Scale)
-- **Predição**: Recursos necessários para próximo Prediction Window
-- **Input**: 18 features de estado
-- **Arquitetura**: 2 camadas BiLSTM (128 → 64)
-- **Target MSE**: < 0.001
+- `drlexp/training/train_online_tasam_marl.py`
 
-### 2. A3C (Small Time-Scale)
-- **Decisão**: ALLOWED/CONDITIONAL/BLOCKED + Ajuste de potência
-- **Workers**: 8 (paralelo)
-- **Action Space**: 9 classes híbridas
-- **Convergência**: reward → 0
+Esse runner usa o ambiente `OnlineGreenRANMARLEnv`, preserva a topologia logica
+do cenario (`du_camera_edge`, `du_sensor_mixed`, `du_vehicle_edge`) e exporta
+checkpoints no mesmo formato TA-SAM (`tasam_marl_actors.pt`,
+`tasam_marl_critic*.pt`, `tasam_marl_checkpoint_meta.json`).
 
-### 3. EE-PA (Power Allocation)
-- **Otimização**: Gradient descent para energia
-- **Target**: ηEE > 80%
+## Base ativa de coleta
 
----
+A coleta legada enviesada foi retirada da trilha ativa.
 
-## 🚀 Como Usar
+Para operar os runners TA-SAM sobre a coleta oficial atual, use:
 
-### 1. Instalar dependências
-```bash
-cd drlexp
-pip install -r requirements.txt
-```
+- `GREENRAN_TASAM_ACTIVE_DB`
+- `GREENRAN_TASAM_ACTIVE_STATE_DIR`
 
-### 2. Treinar SBiLSTM
-```bash
-python training/train_sbilstm.py --db /tmp/rapp_data_lake.db --epochs 50
-```
+Na ausencia desses overrides, a trilha ativa cai no root oficial:
 
-### 3. Treinar A3C
-```bash
-python training/train_a3c.py --workers 8 --db /tmp/rapp_data_lake.db
-```
+- `runs/tasam_article_ns3_collection`
 
----
+## Fora de escopo
 
-## 📊 Métricas de Comparação
-
-| Métrica | RF Atual | DRL Target |
-|---------|----------|------------|
-| Acurácia | 98.01% | > 90% |
-| MAE (CVaR) | 0.58ms | < 0.5ms |
-| Eficiência Energética | N/A | > 80% |
-| Latência Inferência | ~1ms | < 10ms |
-
----
-
-## 📚 Referência
-
-Azimi, Y., Yousefi, S., Kalbkhani, H., & Kunz, T. (2022). Energy-Efficient Deep Reinforcement Learning Assisted Resource Allocation for 5G-RAN Slicing. IEEE Transactions on Vehicular Technology, 71(1), 856-871.
-
----
-
-## 👥 Equipe
-
-**GreenRAN Team - UFPA**
-- Projeto: Open RAN Sustentável para Agro e Campi Inteligentes
-- Artigo de referência: IEEE TVT 2022
+As linhas antigas `A3C`, `SBiLSTM`, `AWAC` e `SAC single-agent` nao fazem mais parte da pilha oficial de DRL.

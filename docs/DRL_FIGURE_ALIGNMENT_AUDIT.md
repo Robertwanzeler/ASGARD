@@ -1,123 +1,21 @@
 # Auditoria de Alinhamento das Figuras DRL vs. ARMD-GreenRAN
 
-## Resumo
+## Arquivado
 
-As figuras do pacote `EE-DRL-GreenRAN` estao alinhadas com o `ARMD-GreenRAN` no nivel de organizacao do pacote, nomenclatura editorial e intencao de mapeamento com o artigo. Elas **nao** estao no mesmo padrao visual final do ARMD, porque ainda misturam:
+Este documento cobria o pacote legado `EE-DRL-GreenRAN`. Essa linha foi removida
+da pilha oficial de DRL do projeto para manter apenas a familia:
 
-- figuras arquiteturais geradas em um estilo proprio;
-- figuras quantitativas curadas de `drlexp/charts`;
-- resolucoes e aspect ratios diferentes;
-- canvas suplementares sem padrao unico.
+- `Task-Specific Sharpness-Aware O-RAN Resource Management Using MARL`
+- cenario GreenRAN atual preservado
+- cenario do artigo
+- cenario-base de referencia do artigo
 
-No ARMD, o padrao e mais rigido: ha um gerador unico com `STYLES`, `OUTPUT_NAMES` e familia fixa de saida, e os PNGs principais saem todos com a mesma resolucao (`1455x1032`).
+As decisoes oficiais da trilha DRL agora estao concentradas em:
 
-## Base da Auditoria
+- [docs/RELATORIO_DRL_GREENRAN_IMPLEMENTACAO.md](/home/robert/orange_nuclear/docs/RELATORIO_DRL_GREENRAN_IMPLEMENTACAO.md:1)
+- [config/tasam_drl_tracks.json](/home/robert/orange_nuclear/config/tasam_drl_tracks.json:1)
 
-- Gerador DRL: [scripts/generate_eedrl_greenran_paper_figures.py](/home/robert/orange_nuclear/scripts/generate_eedrl_greenran_paper_figures.py:3)
-- Pacote DRL: [scripts/materialize_eedrl_greenran_package.py](/home/robert/orange_nuclear/scripts/materialize_eedrl_greenran_package.py:7)
-- Gerador ARMD: [scripts/generate_article00_armd_comparison_figures.py](/home/robert/orange_nuclear/scripts/generate_article00_armd_comparison_figures.py:3)
-- Manifesto DRL: [runs/eedrl_greenran_final/paper_figures/paper_figures_summary.json](/home/robert/orange_nuclear/runs/eedrl_greenran_final/paper_figures/paper_figures_summary.json:1)
-- Manifesto ARMD: [runs/article00/comparison_figures/comparison_summary.json](/home/robert/orange_nuclear/runs/article00/comparison_figures/comparison_summary.json:1)
-
-## Referencia ARMD
-
-O ARMD-GreenRAN esta no padrao desejado para artigo pelos seguintes motivos:
-
-- usa gerador unico e deterministico;
-- congela as curvas de referencia em JSON fixo;
-- atualiza so a serie `ARMD-GreenRAN`;
-- mantem os seis PNGs principais com a mesma resolucao.
-
-Figuras ARMD principais:
-
-- `comparison_reconstruction_threshold_0_5.png` -> `1455x1032`
-- `comparison_reconstruction_dataset_450_thresholds.png` -> `1455x1032`
-- `comparison_indirect_threshold_0_5.png` -> `1455x1032`
-- `comparison_indirect_dataset_450_thresholds.png` -> `1455x1032`
-- `comparison_implicit_threshold_0_5.png` -> `1455x1032`
-- `comparison_implicit_dataset_450_thresholds.png` -> `1455x1032`
-
-## Classificacao das Figuras DRL
-
-### 1. Alinhadas na estrutura, mas fora do padrao visual ARMD
-
-Estas figuras cumprem o papel editorial e foram geradas especificamente para o pacote DRL, mas nao seguem o mesmo canvas e nao formam uma familia visual tao rigida quanto o ARMD.
-
-- `fig01_eedrl_greenran_system_model.png` -> `2004x1215`
-- `fig02_eedrl_greenran_timescales.png` -> `2004x910`
-- `fig03_eedrl_greenran_components.png` -> `1953x1113`
-- `fig04_eedrl_greenran_state_action.png` -> `1953x1079`
-
-Status: `parcialmente alinhadas`
-
-Motivo:
-
-- sao figuras geradas para o artigo;
-- mantem narrativa coerente com a adaptacao GreenRAN;
-- mas variam em altura, proporcao e composicao;
-- nao repetem o mesmo molde visual do conjunto ARMD.
-
-Acao recomendada:
-
-- padronizar canvas unico para toda a familia arquitetural;
-- definir grid, margens, tipografia e legenda fixos;
-- exportar no mesmo alvo de resolucao da trilha ARMD, ou em outro alvo unico igualmente congelado.
-
-### 2. Mais proximas do padrao ARMD
-
-Estas figuras quantitativas ja sao as mais proximas do padrao do ARMD porque usam a trilha oficial do pacote DRL e, em parte, compartilham estilo de eixo inspirado no ARMD.
-
-- `fig08_decision_distribution.png` -> `1250x822`
-- `fig09_reward_by_zone.png` -> `1231x821`
-
-Status: `quase alinhadas`
-
-Motivo:
-
-- possuem dimensoes muito proximas entre si;
-- representam metricas derivadas do runtime/Data Lake atual;
-- podem ser regeneradas de forma mais limpa a partir de artefatos oficiais.
-
-Acao recomendada:
-
-- regenerar ambas num canvas unico fixo;
-- travar titulo, escala, legenda e espessura de linha;
-- usá-las como base do padrao quantitativo DRL.
-
-### 3. Editorialmente corretas, mas ainda heterogeneas
-
-Estas figuras estao corretas no pacote, mas ainda nao combinam com o nivel de padronizacao visual do ARMD.
-
-- `fig05_sbilstm_mae_evolution.png` -> `1935x1169`
-- `fig06_a3c_reward_function.png` -> `1955x1169`
-- `fig07_energy_efficiency_rf_vs_a3c.png` -> `1645x1094`
-- `fig10_summary_metrics.png` -> `1237x747`
-
-Status: `alinhadas no conteudo, nao no padrao visual`
-
-Motivo:
-
-- o manifesto DRL as marca como `ready`;
-- mas as dimensoes variam muito;
-- a trilha ainda herda heterogeneidade dos charts curados;
-- `fig10` destoa mais ainda do restante do bloco quantitativo.
-
-Acao recomendada:
-
-- refazer as quatro por um unico gerador de figuras;
-- manter fonte, grid, escala, legenda e largura de figura identicos;
-- evitar copiar PNG pronto de `drlexp/charts` quando o dado oficial puder ser plotado diretamente.
-
-### 4. Suplementares fora do padrao ARMD
-
-As figuras suplementares nao estao no mesmo padrao de familia do ARMD.
-
-- `suppA_sbilstm_learning_curves.png` -> `1235x1598`
-- `suppB_sbilstm_residual_histograms.png` -> `1260x1598`
-- `suppC_article_vs_greenran_learning.png` -> `2116x1109`
-- `suppD_article_vs_greenran_histograms.png` -> `2083x1109`
-
-Status: `precisam de rework`
+O `ARMD-GreenRAN` permanece fora desta consolidacao e nao foi alterado.
 
 Motivo:
 

@@ -53,6 +53,8 @@ DEFAULT_DB = "/tmp/rapp_data_lake.db"
 DEFAULT_OUTPUT = "./models"
 TEMPORAL_TEST_FRACTION = 0.2
 DEFAULT_TRACE_JSONL = ""
+MIN_FEATURE_DIVERSITY_RATIO = 0.05
+MIN_FEATURE_DIVERSITY_UNIQUE_ROWS = 50
 KNOWN_SCENARIO_STAGES = [
     "allowed_bootstrap",
     "allowed_stable",
@@ -63,6 +65,122 @@ KNOWN_SCENARIO_STAGES = [
     "vehicle_blocked",
     "app2_conditional",
     "app2_blocked",
+]
+FEATURE_PROFILES = (
+    "full",
+    "no_stage",
+    "no_stage_with_slice_state",
+    "no_stage_no_temporal",
+    "runtime_core",
+)
+TEMPORAL_FEATURE_NAMES = {
+    "cvar_diff",
+    "cvar_rolling_mean",
+    "cvar_rolling_std",
+    "cvar_trend",
+    "throughput_trend",
+    "packet_loss_trend",
+    "cvar_lag_1",
+    "cvar_lag_2",
+    "cvar_lag_3",
+    "cvar_lag_4",
+    "cvar_lag_5",
+    "throughput_lag_1",
+    "throughput_lag_2",
+    "throughput_lag_3",
+    "packet_loss_lag_1",
+    "packet_loss_lag_2",
+    "packet_loss_lag_3",
+    "latency_lag_1",
+    "latency_lag_2",
+    "cvar_rolling_3",
+    "cvar_rolling_10",
+    "cvar_rolling_std_3",
+    "cvar_acceleration",
+    "latency_acceleration",
+    "jitter_trend",
+    "cvar_momentum",
+}
+RUNTIME_CORE_FEATURE_NAMES = [
+    "cvar_ms",
+    "latency_p95_ms",
+    "avg_latency_ms",
+    "variance_ms2",
+    "total_active_cameras",
+    "camera_ratio",
+    "total_critical_ues",
+    "cvar_zone",
+    "throughput_mbps",
+    "packet_loss_rate",
+    "jitter_ms",
+    "tx_rx_ratio",
+    "critical_ue_ratio",
+]
+SLICE_STATE_FEATURE_NAMES = [
+    "global_total_demand",
+    "global_usable_budget",
+    "slice_embb_ue_count",
+    "slice_embb_demand",
+    "slice_embb_allocation",
+    "slice_embb_qos_pressure",
+    "slice_embb_completion_ratio",
+    "slice_embb_min_qos_met",
+    "slice_embb_budget_share",
+    "slice_mmtc_ue_count",
+    "slice_mmtc_demand",
+    "slice_mmtc_allocation",
+    "slice_mmtc_qos_pressure",
+    "slice_mmtc_completion_ratio",
+    "slice_mmtc_min_qos_met",
+    "slice_mmtc_budget_share",
+    "slice_urllc_ue_count",
+    "slice_urllc_demand",
+    "slice_urllc_allocation",
+    "slice_urllc_qos_pressure",
+    "slice_urllc_completion_ratio",
+    "slice_urllc_min_qos_met",
+    "slice_urllc_budget_share",
+]
+BASE_NO_STAGE_FEATURE_NAMES = [
+    "cvar_ms",
+    "cvar_diff",
+    "cvar_rolling_mean",
+    "cvar_rolling_std",
+    "latency_p95_ms",
+    "avg_latency_ms",
+    "variance_ms2",
+    "total_active_cameras",
+    "camera_ratio",
+    "total_critical_ues",
+    "cvar_zone",
+    "throughput_mbps",
+    "packet_loss_rate",
+    "jitter_ms",
+    "tx_rx_ratio",
+    "cvar_trend",
+    "throughput_trend",
+    "packet_loss_trend",
+    "cvar_lag_1",
+    "cvar_lag_2",
+    "cvar_lag_3",
+    "cvar_lag_4",
+    "cvar_lag_5",
+    "throughput_lag_1",
+    "throughput_lag_2",
+    "throughput_lag_3",
+    "packet_loss_lag_1",
+    "packet_loss_lag_2",
+    "packet_loss_lag_3",
+    "latency_lag_1",
+    "latency_lag_2",
+    "cvar_rolling_3",
+    "cvar_rolling_10",
+    "cvar_rolling_std_3",
+    "cvar_acceleration",
+    "latency_acceleration",
+    "jitter_trend",
+    "cvar_momentum",
+    "critical_ue_ratio",
 ]
 
 
@@ -113,13 +231,18 @@ def temporal_cv_accuracy(X_train, y_train, n_splits=5):
 
 def build_temporal_evaluation_windows(
     n_samples,
-    test_fraction=TEMPORAL_TEST_FRACTION,
-    max_windows=3,
+    test_fraction=None,
+    max_windows=None,
     min_train_size=100,
 ):
     """Build expanding temporal evaluation windows."""
     if n_samples < 10:
         raise ValueError(f"Dataset muito pequeno para avaliação temporal: {n_samples}")
+
+    if test_fraction is None:
+        test_fraction = 0.10 if n_samples >= 2000 else TEMPORAL_TEST_FRACTION
+    if max_windows is None:
+        max_windows = 8 if n_samples >= 2000 else 3
 
     test_size = max(int(n_samples * test_fraction), 1)
     max_possible_windows = max(1, (n_samples - min_train_size) // max(test_size, 1))
@@ -159,6 +282,34 @@ def _normalize_stage_name(value):
     return stage if stage in KNOWN_SCENARIO_STAGES else "unknown"
 
 
+def select_feature_profile(feature_cols, profile):
+    profile = str(profile or "full").strip().lower()
+    if profile == "full":
+        return list(feature_cols)
+    if profile == "no_stage":
+        return [col for col in feature_cols if col in BASE_NO_STAGE_FEATURE_NAMES]
+    if profile == "no_stage_with_slice_state":
+        allowed = set(BASE_NO_STAGE_FEATURE_NAMES) | set(SLICE_STATE_FEATURE_NAMES)
+        return [col for col in feature_cols if col in allowed]
+    if profile == "no_stage_no_temporal":
+        return [
+            col for col in feature_cols
+            if col in BASE_NO_STAGE_FEATURE_NAMES and col not in TEMPORAL_FEATURE_NAMES
+        ]
+    if profile == "runtime_core":
+        return [col for col in feature_cols if col in RUNTIME_CORE_FEATURE_NAMES]
+    raise ValueError(f"feature profile desconhecido: {profile}")
+
+
+def regression_target_stats(cvar_targets):
+    cvar_targets = np.asarray(cvar_targets, dtype=float)
+    if len(cvar_targets) == 0:
+        return float("nan"), 0
+    variance = float(np.var(cvar_targets))
+    unique = len({round(float(value), 6) for value in cvar_targets.tolist()})
+    return variance, unique
+
+
 def summarize_temporal_window(df_window, feature_cols, decision_labels, cvar_targets):
     """Summarize and validate a temporal holdout window."""
     test_size = len(df_window)
@@ -176,9 +327,7 @@ def summarize_temporal_window(df_window, feature_cols, decision_labels, cvar_tar
     )
     conflicting_sample_ratio = (conflicting_sample_count / test_size) if test_size else 0.0
 
-    cvar_targets = np.asarray(cvar_targets, dtype=float)
-    cvar_target_variance = float(np.var(cvar_targets)) if len(cvar_targets) else float("nan")
-    cvar_target_unique = len({round(float(value), 6) for value in cvar_targets.tolist()}) if len(cvar_targets) else 0
+    cvar_target_variance, cvar_target_unique = regression_target_stats(cvar_targets)
 
     stage_counts = (
         df_window["scenario_stage"].fillna("unknown").astype(str).value_counts().to_dict()
@@ -187,29 +336,44 @@ def summarize_temporal_window(df_window, feature_cols, decision_labels, cvar_tar
     decision_counts = pd.Series(decision_labels).value_counts().to_dict() if len(decision_labels) else {}
 
     flags = {
-        "low_feature_diversity": bool(test_size and (unique_feature_rows <= 3 or unique_feature_ratio < 0.05)),
+        "low_feature_diversity": bool(
+            test_size
+            and (
+                unique_feature_rows <= 3
+                or (
+                    unique_feature_ratio < MIN_FEATURE_DIVERSITY_RATIO
+                    and unique_feature_rows < MIN_FEATURE_DIVERSITY_UNIQUE_ROWS
+                )
+            )
+        ),
         "conflicting_duplicate_features": bool(conflicting_rows > 0 and conflicting_sample_ratio >= 0.10),
         "low_regression_target_variance": bool(len(cvar_targets) and (cvar_target_variance < 1e-9 or cvar_target_unique <= 1)),
     }
 
-    reasons = []
+    blocking_reasons = []
+    warning_reasons = []
     if flags["low_feature_diversity"]:
-        reasons.append(
+        blocking_reasons.append(
             f"holdout feature diversity too low: {unique_feature_rows}/{test_size} unique rows"
         )
     if flags["conflicting_duplicate_features"]:
-        reasons.append(
+        blocking_reasons.append(
             f"holdout has duplicated feature rows with conflicting labels: {conflicting_sample_count}/{test_size} samples"
         )
     if flags["low_regression_target_variance"]:
-        reasons.append(
+        warning_reasons.append(
             f"holdout regression target variance too low: var={cvar_target_variance:.6g}, unique={cvar_target_unique}"
         )
+    reasons = blocking_reasons + warning_reasons
 
     return {
         "mode": "temporal_holdout_with_guardrails",
         "valid": not reasons,
+        "valid_for_classifier": not blocking_reasons,
+        "valid_for_regression": not blocking_reasons and not flags["low_regression_target_variance"],
         "reasons": reasons,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": warning_reasons,
         "test_size": int(test_size),
         "decision_counts": {str(k): int(v) for k, v in decision_counts.items()},
         "stage_counts": {str(k): int(v) for k, v in stage_counts.items()},
@@ -234,6 +398,9 @@ def build_evaluation_summary(df, feature_cols, evaluation_windows):
     decision_totals = {}
     stage_totals = {}
     reasons = []
+    warnings = []
+    valid_classifier_window_count = 0
+    valid_regression_window_count = 0
 
     for window in evaluation_windows:
         test_slice = slice(window["test_start"], window["test_end"])
@@ -254,19 +421,29 @@ def build_evaluation_summary(df, feature_cols, evaluation_windows):
                 "timestamp_end": int(window_df["timestamp"].iloc[-1]) if len(window_df) else 0,
             }
         )
-        if not summary["valid"]:
-            reasons.extend(f"window {window['index']}: {reason}" for reason in summary["reasons"])
+        if summary["valid_for_classifier"]:
+            valid_classifier_window_count += 1
+        if summary["valid_for_regression"]:
+            valid_regression_window_count += 1
+        reasons.extend(f"window {window['index']}: {reason}" for reason in summary["blocking_reasons"])
+        warnings.extend(f"window {window['index']}: {reason}" for reason in summary["warning_reasons"])
         for key, value in summary["decision_counts"].items():
             decision_totals[key] = decision_totals.get(key, 0) + int(value)
         for key, value in summary["stage_counts"].items():
             stage_totals[key] = stage_totals.get(key, 0) + int(value)
         window_summaries.append(summary)
 
+    if valid_regression_window_count <= 0:
+        reasons.append("no temporal holdout window has enough regression target variance")
+
     return {
         "mode": "rolling_temporal_windows",
         "valid": not reasons,
         "reasons": reasons,
+        "warnings": warnings,
         "window_count": len(window_summaries),
+        "valid_classifier_window_count": valid_classifier_window_count,
+        "valid_regression_window_count": valid_regression_window_count,
         "decision_counts": decision_totals,
         "stage_counts": stage_totals,
         "windows": window_summaries,
@@ -333,6 +510,14 @@ def evaluate_classifier_candidate(model_builder, X, y_encoded, cvar_values, labe
     y_pred = np.concatenate(y_pred_all)
     cvar_eval = np.concatenate(cvar_all)
     label_ids = list(range(len(label_encoder.classes_)))
+    classification_metrics = classification_report(
+        y_true,
+        y_pred,
+        labels=label_ids,
+        target_names=label_encoder.classes_.tolist(),
+        output_dict=True,
+        zero_division=0,
+    )
     healthy_accuracy, healthy_allowed_recall = compute_classifier_health_metrics(
         y_true,
         y_pred,
@@ -346,6 +531,7 @@ def evaluate_classifier_candidate(model_builder, X, y_encoded, cvar_values, labe
         "healthy_allowed_recall": healthy_allowed_recall,
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=label_ids).tolist(),
         "classes": label_encoder.classes_.tolist(),
+        "classification_report": classification_metrics,
     }
 
 
@@ -368,6 +554,9 @@ def evaluate_regressor_candidate(model_builder, X, y, evaluation_windows):
         X_test = X[test_slice]
         y_train = y[:window["train_end"]]
         y_test = y[test_slice]
+        y_test_variance, y_test_unique = regression_target_stats(y_test)
+        if y_test_variance < 1e-9 or y_test_unique <= 1:
+            continue
 
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
@@ -380,6 +569,16 @@ def evaluate_regressor_candidate(model_builder, X, y, evaluation_windows):
 
         y_true_all.append(y_test)
         y_pred_all.append(y_pred)
+
+    if not y_true_all:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "r2": float("nan"),
+            "healthy_mae": float("nan"),
+            "healthy_bias": float("nan"),
+            "critical_mae": float("nan"),
+        }
 
     y_true = np.concatenate(y_true_all)
     y_pred = np.concatenate(y_pred_all)
@@ -477,6 +676,12 @@ def load_trace_data(trace_jsonl):
             payload = json.loads(line)
             metrics = payload.get("metrics") or {}
             decision = payload.get("decision") or {}
+            global_state = payload.get("global_state") or {}
+            slice_state = payload.get("slice_state") or {}
+
+            def _slice_metric(slice_id, field, default=0.0):
+                return float(((slice_state.get(slice_id) or {}).get(field, default)) or default)
+
             rows.append({
                 "timestamp": int(payload.get("timestamp") or 0),
                 "scenario_stage": _normalize_stage_name(payload.get("scenario_stage")),
@@ -501,6 +706,29 @@ def load_trace_data(trace_jsonl):
                     metrics.get("latency_p95_per_ue_us", metrics.get("latency_p95_us", 0.0)) or 0.0
                 ),
                 "latency_p95_us": float(metrics.get("latency_p95_us", 0.0) or 0.0),
+                "global_total_demand": float(global_state.get("total_demand", 0.0) or 0.0),
+                "global_usable_budget": float(global_state.get("usable_budget", 0.0) or 0.0),
+                "slice_embb_ue_count": _slice_metric("eMBB", "ue_count", 0.0),
+                "slice_embb_demand": _slice_metric("eMBB", "demand", 0.0),
+                "slice_embb_allocation": _slice_metric("eMBB", "allocation", 0.0),
+                "slice_embb_qos_pressure": _slice_metric("eMBB", "qos_pressure", 0.0),
+                "slice_embb_completion_ratio": _slice_metric("eMBB", "completion_ratio", 0.0),
+                "slice_embb_min_qos_met": _slice_metric("eMBB", "min_qos_met", 0.0),
+                "slice_embb_budget_share": _slice_metric("eMBB", "budget_share", 0.0),
+                "slice_mmtc_ue_count": _slice_metric("mMTC", "ue_count", 0.0),
+                "slice_mmtc_demand": _slice_metric("mMTC", "demand", 0.0),
+                "slice_mmtc_allocation": _slice_metric("mMTC", "allocation", 0.0),
+                "slice_mmtc_qos_pressure": _slice_metric("mMTC", "qos_pressure", 0.0),
+                "slice_mmtc_completion_ratio": _slice_metric("mMTC", "completion_ratio", 0.0),
+                "slice_mmtc_min_qos_met": _slice_metric("mMTC", "min_qos_met", 0.0),
+                "slice_mmtc_budget_share": _slice_metric("mMTC", "budget_share", 0.0),
+                "slice_urllc_ue_count": _slice_metric("URLLC", "ue_count", 0.0),
+                "slice_urllc_demand": _slice_metric("URLLC", "demand", 0.0),
+                "slice_urllc_allocation": _slice_metric("URLLC", "allocation", 0.0),
+                "slice_urllc_qos_pressure": _slice_metric("URLLC", "qos_pressure", 0.0),
+                "slice_urllc_completion_ratio": _slice_metric("URLLC", "completion_ratio", 0.0),
+                "slice_urllc_min_qos_met": _slice_metric("URLLC", "min_qos_met", 0.0),
+                "slice_urllc_budget_share": _slice_metric("URLLC", "budget_share", 0.0),
                 "decision": str(decision.get("decision") or ""),
                 "energy_state": str(decision.get("energy_state") or ""),
                 "confidence": float(decision.get("confidence", 0.0) or 0.0),
@@ -532,6 +760,29 @@ def normalize_training_frame(df):
         "variance_per_ue_us2": 0.0,
         "latency_p95_per_ue_us": 0.0,
         "latency_p95_us": 0.0,
+        "global_total_demand": 0.0,
+        "global_usable_budget": 0.0,
+        "slice_embb_ue_count": 0.0,
+        "slice_embb_demand": 0.0,
+        "slice_embb_allocation": 0.0,
+        "slice_embb_qos_pressure": 0.0,
+        "slice_embb_completion_ratio": 0.0,
+        "slice_embb_min_qos_met": 0.0,
+        "slice_embb_budget_share": 0.0,
+        "slice_mmtc_ue_count": 0.0,
+        "slice_mmtc_demand": 0.0,
+        "slice_mmtc_allocation": 0.0,
+        "slice_mmtc_qos_pressure": 0.0,
+        "slice_mmtc_completion_ratio": 0.0,
+        "slice_mmtc_min_qos_met": 0.0,
+        "slice_mmtc_budget_share": 0.0,
+        "slice_urllc_ue_count": 0.0,
+        "slice_urllc_demand": 0.0,
+        "slice_urllc_allocation": 0.0,
+        "slice_urllc_qos_pressure": 0.0,
+        "slice_urllc_completion_ratio": 0.0,
+        "slice_urllc_min_qos_met": 0.0,
+        "slice_urllc_budget_share": 0.0,
         "decision": "",
         "energy_state": "",
         "confidence": 0.0,
@@ -701,6 +952,18 @@ def engineer_features(df):
         'cvar_acceleration', 'latency_acceleration',
         # NOVAS FEATURES PREDITIVAS (3) - CAUSAIS
         'jitter_trend', 'cvar_momentum', 'critical_ue_ratio',
+        # Slice/global runtime state (23) - CAUSAIS e reais
+        'global_total_demand',
+        'global_usable_budget',
+        'slice_embb_ue_count', 'slice_embb_demand', 'slice_embb_allocation',
+        'slice_embb_qos_pressure', 'slice_embb_completion_ratio',
+        'slice_embb_min_qos_met', 'slice_embb_budget_share',
+        'slice_mmtc_ue_count', 'slice_mmtc_demand', 'slice_mmtc_allocation',
+        'slice_mmtc_qos_pressure', 'slice_mmtc_completion_ratio',
+        'slice_mmtc_min_qos_met', 'slice_mmtc_budget_share',
+        'slice_urllc_ue_count', 'slice_urllc_demand', 'slice_urllc_allocation',
+        'slice_urllc_qos_pressure', 'slice_urllc_completion_ratio',
+        'slice_urllc_min_qos_met', 'slice_urllc_budget_share',
         # Contexto de estágio (10)
         'stage_allowed_bootstrap',
         'stage_allowed_stable',
@@ -761,6 +1024,7 @@ def train_classifier(df, feature_cols, output_dir, evaluation_windows, evaluatio
         'feature_importance': {},
         'confusion_matrix': rf_eval['confusion_matrix'],
         'classes': rf_eval['classes'],
+        'classification_report': rf_eval['classification_report'],
         'split_mode': 'rolling_temporal_windows',
         'evaluation': evaluation_summary,
     }
@@ -898,13 +1162,14 @@ def train_regressor(df, feature_cols, output_dir, evaluation_windows):
     }, rf_reg
 
 
-def save_report(clf_results, reg_results, feature_cols, output_dir):
+def save_report(clf_results, reg_results, feature_cols, output_dir, feature_profile="full"):
     """Save training report."""
     print("[5/6] Salvando relatório...")
 
     report = {
         'timestamp': datetime.now().isoformat(),
         'dataset_size': clf_results.get('dataset_size', 0),
+        'feature_profile': feature_profile,
         'features': feature_cols,
         'evaluation': clf_results.get('evaluation', {}),
         'classifier': {
@@ -914,6 +1179,7 @@ def save_report(clf_results, reg_results, feature_cols, output_dir):
             'cross_validation_std': clf_results['cv_std'],
             'confusion_matrix': clf_results['confusion_matrix'],
             'classes': clf_results['classes'],
+            'classification_report': clf_results.get('classification_report', {}),
         },
         'regressor': {
             'model': reg_results.get('model_name', 'unknown'),
@@ -1040,6 +1306,12 @@ def main():
     parser.add_argument('--db', default=DEFAULT_DB, help='Path to SQLite database')
     parser.add_argument('--trace-jsonl', default=DEFAULT_TRACE_JSONL, help='Optional exported trace JSONL as training source')
     parser.add_argument('--output', default=DEFAULT_OUTPUT, help='Output directory for models')
+    parser.add_argument(
+        '--feature-profile',
+        default='full',
+        choices=FEATURE_PROFILES,
+        help='Feature subset profile used for training/evaluation',
+    )
     parser.add_argument('--retrain', action='store_true', help='Retrain with recent data only (last 24h)')
     parser.add_argument('--hours', type=int, default=24, help='Hours of data to use for retraining')
     args = parser.parse_args()
@@ -1072,6 +1344,8 @@ def main():
 
     # Feature engineering (cria cvar_ms e outras features)
     df, feature_cols = engineer_features(df)
+    feature_cols = select_feature_profile(feature_cols, args.feature_profile)
+    print(f"    → Perfil de features: {args.feature_profile} ({len(feature_cols)} features)")
 
     print(f"\n    → Target de treino: estado atual da rede")
     print(f"    → Registros utilizáveis: {len(df)}")
@@ -1098,7 +1372,7 @@ def main():
     else:
         report_path = os.path.join(args.output, 'training_report.json')
 
-    save_report(clf_results, reg_results, feature_cols, args.output)
+    save_report(clf_results, reg_results, feature_cols, args.output, feature_profile=args.feature_profile)
 
     # Plot
     plot_feature_importance(clf_results, args.output)

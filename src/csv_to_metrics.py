@@ -461,7 +461,7 @@ class ExtendedMetricsCollector:
             sensor["battery_percent"] = round(12.0 if idx < low_battery_target else avg_battery_target, 1)
             sensor["power_mw"] = round(avg_power_target, 1)
             sensor["packets_tx"] = packets_tx
-            sensor["source"] = "ns3_ue_proxy_override"
+            sensor["source"] = "ns3_real_sensor_ue_override"
             total_packets_tx += packets_tx
 
         packets_rx = int(round(total_packets_tx * (delivery_target / 100.0)))
@@ -626,15 +626,22 @@ class ExtendedMetricsCollector:
             tx_pdus = int(ue_data.get("tx_pdus", 0) or 0)
             rx_pdus = int(ue_data.get("rx_pdus", 0) or 0)
             observed_rx_packets += rx_pdus
+            real_throughput_kbps = max(
+                float(ue_data.get("throughput_kbps", 0) or 0),
+                float(ue_data.get("tx_throughput_kbps", 0) or 0),
+                float(ue_data.get("rx_throughput_kbps", 0) or 0),
+                float(ue_data.get("total_pdcp_throughput_kbps", 0) or 0),
+                float(ue_data.get("cu_up_throughput_kbps", 0) or 0),
+            )
             connected = bool(
                 ue_data.get("has_latency_samples")
                 or rx_pdus > 0
-                or float(ue_data.get("throughput_kbps", 0) or 0) > 0
+                or real_throughput_kbps > 0
             )
             packet_loss_percent = global_loss_percent
             latency_ms = float(ue_data.get("latency_avg_us", ue_data.get("latency_us", 0)) or 0) / 1000.0
             nominal_value = float(meta.get("nominal_value", 0.0) or 0.0)
-            value = nominal_value if nominal_value else round(float(ue_data.get("throughput_kbps", 0) or 0), 2)
+            value = nominal_value if nominal_value else round(real_throughput_kbps, 2)
             unit = str(meta.get("unit", "kbps") or "kbps")
             rssi_dbm = float(meta.get("nominal_rssi_dbm", -88.0) or -88.0)
             battery_percent = float(meta.get("nominal_battery_percent", 100.0) or 100.0)
@@ -658,7 +665,7 @@ class ExtendedMetricsCollector:
                 "tx_interval_s": int(meta.get("tx_interval_s", 5) or 5),
                 "packets_tx": rx_pdus,
                 "mobility_profile": str(meta.get("mobility_profile", "stationary") or "stationary"),
-                "source": "ns3_ue_proxy",
+                "source": "ns3_real_sensor_ue",
             })
 
             sensor_values.append(value)
@@ -671,7 +678,13 @@ class ExtendedMetricsCollector:
         connected_count = sum(1 for s in sensor_entries if s["status"] == "ok")
         error_count = len(sensor_entries) - connected_count
         total_throughput_kbps = sum(
-            float(ue_data.get("throughput_kbps", 0) or 0)
+            max(
+                float(ue_data.get("throughput_kbps", 0) or 0),
+                float(ue_data.get("tx_throughput_kbps", 0) or 0),
+                float(ue_data.get("rx_throughput_kbps", 0) or 0),
+                float(ue_data.get("total_pdcp_throughput_kbps", 0) or 0),
+                float(ue_data.get("cu_up_throughput_kbps", 0) or 0),
+            )
             for ue_data in ue_metrics.values()
             if ue_data.get("device_type") == "sensor"
         )
@@ -2370,6 +2383,15 @@ class ExtendedMetricsCollector:
             os.replace(tmp_path, filepath)
         except Exception as e:
             print(f"[CSV_METRICS] Error writing metrics to {filepath}: {e}")
+
+    def clear_runtime_outputs(self):
+        """Remove stale runtime JSON outputs when strict real-only data is unavailable."""
+        for path in (self.output_file, self.extended_output_file):
+            try:
+                if path and os.path.exists(path):
+                    os.unlink(path)
+            except Exception as e:
+                print(f"[CSV_METRICS] Error clearing stale runtime output {path}: {e}")
     
     def write_standard_metrics(self, extended_metrics):
         """Write standard metrics for xApps consumption"""
@@ -2402,6 +2424,19 @@ class ExtendedMetricsCollector:
             }
         
         return result
+
+    def _snapshot_has_proxy_latency(self, extended_metrics):
+        gm = (extended_metrics or {}).get('global_metrics', {}) or {}
+        try:
+            if int(gm.get('proxy_latency_sample_count', 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        for ue_data in ((extended_metrics or {}).get('ue_metrics', {}) or {}).values():
+            if bool((ue_data or {}).get('latency_is_proxy')):
+                return True
+        return False
     
     def run(self):
         """Main loop"""
@@ -2459,6 +2494,7 @@ class ExtendedMetricsCollector:
                         print(
                             f"[CSV_METRICS] Strict real-only mode: skipping snapshot because PDCP is {reason}."
                         )
+                    self.clear_runtime_outputs()
                     time.sleep(self.poll_interval)
                     continue
                 
@@ -2490,6 +2526,19 @@ class ExtendedMetricsCollector:
                             rlc_file=rlc_file,
                         )
                         self._attach_trace_status(extended, trace_status)
+
+                    if self.require_real_pdcp and self._snapshot_has_proxy_latency(extended):
+                        if iteration == 1 or iteration % 5 == 0:
+                            proxy_count = (
+                                extended.get('global_metrics', {}).get('proxy_latency_sample_count', 0)
+                            )
+                            print(
+                                "[CSV_METRICS] Strict real-only mode: skipping snapshot because "
+                                f"proxy latency is still present (proxy_latency_sample_count={proxy_count})."
+                            )
+                        self.clear_runtime_outputs()
+                        time.sleep(self.poll_interval)
+                        continue
                     
                     self.write_metrics(extended, self.extended_output_file)
                     self.export_device_roles_snapshot(extended)

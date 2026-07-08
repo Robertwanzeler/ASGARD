@@ -38,11 +38,14 @@ class FixedScenarioManifestTestCase(unittest.TestCase):
 
     def test_repo_manifest_exposes_canonical_fixed_scenario_counts(self):
         greenran_paths = self._load_module("greenran_paths_repo_manifest_test", "src/greenran_paths.py")
+        manifest = json.loads(
+            (self.project_root / "config" / "greenran_fixed_scenario.json").read_text(encoding="utf-8")
+        )
 
-        self.assertEqual(greenran_paths.get_fixed_total_ues(), 12)
-        self.assertEqual(greenran_paths.get_fixed_active_cameras(), 3)
-        self.assertEqual(greenran_paths.get_fixed_vehicle_base_imsi(), 16)
-        self.assertEqual(greenran_paths.get_fixed_max_vehicles(), 5)
+        self.assertEqual(greenran_paths.get_fixed_total_ues(), manifest["ns3"]["total_ues"])
+        self.assertEqual(greenran_paths.get_fixed_active_cameras(), manifest["apps"]["app1"]["active_cameras"])
+        self.assertEqual(greenran_paths.get_fixed_vehicle_base_imsi(), manifest["apps"]["app3"]["base_imsi"])
+        self.assertEqual(greenran_paths.get_fixed_max_vehicles(), manifest["apps"]["app3"]["max_vehicles"])
 
     def test_env_override_updates_loader_and_mapper_defaults(self):
         override_path = Path(self.temp_dir) / "scenario_override.json"

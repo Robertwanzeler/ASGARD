@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CAORA-style demand and allocation model for the GreenRAN runtime.
+TA-SAM-aligned demand and allocation model for the GreenRAN runtime.
 
 This module materializes the article-aligned variables from [1]:
   - d_ran(t)
@@ -12,9 +12,9 @@ This module materializes the article-aligned variables from [1]:
     Resource Management using Multi-Agent Reinforcement Learning".
     IEEE TMLCN, 2025. arXiv:2511.15002.
 
-Until a trained SAC agent is available online, the runtime uses a deterministic
-bootstrap allocator that preserves RAN priority while exporting real workload
-traces for future SAC training.
+The runtime keeps the current GreenRAN scenario and uses a deterministic
+bootstrap allocator as the live policy while exporting TA-SAM-aligned state for
+shadow evaluation.
 """
 
 from __future__ import annotations
@@ -75,19 +75,22 @@ def estimate_ran_demand(
     camera_observability = _clamp(observed_cameras / max(active_cameras, 1.0)) if active_cameras > 0 else 0.0
     critical_ratio = _clamp(critical_cameras / max(active_cameras, 1.0)) if active_cameras > 0 else 0.0
     throughput_target = max(1.0, _safe_float(config.get("camera_throughput_target_mbps", 25.0), 25.0))
+    throughput_guard = max(throughput_target, _safe_float(config.get("camera_throughput_guard_mbps", 30.0), 30.0))
+    latency_warning_ms = max(1.0, _safe_float(config.get("camera_latency_warning_ms", 80.0), 80.0))
+    latency_target_ms = max(latency_warning_ms, _safe_float(config.get("camera_latency_target_ms", 100.0), 100.0))
     throughput_pressure = _clamp((throughput_target - throughput_mbps) / throughput_target)
     headroom_target = max(1.0, _safe_float(config.get("camera_headroom_target_mbps", 35.0), 35.0))
     throughput_headroom_pressure = _clamp((headroom_target - throughput_mbps) / headroom_target)
-    latency_pressure = _clamp((latency_ms - 20.0) / 60.0)
-    latency_guard_pressure = _clamp((latency_ms - 40.0) / 40.0)
+    latency_pressure = _clamp((latency_ms - 20.0) / max(latency_target_ms - 20.0, 1.0))
+    latency_guard_pressure = _clamp((latency_ms - 40.0) / max(latency_warning_ms - 40.0, 1.0))
     severe_throughput_pressure = _clamp(((throughput_target * 1.15) - throughput_mbps) / max(throughput_target * 1.15, 1.0))
     cvar_pressure = _clamp(cvar_ms / max(1.0, _safe_float(config.get("cvar_target_ms", 120.0), 120.0)))
     p95_pressure = _clamp(p95_ms / max(1.0, _safe_float(config.get("p95_target_ms", 80.0), 80.0)))
     warmup_pressure = 1.0 if active_cameras > 0 and not throughput_ready else 0.0
-    throughput_warning = 1.0 if active_cameras > 0 and throughput_ready and throughput_mbps < 30.0 else 0.0
+    throughput_warning = 1.0 if active_cameras > 0 and throughput_ready and throughput_mbps < throughput_guard else 0.0
     throughput_violation = 1.0 if active_cameras > 0 and throughput_ready and throughput_mbps < throughput_target else 0.0
-    latency_warning = 1.0 if active_cameras > 0 and latency_ms >= 60.0 else 0.0
-    latency_violation = 1.0 if active_cameras > 0 and latency_ms >= 80.0 else 0.0
+    latency_warning = 1.0 if active_cameras > 0 and latency_ms >= latency_warning_ms else 0.0
+    latency_violation = 1.0 if active_cameras > 0 and latency_ms >= latency_target_ms else 0.0
 
     demand = _clamp(
         (0.18 * camera_activity)
@@ -276,8 +279,8 @@ def compute_shared_resource_snapshot(
     utilization = _clamp((r_ran + r_ai) / r_max)
 
     snapshot = {
-        "controller_id": "caora_bootstrap_heuristic",
-        "target_policy_id": "caora_sac_resource_allocation",
+        "controller_id": "tasam_greenran_bootstrap_heuristic",
+        "target_policy_id": "ta_sam_shadow_runtime",
         "decision_domain": "resource_allocation",
         "action_semantics": "resource_share_delta",
         "resource_budget": r_max,

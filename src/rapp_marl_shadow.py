@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -29,6 +30,21 @@ def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     if value > upper:
         return upper
     return value
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() not in {'0', 'false', 'no', 'off', ''}
 
 
 def _completion_estimate(allocation: float, demand: float) -> float:
@@ -199,10 +215,34 @@ def build_shadow_comparison(resource_snapshot: Dict[str, Any] | None, marl_shado
 
 
 class MARLShadowRuntimeEvaluator:
-    def __init__(self) -> None:
-        self.enabled = str(os.environ.get('GREENRAN_MARL_SHADOW_ENABLE', '1')).strip().lower() not in {'0', 'false', 'no'}
+    def __init__(self, config: Dict[str, Any] | None = None) -> None:
+        config = config or {}
+        self.enabled = _to_bool(
+            os.environ.get('GREENRAN_TASAM_ADVISOR_ENABLED', os.environ.get('GREENRAN_MARL_SHADOW_ENABLE', config.get('enabled', True))),
+            default=True,
+        )
         self.policy_id = os.environ.get('GREENRAN_MARL_SHADOW_POLICY_ID', 'ta_sam_marl_shadow_v1')
         self.mode = 'shadow_only'
+        self.advisory_mode = str(
+            os.environ.get('GREENRAN_TASAM_ADVISOR_MODE', config.get('mode', 'shadow'))
+        ).strip().lower() or 'shadow'
+        self.min_confidence = _clamp(
+            os.environ.get('GREENRAN_TASAM_MIN_CONFIDENCE', config.get('min_confidence', 0.70)),
+            0.0,
+            1.0,
+        )
+        self.stability_window = max(
+            1,
+            _safe_int(os.environ.get('GREENRAN_TASAM_STABILITY_WINDOW', config.get('stability_window', 2)), 2),
+        )
+        self.enable_resource_advice = _to_bool(
+            os.environ.get('GREENRAN_TASAM_RESOURCE_ADVICE', config.get('enable_resource_advice', True)),
+            default=True,
+        )
+        self.enable_energy_advice = _to_bool(
+            os.environ.get('GREENRAN_TASAM_ENERGY_ADVICE', config.get('enable_energy_advice', True)),
+            default=True,
+        )
         self.project_root = Path(__file__).resolve().parent.parent
         self.eval_manifest_path = Path(
             os.environ.get(
@@ -223,6 +263,7 @@ class MARLShadowRuntimeEvaluator:
         self._torch = None
         self._actors = None
         self._checkpoint_error = ''
+        self._recommendation_history: deque[str] = deque(maxlen=self.stability_window)
         if self.enabled:
             self._try_load_checkpoint()
 
@@ -241,7 +282,8 @@ class MARLShadowRuntimeEvaluator:
         venv_site = self.project_root / 'drlexp' / '.venv' / 'lib'
         if not venv_site.exists():
             return
-        for child in sorted(venv_site.glob('python*/site-packages')):
+        py_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        for child in sorted(venv_site.glob(f'{py_tag}/site-packages')):
             candidate = child / 'torch'
             if candidate.exists():
                 site_path = str(child)
@@ -284,26 +326,73 @@ class MARLShadowRuntimeEvaluator:
             self._checkpoint_error = 'invalid checkpoint metadata'
             return
 
-        class _ActorNetwork(nn.Module):
-            def __init__(self, input_dim: int, hidden_dim: int = 64, action_dim: int = 3) -> None:
+        hidden_dims = self.checkpoint_meta.get('actor_hidden_dims') or [64, 64]
+        if not isinstance(hidden_dims, list):
+            hidden_dims = [64, 64]
+        hidden_dims = [max(1, _safe_int(dim, 64)) for dim in hidden_dims if _safe_int(dim, 0) > 0] or [64, 64]
+        activation_name = str(self.checkpoint_meta.get('activation', 'relu') or 'relu').strip().lower()
+
+        def _activation_factory():
+            if activation_name == 'tanh':
+                return nn.Tanh()
+            if activation_name == 'gelu':
+                return nn.GELU()
+            if activation_name == 'elu':
+                return nn.ELU()
+            if activation_name == 'leaky_relu':
+                return nn.LeakyReLU()
+            return nn.ReLU()
+
+        action_layout = self.checkpoint_meta.get('action_layout') or ['eMBB', 'mMTC', 'URLLC']
+        action_dim = max(1, len(action_layout) if isinstance(action_layout, list) else 3)
+
+        class _LegacyActorNetwork(nn.Module):
+            def __init__(self, input_dim: int, hidden_dims: List[int], action_dim: int = 3) -> None:
                 super().__init__()
-                self.net = nn.Sequential(
-                    nn.Linear(input_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, action_dim),
-                    nn.Sigmoid(),
-                )
+                layers: List[nn.Module] = []
+                prev_dim = input_dim
+                for hidden_dim in hidden_dims:
+                    layers.append(nn.Linear(prev_dim, hidden_dim))
+                    layers.append(_activation_factory())
+                    prev_dim = hidden_dim
+                layers.append(nn.Linear(prev_dim, action_dim))
+                layers.append(nn.Sigmoid())
+                self.net = nn.Sequential(*layers)
 
             def forward(self, x):
                 out = self.net(x)
                 total = torch.clamp(out.sum(dim=-1, keepdim=True), min=1e-9)
                 return out / total
 
-        actors = nn.ModuleList([_ActorNetwork(du_state_dim) for _ in range(du_count)])
         state_dict = torch.load(ckpt_path, map_location='cpu')
-        actors.load_state_dict(state_dict)
+
+        class _ArticleDirichletActor(nn.Module):
+            def __init__(self, input_dim: int, hidden_dims: List[int], action_dim: int = 3) -> None:
+                super().__init__()
+                layers: List[nn.Module] = []
+                prev_dim = input_dim
+                for hidden_dim in hidden_dims:
+                    layers.append(nn.Linear(prev_dim, hidden_dim))
+                    layers.append(_activation_factory())
+                    prev_dim = hidden_dim
+                self.backbone = nn.Sequential(*layers)
+                self.concentration_head = nn.Linear(prev_dim, action_dim)
+
+            def forward(self, x):
+                raw = self.concentration_head(self.backbone(x))
+                alpha = torch.nn.functional.softplus(raw) + 1e-3
+                total = torch.clamp(alpha.sum(dim=-1, keepdim=True), min=1e-9)
+                return alpha / total
+
+        state_keys = list(state_dict.keys()) if isinstance(state_dict, dict) else []
+        article_style_state = any('.concentration_head.' in key or '.backbone.' in key for key in state_keys)
+        actor_cls = _ArticleDirichletActor if article_style_state else _LegacyActorNetwork
+        actors = nn.ModuleList([actor_cls(du_state_dim, hidden_dims=hidden_dims, action_dim=action_dim) for _ in range(du_count)])
+        try:
+            actors.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            self._checkpoint_error = f'checkpoint load failed: {exc}'
+            return
         actors.eval()
         self._torch = torch
         self._actors = actors
@@ -350,9 +439,116 @@ class MARLShadowRuntimeEvaluator:
             return checkpoint_action, 'checkpoint'
         return self._heuristic_du_action(du_state), 'heuristic'
 
+    def _resource_advice(self, priority: str, resource_snapshot: Dict[str, Any], comparison: Dict[str, Any], shadow_r_ran: float, shadow_r_ai: float) -> Dict[str, Any]:
+        current_r_ran = _safe_float(resource_snapshot.get('r_ran', 0.0), 0.0)
+        current_r_ai = _safe_float(resource_snapshot.get('r_ai', 0.0), 0.0)
+        delta_r_ran = shadow_r_ran - current_r_ran
+        delta_r_ai = shadow_r_ai - current_r_ai
+
+        if not self.enable_resource_advice:
+            return {'enabled': False}
+
+        if delta_r_ran > 0.02:
+            recommendation = 'shift_to_ran'
+        elif delta_r_ran < -0.02:
+            recommendation = 'shift_to_ai'
+        else:
+            recommendation = 'hold'
+
+        return {
+            'enabled': True,
+            'priority': priority,
+            'recommendation': recommendation,
+            'suggested_r_ran': round(shadow_r_ran, 4),
+            'suggested_r_ai': round(shadow_r_ai, 4),
+            'delta_r_ran_vs_live': round(delta_r_ran, 4),
+            'delta_r_ai_vs_live': round(delta_r_ai, 4),
+            'score_delta': round(_safe_float(comparison.get('score_delta', 0.0), 0.0), 6),
+        }
+
+    def _energy_advice(self, priority: str, comparison: Dict[str, Any], shadow_r_ran: float, live_r_ran: float) -> Dict[str, Any]:
+        if not self.enable_energy_advice:
+            return {'enabled': False}
+
+        score_delta = _safe_float(comparison.get('score_delta', 0.0), 0.0)
+        live_shortfall = _safe_float(comparison.get('live_total_shortfall', 0.0), 0.0)
+        shadow_shortfall = _safe_float(comparison.get('shadow_total_shortfall', 0.0), 0.0)
+        live_ran_completion = _safe_float(comparison.get('live_ran_completion_est', 0.0), 0.0)
+        shadow_ran_completion = _safe_float(comparison.get('shadow_ran_completion_est', 0.0), 0.0)
+        delta_r_ran = shadow_r_ran - live_r_ran
+
+        decision = 'CONDITIONAL'
+        action = 'MONITOR'
+        reason = 'shadow comparison inconclusive'
+
+        if score_delta > 0.02 and shadow_shortfall <= live_shortfall:
+            if priority in {'ran_camera', 'ai_guarded'} and abs(delta_r_ran) >= 0.03:
+                decision = 'CONDITIONAL'
+                action = 'FULL_POWER_GUARD'
+                reason = f'shadow keeps protected allocation for priority={priority}'
+            elif shadow_ran_completion >= live_ran_completion:
+                decision = 'ALLOWED'
+                action = 'REDUCE_POWER'
+                reason = 'shadow preserves service completion with better score proxy'
+        elif score_delta < -0.01:
+            decision = 'BLOCKED'
+            action = 'FULL_POWER'
+            reason = 'shadow candidate degrades score proxy'
+
+        return {
+            'enabled': True,
+            'decision': decision,
+            'action': action,
+            'reason': reason,
+            'score_delta': round(score_delta, 6),
+        }
+
+    def _advisor_confidence(self, source: str, comparison: Dict[str, Any], stable_recommendation: bool) -> float:
+        source_score = {
+            'checkpoint': 0.92,
+            'mixed': 0.78,
+            'heuristic': 0.52,
+        }.get(source, 0.45)
+        readiness_score = {
+            'control_candidate': 0.96,
+            'shadow_ready': 0.88,
+            'not_ready': 0.40,
+            'unknown': 0.45,
+        }.get(self.checkpoint_readiness, 0.45)
+        delta_score = _clamp(max(_safe_float(comparison.get('score_delta', 0.0), 0.0), 0.0) / 0.08, 0.0, 1.0)
+        stability_score = 1.0 if stable_recommendation else 0.45
+        return _clamp(
+            (0.35 * source_score)
+            + (0.25 * readiness_score)
+            + (0.25 * delta_score)
+            + (0.15 * stability_score),
+            0.0,
+            1.0,
+        )
+
+    def _recommendation_signature(self, priority: str, resource_advice: Dict[str, Any], energy_advice: Dict[str, Any]) -> str:
+        return ':'.join(
+            [
+                priority,
+                str(resource_advice.get('recommendation', 'hold')),
+                str(round(_safe_float(resource_advice.get('suggested_r_ran', 0.0), 0.0), 3)),
+                str(energy_advice.get('decision', 'CONDITIONAL')),
+                str(energy_advice.get('action', 'MONITOR')),
+            ]
+        )
+
+    def _stability_state(self, signature: str) -> Dict[str, Any]:
+        self._recommendation_history.append(signature)
+        stable = len(self._recommendation_history) >= self.stability_window and len(set(self._recommendation_history)) == 1
+        return {
+            'window': self.stability_window,
+            'samples': len(self._recommendation_history),
+            'stable': stable,
+        }
+
     def evaluate(self, marl_state: Dict[str, Any] | None, resource_snapshot: Dict[str, Any] | None = None) -> Dict[str, Any]:
         if not self.enabled:
-            return {'enabled': False, 'policy_id': self.policy_id, 'mode': self.mode}
+            return {'enabled': False, 'policy_id': self.policy_id, 'mode': self.mode, 'advisory_mode': self.advisory_mode}
         marl_state = marl_state or {}
         resource_snapshot = resource_snapshot or {}
         scenario_control = _load_scenario_control()
@@ -363,6 +559,7 @@ class MARLShadowRuntimeEvaluator:
                 'enabled': True,
                 'policy_id': self.policy_id,
                 'mode': self.mode,
+                'advisory_mode': self.advisory_mode,
                 'available': False,
                 'source': self.checkpoint_source,
                 'checkpoint_readiness': self.checkpoint_readiness,
@@ -421,6 +618,7 @@ class MARLShadowRuntimeEvaluator:
             'available': True,
             'policy_id': self.policy_id,
             'mode': self.mode,
+            'advisory_mode': self.advisory_mode,
             'source': final_source,
             'checkpoint_readiness': self.checkpoint_readiness,
             'checkpoint_run_dir': self.checkpoint_run_dir,
@@ -437,4 +635,60 @@ class MARLShadowRuntimeEvaluator:
             'mean_action_vector': [round(mean_embb, 4), round(mean_mmtc, 4), round(mean_urllc, 4)],
         }
         result['comparison'] = build_shadow_comparison(resource_snapshot, result)
+        resource_advice = self._resource_advice(priority, resource_snapshot, result['comparison'], shadow_r_ran, shadow_r_ai)
+        energy_advice = self._energy_advice(priority, result['comparison'], shadow_r_ran, current_r_ran)
+        stability = self._stability_state(self._recommendation_signature(priority, resource_advice, energy_advice))
+        confidence = self._advisor_confidence(final_source, result['comparison'], stability['stable'])
+        evidence_flags = {
+            'checkpoint_ready': self.checkpoint_readiness in {'shadow_ready', 'control_candidate'},
+            'checkpoint_backed': final_source in {'checkpoint', 'mixed'},
+            'positive_score_delta': _safe_float(result['comparison'].get('score_delta', 0.0), 0.0) > 0.0,
+            'stable_recommendation': stability['stable'],
+            'resource_budget_respected': abs((shadow_r_ran + shadow_r_ai) - usable_budget) <= 1e-6,
+        }
+        gate_passed = all(
+            (
+                evidence_flags['checkpoint_ready'],
+                evidence_flags['checkpoint_backed'],
+                evidence_flags['positive_score_delta'],
+                evidence_flags['stable_recommendation'],
+                confidence >= self.min_confidence,
+            )
+        )
+        advisor = {
+            'enabled': True,
+            'mode': self.advisory_mode,
+            'policy_id': self.policy_id,
+            'source': final_source,
+            'confidence': round(confidence, 4),
+            'min_confidence': round(self.min_confidence, 4),
+            'stability_window': self.stability_window,
+            'valid': gate_passed,
+            'gate_passed': gate_passed,
+            'would_influence': gate_passed and self.advisory_mode not in {'shadow', 'shadow_only'},
+            'resource_advice': resource_advice,
+            'energy_advice': energy_advice,
+            'du_contributions': [
+                {
+                    'du_id': item.get('du_id', 'unknown'),
+                    'primary_slice': item.get('primary_slice', 'unknown'),
+                    'source': item.get('source', 'unknown'),
+                    'dominant_slice': ['eMBB', 'mMTC', 'URLLC'][max(range(3), key=lambda idx: item.get('action_vector', [0.0, 0.0, 0.0])[idx])],
+                    'dominant_share': max(item.get('action_vector', [0.0, 0.0, 0.0])),
+                    'action_vector': item.get('action_vector', []),
+                }
+                for item in du_recommendations
+            ],
+            'stability': stability,
+            'evidence_flags': evidence_flags,
+            'arbitration_score': round(
+                (0.65 * confidence) + (0.35 * _clamp(max(_safe_float(result['comparison'].get('score_delta', 0.0), 0.0), 0.0) / 0.08, 0.0, 1.0)),
+                4,
+            ),
+            'reason': energy_advice.get('reason', ''),
+        }
+        result['confidence'] = advisor['confidence']
+        result['valid'] = advisor['valid']
+        result['would_influence'] = advisor['would_influence']
+        result['advisor'] = advisor
         return result

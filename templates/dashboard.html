@@ -610,6 +610,11 @@
                             CRÍTICO
                         {% endif %}
                     </div>
+                    {% if network_health.improvement_valid %}
+                    <div class="mt-2 small text-muted">
+                        Melhora: {{ "%.1f"|format(network_health.network_improvement_pct) }}% vs baseline
+                    </div>
+                    {% endif %}
                 {% else %}
                     <div class="metric-value status-warning">N/A</div>
                 {% endif %}

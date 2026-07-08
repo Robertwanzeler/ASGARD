@@ -37,6 +37,53 @@ NC='\033[0m' # No Color
 # Pastas
 ORANGE_DIR="$BASE_DIR"
 
+resolve_ric_binary() {
+    local candidate
+    for candidate in \
+        "$RIC_DIR/examples/ric/nearRT-RIC" \
+        "$BASE_DIR/flexric/build/examples/ric/nearRT-RIC"; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_xapp_binary() {
+    local name="$1"
+    find "$RIC_DIR/examples/xApp" -type f -name "$name" | sort | head -n 1
+}
+
+resolve_ns3_binary() {
+    local candidates=(
+        "$NS3_DIR/build/scratch/ns3.42-scenario-greenran-default"
+        "$NS3_DIR/build/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario-default"
+        "$NS3_DIR/build/scratch/ns3.42-Energy_Saving_with_load_balancing_scenario-default"
+        "$NS3_DIR/build/scratch/ns3.42-scenario-zero-default"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_started() {
+    local pid_file="$1"
+    local name="$2"
+    local log_file="$3"
+    sleep 1
+    if [ ! -f "$pid_file" ] || ! kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        log_error "$name encerrou durante o startup"
+        [ -f "$log_file" ] && tail -n 40 "$log_file"
+        exit 1
+    fi
+}
+
 # Funções
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -128,35 +175,40 @@ show_dataset_status() {
 # Verificar dependências
 check_deps() {
     log_info "Verificando dependências..."
+
+    local ric_bin
+    local xapp_slicer_bin
+    local xapp_energy_bin
+    local ns3_bin
+    ric_bin="$(resolve_ric_binary || true)"
+    xapp_slicer_bin="$(resolve_xapp_binary xapp_slicer || true)"
+    xapp_energy_bin="$(resolve_xapp_binary xapp_energy_saver || true)"
+    ns3_bin="$(resolve_ns3_binary || true)"
     
-    # nearRT-RIC
-    if [ ! -f "$RIC_DIR/examples/ric/nearRT-RIC" ]; then
+    if [ -z "$ric_bin" ]; then
         log_error "nearRT-RIC não encontrado em $RIC_DIR/examples/ric/"
         exit 1
     fi
     
-    # xApps
-    if [ ! -f "$RIC_DIR/examples/xApp/c/xapp_slicer" ]; then
+    if [ -z "$xapp_slicer_bin" ]; then
         log_error "xApp-SLICER não encontrado"
         exit 1
     fi
-    if [ ! -f "$RIC_DIR/examples/xApp/c/xapp_energy_saver" ]; then
+    if [ -z "$xapp_energy_bin" ]; then
         log_error "xApp-ENERGY não encontrado"
         exit 1
     fi
     
-    # ns-3
-    if [ ! -f "$NS3_DIR/build/scratch/ns3.42-scenario-greenran-default" ]; then
+    if [ -z "$ns3_bin" ]; then
         log_error "ns-3 não encontrado"
         exit 1
     fi
     
-    # Python scripts
-    if [ ! -f "$ORANGE_DIR/csv_to_metrics.py" ]; then
+    if [ ! -f "$ORANGE_DIR/src/csv_to_metrics.py" ]; then
         log_error "csv_to_metrics.py não encontrado"
         exit 1
     fi
-    if [ ! -f "$ORANGE_DIR/rapp_orchestrator.py" ]; then
+    if [ ! -f "$ORANGE_DIR/src/rapp_orchestrator.py" ]; then
         log_error "rapp_orchestrator.py não encontrado"
         exit 1
     fi
@@ -167,37 +219,49 @@ check_deps() {
 # Iniciar nearRT-RIC
 start_ric() {
     log_info "Iniciando nearRT-RIC..."
+    local ric_bin
+    ric_bin="$(resolve_ric_binary)"
     cd "$ORANGE_DIR"
     export LD_LIBRARY_PATH="$RIC_DIR/src/ric:$FLEXRIC_LIB:$RIC_DIR/src/xApp:$LD_LIBRARY_PATH"
-    $RIC_DIR/examples/ric/nearRT-RIC -c "$ORANGE_DIR/flexric/flexric.conf" -p "$FLEXRIC_LIB/" > /tmp/ric.log 2>&1 &
+    "$ric_bin" -c "$ORANGE_DIR/flexric/flexric.conf" -p "$FLEXRIC_LIB/" > /tmp/ric.log 2>&1 &
     echo $! > /tmp/ric.pid
     sleep 3
+    ensure_started /tmp/ric.pid "nearRT-RIC" /tmp/ric.log
     log_success "nearRT-RIC iniciado (PID: $(cat /tmp/ric.pid))"
 }
 
 # Iniciar ns-3
 start_ns3() {
     log_info "Iniciando ns-3 (20 UEs)..."
+    local ns3_bin
+    ns3_bin="$(resolve_ns3_binary)"
     cd "$NS3_DIR"
-    ./build/scratch/ns3.42-scenario-greenran-default --e2TermIp=127.0.0.1 --simTime=100000 > /tmp/ns3.log 2>&1 &
+    "$ns3_bin" --e2TermIp=127.0.0.1 --simTime=100000 > /tmp/ns3.log 2>&1 &
     echo $! > /tmp/ns3.pid
     sleep 2
+    ensure_started /tmp/ns3.pid "ns-3" /tmp/ns3.log
     log_success "ns-3 iniciado (PID: $(cat /tmp/ns3.pid))"
 }
 
 # Iniciar xApps
 start_xapps() {
     log_info "Iniciando xApp-SLICER..."
+    local xapp_slicer_bin
+    local xapp_energy_bin
+    xapp_slicer_bin="$(resolve_xapp_binary xapp_slicer)"
+    xapp_energy_bin="$(resolve_xapp_binary xapp_energy_saver)"
     cd "$ORANGE_DIR"
     export LD_LIBRARY_PATH="$RIC_DIR/src/ric:$FLEXRIC_LIB:$RIC_DIR/src/xApp:$LD_LIBRARY_PATH"
-    $RIC_DIR/examples/xApp/c/xapp_slicer > /tmp/xapp_slicer.log 2>&1 &
+    "$xapp_slicer_bin" -c "$ORANGE_DIR/flexric/flexric.conf" -p "$FLEXRIC_LIB/" > /tmp/xapp_slicer.log 2>&1 &
     echo $! > /tmp/xapp_slicer.pid
     sleep 1
+    ensure_started /tmp/xapp_slicer.pid "xApp-SLICER" /tmp/xapp_slicer.log
     
     log_info "Iniciando xApp-ENERGY..."
-    $RIC_DIR/examples/xApp/c/xapp_energy_saver > /tmp/xapp_energy.log 2>&1 &
+    "$xapp_energy_bin" -c "$ORANGE_DIR/flexric/flexric.conf" -p "$FLEXRIC_LIB/" > /tmp/xapp_energy.log 2>&1 &
     echo $! > /tmp/xapp_energy.pid
     sleep 2
+    ensure_started /tmp/xapp_energy.pid "xApp-ENERGY" /tmp/xapp_energy.log
     log_success "xApps iniciados (SLICER: $(cat /tmp/xapp_slicer.pid), ENERGY: $(cat /tmp/xapp_energy.pid))"
 }
 
@@ -205,14 +269,16 @@ start_xapps() {
 start_collectors() {
     log_info "Iniciando csv_to_metrics..."
     cd "$ORANGE_DIR"
-    python3 ./csv_to_metrics.py --input-dir "$NS3_DIR" --output "$STATE_DIR/xapp_metrics/metrics.json" --poll-interval "$GREENRAN_COLLECTOR_POLL_INTERVAL" > "$GREENRAN_CSV_LOG" 2>&1 &
+    "$GREENRAN_PYTHON_BIN" ./src/csv_to_metrics.py --input-dir "$NS3_DIR" --output "$STATE_DIR/xapp_metrics/metrics.json" --poll-interval "$GREENRAN_COLLECTOR_POLL_INTERVAL" > "$GREENRAN_CSV_LOG" 2>&1 &
     echo $! > "$GREENRAN_CSV_PID"
     sleep 1
+    ensure_started "$GREENRAN_CSV_PID" "csv_to_metrics" "$GREENRAN_CSV_LOG"
     
     log_info "Iniciando rApp-ResourceOptimizer..."
-    python3 ./rapp_orchestrator.py --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" --synthetic "$GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS" > "$GREENRAN_RAPP_LOG" 2>&1 &
+    "$GREENRAN_PYTHON_BIN" ./src/rapp_orchestrator.py --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" --synthetic "$GREENRAN_ORCHESTRATOR_SYNTHETIC_DAYS" > "$GREENRAN_RAPP_LOG" 2>&1 &
     echo $! > "$GREENRAN_RAPP_PID"
     sleep 1
+    ensure_started "$GREENRAN_RAPP_PID" "rApp-ResourceOptimizer" "$GREENRAN_RAPP_LOG"
     log_success "Coletores iniciados (csv_to_metrics: $(cat "$GREENRAN_CSV_PID"), rApp: $(cat "$GREENRAN_RAPP_PID"))"
 }
 

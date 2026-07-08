@@ -11,8 +11,10 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from queue import Queue, Empty
 from datetime import datetime
+from greenran_runtime import load_runtime_config
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../../config/priority_classes.json")
+RUNTIME_CONFIG = load_runtime_config()
 
 @dataclass
 class PriorityPacket:
@@ -179,6 +181,10 @@ class DecisionEngine:
     
     def make_decision(self, metrics: Dict) -> Dict[str, Any]:
         """Make scheduling decision based on metrics and priorities"""
+        shared_cfg = RUNTIME_CONFIG.get("shared_resources", {})
+        throughput_min_mbps = float(shared_cfg.get("camera_throughput_target_mbps", 25.0) or 25.0)
+        latency_warning_ms = float(shared_cfg.get("camera_latency_warning_ms", 80.0) or 80.0)
+        latency_block_ms = float(shared_cfg.get("camera_latency_target_ms", 100.0) or 100.0)
         decision = {
             'action': 'MAINTAIN',
             'power_level': 100,
@@ -192,28 +198,37 @@ class DecisionEngine:
             latency_ms = camera.get('latency_us', 0) / 1000
             throughput_mbps = camera.get('throughput_kbps', 0) / 1000
             
-            # Throughput < 25 Mbps = BLOCKED
-            if throughput_mbps < 25:
+            # Throughput abaixo do minimo = BLOCKED
+            if throughput_mbps < throughput_min_mbps:
                 decision['action'] = 'BLOCKED'
                 decision['power_level'] = 100
                 decision['priority_class'] = 'CRITICAL'
-                decision['reason'] = f'Camera {camera.get("ue_id")} throughput {throughput_mbps:.1f}Mbps < 25Mbps (SLA violation)'
+                decision['reason'] = (
+                    f'Camera {camera.get("ue_id")} throughput {throughput_mbps:.1f}Mbps '
+                    f'< {throughput_min_mbps:.0f}Mbps (SLA violation)'
+                )
                 return decision
             
-            # Latency >= 80ms = BLOCKED
-            if latency_ms >= 80:
+            # Latency acima do limite duro = BLOCKED
+            if latency_ms >= latency_block_ms:
                 decision['action'] = 'BLOCKED'
                 decision['power_level'] = 100
                 decision['priority_class'] = 'CRITICAL'
-                decision['reason'] = f'Camera {camera.get("ue_id")} latency {latency_ms:.1f}ms >= 80ms'
+                decision['reason'] = (
+                    f'Camera {camera.get("ue_id")} latency {latency_ms:.1f}ms '
+                    f'>= {latency_block_ms:.0f}ms'
+                )
                 return decision
             
-            # Latency 60-80ms = CONDITIONAL
-            if latency_ms >= 60:
+            # Latency na faixa de guarda = CONDITIONAL
+            if latency_ms >= latency_warning_ms:
                 decision['action'] = 'CONDITIONAL'
                 decision['power_level'] = 80
                 decision['priority_class'] = 'CRITICAL'
-                decision['reason'] = f'Camera {camera.get("ue_id")} latency {latency_ms:.1f}ms in [60-80ms] range'
+                decision['reason'] = (
+                    f'Camera {camera.get("ue_id")} latency {latency_ms:.1f}ms '
+                    f'in [{latency_warning_ms:.0f}-{latency_block_ms:.0f}ms] range'
+                )
         
         # Check sensor packet loss
         sensors = metrics.get('sensors', [])

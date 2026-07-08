@@ -44,6 +44,8 @@ from datetime import datetime
 from collections import deque
 from greenran_paths import (
     DRL_VENV_SITE_PACKAGES,
+    MODELS_DIR,
+    PROJECT_ROOT,
     STATE_DIR,
     SLICER_INTENT_PATH,
     ENERGY_INTENT_PATH,
@@ -69,6 +71,12 @@ from rapp_pattern_engine import PatternRecognition
 from rapp_agent_openran import AgentOpenRAN
 from rapp_a1_interface import A1PolicyInterface
 from rapp_ml_predictor import MLPredictor
+from rapp_online_retrain_runtime import (
+    build_online_retrain_command,
+    load_online_retrain_manifest,
+    online_retrain_manifest_path,
+    summarize_online_retrain_manifest,
+)
 from rapp_armd_runtime import ARMDRuntimeAdvisor
 from rapp_rl_policy import build_runtime_rl_policy
 from rapp_sac_resource_model import compute_shared_resource_snapshot
@@ -700,9 +708,19 @@ class RappResourceOptimizer:
             ]
 
             if camera_entries:
+                def _camera_real_throughput_kbps(entry):
+                    candidates = (
+                        float(entry.get('rx_throughput_kbps', 0) or 0),
+                        float(entry.get('throughput_kbps', 0) or 0),
+                        float(entry.get('total_pdcp_throughput_kbps', 0) or 0),
+                        float(entry.get('tx_throughput_kbps', 0) or 0),
+                        float(entry.get('cu_up_throughput_kbps', 0) or 0),
+                    )
+                    return max(candidates)
+
                 worst_latency_us = max(float(entry.get('latency_us', 0) or 0) for entry in camera_entries)
                 min_throughput_kbps = min(
-                    float(entry.get('rx_throughput_kbps', entry.get('throughput_kbps', 0)) or 0)
+                    _camera_real_throughput_kbps(entry)
                     for entry in camera_entries
                 )
                 critical_cameras = sum(
@@ -716,7 +734,7 @@ class RappResourceOptimizer:
                         or int(entry.get('packet_count', 0) or 0) > 0
                         or float(entry.get('rx_bytes', 0) or 0) > 0
                         or float(entry.get('tx_bytes', 0) or 0) > 0
-                        or float(entry.get('rx_throughput_kbps', entry.get('throughput_kbps', 0)) or 0) > 0
+                        or _camera_real_throughput_kbps(entry) > 0
                     )
                 )
                 throughput_sources = {
@@ -1068,8 +1086,23 @@ class RappResourceOptimizer:
             'sim_time_s': sim_time_s,
         }
 
-        CAMERA_THROUGHPUT_WARNING_MBPS = 30.0
-        CAMERA_THROUGHPUT_MIN_MBPS = 25.0
+        shared_resource_cfg = RUNTIME_CONFIG.get('shared_resources', {})
+        CAMERA_THROUGHPUT_MIN_MBPS = max(
+            1.0,
+            float(shared_resource_cfg.get('camera_throughput_target_mbps', 25.0) or 25.0),
+        )
+        CAMERA_THROUGHPUT_WARNING_MBPS = max(
+            CAMERA_THROUGHPUT_MIN_MBPS,
+            float(shared_resource_cfg.get('camera_throughput_guard_mbps', 30.0) or 30.0),
+        )
+        CAMERA_LATENCY_WARNING_MS = max(
+            1.0,
+            float(shared_resource_cfg.get('camera_latency_warning_ms', 80.0) or 80.0),
+        )
+        CAMERA_LATENCY_BLOCK_MS = max(
+            CAMERA_LATENCY_WARNING_MS,
+            float(shared_resource_cfg.get('camera_latency_target_ms', 100.0) or 100.0),
+        )
 
         # A política de câmera precisa continuar válida mesmo quando o SLICER
         # ainda não publicou intent; a fonte primária é App1/override.
@@ -1103,15 +1136,18 @@ class RappResourceOptimizer:
                 f"< {CAMERA_THROUGHPUT_MIN_MBPS:.0f}Mbps - BLOCKED\033[0m"
             )
 
-        # REGRA: Latência ≥ 80ms → BLOCKED
-        elif active_cameras > 0 and camera_latency_ms >= 80:
+        # REGRA: Latência ≥ limite duro → BLOCKED
+        elif active_cameras > 0 and camera_latency_ms >= CAMERA_LATENCY_BLOCK_MS:
             decision['energy_saver'] = 'BLOCKED'
             decision['action'] = 'FULL_POWER'
-            decision['reason'] = f'CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= 80ms'
+            decision['reason'] = f'CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= {CAMERA_LATENCY_BLOCK_MS:.0f}ms'
             decision['confidence'] = 1.0
             decision['priority_violation'] = 'LATENCY'
             self.stats['sla_violations'] += 1
-            print(f"\033[1;31m[rApp] CÂMERA SLA: Latência {camera_latency_ms:.1f}ms >= 80ms - BLOCKED\033[0m")
+            print(
+                f"\033[1;31m[rApp] CÂMERA SLA: Latência {camera_latency_ms:.1f}ms "
+                f">= {CAMERA_LATENCY_BLOCK_MS:.0f}ms - BLOCKED\033[0m"
+            )
 
         # REGRA: Throughput na faixa 25-30Mbps → CONDITIONAL (faixa de cautela)
         elif active_cameras > 0 and camera_throughput_mbps < CAMERA_THROUGHPUT_WARNING_MBPS:
@@ -1128,14 +1164,20 @@ class RappResourceOptimizer:
                 f"[{CAMERA_THROUGHPUT_MIN_MBPS:.0f}-{CAMERA_THROUGHPUT_WARNING_MBPS:.0f}Mbps] - CONDITIONAL\033[0m"
             )
 
-        # REGRA: Latência 60-80ms → CONDITIONAL
-        elif active_cameras > 0 and camera_latency_ms >= 60:
+        # REGRA: Latência na faixa de guarda → CONDITIONAL
+        elif active_cameras > 0 and camera_latency_ms >= CAMERA_LATENCY_WARNING_MS:
             decision['energy_saver'] = 'CONDITIONAL'
             decision['action'] = 'FULL_POWER_GUARD'
-            decision['reason'] = f'CÂMERA: Latência {camera_latency_ms:.1f}ms em [60-80ms] - margem protegida'
+            decision['reason'] = (
+                f'CÂMERA: Latência {camera_latency_ms:.1f}ms em '
+                f'[{CAMERA_LATENCY_WARNING_MS:.0f}-{CAMERA_LATENCY_BLOCK_MS:.0f}ms] - margem protegida'
+            )
             decision['confidence'] = 0.7
             decision['priority_violation'] = 'LATENCY_WARNING'
-            print(f"\033[1;33m[rApp] CÂMERA: Latência {camera_latency_ms:.1f}ms em [60-80ms] - CONDITIONAL\033[0m")
+            print(
+                f"\033[1;33m[rApp] CÂMERA: Latência {camera_latency_ms:.1f}ms em "
+                f"[{CAMERA_LATENCY_WARNING_MS:.0f}-{CAMERA_LATENCY_BLOCK_MS:.0f}ms] - CONDITIONAL\033[0m"
+            )
         
         # Câmera tem prioridade máxima. BLOCKED é violação direta; CONDITIONAL é
         # faixa de guarda e também não pode ser relaxada por CVaR/ML/DRL.
@@ -2683,42 +2725,61 @@ class RappResourceOptimizer:
             import subprocess
             import sys
 
-            script_path = os.path.join(os.path.dirname(__file__), 'train_ml_model.py')
+            command = build_online_retrain_command(
+                python_bin=sys.executable,
+                state_dir=STATE_DIR,
+                models_dir=MODELS_DIR,
+            )
+            manifest_path = online_retrain_manifest_path(STATE_DIR)
             result = subprocess.run(
-                [sys.executable, script_path, '--retrain', '--hours', '24', '--output', './models'],
+                command,
                 capture_output=True,
                 text=True,
-                timeout=300,
-                cwd=os.path.dirname(__file__)
+                timeout=600,
+                cwd=as_str(PROJECT_ROOT)
             )
 
-            if result.returncode == 0:
-                print(f"\033[1;32m[rApp ML] Retreinamento concluído (#{self.ml_retrain_count + 1})\033[0m")
-
-                # Recarregar modelos
-                self.ml_predictor._load_models()
-
-                # Mostrar accuracy do novo modelo
-                report_path = os.path.join(os.path.dirname(__file__), 'models', 'training_report.json')
-                if os.path.exists(report_path):
-                    import json
-                    with open(report_path, 'r') as f:
-                        report = json.load(f)
-                        accuracy = report.get('classifier', {}).get('random_forest_accuracy', 0)
-                        classes = report.get('classifier', {}).get('classes', [])
-                        print(f"\033[1;32m[rApp ML] Nova accuracy: {accuracy:.2%}, Classes: {classes}\033[0m")
-                
-                # Log do stdout para debug (últimas 500 chars)
-                if result.stdout:
-                    print(f"\033[1;34m[rApp ML] Log do treino: {result.stdout[-500:]}\033[0m")
-            else:
+            if result.returncode != 0:
                 print(f"\033[1;31m[rApp ML] Erro no retreinamento (código {result.returncode}):\033[0m")
                 print(f"\033[1;31m[rApp ML] STDERR: {result.stderr[-500:]}\033[0m")
                 if result.stdout:
                     print(f"\033[1;31m[rApp ML] STDOUT: {result.stdout[-500:]}\033[0m")
+                return
+
+            manifest = load_online_retrain_manifest(manifest_path)
+            summary = summarize_online_retrain_manifest(manifest)
+            status = summary.get('status', 'missing')
+            reasons = summary.get('reasons', [])
+
+            if status == 'promoted':
+                print(f"\033[1;32m[rApp ML] Promoção online concluída (#{self.ml_retrain_count + 1})\033[0m")
+                self.ml_predictor._load_models()
+                accuracy = summary.get('rf_accuracy')
+                regressor_r2 = summary.get('regressor_r2')
+                classes = summary.get('classes', [])
+                feature_profile = summary.get('feature_profile', '')
+                accuracy_text = "n/a" if accuracy is None else f"{float(accuracy):.2%}"
+                r2_text = "n/a" if regressor_r2 is None else f"{float(regressor_r2):.4f}"
+                print(
+                    f"\033[1;32m[rApp ML] Modelo ativo: profile={feature_profile}, "
+                    f"accuracy={accuracy_text}, r2={r2_text}, classes={classes}\033[0m"
+                )
+            else:
+                print(f"\033[1;33m[rApp ML] Retreinamento online não promoveu modelo: status={status}\033[0m")
+                if reasons:
+                    print(f"\033[1;33m[rApp ML] Motivos: {' | '.join(str(reason) for reason in reasons)}\033[0m")
+                quality_status = summary.get('collection_quality_status')
+                quality_reasons = summary.get('collection_quality_reasons', [])
+                if quality_status and quality_status != 'ready':
+                    print(f"\033[1;33m[rApp ML] Gate da coleta: {quality_status}\033[0m")
+                    if quality_reasons:
+                        print(f"\033[1;33m[rApp ML] Coleta: {' | '.join(str(reason) for reason in quality_reasons)}\033[0m")
+
+            if result.stdout:
+                print(f"\033[1;34m[rApp ML] Log do retreino online: {result.stdout[-500:]}\033[0m")
 
         except subprocess.TimeoutExpired:
-            print(f"\033[1;31m[rApp ML] Timeout no retreinamento (>5min)\033[0m")
+            print(f"\033[1;31m[rApp ML] Timeout no retreinamento online (>10min)\033[0m")
         except Exception as e:
             print(f"\033[1;31m[rApp ML] Erro no retreinamento: {e}\033[0m")
 

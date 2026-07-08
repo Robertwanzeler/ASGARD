@@ -1,0 +1,64 @@
+{
+  "schema": "greenran.tasam.article_scenario.v1",
+  "description": "Canonical reproduction preset for Lotfi et al. TA-SAM MARL O-RAN scenario.",
+  "source_pdf": "docs/Task-Specific_Sharpness-Aware_O-RAN_Resource_Management_Using_Multi-Agent_Reinforcement_Learning.pdf",
+  "scenario": {
+    "slices": [
+      "eMBB",
+      "mMTC",
+      "URLLC"
+    ],
+    "du_count": 6,
+    "users": 200,
+    "rb_bandwidth_khz": 200,
+    "mobility_mps": {
+      "min": 10,
+      "max": 20
+    },
+    "mobility_directions_rad": [
+      "-pi/3",
+      "-pi/6",
+      "-pi/12",
+      "0",
+      "pi/12",
+      "pi/6",
+      "pi/3"
+    ]
+  },
+  "training": {
+    "optimizer": "Adam",
+    "learning_rate": 0.0001,
+    "actor_hidden_dims": [
+      300,
+      400,
+      400
+    ],
+    "critic_hidden_dims": [
+      300,
+      400,
+      400
+    ],
+    "activation": "tanh",
+    "rho_start": 0.5,
+    "rho_final": 0.01,
+    "td_var_threshold": 0.01,
+    "warmup_epochs": 2,
+    "official_epoch_grid": [
+      25,
+      50,
+      100
+    ]
+  },
+  "baselines": [
+    "no_sam",
+    "l2",
+    "actor_sam",
+    "critic_sam",
+    "both_sam",
+    "tasam_selective"
+  ],
+  "notes": [
+    "The paper specifies Nt/Ne iterations/evaluations but does not publish a fixed epoch count.",
+    "This preset maps Nt to epochs and uses the official epoch grid for reproducibility."
+  ]
+}

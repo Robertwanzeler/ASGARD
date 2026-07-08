@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Replay Buffer for DRL Training
-==============================
-Implementation of experience replay buffer for A3C and other DRL algorithms.
-Based on the paper's approach for storing (state, action, reward, next_state) tuples.
-
-Author: GreenRAN Team - UFPA
-"""
+"""Replay buffers used by the TA-SAM DRL experiments."""
 
 import numpy as np
 import random
@@ -104,6 +97,7 @@ class ReplayBuffer:
         dones = np.array([self.buffer[i][4] for i in indices])
         
         # Compute importance sampling weights
+        beta = getattr(self, "beta", 0.4)
         weights = (len(self.buffer) * probs[indices]) ** (-beta)
         weights /= weights.max()
         

@@ -1,19 +1,7 @@
-"""
-GreenRAN DRL Experiment Package
-===============================
-
-The original package targets the legacy EE-DRL energy-control line. The SAC
-migration adds a parallel CAORA-style environment without rewriting the legacy
-modules in place.
-"""
+"""TA-SAM MARL package for the GreenRAN DRL tracks."""
 
 __version__ = "1.0.0"
 __author__ = "GreenRAN Team - UFPA"
-
-try:
-    from .caora_sac_environment import CAORASACEnv
-except Exception:
-    CAORASACEnv = None
 
 from .replay_buffer import ReplayBuffer
 
@@ -23,13 +11,18 @@ except Exception:
     TASAMMultiAgentTrainer = None
 
 try:
-    from .gym_environment import GreenRANGymEnv
+    from .ta_sam_marl_sac import TASAMArticleSACTrainer
 except Exception:
-    GreenRANGymEnv = None
+    TASAMArticleSACTrainer = None
+
+try:
+    from .online_greenran_marl_env import OnlineGreenRANMARLEnv
+except Exception:
+    OnlineGreenRANMARLEnv = None
 
 __all__ = [
-    'CAORASACEnv',
     'ReplayBuffer',
     'TASAMMultiAgentTrainer',
-    'GreenRANGymEnv',
+    'TASAMArticleSACTrainer',
+    'OnlineGreenRANMARLEnv',
 ]
