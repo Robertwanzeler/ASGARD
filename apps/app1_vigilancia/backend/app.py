@@ -38,8 +38,9 @@ if str(SRC_DIR) not in sys.path:
 from greenran_paths import STATE_DIR  # noqa: E402
 from greenran_runtime import load_runtime_config  # noqa: E402
 from services import CameraRegistryStore, GreenRANContextReader, VideoAnalysisStore, VigilanceEventStore  # noqa: E402
+from real_video_pipeline import RealVideoPipeline  # noqa: E402
 
-
+IA_PIPELINE = RealVideoPipeline()
 RUNTIME_CONFIG = load_runtime_config()
 APP_HOST = "0.0.0.0"
 APP_PORT = 5100
