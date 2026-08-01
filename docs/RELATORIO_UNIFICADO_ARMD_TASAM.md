@@ -482,7 +482,159 @@ O objetivo dessa continuação é:
 - comparar o comportamento do treino entre seeds;
 - preparar uma leitura mais robusta para figuras e comparação final.
 
-### 8.6 Leitura final da simulação TA-SAM
+### 8.6 Comparação direta entre TA-SAM e SAC
+
+Para remover ambiguidade, a comparação `TA-SAM vs SAC` foi consolidada em três
+níveis distintos: `artigo`, `replay controlado do nosso cenário` e `treino
+online parcial do nosso cenário atual`.
+
+#### Resultado do artigo base
+
+No artigo de referência, o `TA-SAM` superou o `SAC` de forma clara:
+
+- `q0` nos últimos `100 passos`: `SAC = 0.1571`, `TA-SAM = 0.1996`
+- vantagem final do `TA-SAM`: `+27.0%`
+- `q0` global: `SAC = 0.1607`, `TA-SAM = 0.1799`
+- vantagem global do `TA-SAM`: `+12.0%`
+- esquecimento catastrófico: `SAC = -14.3%`, `TA-SAM = -6.7%`
+
+Portanto, na referência metodológica, o `TA-SAM` foi superior ao `SAC`.
+
+#### Resultado no nosso replay controlado
+
+No arquivo
+`runs/tasam_greenran_comparison/tasam_scenario_comparison.csv`, o baseline
+`SAC` local aparece como `mode = no_sam`, e o `TA-SAM` principal aparece como
+`mode = tasam_selective`.
+
+Nos cenários mais úteis para comparação local, o quadro ficou assim:
+
+| Cenário | SAC (`eval_return`) | TA-SAM (`eval_return`) | Diferença |
+|---|---:|---:|---:|
+| `equal` | 21.7010 | 21.9600 | `+1.19%` |
+| `non_equal` | 21.7010 | 21.9803 | `+1.29%` |
+| `dynamic` | 21.7010 | 20.0366 | `-7.67%` |
+
+Leitura:
+
+- em `equal`, o `TA-SAM` ficou levemente acima do `SAC`;
+- em `non_equal`, o `TA-SAM` também ficou levemente acima do `SAC`;
+- em `dynamic`, que é a forma mais próxima do agendamento do artigo
+  (`rho 0.5 -> 0.01`), o `TA-SAM` ainda ficou abaixo do `SAC` no nosso cenário.
+
+Mesmo quando o ganho em retorno foi pequeno, o `TA-SAM` mostrou política mais
+estável que o baseline em `equal` e `non_equal`, com redução forte de
+`action_var_mean`:
+
+- `equal`: de `0.02978` para `0.00398`
+- `non_equal`: de `0.02978` para `0.00444`
+
+#### Resultado no treino online parcial de 60 episódios
+
+No treino online fiel ao artigo, executado em
+`runs/sac_bootstrap/online_tasam_marl`, o que existe hoje é apenas a trilha
+`TA-SAM`. O resumo parcial dos `60 episódios` foi:
+
+- `mean_return_all = 85.0772`
+- `mean_return_last_10 = 87.1450`
+- `best_episode_return = 88.3605`
+- `last_episode_return = 86.1525`
+
+Leitura:
+
+- o `TA-SAM` mostrou aprendizado estável no nosso cenário GreenRAN atual;
+- os últimos episódios ficaram acima da média geral, sinal de melhora ao longo
+  do treino;
+- esse recorte continua válido como evidência preliminar, mas não como
+  comparação final `TA-SAM vs SAC`.
+
+#### Rodada pareada 60 vs 60
+
+Para fechar a comparação de forma justa, foi executada a rodada pareada em
+`60 episódios` no mesmo cenário, mesma seed e mesmo pipeline:
+
+- `SAC` em `runs/sac_bootstrap/online_sac_match_tasam_60ep`
+- `TA-SAM` em `runs/sac_bootstrap/online_tasam_parallel_match60_v1`
+
+Resumo consolidado:
+
+| Método | `mean_return_last_100` | `final_eval.mean_return` |
+|---|---:|---:|
+| `SAC` | `89.4145` | `96.2304` |
+| `TA-SAM` seed `42` | `84.2045` | `92.7165` |
+| `TA-SAM` seed `43` | `84.9366` | `92.5664` |
+| `TA-SAM` média | `84.5705` | `92.6415` |
+
+Leitura direta:
+
+- na janela dos últimos `100 passos`, o `SAC` ficou `+5.42%` acima da média
+  dos dois `TA-SAM`;
+- na avaliação final, o `SAC` ficou `+3.73%` acima da média dos dois `TA-SAM`;
+- nas duas seeds do `TA-SAM`, o comportamento foi consistente, sem colapso,
+  mas ainda abaixo do baseline `SAC`.
+
+#### Por que o SAC ganhou
+
+Os dados apontam que a diferença não veio de um `critic` pior no `TA-SAM`.
+O padrão foi outro:
+
+- `critic_loss` médio menor no `TA-SAM` que no `SAC`:
+  - `SAC = 3.9841`
+  - `TA-SAM seed 42 = 1.1582`
+  - `TA-SAM seed 43 = 1.2763`
+- `td_var_mean` médio também menor no `TA-SAM`, sinal de atualização mais
+  conservadora:
+  - `SAC = 1.9778`
+  - `TA-SAM seed 42 = 0.5730`
+  - `TA-SAM seed 43 = 0.6311`
+- `action_var_mean` muito mais baixo no `TA-SAM`, sugerindo política mais
+  restrita:
+  - `SAC = 0.0172`
+  - `TA-SAM seed 42 = 0.0041`
+  - `TA-SAM seed 43 = 0.0111`
+
+Por faixa de episódio, o comportamento também foi claro:
+
+- o `SAC` evoluiu de `83.92` nos `10` primeiros episódios para `92.32` nos
+  `10` últimos;
+- o `TA-SAM` evoluiu menos e ficou em torno de `84.35` a `84.61` no fim;
+- a diferença cresceu na metade final do treino.
+
+Leitura técnica:
+
+- o `TA-SAM` ficou mais estável, mas também mais conservador;
+- `selected_fraction = 1.0` nas duas seeds mostra que o modo seletivo não foi
+  realmente seletivo nesta corrida;
+- com `rho` ainda agressivo no começo e `action_var_mean` baixo, o `TA-SAM`
+  perdeu capacidade de exploração e não atingiu o retorno do `SAC`.
+
+Conclusão da comparação online:
+
+- `no artigo`, o `TA-SAM` vence o `SAC` com folga;
+- `no nosso replay controlado`, o `TA-SAM` já vence o `SAC` em `equal` e
+  `non_equal`, mas ainda perde em `dynamic`;
+- `no nosso online match60`, o `SAC` venceu o `TA-SAM` por margem moderada.
+
+### 8.7 Resumo das rodadas online
+
+Para fechar a leitura, a tabela abaixo concentra as rodadas online que
+importam para o cenário atual:
+
+| Rodada | Métrica principal | Valor | Leitura |
+|---|---|---:|---|
+| `TA-SAM parcial 60` | `mean_return_all` | `85.08` | Evidência inicial boa, mas ainda preliminar. |
+| `SAC 60` | `mean_return_last_100` / `final_eval.mean_return` | `89.41` / `96.23` | Melhor baseline online do cenário atual. |
+| `TA-SAM match60` | Média das duas seeds | `84.57` / `92.64` | Rodada justa, mas abaixo do `SAC`. |
+| `TA-SAM selective_v3` | Média das duas seeds | `84.57` / `92.64` | Mesma leitura do `match60`; seletividade não mudou o resultado. |
+
+Leitura final:
+
+- o `TA-SAM` antigo continua válido como evidência preliminar;
+- o `SAC 60` foi o melhor resultado online na comparação justa;
+- as variantes `match60` e `selective_v3` do `TA-SAM` ficaram estáveis, mas
+  não superaram o `SAC`.
+
+### 8.8 Leitura final da simulação TA-SAM
 
 O resultado principal da trilha `TA-SAM` foi:
 
@@ -491,11 +643,11 @@ O resultado principal da trilha `TA-SAM` foi:
 - redução clara de `catastrophic forgetting`;
 - aumento do `alpha` final, indicando dinâmica de exploração diferente do baseline.
 
-Em resumo, a reprodução confirmou a superioridade do `TA-SAM` sobre o `SAC`
-nesse cenário de slicing. Em paralelo, o treino `online` fiel ao artigo no
-cenário GreenRAN já mostrou sinal positivo nos `60 primeiros episódios`, e a
-continuação multiseed em andamento foi mantida para ampliar a base empírica
-antes da comparação final.
+Em resumo, a reprodução do artigo confirmou a superioridade do `TA-SAM` sobre
+o `SAC` na referência externa, enquanto o nosso `online match60` mostrou que,
+no cenário GreenRAN atual, o `SAC` ainda ficou à frente. O treino `online`
+continua útil como evidência de comportamento, mas a vantagem do artigo ainda
+não apareceu de forma consistente no cenário atual.
 
 ---
 
@@ -506,8 +658,9 @@ As duas simulações cumprem papéis complementares no GreenRAN:
 - `ARMD-GreenRAN` foi a trilha mais forte para aprendizado e reconstrução de
   conflitos, com `F1 = 1.0` no melhor caso geral e desempenho superior à
   referência com apenas `200 épocas`.
-- `TA-SAM` foi a trilha de política de controle, mostrando vantagem sobre `SAC`
-  e menor esquecimento catastrófico na alocação de recursos.
+- `TA-SAM` foi a trilha de política de controle, com vantagem clara no artigo
+  e nos cenários controlados `equal`/`non_equal`, mas perdeu para `SAC` no
+  `online match60` do cenário GreenRAN atual.
 
 Em termos de arquitetura, o sistema final fica coerente assim:
 
