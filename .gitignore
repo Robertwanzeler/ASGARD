@@ -52,8 +52,14 @@ htmlcov/
 /models/**/*.joblib
 /models/**/*.pt
 /models/*.png
+/models/**/*.png
 /models/a3c/
 /models/sbilstm/
+/models/tasam_preliminary_20260730/
+
+# Scratch / throwaway scripts
+/teste.py
+/test_gate.py
 
 # Preserve text docs and dependency manifests
 *.txt
