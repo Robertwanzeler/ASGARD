@@ -115,7 +115,10 @@ class ExtendedMetricsCollector:
         self.carla_vehicle_state_mtime = None
         self._warned_missing_pdcp = False
         self.trace_stale_threshold_s = float(os.environ.get("GREENRAN_PDCP_STALE_SECONDS", "30"))
-        self.require_real_pdcp = os.environ.get("GREENRAN_REQUIRE_REAL_PDCP", "0").strip().lower() in {
+        fixed_scenario_config = os.environ.get("GREENRAN_FIXED_SCENARIO_CONFIG", "")
+        state_dir_hint = os.environ.get("GREENRAN_STATE_DIR", "")
+        article_collection_runtime = "tasam_article_ns3_collection" in fixed_scenario_config or "tasam_article_ns3_collection" in state_dir_hint
+        self.require_real_pdcp = article_collection_runtime or os.environ.get("GREENRAN_REQUIRE_REAL_PDCP", "0").strip().lower() in {
             "1",
             "true",
             "yes",

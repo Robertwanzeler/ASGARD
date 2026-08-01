@@ -40,6 +40,7 @@ import argparse
 import signal
 import json
 import re
+import socket
 from datetime import datetime
 from collections import deque
 from greenran_paths import (
@@ -484,6 +485,19 @@ class RappResourceOptimizer:
             'vehicle_active': self.xapp_manager.is_running("vehicle_control"),
         }
     
+    def _check_socket(self, socket_path):
+        """Verifica se um Unix Domain Socket está acessível."""
+        if not os.path.exists(socket_path):
+            return "MISSING"
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(0.1)
+            sock.connect(socket_path)
+            sock.close()
+            return "OK"
+        except:
+            return "UNRESPONSIVE"
+
     def get_xapp_status(self):
         """Retorna status dos xApps e salva em arquivo."""
         status = {}
@@ -493,6 +507,7 @@ class RappResourceOptimizer:
         slicer_running = self.xapp_manager.is_running('slicer')
         status['SLICER'] = {
             'status': 'RUNNING' if slicer_running else 'STOPPED',
+            'socket': self._check_socket("/tmp/slicer.sock"),
             'pid': slicer_pid,
             'last_cycle': getattr(self, 'cycle', 0),
             'total_restarts': 0,
@@ -504,6 +519,7 @@ class RappResourceOptimizer:
         energy_running = self.xapp_manager.is_running('energy_saver')
         status['ENERGY'] = {
             'status': 'RUNNING' if energy_running else 'STOPPED',
+            'socket': self._check_socket("/tmp/energy_saver.sock"),
             'pid': energy_pid,
             'last_cycle': getattr(self, 'cycle', 0),
             'total_restarts': 0,
@@ -530,21 +546,31 @@ class RappResourceOptimizer:
         return status
     
     def read_slicer_intent(self):
-        """Lê intenção do SLICER."""
+        """Lê intenção do SLICER via Socket com fallback para arquivo."""
+        # 1. Tentar ler via socket
         try:
-            if not os.path.exists(SLICER_INTENT_PATH):
-                return None
-            
-            intent = {}
-            with open(SLICER_INTENT_PATH, 'r') as f:
-                for line in f:
-                    if '=' in line:
-                        key, value = line.strip().split('=', 1)
-                        intent[key.strip()] = _coerce_intent_value(value)
-            return intent
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(0.1) # 100ms
+            sock.connect("/tmp/slicer.sock")
+            data = sock.recv(1024)
+            sock.close()
+            return json.loads(data.decode('utf-8'))
         except Exception as e:
-            print(f"[rApp] ERRO ao ler SLICER: {e}")
-            return None
+            # Fallback para leitura de arquivo
+            try:
+                if not os.path.exists(SLICER_INTENT_PATH):
+                    return None
+                
+                intent = {}
+                with open(SLICER_INTENT_PATH, 'r') as f:
+                    for line in f:
+                        if '=' in line:
+                            key, value = line.strip().split('=', 1)
+                            intent[key.strip()] = _coerce_intent_value(value)
+                return intent
+            except Exception as e2:
+                print(f"[rApp] ERRO ao ler SLICER (Socket e Fallback): {e}, {e2}")
+                return None
     
     def read_energy_intent(self):
         """Lê intenção do ENERGY SAVER."""

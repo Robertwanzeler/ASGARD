@@ -247,13 +247,13 @@ class MARLShadowRuntimeEvaluator:
         self.eval_manifest_path = Path(
             os.environ.get(
                 'GREENRAN_TASAM_EVAL_MANIFEST',
-                self.project_root / 'runs' / 'sac_bootstrap' / 'tasam_candidate_evaluation_latest.json',
+                self.project_root / 'runs' / 'tasam_greenran_real' / 'tasam_candidate_evaluation_latest.json',
             )
         )
         self.control_gate_manifest_path = Path(
             os.environ.get(
                 'GREENRAN_MARL_CONTROL_GATE_MANIFEST',
-                self.project_root / 'runs' / 'sac_bootstrap' / 'marl_control_gate_latest.json',
+                self.project_root / 'runs' / 'tasam_greenran_real' / 'marl_control_gate_latest.json',
             )
         )
         self.checkpoint_source = 'heuristic'

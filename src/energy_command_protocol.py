@@ -42,12 +42,16 @@ Uso:
 import json
 import time
 import os
+import socket
 
 from greenran_paths import ENERGY_COMMAND_PATH, ENERGY_INTENT_PATH, as_str
 
 # Caminhos de comunicação
 ENERGY_COMMAND_PATH = as_str(ENERGY_COMMAND_PATH)
 ENERGY_INTENT_PATH = as_str(ENERGY_INTENT_PATH)
+SOCKET_PATH = "/tmp/energy_saver.sock"
+
+# ... (ACTIONS definition remains the same) ...
 
 # Ações válidas
 # Cenário real: 1 RU (LTE) + 1 mmWave = 2 torres
@@ -120,16 +124,7 @@ class EnergyCommand:
     
     def write_command(self, action, power_level=None, reason="", ttl=None):
         """
-        Escreve comando de energia para o xApp.
-        
-        Args:
-            action: Ação desejada (FULL_POWER, REDUCE_POWER, CONDITIONAL_REDUCE, POWER_DOWN, POWER_DOWN_ECO, MAINTAIN)
-            power_level: Nível de potência 0-100 (opcional, usa default da ação)
-            reason: String explicativa do motivo
-            ttl: Timeout em segundos (padrão: 5s)
-        
-        Returns:
-            bool: True se escrita com sucesso
+        Envia comando de energia via Socket para o xApp.
         """
         if action not in ACTIONS:
             print(f"[EnergyProtocol] ERRO: Ação '{action}' inválida")
@@ -156,18 +151,13 @@ class EnergyCommand:
         }
         
         try:
-            # Escrever com atomicidade (write + rename)
-            temp_path = self.command_path + '.tmp'
-            with open(temp_path, 'w') as f:
-                json.dump(command, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
+            # Enviar via Socket
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(SOCKET_PATH)
+            sock.sendall(json.dumps(command).encode('utf-8'))
+            sock.close()
             
-            # Renomear atomicamente
-            os.replace(temp_path, self.command_path)
-            
-            print(f"[EnergyProtocol] Comando enviado: {action} (power={power_level}%, TTL={ttl}s)")
-            print(f"[EnergyProtocol] Motivo: {reason}")
+            print(f"[EnergyProtocol] Comando enviado via Socket: {action}")
             
             # Gravar no DataLake se disponível
             if self.data_lake:
@@ -182,8 +172,26 @@ class EnergyCommand:
             return True
             
         except Exception as e:
-            print(f"[EnergyProtocol] ERRO ao escrever comando: {e}")
-            return False
+            print(f"[EnergyProtocol] ERRO ao enviar comando via Socket: {e}. Fallback para arquivo.")
+            # Fallback para o modo arquivo original
+            try:
+                temp_path = self.command_path + '.tmp'
+                with open(temp_path, 'w') as f:
+                    json.dump(command, f, indent=2)
+                os.replace(temp_path, self.command_path)
+                
+                if self.data_lake:
+                    self.data_lake.record_energy_command(
+                        command=action,
+                        power_percent=power_level,
+                        ru_count=action_info['ru_count'],
+                        mmwave_count=action_info['mmwave_count'],
+                        reason=reason
+                    )
+                return True
+            except Exception as e2:
+                print(f"[EnergyProtocol] ERRO no Fallback: {e2}")
+                return False
     
     def read_command(self):
         """
