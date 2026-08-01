@@ -42,8 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-profile", default="greenran_conflict_cycle", help="Stage profile")
     parser.add_argument("--cpu-threads", type=int, default=4, help="CPU threads allocated to each training process")
     parser.add_argument("--interop-threads", type=int, default=1, help="Interop threads allocated to each training process")
-    parser.add_argument("--checkpoint-interval", type=int, default=25, help="Checkpoint interval for each training process")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Checkpoint interval for each training process")
     parser.add_argument("--eval-interval", type=int, default=50, help="Evaluation interval for each training process")
+    parser.add_argument("--td-var-threshold", type=float, default=0.01, help="Selective TD variance threshold")
+    parser.add_argument("--min-selected-fraction", type=float, default=0.10, help="Minimum selected fraction for selective SAM")
+    parser.add_argument("--warmup-episodes", type=int, default=2, help="Warmup episodes with forced SAM")
+    parser.add_argument("--actor-sam-rho", type=float, default=0.5, help="Initial actor SAM rho")
+    parser.add_argument("--actor-sam-rho-final", type=float, default=0.01, help="Final actor SAM rho")
+    parser.add_argument("--critic-sam-rho", type=float, default=0.5, help="Initial critic SAM rho")
+    parser.add_argument("--critic-sam-rho-final", type=float, default=0.01, help="Final critic SAM rho")
+    parser.add_argument("--article-hidden", action="store_true", help="Use article-sized hidden layers (300,400,400)")
+    parser.add_argument("--resume", action="store_true", help="Resume each seed from its local checkpoint if present")
+    parser.add_argument("--stop-on-failure", action="store_true", help="Stop every other seed if any seed exits with failure")
     parser.add_argument("--python", default=sys.executable, help="Python executable used to spawn the trainer")
     parser.add_argument("--dry-run", action="store_true", help="Print the launch plan without starting processes")
     return parser.parse_args()
@@ -80,8 +90,29 @@ def build_command(args: argparse.Namespace, seed: int) -> tuple[list[str], Path]
         str(args.eval_interval),
         "--seed",
         str(seed),
-        "--article-hidden",
     ]
+    if args.article_hidden:
+        cmd.append("--article-hidden")
+    if args.resume:
+        cmd.append("--resume")
+    cmd.extend(
+        [
+            "--td-var-threshold",
+            str(args.td_var_threshold),
+            "--min-selected-fraction",
+            str(args.min_selected_fraction),
+            "--warmup-episodes",
+            str(args.warmup_episodes),
+            "--actor-sam-rho",
+            str(args.actor_sam_rho),
+            "--actor-sam-rho-final",
+            str(args.actor_sam_rho_final),
+            "--critic-sam-rho",
+            str(args.critic_sam_rho),
+            "--critic-sam-rho-final",
+            str(args.critic_sam_rho_final),
+        ]
+    )
     return cmd, output_dir
 
 
@@ -92,6 +123,7 @@ def build_env(cpu_threads: int) -> dict[str, str]:
     env["MKL_NUM_THREADS"] = thread_value
     env["OPENBLAS_NUM_THREADS"] = thread_value
     env["NUMEXPR_NUM_THREADS"] = thread_value
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 
@@ -125,7 +157,7 @@ def main() -> int:
         for item in plan:
             output_dir = Path(item["output_dir"])
             output_dir.mkdir(parents=True, exist_ok=True)
-            log_handle = (output_dir / "launcher.log").open("a", encoding="utf-8")
+            log_handle = (output_dir / "launcher.log").open("a", encoding="utf-8", buffering=1)
             log_handle.write(
                 json.dumps(
                     {
@@ -138,6 +170,7 @@ def main() -> int:
                 )
                 + "\n"
             )
+            log_handle.flush()
             proc = subprocess.Popen(
                 item["command"],
                 cwd=str(ROOT),
@@ -162,15 +195,17 @@ def main() -> int:
                     )
                     + "\n"
                 )
+                log_handle.flush()
                 log_handle.close()
                 processes.remove((seed, proc, log_handle))
                 if status != 0 and exit_code == 0:
                     exit_code = int(status)
-                    for other_seed, other_proc, _ in processes:
-                        try:
-                            os.killpg(other_proc.pid, signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
+                    if args.stop_on_failure:
+                        for other_seed, other_proc, _ in processes:
+                            try:
+                                os.killpg(other_proc.pid, signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
             time.sleep(1.0)
         return exit_code
     except KeyboardInterrupt:

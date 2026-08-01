@@ -69,7 +69,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-root", default="", help="Optional existing collection root used as the baseline when computing remaining targets")
     parser.add_argument("--pdcp-stale-seconds", type=float, default=3600.0, help="PDCP stale threshold propagated to offline rounds")
     parser.add_argument("--export-limit", type=int, default=0, help="Optional transition cap per round")
-    parser.add_argument("--allow-proxy", action="store_true", help="Keep proxy-latency transitions in exported traces")
     parser.add_argument("--ns3-bin", default=str(DEFAULT_NS3_BIN), help="ns-3 scenario binary")
     parser.add_argument("--base-config", default=str(BASE_CONFIG), help="Base scenario JSON config")
     parser.add_argument("--dry-run", action="store_true", help="Prepare commands without executing them")
@@ -146,7 +145,6 @@ def try_repair_round_artifacts(
     round_dir_path: Path,
     min_round_transitions: int,
     *,
-    allow_proxy: bool = False,
     export_limit: int = 0,
 ) -> tuple[bool, list[str]]:
     if not round_has_repairable_raw_artifacts(round_dir_path):
@@ -159,7 +157,7 @@ def try_repair_round_artifacts(
         "trace_jsonl": export_dir / "tasam_article_trace.jsonl",
         "summary_json": export_dir / "tasam_article_export_summary.json",
     }
-    repair_args = SimpleNamespace(export_limit=int(export_limit), allow_proxy=bool(allow_proxy))
+    repair_args = SimpleNamespace(export_limit=int(export_limit))
     try:
         export_round(paths, repair_args, False)
     except Exception as exc:
@@ -232,7 +230,6 @@ def recover_resumable_round_payloads(
     output_root: Path,
     min_round_transitions: int,
     *,
-    allow_proxy: bool = False,
     export_limit: int = 0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     round_dirs = existing_round_dirs(output_root)
@@ -248,7 +245,6 @@ def recover_resumable_round_payloads(
             repaired, repair_problems = try_repair_round_artifacts(
                 round_dir_path,
                 min_round_transitions,
-                allow_proxy=allow_proxy,
                 export_limit=export_limit,
             )
             if repaired:
@@ -428,7 +424,6 @@ def main() -> int:
     round_payloads, recovered_rounds = recover_resumable_round_payloads(
         output_root,
         int(args.min_round_transitions),
-        allow_proxy=bool(args.allow_proxy),
         export_limit=int(args.export_limit),
     )
     for recovered in recovered_rounds:

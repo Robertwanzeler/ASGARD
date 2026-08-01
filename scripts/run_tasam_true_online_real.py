@@ -63,7 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--since-ts", type=int, default=0, help="Optional lower timestamp bound for exports")
     parser.add_argument("--until-ts", type=int, default=0, help="Optional upper timestamp bound for exports")
-    parser.add_argument("--allow-proxy", action="store_true", help="Allow proxy rows in the export (disabled by default)")
     parser.add_argument("--include-invalid", action="store_true", help="Include invalid transitions in the export (disabled by default)")
     parser.add_argument("--max-step-gap-s", type=int, default=20, help="Maximum wall-clock timestamp gap for s->s' pairing")
     parser.add_argument("--max-sim-reset-gap-s", type=float, default=1.0, help="Maximum sim-time reset gap before transition invalidation")
@@ -210,8 +209,6 @@ def build_export_command(args: argparse.Namespace) -> list[str]:
         cmd.extend(["--since-ts", str(args.since_ts)])
     if args.until_ts:
         cmd.extend(["--until-ts", str(args.until_ts)])
-    if args.allow_proxy:
-        cmd.append("--allow-proxy")
     if args.include_invalid:
         cmd.append("--include-invalid")
     return cmd

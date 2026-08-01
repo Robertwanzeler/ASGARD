@@ -83,6 +83,22 @@ def _extract_metric(summary_path: Path, metric: str) -> float:
         raise ValueError(f"Invalid numeric value for final_metrics.{metric} in {summary_path}: {value!r}") from exc
 
 
+def _extract_requested_rho(summary_path: Path) -> float | None:
+    payload = _load_json(summary_path)
+    actor_rho = payload.get("actor_sam_rho")
+    actor_rho_final = payload.get("actor_sam_rho_final")
+    critic_rho = payload.get("critic_sam_rho")
+    critic_rho_final = payload.get("critic_sam_rho_final")
+    values = [actor_rho, actor_rho_final, critic_rho, critic_rho_final]
+    try:
+        parsed = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+    if max(parsed) - min(parsed) > 1e-9:
+        return None
+    return float(parsed[0])
+
+
 def _parse_custom_rho_scenarios(input_root: Path) -> list[tuple[str, float]]:
     custom: list[tuple[str, float]] = []
     for child in sorted(input_root.iterdir()):
@@ -121,7 +137,7 @@ def build_plot_payload(input_root: Path, metric: str) -> list[dict[str, Any]]:
             rows.append(
                 {
                     "scenario": scenario,
-                    "rho_value": rho_value,
+                    "rho_value": _extract_requested_rho(summary_path) or rho_value,
                     "mode": mode,
                     "label": LABELS[mode],
                     "value": _extract_metric(summary_path, metric),
@@ -133,14 +149,13 @@ def build_plot_payload(input_root: Path, metric: str) -> list[dict[str, Any]]:
 
 def _group_values(rows: list[dict[str, Any]]) -> dict[str, list[float]]:
     grouped = {mode: [] for mode in DISPLAY_MODES}
-    ordered_scenarios = [row["scenario"] for row in sorted(rows, key=lambda item: item["rho_value"]) if row["mode"] == DISPLAY_MODES[0]]
-    seen: set[str] = set()
-    ordered_scenarios = [scenario for scenario in ordered_scenarios if not (scenario in seen or seen.add(scenario))]
-    for scenario in ordered_scenarios:
-        scenario_rows = [row for row in rows if row["scenario"] == scenario]
-        row_by_mode = {row["mode"]: row for row in scenario_rows}
+    ordered_rhos = sorted({round(float(row["rho_value"]), 4) for row in rows})
+    for rho_value in ordered_rhos:
+        rho_rows = [row for row in rows if round(float(row["rho_value"]), 4) == rho_value]
+        row_by_mode = {row["mode"]: row for row in rho_rows}
         for mode in DISPLAY_MODES:
-            grouped[mode].append(float(row_by_mode[mode]["value"]))
+            payload = row_by_mode.get(mode)
+            grouped[mode].append(float(payload["value"]) if payload else float("nan"))
     return grouped
 
 
@@ -165,70 +180,44 @@ def render_figure(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     grouped = _group_values(rows)
-    scenario_order = []
-    seen: set[str] = set()
-    for row in sorted(rows, key=lambda item: item["rho_value"]):
-        if row["scenario"] in seen:
-            continue
-        seen.add(row["scenario"])
-        scenario_order.append(row["scenario"])
-    x_positions = [next(row["rho_value"] for row in rows if row["scenario"] == scenario) for scenario in scenario_order]
-    bar_width = 0.0018 if paper_caption_mode else 0.0022
+    x_positions = sorted({round(float(row["rho_value"]), 4) for row in rows})
+    bar_width = 0.00155 if paper_caption_mode else 0.00185
     offsets = {
         "both_sam": -bar_width,
         "actor_sam": 0.0,
         "critic_sam": bar_width,
     }
 
-    fig, ax = plt.subplots(figsize=(5.4, 4.1) if paper_caption_mode else (6.0, 4.4))
+    fig, ax = plt.subplots(figsize=(4.8, 4.0) if paper_caption_mode else (5.6, 4.4))
     for mode in DISPLAY_MODES:
         xs = [x + offsets[mode] for x in x_positions]
-        ax.bar(
-            xs,
-            grouped[mode],
-            width=bar_width,
-            color=COLORS[mode],
-            edgecolor="black",
-            linewidth=0.6,
-            label=LABELS[mode],
-            zorder=3,
-        )
+        label_drawn = False
+        for x_value, y_value in zip(xs, grouped[mode]):
+            if y_value != y_value:
+                continue
+            ax.bar(
+                x_value,
+                y_value,
+                width=bar_width,
+                color=COLORS[mode],
+                edgecolor="black",
+                linewidth=0.65,
+                label=LABELS[mode] if not label_drawn else None,
+                zorder=3,
+            )
+            label_drawn = True
 
     tick_values = PAPER_RHO_TICKS
     tick_labels = ["0", "0.01", "0.02", "0.03", "0.04", "0.05", "0.06"]
-    ax.set_xlim(0.0, 0.06 + (bar_width * 2.5))
+    ax.set_xlim(-0.001, 0.061)
     ax.set_xticks(tick_values)
     ax.set_xticklabels(tick_labels)
     ax.set_xlabel(r"$\rho$ values")
     ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.22, zorder=0)
+    ax.grid(True, alpha=0.18, linewidth=0.6, zorder=0)
     ax.legend(loc="upper right", fontsize=8, frameon=True)
     ax.tick_params(axis="both", labelsize=9)
-
-    present_rhos = {round(float(row["rho_value"]), 4) for row in rows}
-    ymax = max(max(values) for values in grouped.values()) if grouped else 1.0
-    for rho_value in (0.03, 0.04):
-        if round(rho_value, 4) in present_rhos:
-            continue
-        ax.axvline(rho_value, color="#b5b5b5", linestyle="--", linewidth=0.8, alpha=0.55, zorder=1)
-        ax.text(
-            rho_value,
-            ymax * 0.14,
-            "N/D",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            fontweight="bold",
-            color="#5f5f5f",
-            bbox={
-                "boxstyle": "round,pad=0.18",
-                "facecolor": "white",
-                "edgecolor": "#c7c7c7",
-                "linewidth": 0.6,
-                "alpha": 0.92,
-            },
-            zorder=4,
-        )
+    ax.set_axisbelow(True)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=220, bbox_inches="tight")

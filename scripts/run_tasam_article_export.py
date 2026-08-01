@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-proxy",
         action="store_true",
         default=_env_bool("GREENRAN_TASAM_EXPORT_ALLOW_PROXY", False),
-        help="Keep transitions that include proxy latency",
+        help="Legacy compatibility option; final GreenRAN training still requires the quality gate",
     )
     parser.add_argument(
         "--trainable-profile",
@@ -231,7 +231,7 @@ def main() -> int:
         db_path=db_path,
         trace_path=trace_path,
         summary_path=summary_path,
-        limit=args.limit,
+        limit=args.limit or 0,
         allow_proxy=args.allow_proxy,
         include_invalid=True,
     )

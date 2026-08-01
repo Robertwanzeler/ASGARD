@@ -20,14 +20,14 @@ from evaluate_marl_control_gate import evaluate_control_gate, write_payload
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SELECTED_MANIFEST = (
-    PROJECT_ROOT / "runs" / "sac_bootstrap" / "tasam_selected_greenran" / "tasam_selected_checkpoint_manifest.json"
+    PROJECT_ROOT / "runs" / "tasam_greenran_real" / "tasam_selected_checkpoint_manifest.json"
 )
-DEFAULT_ACTIVE_EVAL = PROJECT_ROOT / "runs" / "sac_bootstrap" / "tasam_candidate_evaluation_latest.json"
-DEFAULT_GATE_OUTPUT = PROJECT_ROOT / "runs" / "sac_bootstrap" / "marl_control_gate_latest.json"
-DEFAULT_RUNTIME_EVAL = PROJECT_ROOT / "runs" / "sac_bootstrap" / "marl_shadow_runtime_eval_latest.json"
-DEFAULT_MANUAL_APPROVAL = PROJECT_ROOT / "runs" / "sac_bootstrap" / "marl_control_trial_approval.json"
-DEFAULT_BACKUP_DIR = PROJECT_ROOT / "runs" / "sac_bootstrap" / "tasam_candidate_evaluation_backups"
-DEFAULT_ACTIVATION_RECEIPT = PROJECT_ROOT / "runs" / "sac_bootstrap" / "tasam_selected_greenran" / "activation_receipt_latest.json"
+DEFAULT_ACTIVE_EVAL = PROJECT_ROOT / "runs" / "tasam_greenran_real" / "tasam_candidate_evaluation_latest.json"
+DEFAULT_GATE_OUTPUT = PROJECT_ROOT / "runs" / "tasam_greenran_real" / "marl_control_gate_latest.json"
+DEFAULT_RUNTIME_EVAL = PROJECT_ROOT / "runs" / "tasam_greenran_real" / "marl_shadow_runtime_eval_latest.json"
+DEFAULT_MANUAL_APPROVAL = PROJECT_ROOT / "runs" / "tasam_greenran_real" / "marl_control_trial_approval.json"
+DEFAULT_BACKUP_DIR = PROJECT_ROOT / "runs" / "tasam_greenran_real" / "tasam_candidate_evaluation_backups"
+DEFAULT_ACTIVATION_RECEIPT = PROJECT_ROOT / "runs" / "tasam_greenran_real" / "activation_receipt_latest.json"
 
 
 def build_parser() -> argparse.ArgumentParser:

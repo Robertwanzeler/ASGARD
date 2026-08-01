@@ -57,7 +57,10 @@ APP1_WARNING = {
     **APP1_HEALTHY,
     "throughput_mbps": 27.4,
     "avg_throughput_mbps": 28.4,
-    "latency_ms": 82.0,
+    # Keep the warning inside the rApp's CONDITIONAL band. The ARMD protocol
+    # escalates camera latency at >=80 ms, so 82 ms would be BLOCKED rather
+    # than the stage label declared by tasam_training_balanced_v1.
+    "latency_ms": 72.0,
 }
 
 APP1_GUARD = {

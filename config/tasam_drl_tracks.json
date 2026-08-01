@@ -11,7 +11,14 @@
       "scenario_source": "current_greenran_runtime",
       "output_root": "runs/tasam_greenran_real",
       "entrypoint": "scripts/run_tasam_greenran_real.py",
-      "training_runner": "drlexp/training/train_tasam_marl.py"
+      "collection_root": "runs/greenran_tasam_3du_collection",
+      "collection_entrypoint": "scripts/run_greenran_tasam_3du_collection.sh",
+      "official_data_source": "runs/greenran_tasam_3du_collection/rapp_data_lake.db",
+      "training_runner": "drlexp/training/train_tasam_marl.py",
+      "policy_topology_id": "greenran_fixed_marl_v1",
+      "logical_du_count": 3,
+      "dataset_quality_gate": "scripts/validate_tasam_dataset.py",
+      "control_mode": "shadow_only"
     },
     {
       "track_id": "tasam_article_reproduction",

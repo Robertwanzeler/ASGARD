@@ -36,7 +36,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=42, help='Deterministic seed')
     parser.add_argument('--modes', default=','.join(MODES), help='Comma-separated baseline modes')
     parser.add_argument('--rho-scenario', choices=RHO_SCENARIOS, default='dynamic', help='Paper rho scenario to reproduce')
-    parser.add_argument('--allow-proxy', action='store_true', help='Keep proxy-latency rows in the exported trace')
     parser.add_argument('--train-python', default=None, help='Training Python executable')
     parser.add_argument('--dry-run', action='store_true', help='Print commands only')
     return parser
@@ -84,8 +83,6 @@ def main() -> int:
     ]
     if args.limit is not None:
         export_cmd.extend(['--limit', str(args.limit)])
-    if args.allow_proxy:
-        export_cmd.append('--allow-proxy')
     run(export_cmd, args.dry_run)
     for mode in modes:
         cmd = [

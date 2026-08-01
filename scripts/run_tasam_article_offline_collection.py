@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--armd-mode", default="off", help="ARMD runtime mode for offline collection (default: off)")
     parser.add_argument("--pdcp-stale-seconds", type=float, default=3600.0, help="PDCP stale threshold for offline collection; keep high to avoid proxy fallback during short rounds")
     parser.add_argument("--export-limit", type=int, default=0, help="Optional transition cap per round")
-    parser.add_argument("--allow-proxy", action="store_true", help="Keep proxy-latency transitions in exported traces")
+    parser.add_argument("--allow-proxy", action="store_true", help="Legacy compatibility option for exploratory runs")
     parser.add_argument("--ns3-bin", default=str(DEFAULT_NS3_BIN), help="ns-3 scenario binary")
     parser.add_argument("--base-config", default=str(BASE_CONFIG), help="Base scenario JSON config")
     parser.add_argument("--dry-run", action="store_true", help="Prepare commands without executing them")

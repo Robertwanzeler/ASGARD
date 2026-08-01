@@ -345,17 +345,6 @@ class TASAMMultiAgentTrainer:
             selected_indices = list(range(len(first_pass_records)))
             selected_agents = total_agents
 
-        # Se nada foi selecionado fora do warmup, forcar top 10% por TD error.
-        if self.sam_mode == 'tasam_selective' and not selected_indices and not warmup and first_pass_records:
-            n_force = max(1, round(len(first_pass_records) * min_selected_fraction))
-            sorted_idx = sorted(
-                range(len(first_pass_records)),
-                key=lambda i: first_pass_td_errors[i],
-                reverse=True,
-            )[:n_force]
-            selected_indices = sorted_idx
-            selected_agents = sum(first_pass_records[i][4] for i in sorted_idx)
-
         for idx in selected_indices:
             global_x, du_inputs, target_actions, reward, n_du, td_error = first_pass_records[idx]
             actor_actions = [actor(du_x) for actor, du_x in zip(self.actors, du_inputs)]

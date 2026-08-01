@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--trace-jsonl', required=True, help='Offline trace JSONL to train on')
     parser.add_argument('--output-root', default=str(DEFAULT_OUTPUT), help='Sweep output directory')
     parser.add_argument('--seeds', type=parse_csv_ints, default=(42, 43, 44, 45, 46), help='Comma-separated seed list')
-    parser.add_argument('--mode', default='tasam_selective', choices=('tasam_selective',), help='TA-SAM mode for this sweep')
+    parser.add_argument('--mode', default='tasam_selective', choices=('no_sam', 'tasam_selective'), help='Mode for this GreenRAN comparison sweep')
     parser.add_argument('--train-python', default=None, help='Training Python executable')
     parser.add_argument('--max-epochs', type=int, default=200, help='Maximum epochs per seed')
     parser.add_argument('--checkpoint-every', type=int, default=10, help='Checkpoint cadence')
@@ -61,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--critic-sam-rho', type=float, default=0.5, help='Critic initial SAM rho')
     parser.add_argument('--critic-sam-rho-final', type=float, default=0.01, help='Critic final SAM rho')
     parser.add_argument('--dry-run', action='store_true', help='Print commands without executing them')
+    parser.add_argument('--expected-topology-id', default='greenran_fixed_marl_v1', help='Topology required by the GreenRAN policy')
+    parser.add_argument('--expected-du-count', type=int, default=3, help='Logical DU count required by the GreenRAN policy')
+    parser.add_argument('--min-transitions', type=int, default=1500, help='Minimum valid transitions required by the quality gate')
+    parser.add_argument('--skip-quality-gate', action='store_true', help='Skip the dataset gate only for a smoke run')
     return parser
 
 
@@ -312,6 +316,20 @@ def main() -> int:
     trace_jsonl = Path(args.trace_jsonl)
     if not args.dry_run and not trace_jsonl.exists():
         raise SystemExit(f'trace not found: {trace_jsonl}')
+
+    if not args.dry_run and not args.skip_quality_gate:
+        quality_report = output_root / 'tasam_dataset_quality.json'
+        validate_cmd = [
+            sys.executable,
+            str(ROOT / 'scripts' / 'validate_tasam_dataset.py'),
+            '--trace-jsonl', str(trace_jsonl),
+            '--output-json', str(quality_report),
+            '--expected-topology-id', str(args.expected_topology_id),
+            '--expected-du-count', str(args.expected_du_count),
+            '--min-transitions', str(args.min_transitions),
+        ]
+        print(' '.join(validate_cmd), flush=True)
+        subprocess.run(validate_cmd, cwd=ROOT, check=True)
 
     for seed in args.seeds:
         cmd = build_train_command(args, seed)

@@ -48,6 +48,7 @@ EXTENDED_METRICS_PREFERRED_COLUMNS = (
     "mac_trace_age_s",
     "pdcp_latest_sim_time_s",
 )
+METRICS_TIMESTAMP_TOLERANCE_S = 3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -235,6 +236,26 @@ def fetch_metrics(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
         (timestamp,),
     )
     if not row:
+        # The collector and rApp publish on independent cadences. Recover a
+        # nearby metric snapshot instead of dropping an otherwise valid
+        # transition, while bounding the match tightly enough to avoid
+        # crossing scenario stages.
+        row = fetch_one(
+            cursor,
+            f"""
+            select {", ".join(selected_columns)}
+            from extended_metrics
+            where timestamp between ? and ?
+            order by abs(timestamp - ?) asc
+            limit 1
+            """,
+            (
+                int(timestamp) - METRICS_TIMESTAMP_TOLERANCE_S,
+                int(timestamp) + METRICS_TIMESTAMP_TOLERANCE_S,
+                int(timestamp),
+            ),
+        )
+    if not row:
         return {}
     return {key: row[key] for key in row.keys()}
 
@@ -274,6 +295,9 @@ def scenario_stage_from_shadow(
     conflict: dict[str, Any],
     metrics: dict[str, Any],
 ) -> str:
+    controlled_stage = controlled_stage_label(decision)
+    if controlled_stage:
+        return controlled_stage
     snapshot = shadow.get("snapshot") if isinstance(shadow, dict) else {}
     if isinstance(snapshot, dict):
         marl_shadow = snapshot.get("marl_shadow") or {}
@@ -339,7 +363,7 @@ def collection_quality(metrics: dict[str, Any], current: dict[str, Any], nxt: di
         "sim_reset": sim_reset,
         "valid_for_training": (
             (args.allow_proxy or proxy_count <= 0)
-            and pdcp_real
+            and (pdcp_real or args.allow_proxy)
             and ts_gap <= args.max_step_gap_s
             and not sim_reset
             and not suspected_stale_proxy
@@ -391,7 +415,32 @@ def compute_reward(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def controlled_stage_label(decision: dict[str, Any]) -> str:
+    """Recover the balanced collection stage from a controlled decision."""
+    if str(decision.get("improvement_source") or "").strip().lower() != "scenario_control_override":
+        return ""
+    decision_name = str(decision.get("decision") or "").strip().upper()
+    reason = " ".join(
+        str(decision.get(key) or "").strip().lower()
+        for key in ("reason", "priority_violation", "armd_scenario")
+    )
+    if "vehicle" in reason:
+        domain = "vehicle"
+    elif "app2" in reason or "mtc" in reason or "mmtc" in reason:
+        domain = "app2"
+    else:
+        domain = "camera"
+    return {
+        "ALLOWED": "allowed_stable",
+        "CONDITIONAL": f"{domain}_conditional",
+        "BLOCKED": f"{domain}_blocked",
+    }.get(decision_name, "")
+
+
 def stage_label(decision: dict[str, Any], conflict: dict[str, Any], metrics: dict[str, Any]) -> str:
+    controlled_stage = controlled_stage_label(decision)
+    if controlled_stage:
+        return controlled_stage
     reason = str(decision.get("reason") or "").lower()
     if conflict.get("recent_count", 0) > 0:
         return "conflict_context"

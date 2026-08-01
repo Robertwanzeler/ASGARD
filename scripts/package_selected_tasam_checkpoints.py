@@ -21,6 +21,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--primary-checkpoint-dir", required=True, help="Balanced primary checkpoint directory")
     parser.add_argument("--secondary-checkpoint-dir", required=True, help="Aggressive secondary checkpoint directory")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Output root for packaged checkpoints")
+    parser.add_argument("--expected-topology-id", default="greenran_fixed_marl_v1", help="Topology label for the packaged policy")
+    parser.add_argument("--expected-du-count", type=int, default=3, help="DU count required by the GreenRAN policy")
     return parser
 
 
@@ -118,6 +120,14 @@ def package_checkpoint(checkpoint_dir: Path, *, output_root: Path, role: str, us
             shutil.copy2(path, package_dir / path.name)
 
     summary = build_selected_summary(parent_summary, checkpoint_dir=checkpoint_dir, role=role, usage_profile=usage_profile)
+    expected_du_count = int(getattr(package_checkpoint, "expected_du_count", 0) or 0)
+    if expected_du_count and int(summary.get("du_count", 0) or 0) != expected_du_count:
+        raise ValueError(
+            f"checkpoint {checkpoint_dir} has du_count={summary.get('du_count')}; "
+            f"expected {expected_du_count}"
+        )
+    summary["policy_topology_id"] = str(getattr(package_checkpoint, "expected_topology_id", "") or "")
+    summary["policy_du_count"] = expected_du_count or int(summary.get("du_count", 0) or 0)
     summary_path = package_dir / "tasam_marl_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -125,6 +135,8 @@ def package_checkpoint(checkpoint_dir: Path, *, output_root: Path, role: str, us
     return {
         "role": role,
         "usage_profile": usage_profile,
+        "policy_topology_id": summary["policy_topology_id"],
+        "policy_du_count": summary["policy_du_count"],
         "package_dir": str(package_dir.resolve()),
         "summary_path": str(summary_path.resolve()),
         "source_checkpoint_dir": str(checkpoint_dir.resolve()),
@@ -140,6 +152,8 @@ def package_checkpoint(checkpoint_dir: Path, *, output_root: Path, role: str, us
 def write_manifest(output_root: Path, primary: dict[str, Any], secondary: dict[str, Any]) -> tuple[Path, Path]:
     manifest = {
         "schema": "greenran.tasam_selected_checkpoint_manifest.v1",
+        "policy_topology_id": primary.get("policy_topology_id", "greenran_fixed_marl_v1"),
+        "policy_du_count": int(primary.get("policy_du_count", 3) or 3),
         "decision": {
             "primary_role": "balanced_use",
             "secondary_role": "aggressive_benchmark",
@@ -182,6 +196,11 @@ def main() -> int:
     args = build_parser().parse_args()
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+
+    # Keep the existing programmatic API compatible with older tests while
+    # making the CLI packaging contract explicit for the current 3-DU policy.
+    package_checkpoint.expected_topology_id = args.expected_topology_id
+    package_checkpoint.expected_du_count = args.expected_du_count
 
     primary = package_checkpoint(
         Path(args.primary_checkpoint_dir),

@@ -10,10 +10,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OFFICIAL_COLLECTION_DB = ROOT / 'runs' / 'tasam_article_ns3_collection' / 'rapp_data_lake.db'
+OFFICIAL_COLLECTION_DB = ROOT / 'runs' / 'greenran_tasam_3du_collection' / 'rapp_data_lake.db'
 DEFAULT_OUTPUT = ROOT / 'runs' / 'tasam_greenran_real'
 DEFAULT_TRAIN_PYTHON = ROOT / 'drlexp' / '.venv' / 'bin' / 'python'
-MODES = ('no_sam', 'l2', 'actor_sam', 'critic_sam', 'both_sam', 'tasam_selective')
+MODES = ('no_sam', 'tasam_selective', 'l2', 'actor_sam', 'critic_sam', 'both_sam')
 
 
 def resolve_default_db() -> Path:
@@ -25,15 +25,21 @@ def resolve_default_db() -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Run TA-SAM on real GreenRAN/rApp data')
+    parser = argparse.ArgumentParser(description='Run TA-SAM on real 3-DU GreenRAN/rApp data')
     parser.add_argument('--db', default=str(resolve_default_db()), help='GreenRAN data-lake SQLite DB')
     parser.add_argument('--output-root', default=str(DEFAULT_OUTPUT), help='Output directory')
     parser.add_argument('--trace-jsonl', default=None, help='Reuse an existing raw or filtered trace JSONL')
     parser.add_argument('--skip-export', action='store_true', help='Skip DB export and reuse the trace path already on disk')
-    parser.add_argument('--trace-profile', choices=('raw', 'article_faithful', 'article_stress', 'postfix_clean'), default='raw', help='Dataset profile to train from')
+    parser.add_argument('--trace-profile', choices=('raw', 'article_faithful', 'article_stress', 'postfix_clean', 'rapp_online_trainable'), default='rapp_online_trainable', help='Dataset profile to train from')
     parser.add_argument('--limit', type=int, default=None, help='Optional transition limit')
     parser.add_argument('--epochs', type=int, default=25, help='Training epochs; maps to paper Nt')
-    parser.add_argument('--modes', default=','.join(MODES), help='Comma-separated modes')
+    parser.add_argument('--modes', default='no_sam,tasam_selective', help='Comma-separated modes')
+    parser.add_argument('--seed', type=int, default=42, help='Training seed')
+    parser.add_argument('--expected-topology-id', default='greenran_fixed_marl_v1', help='Topology required by the GreenRAN policy')
+    parser.add_argument('--expected-du-count', type=int, default=3, help='Logical DU count required by the GreenRAN policy')
+    parser.add_argument('--min-transitions', type=int, default=1500, help='Minimum valid transitions required by the quality gate')
+    parser.add_argument('--quality-report', default=None, help='Optional dataset quality report path')
+    parser.add_argument('--skip-quality-gate', action='store_true', help='Skip validation only for an explicit smoke run')
     parser.add_argument('--allow-proxy', action='store_true', help='Keep proxy-latency rows')
     parser.add_argument('--max-p95-ms', type=float, default=None, help='Optional upper bound for filtered latency_p95_ms')
     parser.add_argument('--max-cvar-ms', type=float, default=None, help='Optional upper bound for filtered cvar_ms')
@@ -46,6 +52,27 @@ def run(cmd: list[str], dry_run: bool) -> None:
     print(' '.join(cmd), flush=True)
     if not dry_run:
         subprocess.run(cmd, cwd=ROOT, check=True)
+
+
+def resolve_train_python(explicit: str | None) -> str:
+    """Select a trainer interpreter that actually has PyTorch installed."""
+    candidates = [Path(explicit)] if explicit else [DEFAULT_TRAIN_PYTHON, Path(sys.executable), Path('/usr/bin/python3')]
+    checked: set[str] = set()
+    for candidate in candidates:
+        value = str(candidate)
+        if value in checked or not candidate.exists():
+            continue
+        checked.add(value)
+        probe = subprocess.run(
+            [value, '-c', 'import torch'],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return value
+    raise SystemExit('No training Python interpreter with PyTorch available; pass --train-python explicitly')
 
 
 def main() -> int:
@@ -64,7 +91,7 @@ def main() -> int:
             'Active GreenRAN collection DB not found: '
             f'{db_path}. Pass --db explicitly or set GREENRAN_TASAM_ACTIVE_DB.'
         )
-    train_py = args.train_python or str(DEFAULT_TRAIN_PYTHON if DEFAULT_TRAIN_PYTHON.exists() else sys.executable)
+    train_py = resolve_train_python(args.train_python)
     output_root.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_export and args.trace_jsonl is None:
@@ -107,6 +134,24 @@ def main() -> int:
             filter_cmd.extend(['--max-cvar-ms', str(args.max_cvar_ms)])
         run(filter_cmd, args.dry_run)
         train_trace = filtered_trace
+
+    if not args.skip_quality_gate:
+        quality_report = Path(args.quality_report) if args.quality_report else output_root / 'tasam_dataset_quality.json'
+        validate_cmd = [
+            sys.executable,
+            str(ROOT / 'scripts' / 'validate_tasam_dataset.py'),
+            '--trace-jsonl',
+            str(train_trace),
+            '--output-json',
+            str(quality_report),
+            '--expected-topology-id',
+            str(args.expected_topology_id),
+            '--expected-du-count',
+            str(args.expected_du_count),
+            '--min-transitions',
+            str(args.min_transitions),
+        ]
+        run(validate_cmd, args.dry_run)
 
     for mode in modes:
         cmd = [
@@ -153,7 +198,7 @@ def main() -> int:
             '--batch-size',
             '128',
             '--seed',
-            '42',
+            str(args.seed),
             '--article-hidden',
             '--activation',
             'tanh',

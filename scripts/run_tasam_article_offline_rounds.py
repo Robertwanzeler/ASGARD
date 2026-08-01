@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=25, help="Training epochs per round")
     parser.add_argument("--modes", default=",".join(MODES), help="Comma-separated modes to train")
     parser.add_argument("--limit", type=int, default=None, help="Optional transition limit for smoke runs")
-    parser.add_argument("--allow-proxy", action="store_true", help="Keep proxy-latency rows in the exported trace")
+    parser.add_argument("--allow-proxy", action="store_true", help="Legacy compatibility option for exploratory runs")
     parser.add_argument("--seed", type=int, default=42, help="Deterministic seed")
     parser.add_argument("--train-python", default=None, help="Training Python executable")
     parser.add_argument("--plateau-rounds", type=int, default=3, help="Consecutive plateau rounds required for convergence")

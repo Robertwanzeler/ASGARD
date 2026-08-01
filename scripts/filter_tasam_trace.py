@@ -35,7 +35,14 @@ POSTFIX_CLEAN_EXPECTED_DECISION = {
     "allowed_recovery": "ALLOWED",
 }
 
-PROFILES = ("raw", "article_faithful", "article_stress", "postfix_clean", "rapp_online_trainable")
+PROFILES = (
+    "raw",
+    "article_faithful",
+    "article_stress",
+    "postfix_clean",
+    "rapp_online_trainable",
+    "rapp_online_controlled_trainable",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,6 +137,21 @@ def profile_rules(profile: str) -> dict[str, Any]:
             "require_valid": True,
             "require_pdcp_real": True,
             "require_proxy_free": True,
+            "since_ts": POSTFIX_CLEAN_SINCE_TS,
+            "require_metrics": True,
+            "require_next_metrics": True,
+            "expected_stage_decisions": dict(POSTFIX_CLEAN_EXPECTED_DECISION),
+            "strict_stage_reasons": True,
+        }
+    if profile == "rapp_online_controlled_trainable":
+        return {
+            "allowed_stages": set(POSTFIX_CLEAN_ALLOWED_STAGES),
+            "require_valid": True,
+            "require_pdcp_real": False,
+            # GreenRAN's balanced event alternator controls application
+            # latency when ns-3 emits PDCP throughput but no per-UE latency;
+            # keep those samples in a separate controlled-training profile.
+            "require_proxy_free": False,
             "since_ts": POSTFIX_CLEAN_SINCE_TS,
             "require_metrics": True,
             "require_next_metrics": True,

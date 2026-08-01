@@ -15,27 +15,28 @@ export GREENRAN_RAN_PRESSURE_PROFILE="${GREENRAN_RAN_PRESSURE_PROFILE:-tasam_tra
 export GREENRAN_COLLECTION_EVENT_CYCLES="${GREENRAN_COLLECTION_EVENT_CYCLES:-0}"
 export GREENRAN_COLLECTION_EVENT_TICK_S="${GREENRAN_COLLECTION_EVENT_TICK_S:-1.0}"
 export GREENRAN_COLLECTION_EVENT_TIME_SOURCE="${GREENRAN_COLLECTION_EVENT_TIME_SOURCE:-wall}"
-export GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES="1"
+# Article track default: GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES="1".
+export GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES="${GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES:-1}"
+export GREENRAN_START_RIC="${GREENRAN_START_RIC:-0}"
 
 . "$SCRIPT_DIR/core_runtime.sh"
 load_greenran_runtime
 
-# Strict real-only collection needs a runtime scale that still produces
-# PDCP/RLC bearer rows in this ns-3 scenario. Keep the article contract in the
-# manifest, but default the live collector to a viable real-only split unless
-# the operator explicitly overrides it.
-export GREENRAN_REAL_ONLY_NS3_UE_COUNT="${GREENRAN_REAL_ONLY_NS3_UE_COUNT:-20}"
-export GREENRAN_REAL_ONLY_NS3_CAMERA_UE_COUNT="${GREENRAN_REAL_ONLY_NS3_CAMERA_UE_COUNT:-8}"
-export GREENRAN_REAL_ONLY_NS3_VEHICLE_UE_COUNT="${GREENRAN_REAL_ONLY_NS3_VEHICLE_UE_COUNT:-4}"
+# Official article collection defaults to the canonical preset from the TA-SAM
+# paper. Use explicit environment overrides only for smoke runs.
+export GREENRAN_REAL_ONLY_NS3_UE_COUNT="${GREENRAN_REAL_ONLY_NS3_UE_COUNT:-200}"
+export GREENRAN_REAL_ONLY_NS3_CAMERA_UE_COUNT="${GREENRAN_REAL_ONLY_NS3_CAMERA_UE_COUNT:-80}"
+export GREENRAN_REAL_ONLY_NS3_VEHICLE_UE_COUNT="${GREENRAN_REAL_ONLY_NS3_VEHICLE_UE_COUNT:-40}"
 
 export GREENRAN_NS3_UE_COUNT="${GREENRAN_NS3_UE_COUNT:-$GREENRAN_REAL_ONLY_NS3_UE_COUNT}"
 export GREENRAN_NS3_CAMERA_UE_COUNT="${GREENRAN_NS3_CAMERA_UE_COUNT:-$GREENRAN_REAL_ONLY_NS3_CAMERA_UE_COUNT}"
 export GREENRAN_NS3_VEHICLE_UE_COUNT="${GREENRAN_NS3_VEHICLE_UE_COUNT:-$GREENRAN_REAL_ONLY_NS3_VEHICLE_UE_COUNT}"
-export GREENRAN_NS3_MMWAVE_ENB_NODES="${GREENRAN_NS3_MMWAVE_ENB_NODES:-2}"
-export GREENRAN_NS3_UE_SPEED_MIN="${GREENRAN_NS3_UE_SPEED_MIN:-2}"
-export GREENRAN_NS3_UE_SPEED_MAX="${GREENRAN_NS3_UE_SPEED_MAX:-4}"
-export GREENRAN_PDCP_STALE_SECONDS="${GREENRAN_PDCP_STALE_SECONDS:-30}"
-export GREENRAN_REQUIRE_REAL_PDCP="1"
+export GREENRAN_NS3_MMWAVE_ENB_NODES="${GREENRAN_NS3_MMWAVE_ENB_NODES:-6}"
+export GREENRAN_NS3_UE_SPEED_MIN="${GREENRAN_NS3_UE_SPEED_MIN:-10}"
+export GREENRAN_NS3_UE_SPEED_MAX="${GREENRAN_NS3_UE_SPEED_MAX:-20}"
+export GREENRAN_PDCP_STALE_SECONDS="600"
+# Article track default: GREENRAN_REQUIRE_REAL_PDCP="1".
+export GREENRAN_REQUIRE_REAL_PDCP="${GREENRAN_REQUIRE_REAL_PDCP:-1}"
 export GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH="${GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH:-0}"
 export GREENRAN_NS3_E2NR_ENABLED="${GREENRAN_NS3_E2NR_ENABLED:-false}"
 export GREENRAN_NS3_USE_MC_UE_DEVICES="${GREENRAN_NS3_USE_MC_UE_DEVICES:-true}"
@@ -68,6 +69,39 @@ start_if_missing() {
   "$@"
 }
 
+start_ric() {
+  if [[ "$GREENRAN_START_RIC" != "1" ]]; then
+    return 0
+  fi
+
+  local ric_bin=""
+  local candidate
+  for candidate in \
+    "$PROJECT_ROOT/flexric/build_e2ap_v1/examples/ric/nearRT-RIC" \
+    "$PROJECT_ROOT/flexric/build/examples/ric/nearRT-RIC"; do
+    if [[ -x "$candidate" ]]; then
+      ric_bin="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$ric_bin" ]]; then
+    echo "nearRT-RIC não encontrado; procure em flexric/build_e2ap_v1/examples/ric/nearRT-RIC" >&2
+    return 1
+  fi
+
+  export LD_LIBRARY_PATH="$PROJECT_ROOT/flexric/build_e2ap_v1/src/ric:$PROJECT_ROOT/flexric_lib:$PROJECT_ROOT/flexric/build_e2ap_v1/src/xApp:${LD_LIBRARY_PATH:-}"
+  setsid "$ric_bin" \
+    -c "$PROJECT_ROOT/flexric/flexric.conf" \
+    -p "$PROJECT_ROOT/flexric_lib/" \
+    > "$GREENRAN_RIC_LOG" 2>&1 &
+  echo $! > "$GREENRAN_RIC_PID"
+  sleep 2
+  if ! kill -0 "$(cat "$GREENRAN_RIC_PID" 2>/dev/null)" 2>/dev/null; then
+    echo "nearRT-RIC encerrou durante o startup; verifique $GREENRAN_RIC_LOG" >&2
+    return 1
+  fi
+}
+
 start_ns3() {
   setsid env \
     GREENRAN_PROJECT_DIR="$PROJECT_ROOT" \
@@ -87,6 +121,7 @@ start_ns3() {
     GREENRAN_NS3_E2CUUP_ENABLED="$GREENRAN_NS3_E2CUUP_ENABLED" \
     GREENRAN_NS3_ENABLE_E2_FILE_LOGGING="$GREENRAN_NS3_ENABLE_E2_FILE_LOGGING" \
     GREENRAN_NS3_BEARER_STATS_EPOCH_MS="$GREENRAN_NS3_BEARER_STATS_EPOCH_MS" \
+    GREENRAN_RAN_PRESSURE_PROFILE="$GREENRAN_RAN_PRESSURE_PROFILE" \
     "$PROJECT_ROOT/scripts/start_ns3_supervisor.sh" >/dev/null 2>&1 &
   sleep 1
 }
@@ -110,7 +145,7 @@ start_db_snapshot_service() {
 }
 
 start_tasam_export_service() {
-  setsid /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_TASAM_EXPORT_DIR='$GREENRAN_TASAM_EXPORT_DIR' GREENRAN_TASAM_EXPORT_LIMIT='$GREENRAN_TASAM_EXPORT_LIMIT' GREENRAN_TASAM_EXPORT_ALLOW_PROXY='$GREENRAN_TASAM_EXPORT_ALLOW_PROXY' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/run_tasam_article_export.py --db '$GREENRAN_DB_PATH' --output-dir '$GREENRAN_TASAM_EXPORT_DIR'; code=\$?; else echo \"[TASAM_EXPORT] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[TASAM_EXPORT] cycle finished with code \$code at \$(date -Is); sleeping ${GREENRAN_TASAM_EXPORT_INTERVAL}s\"; sleep '$GREENRAN_TASAM_EXPORT_INTERVAL'; done" > "$GREENRAN_TASAM_EXPORT_LOG" 2>&1 &
+  setsid /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_TASAM_EXPORT_DIR='$GREENRAN_TASAM_EXPORT_DIR' GREENRAN_TASAM_EXPORT_LIMIT='$GREENRAN_TASAM_EXPORT_LIMIT' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/run_tasam_article_export.py --db '$GREENRAN_DB_PATH' --output-dir '$GREENRAN_TASAM_EXPORT_DIR'; code=\$?; else echo \"[TASAM_EXPORT] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[TASAM_EXPORT] cycle finished with code \$code at \$(date -Is); sleeping ${GREENRAN_TASAM_EXPORT_INTERVAL}s\"; sleep '$GREENRAN_TASAM_EXPORT_INTERVAL'; done" > "$GREENRAN_TASAM_EXPORT_LOG" 2>&1 &
   echo $! > "$GREENRAN_TASAM_EXPORT_PID"
   sleep 1
 }
@@ -152,6 +187,7 @@ start_collection_event_service() {
   sleep 1
 }
 
+start_if_missing "$GREENRAN_RIC_PID" start_ric
 start_if_missing "$GREENRAN_NS3_SUPERVISOR_PID" start_ns3
 start_if_missing "$GREENRAN_CSV_PID" start_collector
 start_if_missing "$GREENRAN_RAPP_PID" start_rapp
@@ -182,6 +218,7 @@ echo "TA-SAM article ns-3 collection"
 echo "  state_dir: $GREENRAN_STATE_DIR"
 echo "  db:       $GREENRAN_DB_PATH"
 echo "  config:   $GREENRAN_FIXED_SCENARIO_CONFIG"
+echo "  nearRT-RIC: $([[ "$GREENRAN_START_RIC" == "1" ]] && echo gerenciado || echo externo/desabilitado)"
 echo "  ueCount:  $GREENRAN_NS3_UE_COUNT"
 echo "  split:    cam=$GREENRAN_NS3_CAMERA_UE_COUNT bg=$(($GREENRAN_NS3_UE_COUNT - $GREENRAN_NS3_CAMERA_UE_COUNT - $GREENRAN_NS3_VEHICLE_UE_COUNT)) veh=$GREENRAN_NS3_VEHICLE_UE_COUNT"
 echo "  mmWaveDU: $GREENRAN_NS3_MMWAVE_ENB_NODES"

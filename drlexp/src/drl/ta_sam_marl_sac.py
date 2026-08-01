@@ -592,8 +592,6 @@ class TASAMArticleSACTrainer:
             actor_loss = ((alpha * log_prob) - min_q_pi).mean() + (bc_weight * imitation_loss) + self._l2_penalty(self.actors)
 
             selected = batch_td_var >= effective_threshold or warmup
-            if self.sam_mode == 'tasam_selective' and not selected and not warmup and selected_updates == 0 and (step_idx + self.actor_update_interval >= updates):
-                selected = True
             actor_rho = linear_rho_schedule(self.actor_rho_start, self.actor_rho_final, epoch_progress)
             if self.sam_mode == 'tasam_selective':
                 actor_rho = td_scaled_rho(actor_rho, self.actor_rho_final, batch_td_var, td_var_cap)
