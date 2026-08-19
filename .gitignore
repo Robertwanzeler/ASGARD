@@ -1,79 +1,30 @@
-# Build artifacts
-__pycache__/
-*.pyc
-*.pyo
-*.so
-build/
-dist/
+# Build do ns-3
+ns3-base/build/
+ns3-base/cmake-cache/
+ns3-base/.lock-ns3_*
+ns3-base/*.log
 
-# Logs
-nohup.out
+# Saídas de execução e debug
 *.log
-*.pid
+*.out
+*.pcap
+*.tr
+*.xml
+valgrind-*.txt
+gdb-*.txt
+core
+core.*
 
-# Binary libraries
-flexric_lib/
+# Python e ferramentas locais
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
 
-# IDE
+# IDE e sistema operacional
 .vscode/
 .idea/
 .DS_Store
-
-# Python environments and tooling
-.venv/
-venv/
-env/
-drlexp/.venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Local databases and SQLite sidecars
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
-
-# Runtime state and generated outputs
-/results/
-!/runs/.gitkeep
-!/runs/existing_data/
-!/runs/article00/
-!/runs/experimentos_conflitos/
-/runs/**
-/runs/**/state_snapshot/
-/charts/*.csv
-/charts/*.png
-/models/*.joblib
-/models/*.pt
-/models/**/*.joblib
-/models/**/*.pt
-/models/*.png
-/models/**/*.png
-/models/a3c/
-/models/sbilstm/
-/models/tasam_preliminary_20260730/
-
-# Scratch / throwaway scripts
-/teste.py
-/test_gate.py
-
-# Preserve text docs and dependency manifests
-*.txt
-!requirements.txt
-!requirements-dev.txt
-!README*.txt
-!models/*.txt
-carla/
-.venv-graphsage/
-.venv/
-
-# Local packaged dependencies and runtime captures
-/carla_0.9.16.tar.gz
-/venv_graphsage.tar.gz
-/docs/-greenran-oran--master.zip
-/docs/.~lock.*
-/state/live_carla_real/

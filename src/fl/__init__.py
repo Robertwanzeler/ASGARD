@@ -1,1 +1,0 @@
-# GreenRAN - Federated Learning Module

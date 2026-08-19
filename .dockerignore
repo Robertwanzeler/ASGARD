@@ -1,0 +1,5 @@
+*
+!ns3-base/
+!ns3-base/**
+!docker_project/
+!docker_project/**

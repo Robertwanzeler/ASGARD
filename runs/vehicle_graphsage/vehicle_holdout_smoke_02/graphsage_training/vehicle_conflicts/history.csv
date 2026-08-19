@@ -1,2 +1,0 @@
-epoch,loss,precision,recall,f1,tp,fp,fn,tn,predicted_edges,target_edges,threshold,train_precision,train_recall,train_f1,train_tp,train_fp,train_fn,train_tn
-1,1.240515,0.09375,0.5,0.157895,6,58,6,40,64,12,0.5,0.15625,0.833333,0.263158,10,54,2,44

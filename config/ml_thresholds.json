@@ -1,8 +1,0 @@
-{
-  "db_override_threshold": 0.75,
-  "db_boost_threshold": 0.70,
-  "cvar_critical_ms": 75,
-  "cvar_warning_ms": 55,
-  "predicted_cvar_blocked": 75,
-  "predicted_cvar_warning": 55
-}
