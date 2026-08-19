@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+OUT_DIR="${GREENRAN_DRL_ARTICLE_OUT_DIR:-$BASE_DIR/runs/tasam_greenran_real/article_metrics_real}"
+
+mkdir -p "$OUT_DIR"
+
+export GREENRAN_DRL_TRACE="${GREENRAN_DRL_TRACE:-1}"
+export GREENRAN_DRL_TRACE_FILE="${GREENRAN_DRL_TRACE_FILE:-$OUT_DIR/tasam_shadow_trace.jsonl}"
+export GREENRAN_COLLECTION_EVENT_PROFILE="${GREENRAN_COLLECTION_EVENT_PROFILE:-drl_article_v1}"
+export GREENRAN_COLLECTION_EVENT_CYCLES="${GREENRAN_COLLECTION_EVENT_CYCLES:-0}"
+export GREENRAN_COLLECTION_EVENT_TICK_S="${GREENRAN_COLLECTION_EVENT_TICK_S:-1.0}"
+export GREENRAN_SIM_TIME="${GREENRAN_SIM_TIME:-100000}"
+export GREENRAN_RL_POLICY="${GREENRAN_RL_POLICY:-ta_sam_shadow}"
+export GREENRAN_APP2_REAL_SENSOR_WAIT_SECONDS="${GREENRAN_APP2_REAL_SENSOR_WAIT_SECONDS:-90}"
+
+cd "$BASE_DIR"
+exec ./scripts/run_greenran_v2.sh

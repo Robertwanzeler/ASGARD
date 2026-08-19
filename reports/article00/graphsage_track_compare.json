@@ -1,0 +1,35 @@
+{
+  "schema": "greenran.graphsage_track_compare.v1",
+  "generated_at": "2026-04-29T13:44:48.394571+00:00",
+  "greenran_track": {
+    "docs": {
+      "ANALISE_CONFLITOS_GNN.md": true,
+      "CONFLICT_DATASET_PIPELINE.md": true
+    },
+    "scripts": {
+      "generate_graphsage_paper_multiseed.py": true
+    },
+    "training": {
+      "train_graphsage_conflicts.py": true
+    }
+  },
+  "article00_track": {
+    "docs": {
+      "ARTICLE00_EXPERIMENTOS.md": true,
+      "ARTICLE00_METODO.md": true,
+      "ESTUDO_ARTIGOS_BASE.md": true
+    },
+    "scripts": {
+      "generate_article00_dataset.py": true,
+      "run_article00_experiments.py": true,
+      "generate_graphsage_article00_figures.py": true
+    },
+    "training": {
+      "train_graphsage_article00.py": true
+    }
+  },
+  "notes": [
+    "This report compares file presence and organization only.",
+    "It does not claim methodological equivalence between the two tracks."
+  ]
+}

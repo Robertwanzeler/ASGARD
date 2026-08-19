@@ -1,0 +1,1133 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - GreenRAN rApp{% endblock %}
+
+{% block extra_head %}
+<style>
+    /* CORREÇÃO_TEXTO_INVISIVEL - Forçar cores em todas as tabelas */
+    .card-body table { background-color: transparent !important; }
+    .card-body table td { color: #bbbbbb !important; background-color: transparent !important; }
+    .card-body table th { color: #ffffff !important; background-color: #0f3460 !important; }
+    .card-body .table-sm td { color: #cccccc !important; }
+    .card-body .table-sm td:first-child { color: #ffffff !important; font-weight: bold; }
+    
+    /* Regras de coordenação - forçar cor */
+    .card-body table:nth-of-type(2) td { color: #dddddd !important; }
+    .card-body table:nth-of-type(2) td:first-child { color: #00ff88 !important; }
+    
+    /* Estatísticas - forçar cor dos valores */
+    .card-body .table td:last-child { color: #ffffff !important; font-weight: bold; }
+    
+    #energy-stats .metric-value {
+        color: #00ff88 !important;
+        font-size: 2.5rem;
+        font-weight: bold;
+    }
+    #energy-stats .metric-label {
+        color: #aaa !important;
+    }
+    #energy-stats .card-body {
+        color: #eee;
+    }
+    #energy-stats strong {
+        color: #fff !important;
+    }
+    .energy-cmd {
+        color: #aaa;
+        margin-bottom: 4px;
+    }
+    .energy-cmd-full { color: #ffc107; font-weight: bold; }
+    .energy-cmd-eco { color: #00ff88; font-weight: bold; }
+    .table td strong { color: #ffffff !important; font-size: 1.1em; }
+    .table-sm td strong, .table td strong { color: #ffffff !important; font-weight: bold; }
+    /* NOVO: Estilos para Timeline de Períodos */
+    .period-box {
+        border: 2px solid #333;
+        transition: all 0.3s ease;
+    }
+    .period-active {
+        border-color: #00ff88;
+        box-shadow: 0 0 15px rgba(0, 255, 136, 0.3);
+    }
+    .period-label {
+        font-size: 0.85rem;
+        color: #aaa;
+    }
+    .period-stats {
+        font-size: 1.2rem;
+        font-weight: bold;
+    }
+    .sla-grid-card {
+        height: 100%;
+        background: rgba(15, 52, 96, 0.28);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 10px;
+        padding: 14px 16px;
+    }
+    .sla-grid-card p {
+        margin-bottom: 6px;
+        color: #aaa;
+        font-size: 0.88rem;
+    }
+    .sla-grid-card strong {
+        color: #fff !important;
+    }
+    .armd-panel {
+        background: radial-gradient(circle at top left, rgba(26, 91, 140, 0.35), rgba(9, 15, 28, 0.95));
+        border: 1px solid rgba(143, 211, 255, 0.16);
+        border-radius: 14px;
+        padding: 18px;
+    }
+    .armd-hero {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 18px;
+        flex-wrap: wrap;
+    }
+    .armd-kicker {
+        color: #8fd3ff;
+        font-size: 0.82rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 6px;
+    }
+    .armd-scenario {
+        color: #fff;
+        font-size: 1.7rem;
+        font-weight: 700;
+        line-height: 1.05;
+        margin-bottom: 8px;
+    }
+    .armd-meta {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 0;
+    }
+    .armd-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.08);
+        color: #d7e7ff;
+        font-size: 0.86rem;
+    }
+    .armd-pill strong {
+        color: #fff !important;
+    }
+    .armd-score {
+        min-width: 160px;
+        text-align: right;
+    }
+    .armd-score-value {
+        color: #00ff88;
+        font-size: 2.2rem;
+        font-weight: 700;
+        line-height: 1;
+        margin-bottom: 6px;
+    }
+    .armd-score-label {
+        color: #8da6c3;
+        font-size: 0.85rem;
+    }
+    .armd-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 12px;
+        margin-top: 16px;
+    }
+    .armd-cell {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 12px 14px;
+    }
+    .armd-cell-label {
+        color: #8da6c3;
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 5px;
+    }
+    .armd-cell-value {
+        color: #fff;
+        font-weight: 600;
+        word-break: break-word;
+    }
+    .armd-reason {
+        margin-top: 14px;
+        padding: 12px 14px;
+        background: rgba(255,255,255,0.03);
+        border-left: 3px solid #8fd3ff;
+        border-radius: 10px;
+        color: #d3def0;
+    }
+    .armd-reason strong {
+        color: #fff !important;
+        display: block;
+        margin-bottom: 4px;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-3">
+    <div class="col-md-12">
+        <div class="card" style="border-left: 4px solid #00bcd4;">
+            <div class="card-body" style="padding: 14px 18px;">
+                <div class="armd-hero">
+                    <div>
+                        <div class="armd-kicker">Baseline Fixo Ativo</div>
+                        <div class="armd-scenario">{{ fixed_scenario.scenario_id }}</div>
+                    </div>
+                    <div class="armd-meta">
+                        <span class="armd-pill"><strong>ns-3</strong> {{ fixed_scenario.total_ues }} UEs</span>
+                        <span class="armd-pill"><strong>App1</strong> {{ fixed_scenario.active_cameras }} câmeras</span>
+                        <span class="armd-pill"><strong>Background</strong> {{ fixed_scenario.background_ues }} UEs</span>
+                        <span class="armd-pill"><strong>App3</strong> até {{ fixed_scenario.max_vehicles }} veículos</span>
+                        <span class="armd-pill"><strong>IMSI App3</strong> {{ fixed_scenario.vehicle_base_imsi }}-{{ fixed_scenario.vehicle_imsi_end }}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- NOVO: Timeline de Períodos -->
+<div class="row">
+    <div class="col-md-12">
+        <div class="card" style="border-left: 4px solid #ff6600;">
+            <div class="card-header" style="background: linear-gradient(90deg, #0f3460 0%, #1a1a2e 100%);">
+                <h5 class="mb-0">⏱️ Períodos de Simulação (Alternância)</h5>
+            </div>
+            <div class="card-body">
+                <div class="row text-center">
+                    <div class="col-md-4">
+                        <div class="period-box {% if current_period == 1 %}period-active{% endif %}" style="padding: 15px; border-radius: 10px; background: {% if current_period == 1 %}#0f3460{% else %}#16213e{% endif %};">
+                            <h4 style="color: #00ff88;">PERÍODO 1</h4>
+                            <p style="color: #aaa; font-size: 0.9rem;">0-5 min (Tráfego LEVE)</p>
+                            <p style="color: #fff; font-size: 1.5rem;">{{ period1_stats.allowed + period1_stats.blocked }} decisões</p>
+                            <p style="color: #00ff88;">{{ period1_stats.allowed }} Allow / <span style="color: #ff4444;">{{ period1_stats.blocked }} Block</span></p>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div style="padding: 15px;">
+                            <h4 style="color: #ff6600;">PERÍODO ATUAL</h4>
+                            <p style="color: #aaa;">{{ current_period_name }}</p>
+                            <hr style="border-color: #333;">
+                            <p style="color: #fff;">CVaR: <span style="color: {% if current_cvar < 40 %}#00ff88{% elif current_cvar < 120 %}#8fd3ff{% elif current_cvar < 250 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(current_cvar) }}ms</span></p>
+                            <p style="color: #fff;">Decisão: <span style="color: {% if energy_saver == 'ALLOWED' %}#00ff88{% elif energy_saver == 'BLOCKED' %}#ff4444{% else %}#ffaa00{% endif %};">{{ energy_saver }}</span></p>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="period-box {% if current_period == 2 %}period-active{% endif %}" style="padding: 15px; border-radius: 10px; background: {% if current_period == 2 %}#0f3460{% else %}#16213e{% endif %};">
+                            <h4 style="color: #ff6600;">PERÍODO 2</h4>
+                            <p style="color: #aaa; font-size: 0.9rem;">5-10 min (Tráfego PESADO)</p>
+                            <p style="color: #fff; font-size: 1.5rem;">{{ period2_stats.allowed + period2_stats.blocked }} decisões</p>
+                            <p style="color: #00ff88;">{{ period2_stats.allowed }} Allow / <span style="color: #ff4444;">{{ period2_stats.blocked }} Block</span></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Métricas Principais -->
+    <div class="col-md">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Latência P95</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if metrics and metrics.global_metrics %}
+                    <div class="metric-value {% if metrics.global_metrics.latency_p95_us > 80000 %}status-critical{% elif metrics.global_metrics.latency_p95_us > 60000 %}status-warning{% else %}status-ok{% endif %}">
+                        {{ "%.1f"|format(metrics.global_metrics.latency_p95_us / 1000) }} ms
+                    </div>
+                {% else %}
+                    <div class="metric-value status-warning">N/A</div>
+                {% endif %}
+                <div class="metric-label">95% dos pacotes abaixo deste valor</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Câmeras Ativas</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if metrics %}
+                    <div class="metric-value status-ok">{{ metrics.active_cameras }}</div>
+                {% else %}
+                    <div class="metric-value status-warning">N/A</div>
+                {% endif %}
+                <div class="metric-label">Câmeras de vigilância</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Quality Score</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if pattern_summary and pattern_summary.extended_metrics_analysis and pattern_summary.extended_metrics_analysis.get('quality_score') %}
+                    {% set score = pattern_summary.extended_metrics_analysis.quality_score %}
+                    <div class="metric-value {% if score >= 80 %}status-ok{% elif score >= 60 %}status-warning{% else %}status-critical{% endif %}">
+                        {{ "%.0f"|format(score) }}
+                    </div>
+                {% else %}
+                    <div class="metric-value status-ok">80</div>
+                {% endif %}
+                <div class="metric-label">Qualidade da rede (A-F)</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">xApps Status</h5>
+            </div>
+            <div class="card-body text-center">
+                {% set slicer_ok = xapp_status.SLICER.status == 'RUNNING' if xapp_status.SLICER else false %}
+                {% set energy_ok = xapp_status.ENERGY.status == 'RUNNING' if xapp_status.ENERGY else false %}
+                {% set vehicle_ok = xapp_status.VEHICLE.status == 'RUNNING' if xapp_status.VEHICLE else false %}
+                {% if slicer_ok and energy_ok and vehicle_ok %}
+                    <div class="metric-value status-ok">✓</div>
+                {% else %}
+                    <div class="metric-value status-warning">⚠</div>
+                {% endif %}
+                <div class="metric-label">SLICER, ENERGY & VEHICLE</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mt-3">
+    <div class="col-md-12">
+        <div class="card" style="border-left: 4px solid #8fd3ff;">
+            <div class="card-header">
+                <h5 class="mb-0">🧠 ARMD-GreenRAN</h5>
+            </div>
+            <div class="card-body">
+                {% set armd = policy_status.armd if policy_status and policy_status.armd else {} %}
+                {% if armd and armd.present %}
+                <div class="armd-panel">
+                    <div class="armd-hero">
+                        <div>
+                            <div class="armd-kicker">Classificação operacional ativa</div>
+                            <div class="armd-scenario">{{ armd.scenario }}</div>
+                            <div class="armd-meta">
+                                <span class="armd-pill">
+                                    atenção
+                                    <strong style="color: {% if armd.attention_level == 'override' %}#ff6b6b{% elif armd.attention_level == 'critical' %}#ffbf69{% elif armd.attention_level == 'guard' %}#8fd3ff{% else %}#d7e7ff{% endif %} !important;">
+                                        {{ (armd.attention_level or 'none')|upper }}
+                                    </strong>
+                                </span>
+                                <span class="armd-pill">
+                                    override
+                                    <strong style="color: {% if armd.override_applied %}#ff6b6b{% else %}#00ff88{% endif %} !important;">
+                                        {{ 'SIM' if armd.override_applied else 'NÃO' }}
+                                    </strong>
+                                </span>
+                                <span class="armd-pill">
+                                    modo
+                                    <strong>{{ (armd.mode or 'n/a')|upper }}</strong>
+                                </span>
+                            </div>
+                        </div>
+                        <div class="armd-score">
+                            <div class="armd-score-value" style="color: {% if (armd.confidence or 0) >= 0.95 %}#00ff88{% elif (armd.confidence or 0) >= 0.85 %}#ffaa00{% else %}#ff6b6b{% endif %};">
+                                {{ "%.2f"|format(armd.confidence or 0) }}
+                            </div>
+                            <div class="armd-score-label">confidence score</div>
+                        </div>
+                    </div>
+                    <div class="armd-grid">
+                        <div class="armd-cell">
+                            <div class="armd-cell-label">Domínio</div>
+                            <div class="armd-cell-value">{{ armd.domain or 'n/a' }}</div>
+                        </div>
+                        <div class="armd-cell">
+                            <div class="armd-cell-label">Source</div>
+                            <div class="armd-cell-value">{{ armd.source or 'n/a' }}</div>
+                        </div>
+                        <div class="armd-cell">
+                            <div class="armd-cell-label">Escopo</div>
+                            <div class="armd-cell-value">{{ (armd.policy_scope or [])|join(', ') if armd.policy_scope else 'n/a' }}</div>
+                        </div>
+                        <div class="armd-cell">
+                            <div class="armd-cell-label">Ação esperada</div>
+                            <div class="armd-cell-value">{{ armd.expected_action or 'n/a' }}</div>
+                        </div>
+                        <div class="armd-cell">
+                            <div class="armd-cell-label">Estado esperado</div>
+                            <div class="armd-cell-value">{{ armd.expected_energy_saver or 'n/a' }}</div>
+                        </div>
+                    </div>
+                    <div class="armd-reason">
+                        <strong>Motivo operacional</strong>
+                        {{ armd.reason or 'Sem justificativa adicional.' }}
+                    </div>
+                </div>
+                {% else %}
+                <p class="mb-0"><span class="badge bg-secondary">INATIVO</span> Nenhuma política ARMD ativa foi publicada no ciclo atual.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mt-3">
+    <div class="col-md-12">
+        <div class="card" style="border-left: 4px solid #00ff88;">
+            <div class="card-header">
+                <h5 class="mb-0">🛡️ SLA das Aplicações</h5>
+            </div>
+            <div class="card-body">
+                {% set camera_sla = service_slas.camera if service_slas else {} %}
+                {% set app3_sla = service_slas.app3 if service_slas else {} %}
+                {% set app2_sla = service_slas.app2 if service_slas else {} %}
+                <div class="row g-3">
+                    <div class="col-lg-4">
+                        <div class="sla-grid-card">
+                            <div class="text-center mb-3">
+                                <span class="badge" style="background: {% if camera_sla.status == 'PROTEGIDA' %}#00ff88{% elif camera_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000; font-size: 1rem; padding: 8px 15px;">
+                                    CÂMERAS {{ camera_sla.status or 'INATIVA' }}
+                                </span>
+                            </div>
+                            <p>Ativas: <strong>{{ camera_sla.active or 0 }}</strong></p>
+                            <p>Throughput mín: <strong style="color: {% if (camera_sla.throughput_mbps or 0) >= 30 %}#00ff88{% elif (camera_sla.throughput_mbps or 0) >= 25 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(camera_sla.throughput_mbps or 0) }} Mbps</strong></p>
+                            <p>Latência máx: <strong style="color: {% if (camera_sla.latency_ms or 0) < 60 %}#00ff88{% elif (camera_sla.latency_ms or 0) < 80 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(camera_sla.latency_ms or 0) }} ms</strong></p>
+                            <p>Proposta: <strong style="color: #8fd3ff;">{{ camera_sla.proposal_status or 'idle' }}</strong></p>
+                            <p>Runtime: <strong style="color: {% if camera_sla.runtime_status == 'ok' %}#00ff88{% elif camera_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ camera_sla.runtime_status or 'idle' }}</strong></p>
+                            <p>SLA: <strong style="color: {% if camera_sla.runtime_status == 'ok' %}#00ff88{% elif camera_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ camera_sla.reason or 'Sem dados' }}</strong></p>
+                        </div>
+                    </div>
+                    <div class="col-lg-4">
+                        <div class="sla-grid-card">
+                            <div class="text-center mb-3">
+                                <span class="badge" style="background: {% if app3_sla.status == 'PROTEGIDA' %}#00ff88{% elif app3_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000; font-size: 1rem; padding: 8px 15px;">
+                                    APP3 {{ app3_sla.status or 'INATIVA' }}
+                                </span>
+                            </div>
+                            <p>Veículos: <strong>{{ app3_sla.active or 0 }}</strong></p>
+                            <p>Pedestres: <strong>{{ scenario_counts.pedestrians or 0 }}</strong></p>
+                            <p>Risco alto / degr.: <strong style="color: {% if (app3_sla.high_risk or 0) == 0 and (app3_sla.degraded or 0) == 0 %}#00ff88{% elif (app3_sla.high_risk or 0) == 0 %}#ffaa00{% else %}#ff4444{% endif %};">{{ app3_sla.high_risk or 0 }} / {{ app3_sla.degraded or 0 }}</strong></p>
+                            <p>Latência máx: <strong style="color: {% if (app3_sla.latency_ms or 0) < 50 %}#00ff88{% elif (app3_sla.latency_ms or 0) < 100 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(app3_sla.latency_ms or 0) }} ms</strong></p>
+                            <p>Packet loss: <strong style="color: {% if (app3_sla.packet_loss_percent or 0) < 2 %}#00ff88{% elif (app3_sla.packet_loss_percent or 0) < 5 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(app3_sla.packet_loss_percent or 0) }}%</strong></p>
+                            <p>Proposta: <strong style="color: #8fd3ff;">{{ app3_sla.proposal_status or 'idle' }}</strong></p>
+                            <p>Runtime: <strong style="color: {% if app3_sla.runtime_status == 'ok' %}#00ff88{% elif app3_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ app3_sla.runtime_status or 'idle' }}</strong></p>
+                            <p>SLA: <strong style="color: {% if app3_sla.runtime_status == 'ok' %}#00ff88{% elif app3_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ app3_sla.reason or 'Sem dados' }}</strong></p>
+                        </div>
+                    </div>
+                    <div class="col-lg-4">
+                        <div class="sla-grid-card">
+                            <div class="text-center mb-3">
+                                <span class="badge" style="background: {% if app2_sla.status == 'PROTEGIDA' %}#00ff88{% elif app2_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000; font-size: 1rem; padding: 8px 15px;">
+                                    APP2 {{ app2_sla.status or 'INATIVA' }}
+                                </span>
+                            </div>
+                            <p>Sensores: <strong>{{ app2_sla.connected or 0 }}/{{ app2_sla.active or 0 }}</strong></p>
+                            <p>Packet loss: <strong style="color: {% if (app2_sla.packet_loss_percent or 0) < 5 %}#00ff88{% elif (app2_sla.packet_loss_percent or 0) < 10 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(app2_sla.packet_loss_percent or 0) }}%</strong></p>
+                            <p>Latência média: <strong style="color: {% if (app2_sla.latency_ms or 0) < 500 %}#00ff88{% elif (app2_sla.latency_ms or 0) < 1000 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(app2_sla.latency_ms or 0) }} ms</strong></p>
+                            <p>Proposta: <strong style="color: #8fd3ff;">{{ app2_sla.proposal_status or 'idle' }}</strong></p>
+                            <p>Runtime: <strong style="color: {% if app2_sla.runtime_status == 'ok' %}#00ff88{% elif app2_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ app2_sla.runtime_status or 'idle' }}</strong></p>
+                            <p>SLA: <strong style="color: {% if app2_sla.runtime_status == 'ok' %}#00ff88{% elif app2_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ app2_sla.reason or 'Sem dados' }}</strong></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- NOVO: Gráfico CVaR com Zonas Coloridas -->
+    <div class="col-md-6">
+        <div class="card" style="border-left: 4px solid #ffaa00;">
+            <div class="card-header">
+                <h5 class="mb-0">📊 CVaR ao Longo do Tempo (com Zonas)</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="cvarChart"></canvas>
+                <div class="mt-2" style="font-size: 0.75rem; color: #aaa; display: flex; justify-content: space-around;">
+                    <span style="color: #00ff88;">● ECO: < 40ms</span>
+                    <span style="color: #8fd3ff;">● Normal: 40-120ms</span>
+                    <span style="color: #ffaa00;">● Atenção: 120-250ms</span>
+                    <span style="color: #ff4444;">● Crítico: ≥250ms</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Gráfico de Latência -->
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Histórico de Latência (60 min)</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="latencyChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="row">
+    <div class="col-md-6">
+        <div class="card" style="border-left: 4px solid #8fd3ff;">
+            <div class="card-header">
+                <h5 class="mb-0">🚗 Latência Veicular Máxima</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="vehicleLatencyChart"></canvas>
+                <div class="mt-2" style="font-size: 0.75rem; color: #aaa; display: flex; justify-content: space-around;">
+                    <span style="color: #00ff88;">● OK: &lt; 50ms</span>
+                    <span style="color: #ffaa00;">● Guarda: 50-100ms</span>
+                    <span style="color: #ff4444;">● Crítico: ≥100ms</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card" style="border-left: 4px solid #00ff88;">
+            <div class="card-header">
+                <h5 class="mb-0">🚙 Estado Veicular Atual</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="vehicleStatusChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="row">
+    <!-- Status dos xApps -->
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">xApps</h5>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm">
+                    {% for name in ['SLICER', 'ENERGY', 'VEHICLE'] %}
+                    {% if xapp_status[name] %}
+                    <tr>
+                        <td><font color="#FFFFFF"><b>{{ name }}</b></font></td>
+                        <td>
+                            {% if xapp_status[name].status == 'RUNNING' %}
+                                <span class="badge badge-ok">RODANDO</span>
+                            {% elif xapp_status[name].status == 'UNRESPONSIVE' %}
+                                <span class="badge badge-warning">UNRESPONSIVE</span>
+                            {% else %}
+                                <span class="badge badge-critical">{{ xapp_status[name].status }}</span>
+                            {% endif %}
+                        </td>
+                        <td>PID: {{ xapp_status[name].pid if xapp_status[name].pid else xapp_status[name].status }}</td>
+                    </tr>
+                    {% endif %}
+                    {% endfor %}
+                </table>
+            </div>
+        </div>
+        
+        <!-- Decisões Recentes -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Estatísticas (24h)</h5>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm">
+                    <tr>
+                        <td>Total</td>
+                        <td>{{ decision_stats.total }}</td>
+                    </tr>
+                    <tr>
+                        <td>Allow</td>
+                        <td class="status-ok">{{ decision_stats.allowed }}</td>
+                    </tr>
+                    <tr>
+                        <td>Block</td>
+                        <td class="status-critical">{{ decision_stats.blocked }}</td>
+                    </tr>
+                    <tr>
+                        <td>Conditional</td>
+                        <td class="status-warning">{{ decision_stats.conditional }}</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Alertas Recentes -->
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Alertas Recentes</h5>
+            </div>
+            <div class="card-body">
+                {% if recent_alerts %}
+                    <pre>{{ recent_alerts|join('\n') }}</pre>
+                {% else %}
+                    <p class="text-muted">Nenhum alerta recente</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Coordenação rApp-xApps -->
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">CVaR/UE</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if network_health and network_health.cvar_us %}
+                    {% set cvar_ms = network_health.cvar_us / 1000 %}
+                    <div class="metric-value {% if cvar_ms < 120 %}status-ok{% elif cvar_ms < 250 %}status-warning{% else %}status-critical{% endif %}">
+                        {{ "%.1f"|format(cvar_ms) }} ms
+                    </div>
+                    <div class="metric-label">
+                        {% if cvar_ms < 40 %}
+                            ECO saudável
+                        {% elif cvar_ms < 120 %}
+                            NORMAL
+                        {% elif cvar_ms < 250 %}
+                            ATENÇÃO
+                        {% else %}
+                            CRÍTICO
+                        {% endif %}
+                    </div>
+                    {% if network_health.improvement_valid %}
+                    <div class="mt-2 small text-muted">
+                        Melhora: {{ "%.1f"|format(network_health.network_improvement_pct) }}% vs baseline
+                    </div>
+                    {% endif %}
+                {% else %}
+                    <div class="metric-value status-warning">N/A</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Slope (Tendência)</h5>
+            </div>
+            <div class="card-body text-center">
+                {% if trend_analysis and trend_analysis.slope_ms_per_sec is not none %}
+                    {% set slope = trend_analysis.slope_ms_per_sec %}
+                    <div class="metric-value {% if slope < 0 %}status-ok{% elif slope < 2 %}status-warning{% else %}status-critical{% endif %}">
+                        {{ "%+.1f"|format(slope) }} ms/s
+                    </div>
+                    <div class="metric-label">
+                        {% if slope < 0 %}
+                            DESCENDO → ALLOWED
+                        {% elif slope < 2 %}
+                            ESTÁVEL
+                        {% else %}
+                            SUBINDO → BLOCKED
+                        {% endif %}
+                    </div>
+                {% else %}
+                    <div class="metric-value status-warning">N/A</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Decisão rApp</h5>
+            </div>
+            <div class="card-body text-center">
+                <div class="metric-value {% if energy_saver == 'ALLOWED' %}status-ok{% elif energy_saver == 'BLOCKED' %}status-critical{% else %}status-warning{% endif %}">
+                    {{ energy_saver or 'UNKNOWN' }}
+                </div>
+                <div class="metric-label">
+                    {% if energy_saver == 'ALLOWED' %}
+                        Energia pode economizar
+                    {% elif energy_saver == 'BLOCKED' %}
+                        Protegendo câmeras
+                    {% else %}
+                        Margem protegida
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Painel de Energia -->
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Economia de Energia</h5>
+            </div>
+            <div class="card-body">
+                <div id="energy-stats">
+                    <div class="text-center">
+                        <span class="text-muted">Carregando...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Timeline de Energia -->
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Histórico de Comandos de Energia</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="energyChart" height="80"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Regras de Coordenação -->
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Regras de Coordenação rApp-xApps</h5>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm">
+                    <tr>
+                        <td><strong>REGRA 1:</strong></td>
+                        <td>Câmeras são prioridade MÁXIMA</td>
+                        <td>{% if slicer_state == 'CRITICAL' %}<span class="badge badge-critical">ATIVA</span>{% else %}<span class="badge badge-ok">OK</span>{% endif %}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>REGRA 2:</strong></td>
+                        <td>Câmera: &lt;25Mbps ou ≥80ms → BLOCKED</td>
+                        <td>{% if energy_saver == 'BLOCKED' %}<span class="badge badge-critical">ATIVA</span>{% else %}<span class="badge badge-ok">OK</span>{% endif %}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>REGRA 3:</strong></td>
+                        <td>Câmera: 25-30Mbps ou 60-80ms → FULL_POWER_GUARD</td>
+                        <td>{% if energy_saver == 'CONDITIONAL' %}<span class="badge badge-warning">ATIVA</span>{% else %}<span class="badge badge-ok">OK</span>{% endif %}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>REGRA 4:</strong></td>
+                        <td>Slope > 2ms/s → bloqueio preventivo</td>
+                        <td>{% if trend_analysis and trend_analysis.slope_ms_per_sec > 2 %}<span class="badge badge-critical">ATIVA</span>{% else %}<span class="badge badge-ok">OK</span>{% endif %}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>REGRA 5:</strong></td>
+                        <td>CVaR ≥ 250ms ou P95 ≥ 120ms → BLOCKED</td>
+                        <td>{% if network_health and (network_health.cvar_us >= 250000 or network_health.p95_us >= 120000) %}<span class="badge badge-critical">ATIVA</span>{% else %}<span class="badge badge-ok">OK</span>{% endif %}</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ctx = document.getElementById('latencyChart').getContext('2d');
+const latencyChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: {{ range(latency_history|length)|list|tojson }},
+        datasets: [{
+            label: 'Latência (ms)',
+            data: {{ latency_history|tojson }},
+            borderColor: '#00ff88',
+            backgroundColor: 'rgba(0, 255, 136, 0.1)',
+            fill: true,
+            tension: 0.4
+        }]
+    },
+    options: {
+        responsive: true,
+        scales: {
+            y: {
+                beginAtZero: true,
+                grid: { color: '#333' },
+                ticks: { color: '#aaa' }
+            },
+            x: {
+                grid: { color: '#333' },
+                ticks: { color: '#aaa' }
+            }
+        },
+        plugins: {
+            legend: { labels: { color: '#eee' } }
+        }
+    }
+});
+
+// NOVO: Gráfico CVaR com Zonas Coloridas
+const cvarCtx = document.getElementById('cvarChart').getContext('2d');
+
+// Dados do CVaR vindos do servidor (últimas 50 amostras)
+const cvarData = {{ cvar_history|tojson }};
+
+const cvarChart = new Chart(cvarCtx, {
+    type: 'line',
+    data: {
+        labels: {{ range(cvar_history|length)|list|tojson }},
+        datasets: [{
+            label: 'CVaR (ms)',
+            data: cvarData,
+            borderColor: function(context) {
+                const value = context.raw;
+                if (value < 40) return '#00ff88';
+                if (value < 120) return '#8fd3ff';
+                if (value < 250) return '#ffaa00';
+                return '#ff4444';
+            },
+            backgroundColor: function(context) {
+                const value = context.raw;
+                if (value < 40) return 'rgba(0, 255, 136, 0.2)';
+                if (value < 120) return 'rgba(143, 211, 255, 0.16)';
+                if (value < 250) return 'rgba(255, 170, 0, 0.2)';
+                return 'rgba(255, 68, 68, 0.2)';
+            },
+            fill: true,
+            tension: 0.3,
+            pointRadius: 3,
+            pointBackgroundColor: function(context) {
+                const value = context.raw;
+                if (value < 40) return '#00ff88';
+                if (value < 120) return '#8fd3ff';
+                if (value < 250) return '#ffaa00';
+                return '#ff4444';
+            }
+        }, {
+            label: 'Limite 250ms',
+            data: Array(cvarData.length).fill(250),
+            borderColor: '#ff4444',
+            borderDash: [5, 5],
+            borderWidth: 1,
+            pointRadius: 0,
+            fill: false
+        }, {
+            label: 'Limite 120ms',
+            data: Array(cvarData.length).fill(120),
+            borderColor: '#ffaa00',
+            borderDash: [5, 5],
+            borderWidth: 1,
+            pointRadius: 0,
+            fill: false
+        }, {
+            label: 'Limite 40ms',
+            data: Array(cvarData.length).fill(40),
+            borderColor: '#8fd3ff',
+            borderDash: [5, 5],
+            borderWidth: 1,
+            pointRadius: 0,
+            fill: false
+        }]
+    },
+    options: {
+        responsive: true,
+        scales: {
+            y: {
+                beginAtZero: true,
+                grid: { color: '#333' },
+                ticks: { color: '#aaa' },
+                title: { display: true, text: 'CVaR (ms)', color: '#aaa' }
+            },
+            x: {
+                grid: { color: '#333' },
+                ticks: { color: '#aaa' }
+            }
+        },
+        plugins: {
+            legend: { 
+                labels: { 
+                    color: '#eee',
+                    filter: function(item, chart) {
+                        return !item.text.includes('Limite');
+                    }
+                } 
+            },
+            annotation: {
+                annotations: {
+                    zoneGreen: {
+                        type: 'box',
+                        yMin: 0,
+                        yMax: 40,
+                        backgroundColor: 'rgba(0, 255, 136, 0.1)',
+                        borderWidth: 0
+                    },
+                    zoneBlue: {
+                        type: 'box',
+                        yMin: 40,
+                        yMax: 120,
+                        backgroundColor: 'rgba(143, 211, 255, 0.08)',
+                        borderWidth: 0
+                    },
+                    zoneYellow: {
+                        type: 'box',
+                        yMin: 120,
+                        yMax: 250,
+                        backgroundColor: 'rgba(255, 170, 0, 0.1)',
+                        borderWidth: 0
+                    },
+                    zoneRed: {
+                        type: 'box',
+                        yMin: 250,
+                        yMax: 300,
+                        backgroundColor: 'rgba(255, 68, 68, 0.1)',
+                        borderWidth: 0
+                    }
+                }
+            }
+        }
+    }
+});
+
+const vehicleHistory = {{ vehicle_history|default([], true)|tojson }};
+const vehicleStatusSummary = {
+    total: {{ (service_slas.app3.active if service_slas and service_slas.app3 else 0)|tojson }},
+    highRisk: {{ (service_slas.app3.high_risk if service_slas and service_slas.app3 else 0)|tojson }},
+    degraded: {{ (service_slas.app3.degraded if service_slas and service_slas.app3 else 0)|tojson }},
+    healthy: Math.max(
+        {{ (service_slas.app3.active if service_slas and service_slas.app3 else 0)|tojson }} -
+        {{ (service_slas.app3.high_risk if service_slas and service_slas.app3 else 0)|tojson }} -
+        {{ (service_slas.app3.degraded if service_slas and service_slas.app3 else 0)|tojson }},
+        0
+    )
+};
+
+const vehicleLatencyCanvas = document.getElementById('vehicleLatencyChart');
+if (vehicleLatencyCanvas) {
+    new Chart(vehicleLatencyCanvas.getContext('2d'), {
+        type: 'line',
+        data: {
+            labels: vehicleHistory.map(item => item.label),
+            datasets: [{
+                label: 'Latência veicular máx (ms)',
+                data: vehicleHistory.map(item => item.max_latency_ms),
+                borderColor: '#8fd3ff',
+                backgroundColor: 'rgba(143, 211, 255, 0.14)',
+                fill: true,
+                tension: 0.3,
+                pointRadius: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    grid: { color: '#333' },
+                    ticks: { color: '#aaa' }
+                },
+                x: {
+                    grid: { color: '#333' },
+                    ticks: { color: '#aaa', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }
+                }
+            },
+            plugins: {
+                legend: { labels: { color: '#eee' } }
+            }
+        }
+    });
+}
+
+const vehicleStatusCanvas = document.getElementById('vehicleStatusChart');
+if (vehicleStatusCanvas) {
+    new Chart(vehicleStatusCanvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+            labels: ['Saudáveis', 'Risco alto', 'Autonomia degradada'],
+            datasets: [{
+                label: 'Veículos',
+                data: [vehicleStatusSummary.healthy, vehicleStatusSummary.highRisk, vehicleStatusSummary.degraded],
+                backgroundColor: ['#00ff88', '#ff4444', '#ffaa00'],
+                borderColor: ['#00ff88', '#ff4444', '#ffaa00'],
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    grid: { color: '#333' },
+                    ticks: { color: '#aaa', precision: 0 }
+                },
+                x: {
+                    grid: { color: '#333' },
+                    ticks: { color: '#aaa' }
+                }
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return `${context.raw} veículo(s)`;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// Fetch energy stats
+function fetchEnergyStats() {
+    // Fetch both current state and historical stats
+    Promise.all([
+        fetch('/api/energy/current').then(r => r.json()),
+        fetch('/api/energy').then(r => r.json())
+    ])
+    .then(([currentData, historyData]) => {
+        const container = document.getElementById('energy-stats');
+        
+        // Current state
+        const current = currentData;
+        const currentPower = current.power_percent || 100;
+        const currentSavings = current.savings_percent || 0;
+        const currentAction = current.action || 'UNKNOWN';
+        
+        // Calculate color based on savings
+        let savingsColor = '#ff4444'; // Red - low savings
+        if (currentSavings >= 75) savingsColor = '#00ff88'; // Green - high savings
+        else if (currentSavings >= 50) savingsColor = '#28a745'; // Green
+        else if (currentSavings >= 25) savingsColor = '#ffaa00'; // Yellow
+        
+        // History stats
+        if (!historyData || !historyData.total_commands || historyData.total_commands === 0) {
+            container.innerHTML = `
+                <div class="text-center mb-3">
+                    <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings.toFixed(1)}%</div>
+                    <div style="color: #aaa; font-size: 0.9rem;">ECONOMIA ATUAL</div>
+                    <div style="color: #fff; font-size: 1.1rem; margin-top: 5px;">${currentAction}</div>
+                    <div style="color: #888; font-size: 0.85rem;">Potência: ${currentPower}%</div>
+                </div>
+                <div class="text-center text-muted">Aguardando dados...</div>
+            `;
+            return;
+        }
+        
+        const total = historyData.total_commands;
+        const avgPower = historyData.avg_power || 100;
+        const savings = historyData.total_savings_percent || (100 - avgPower);
+        const commands = historyData.by_command;
+        
+        let html = `
+            <div class="text-center mb-3">
+                <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings.toFixed(1)}%</div>
+                <div style="color: #aaa; font-size: 0.9rem;">ECONOMIA ATUAL</div>
+                <div style="background: #0f3460; padding: 8px; border-radius: 5px; margin-top: 8px;">
+                    <div style="color: ${savingsColor}; font-size: 1.2rem; font-weight: bold;">${currentAction}</div>
+                    <div style="color: #ccc; font-size: 0.85rem;">Potência: ${currentPower}%</div>
+                </div>
+            </div>
+            <div class="row text-center">
+                <div class="col-6">
+                    <div style="color: #888; font-size: 0.8rem;">Média Geral</div>
+                    <div style="color: #fff; font-weight: bold;">${savings.toFixed(1)}%</div>
+                </div>
+                <div class="col-6">
+                    <div style="color: #888; font-size: 0.8rem;">Total Cmd</div>
+                    <div style="color: #fff; font-weight: bold;">${total}</div>
+                </div>
+            </div>
+            <hr style="border-color: #333;">
+            <div style="color: #aaa; font-size: 0.85rem;">
+        `;
+        
+        const cmdOrder = ['FULL_POWER', 'CONDITIONAL_REDUCE', 'POWER_DOWN', 'POWER_DOWN_ECO'];
+        cmdOrder.forEach(cmd => {
+            if (commands[cmd]) {
+                const c = commands[cmd];
+                const pct = ((c.count / total) * 100).toFixed(1);
+                const power = c.avg_power_percent;
+                const cmdColor = cmd === 'FULL_POWER' ? '#ffc107' : '#00ff88';
+                html += `<div style="margin-bottom: 4px;"><span style="color: ${cmdColor}; font-weight: bold;">${cmd}</span> <span style="color: #888;">${c.count} (${pct}%)</span></div>`;
+            }
+        });
+        
+        html += '</div>';
+        container.innerHTML = html;
+    })
+    .catch(err => {
+        console.error('Error fetching energy stats:', err);
+    });
+}
+
+// Energy timeline chart
+let energyChart = null;
+function fetchEnergyTimeline() {
+    fetch('/api/history/60')
+        .then(response => response.json())
+        .then(data => {
+            if (!data || data.length === 0) return;
+            
+            const ctx = document.getElementById('energyChart');
+            if (!ctx) return;
+            
+            const labels = data.map(d => new Date(d.timestamp * 1000).toLocaleTimeString());
+            const powerData = data.map(d => d.power_percent || 100);
+            
+            if (energyChart) energyChart.destroy();
+            
+            energyChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Potência (%)',
+                        data: powerData,
+                        borderColor: '#28a745',
+                        backgroundColor: 'rgba(40, 167, 69, 0.1)',
+                        fill: true,
+                        tension: 0.3
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            min: 0,
+                            max: 100,
+                            ticks: { color: '#aaa' },
+                            title: { display: true, text: 'Potência %', color: '#aaa' }
+                        },
+                        x: {
+                            ticks: { color: '#aaa' }
+                        }
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#eee' } }
+                    }
+                }
+            });
+        })
+        .catch(err => console.error('Error fetching energy timeline:', err));
+}
+
+// Load energy data on page load
+fetchEnergyStats();
+setInterval(fetchEnergyStats, 30000);
+fetchEnergyTimeline();
+setInterval(fetchEnergyTimeline, 60000);
+</script>
+{% endblock %}

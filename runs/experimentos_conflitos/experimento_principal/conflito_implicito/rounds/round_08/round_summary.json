@@ -1,0 +1,21 @@
+{
+  "scenario": "conflito_implicito",
+  "round": 8,
+  "start_ts": 1777007095,
+  "end_ts": 1777007215,
+  "start_iso": "2026-04-24T02:04:55",
+  "end_iso": "2026-04-24T02:06:55",
+  "duration_s": 120,
+  "rows": 24,
+  "nodes": 7,
+  "edges": 6,
+  "confirmed_by_data": 6,
+  "weak_or_low_support": 0,
+  "spurious_in_baseline": 0,
+  "emergent_from_data": 0,
+  "dataset_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/conflito_implicito/rounds/round_08/conflict_dataset.csv",
+  "graph_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/conflito_implicito/rounds/round_08/conflict_graph.json",
+  "adjacency_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/conflito_implicito/rounds/round_08/conflict_adjacency.json",
+  "report_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/conflito_implicito/rounds/round_08/conflict_report.json",
+  "cumulative_rows": 192
+}

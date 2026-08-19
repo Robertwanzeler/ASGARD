@@ -1,0 +1,647 @@
+{
+  "timestamp": "2026-07-04T18:03:44.241059",
+  "dataset_size": 10900,
+  "feature_profile": "no_stage_with_slice_state",
+  "features": [
+    "cvar_ms",
+    "cvar_diff",
+    "cvar_rolling_mean",
+    "cvar_rolling_std",
+    "latency_p95_ms",
+    "avg_latency_ms",
+    "variance_ms2",
+    "total_active_cameras",
+    "camera_ratio",
+    "total_critical_ues",
+    "cvar_zone",
+    "throughput_mbps",
+    "packet_loss_rate",
+    "jitter_ms",
+    "tx_rx_ratio",
+    "cvar_trend",
+    "throughput_trend",
+    "packet_loss_trend",
+    "cvar_lag_1",
+    "cvar_lag_2",
+    "cvar_lag_3",
+    "cvar_lag_4",
+    "cvar_lag_5",
+    "throughput_lag_1",
+    "throughput_lag_2",
+    "throughput_lag_3",
+    "packet_loss_lag_1",
+    "packet_loss_lag_2",
+    "packet_loss_lag_3",
+    "latency_lag_1",
+    "latency_lag_2",
+    "cvar_rolling_3",
+    "cvar_rolling_10",
+    "cvar_rolling_std_3",
+    "cvar_acceleration",
+    "latency_acceleration",
+    "jitter_trend",
+    "cvar_momentum",
+    "critical_ue_ratio",
+    "global_total_demand",
+    "global_usable_budget",
+    "slice_embb_ue_count",
+    "slice_embb_demand",
+    "slice_embb_allocation",
+    "slice_embb_qos_pressure",
+    "slice_embb_completion_ratio",
+    "slice_embb_min_qos_met",
+    "slice_embb_budget_share",
+    "slice_mmtc_ue_count",
+    "slice_mmtc_demand",
+    "slice_mmtc_allocation",
+    "slice_mmtc_qos_pressure",
+    "slice_mmtc_completion_ratio",
+    "slice_mmtc_min_qos_met",
+    "slice_mmtc_budget_share",
+    "slice_urllc_ue_count",
+    "slice_urllc_demand",
+    "slice_urllc_allocation",
+    "slice_urllc_qos_pressure",
+    "slice_urllc_completion_ratio",
+    "slice_urllc_min_qos_met",
+    "slice_urllc_budget_share"
+  ],
+  "evaluation": {
+    "mode": "rolling_temporal_windows",
+    "valid": true,
+    "reasons": [],
+    "warnings": [
+      "window 1: holdout regression target variance too low: var=0, unique=1",
+      "window 2: holdout regression target variance too low: var=0, unique=1",
+      "window 3: holdout regression target variance too low: var=0, unique=1",
+      "window 4: holdout regression target variance too low: var=0, unique=1",
+      "window 5: holdout regression target variance too low: var=0, unique=1",
+      "window 8: holdout regression target variance too low: var=0, unique=1"
+    ],
+    "window_count": 8,
+    "valid_classifier_window_count": 8,
+    "valid_regression_window_count": 2,
+    "decision_counts": {
+      "ALLOWED": 3456,
+      "CONDITIONAL": 2655,
+      "BLOCKED": 2609
+    },
+    "stage_counts": {
+      "allowed_stable": 1536,
+      "camera_conditional": 1278,
+      "allowed_recovery": 1149,
+      "camera_blocked": 884,
+      "vehicle_blocked": 861,
+      "app2_blocked": 864,
+      "allowed_bootstrap": 771,
+      "app2_conditional": 700,
+      "vehicle_conditional": 677
+    },
+    "windows": [
+      {
+        "mode": "temporal_holdout_with_guardrails",
+        "valid": false,
+        "valid_for_classifier": true,
+        "valid_for_regression": false,
+        "reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "blocking_reasons": [],
+        "warning_reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "test_size": 1090,
+        "decision_counts": {
+          "ALLOWED": 428,
+          "CONDITIONAL": 333,
+          "BLOCKED": 329
+        },
+        "stage_counts": {
+          "allowed_stable": 187,
+          "camera_conditional": 164,
+          "allowed_recovery": 145,
+          "camera_blocked": 114,
+          "vehicle_blocked": 111,
+          "app2_blocked": 104,
+          "allowed_bootstrap": 96,
+          "app2_conditional": 89,
+          "vehicle_conditional": 80
+        },
+        "feature_uniqueness": {
+          "unique_rows": 56,
+          "unique_ratio": 0.05137614678899083,
+          "conflicting_rows": 0,
+          "conflicting_sample_count": 0,
+          "conflicting_sample_ratio": 0.0
+        },
+        "regression_target": {
+          "variance": 0.0,
+          "unique_values": 1
+        },
+        "degenerate_flags": {
+          "low_feature_diversity": false,
+          "conflicting_duplicate_features": false,
+          "low_regression_target_variance": true
+        },
+        "index": 1,
+        "train_size": 2180,
+        "test_start": 2180,
+        "test_end": 3270,
+        "timestamp_start": 1783138661,
+        "timestamp_end": 1783146168
+      },
+      {
+        "mode": "temporal_holdout_with_guardrails",
+        "valid": false,
+        "valid_for_classifier": true,
+        "valid_for_regression": false,
+        "reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "blocking_reasons": [],
+        "warning_reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "test_size": 1090,
+        "decision_counts": {
+          "ALLOWED": 427,
+          "CONDITIONAL": 332,
+          "BLOCKED": 331
+        },
+        "stage_counts": {
+          "allowed_stable": 190,
+          "camera_conditional": 163,
+          "allowed_recovery": 142,
+          "camera_blocked": 112,
+          "app2_blocked": 110,
+          "vehicle_blocked": 109,
+          "allowed_bootstrap": 95,
+          "app2_conditional": 88,
+          "vehicle_conditional": 81
+        },
+        "feature_uniqueness": {
+          "unique_rows": 57,
+          "unique_ratio": 0.05229357798165138,
+          "conflicting_rows": 0,
+          "conflicting_sample_count": 0,
+          "conflicting_sample_ratio": 0.0
+        },
+        "regression_target": {
+          "variance": 0.0,
+          "unique_values": 1
+        },
+        "degenerate_flags": {
+          "low_feature_diversity": false,
+          "conflicting_duplicate_features": false,
+          "low_regression_target_variance": true
+        },
+        "index": 2,
+        "train_size": 3270,
+        "test_start": 3270,
+        "test_end": 4360,
+        "timestamp_start": 1783146173,
+        "timestamp_end": 1783153626
+      },
+      {
+        "mode": "temporal_holdout_with_guardrails",
+        "valid": false,
+        "valid_for_classifier": true,
+        "valid_for_regression": false,
+        "reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "blocking_reasons": [],
+        "warning_reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "test_size": 1090,
+        "decision_counts": {
+          "ALLOWED": 435,
+          "CONDITIONAL": 334,
+          "BLOCKED": 321
+        },
+        "stage_counts": {
+          "allowed_stable": 194,
+          "camera_conditional": 154,
+          "allowed_recovery": 144,
+          "vehicle_blocked": 108,
+          "camera_blocked": 107,
+          "app2_blocked": 106,
+          "allowed_bootstrap": 97,
+          "vehicle_conditional": 90,
+          "app2_conditional": 90
+        },
+        "feature_uniqueness": {
+          "unique_rows": 55,
+          "unique_ratio": 0.05045871559633028,
+          "conflicting_rows": 0,
+          "conflicting_sample_count": 0,
+          "conflicting_sample_ratio": 0.0
+        },
+        "regression_target": {
+          "variance": 0.0,
+          "unique_values": 1
+        },
+        "degenerate_flags": {
+          "low_feature_diversity": false,
+          "conflicting_duplicate_features": false,
+          "low_regression_target_variance": true
+        },
+        "index": 3,
+        "train_size": 4360,
+        "test_start": 4360,
+        "test_end": 5450,
+        "timestamp_start": 1783153651,
+        "timestamp_end": 1783161114
+      },
+      {
+        "mode": "temporal_holdout_with_guardrails",
+        "valid": false,
+        "valid_for_classifier": true,
+        "valid_for_regression": false,
+        "reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "blocking_reasons": [],
+        "warning_reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "test_size": 1090,
+        "decision_counts": {
+          "ALLOWED": 431,
+          "BLOCKED": 331,
+          "CONDITIONAL": 328
+        },
+        "stage_counts": {
+          "allowed_stable": 192,
+          "camera_conditional": 160,
+          "allowed_recovery": 144,
+          "app2_blocked": 114,
+          "camera_blocked": 110,
+          "vehicle_blocked": 107,
+          "allowed_bootstrap": 95,
+          "app2_conditional": 86,
+          "vehicle_conditional": 82
+        },
+        "feature_uniqueness": {
+          "unique_rows": 56,
+          "unique_ratio": 0.05137614678899083,
+          "conflicting_rows": 0,
+          "conflicting_sample_count": 0,
+          "conflicting_sample_ratio": 0.0
+        },
+        "regression_target": {
+          "variance": 0.0,
+          "unique_values": 1
+        },
+        "degenerate_flags": {
+          "low_feature_diversity": false,
+          "conflicting_duplicate_features": false,
+          "low_regression_target_variance": true
+        },
+        "index": 4,
+        "train_size": 5450,
+        "test_start": 5450,
+        "test_end": 6540,
+        "timestamp_start": 1783161119,
+        "timestamp_end": 1783168659
+      },
+      {
+        "mode": "temporal_holdout_with_guardrails",
+        "valid": false,
+        "valid_for_classifier": true,
+        "valid_for_regression": false,
+        "reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "blocking_reasons": [],
+        "warning_reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "test_size": 1090,
+        "decision_counts": {
+          "ALLOWED": 436,
+          "CONDITIONAL": 336,
+          "BLOCKED": 318
+        },
+        "stage_counts": {
+          "allowed_stable": 191,
+          "camera_conditional": 163,
+          "allowed_recovery": 146,
+          "camera_blocked": 110,
+          "vehicle_blocked": 104,
+          "app2_blocked": 104,
+          "allowed_bootstrap": 99,
+          "app2_conditional": 89,
+          "vehicle_conditional": 84
+        },
+        "feature_uniqueness": {
+          "unique_rows": 52,
+          "unique_ratio": 0.047706422018348627,
+          "conflicting_rows": 0,
+          "conflicting_sample_count": 0,
+          "conflicting_sample_ratio": 0.0
+        },
+        "regression_target": {
+          "variance": 0.0,
+          "unique_values": 1
+        },
+        "degenerate_flags": {
+          "low_feature_diversity": false,
+          "conflicting_duplicate_features": false,
+          "low_regression_target_variance": true
+        },
+        "index": 5,
+        "train_size": 6540,
+        "test_start": 6540,
+        "test_end": 7630,
+        "timestamp_start": 1783168664,
+        "timestamp_end": 1783176162
+      },
+      {
+        "mode": "temporal_holdout_with_guardrails",
+        "valid": true,
+        "valid_for_classifier": true,
+        "valid_for_regression": true,
+        "reasons": [],
+        "blocking_reasons": [],
+        "warning_reasons": [],
+        "test_size": 1090,
+        "decision_counts": {
+          "ALLOWED": 432,
+          "CONDITIONAL": 336,
+          "BLOCKED": 322
+        },
+        "stage_counts": {
+          "allowed_stable": 191,
+          "camera_conditional": 161,
+          "allowed_recovery": 145,
+          "app2_blocked": 109,
+          "camera_blocked": 108,
+          "vehicle_blocked": 105,
+          "allowed_bootstrap": 96,
+          "app2_conditional": 88,
+          "vehicle_conditional": 87
+        },
+        "feature_uniqueness": {
+          "unique_rows": 563,
+          "unique_ratio": 0.5165137614678899,
+          "conflicting_rows": 0,
+          "conflicting_sample_count": 0,
+          "conflicting_sample_ratio": 0.0
+        },
+        "regression_target": {
+          "variance": 39.710258051702155,
+          "unique_values": 8
+        },
+        "degenerate_flags": {
+          "low_feature_diversity": false,
+          "conflicting_duplicate_features": false,
+          "low_regression_target_variance": false
+        },
+        "index": 6,
+        "train_size": 7630,
+        "test_start": 7630,
+        "test_end": 8720,
+        "timestamp_start": 1783176167,
+        "timestamp_end": 1783183673
+      },
+      {
+        "mode": "temporal_holdout_with_guardrails",
+        "valid": true,
+        "valid_for_classifier": true,
+        "valid_for_regression": true,
+        "reasons": [],
+        "blocking_reasons": [],
+        "warning_reasons": [],
+        "test_size": 1090,
+        "decision_counts": {
+          "ALLOWED": 436,
+          "BLOCKED": 330,
+          "CONDITIONAL": 324
+        },
+        "stage_counts": {
+          "allowed_stable": 197,
+          "camera_conditional": 154,
+          "allowed_recovery": 142,
+          "app2_blocked": 111,
+          "camera_blocked": 111,
+          "vehicle_blocked": 108,
+          "allowed_bootstrap": 97,
+          "vehicle_conditional": 85,
+          "app2_conditional": 85
+        },
+        "feature_uniqueness": {
+          "unique_rows": 447,
+          "unique_ratio": 0.41009174311926605,
+          "conflicting_rows": 0,
+          "conflicting_sample_count": 0,
+          "conflicting_sample_ratio": 0.0
+        },
+        "regression_target": {
+          "variance": 19.804329072073955,
+          "unique_values": 4
+        },
+        "degenerate_flags": {
+          "low_feature_diversity": false,
+          "conflicting_duplicate_features": false,
+          "low_regression_target_variance": false
+        },
+        "index": 7,
+        "train_size": 8720,
+        "test_start": 8720,
+        "test_end": 9810,
+        "timestamp_start": 1783183678,
+        "timestamp_end": 1783191257
+      },
+      {
+        "mode": "temporal_holdout_with_guardrails",
+        "valid": false,
+        "valid_for_classifier": true,
+        "valid_for_regression": false,
+        "reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "blocking_reasons": [],
+        "warning_reasons": [
+          "holdout regression target variance too low: var=0, unique=1"
+        ],
+        "test_size": 1090,
+        "decision_counts": {
+          "ALLOWED": 431,
+          "CONDITIONAL": 332,
+          "BLOCKED": 327
+        },
+        "stage_counts": {
+          "allowed_stable": 194,
+          "camera_conditional": 159,
+          "allowed_recovery": 141,
+          "camera_blocked": 112,
+          "vehicle_blocked": 109,
+          "app2_blocked": 106,
+          "allowed_bootstrap": 96,
+          "vehicle_conditional": 88,
+          "app2_conditional": 85
+        },
+        "feature_uniqueness": {
+          "unique_rows": 56,
+          "unique_ratio": 0.05137614678899083,
+          "conflicting_rows": 0,
+          "conflicting_sample_count": 0,
+          "conflicting_sample_ratio": 0.0
+        },
+        "regression_target": {
+          "variance": 0.0,
+          "unique_values": 1
+        },
+        "degenerate_flags": {
+          "low_feature_diversity": false,
+          "conflicting_duplicate_features": false,
+          "low_regression_target_variance": true
+        },
+        "index": 8,
+        "train_size": 9810,
+        "test_start": 9810,
+        "test_end": 10900,
+        "timestamp_start": 1783191262,
+        "timestamp_end": 1783198861
+      }
+    ]
+  },
+  "classifier": {
+    "selected_classifier": "random_forest",
+    "random_forest_accuracy": 1.0,
+    "cross_validation_mean": 1.0,
+    "cross_validation_std": 0.0,
+    "confusion_matrix": [
+      [
+        3456,
+        0,
+        0
+      ],
+      [
+        0,
+        2609,
+        0
+      ],
+      [
+        0,
+        0,
+        2655
+      ]
+    ],
+    "classes": [
+      "ALLOWED",
+      "BLOCKED",
+      "CONDITIONAL"
+    ],
+    "classification_report": {
+      "ALLOWED": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 3456.0
+      },
+      "BLOCKED": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 2609.0
+      },
+      "CONDITIONAL": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 2655.0
+      },
+      "accuracy": 1.0,
+      "macro avg": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 8720.0
+      },
+      "weighted avg": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 8720.0
+      }
+    },
+    "healthy_accuracy": 1.0,
+    "healthy_allowed_recall": 1.0
+  },
+  "regressor": {
+    "model": "HistGradientBoostingRegressor+log1p",
+    "mae_ms": 0.021797619789746026,
+    "rmse_ms": 0.22169598533247126,
+    "r2": 0.998384336807098,
+    "healthy_mae_ms": 0.03006028911575375,
+    "healthy_bias_ms": 0.023936842877318006,
+    "critical_mae_ms": NaN
+  },
+  "feature_importance": {
+    "cvar_ms": 0.0,
+    "cvar_diff": 7.883905553326724e-06,
+    "cvar_rolling_mean": 0.00022074956696888266,
+    "cvar_rolling_std": 1.210167116745335e-18,
+    "latency_p95_ms": 2.5638157678003044e-05,
+    "avg_latency_ms": 0.0003014486572322283,
+    "variance_ms2": 4.0095282547171696e-05,
+    "total_active_cameras": 0.0,
+    "camera_ratio": 0.0,
+    "total_critical_ues": 0.0,
+    "cvar_zone": 0.0,
+    "throughput_mbps": 0.0,
+    "packet_loss_rate": 4.596001176384849e-05,
+    "jitter_ms": 0.0,
+    "tx_rx_ratio": 8.732057556922149e-05,
+    "cvar_trend": 0.0,
+    "throughput_trend": 0.0,
+    "packet_loss_trend": 8.105501530548858e-06,
+    "cvar_lag_1": 0.0,
+    "cvar_lag_2": 0.0,
+    "cvar_lag_3": 0.0001735247566780123,
+    "cvar_lag_4": 1.0347639844216779e-05,
+    "cvar_lag_5": 0.0002241480275993397,
+    "throughput_lag_1": 0.0,
+    "throughput_lag_2": 6.816934042717692e-06,
+    "throughput_lag_3": 0.0,
+    "packet_loss_lag_1": 2.1261925392494856e-05,
+    "packet_loss_lag_2": 7.3237406576175695e-06,
+    "packet_loss_lag_3": 2.455810644744501e-06,
+    "latency_lag_1": 0.0003160116132916799,
+    "latency_lag_2": 0.0,
+    "cvar_rolling_3": 0.0,
+    "cvar_rolling_10": 0.0005065006100712051,
+    "cvar_rolling_std_3": 1.1870858448508617e-18,
+    "cvar_acceleration": 1.228852141729162e-18,
+    "latency_acceleration": 0.0,
+    "jitter_trend": 0.0,
+    "cvar_momentum": 0.0,
+    "critical_ue_ratio": 0.0,
+    "global_total_demand": 0.05532427932727876,
+    "global_usable_budget": 0.07619134068226756,
+    "slice_embb_ue_count": 0.0,
+    "slice_embb_demand": 0.10126962888755962,
+    "slice_embb_allocation": 0.07885741365254244,
+    "slice_embb_qos_pressure": 0.10279900053773319,
+    "slice_embb_completion_ratio": 0.003148333495478735,
+    "slice_embb_min_qos_met": 0.11535648762600707,
+    "slice_embb_budget_share": 0.03091843954500665,
+    "slice_mmtc_ue_count": 0.00815462010862382,
+    "slice_mmtc_demand": 0.014692384701666226,
+    "slice_mmtc_allocation": 0.028480774097844264,
+    "slice_mmtc_qos_pressure": 0.030829506366785702,
+    "slice_mmtc_completion_ratio": 0.07704519977302096,
+    "slice_mmtc_min_qos_met": 0.003233944348351772,
+    "slice_mmtc_budget_share": 0.015047948639157833,
+    "slice_urllc_ue_count": 0.0,
+    "slice_urllc_demand": 0.03233488839700203,
+    "slice_urllc_allocation": 0.04718141303797916,
+    "slice_urllc_qos_pressure": 0.02608243961070058,
+    "slice_urllc_completion_ratio": 0.11488422925465355,
+    "slice_urllc_min_qos_met": 0.0024373349753394743,
+    "slice_urllc_budget_share": 0.03372480021793512
+  }
+}

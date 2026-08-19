@@ -1,0 +1,366 @@
+{% extends "base.html" %}
+{% block title %}xApps - GreenRAN rApp{% endblock %}
+{% block extra_head %}
+<style>
+    .armd-mini-panel {
+        background: linear-gradient(145deg, rgba(17, 29, 52, 0.96), rgba(9, 15, 28, 0.96));
+        border: 1px solid rgba(143, 211, 255, 0.14);
+        border-radius: 14px;
+        padding: 16px;
+    }
+    .armd-mini-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+    }
+    .armd-mini-label {
+        color: #7dbdf0;
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 4px;
+    }
+    .armd-mini-scenario {
+        color: #fff;
+        font-size: 1.4rem;
+        font-weight: 700;
+        line-height: 1.05;
+    }
+    .armd-mini-confidence {
+        text-align: right;
+    }
+    .armd-mini-confidence .value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        line-height: 1;
+    }
+    .armd-mini-confidence .caption {
+        color: #8da6c3;
+        font-size: 0.8rem;
+    }
+    .armd-mini-badges {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+    }
+    .armd-mini-badge {
+        padding: 5px 10px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.08);
+        color: #d7e7ff;
+        font-size: 0.84rem;
+    }
+    .armd-mini-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 10px;
+        margin-bottom: 12px;
+    }
+    .armd-mini-cell {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 10px;
+        padding: 10px 12px;
+    }
+    .armd-mini-cell .k {
+        color: #8da6c3;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 4px;
+    }
+    .armd-mini-cell .v {
+        color: #fff;
+        font-weight: 600;
+        word-break: break-word;
+    }
+    .armd-mini-reason {
+        color: #d3def0;
+        background: rgba(255,255,255,0.03);
+        border-left: 3px solid #8fd3ff;
+        border-radius: 8px;
+        padding: 10px 12px;
+    }
+</style>
+{% endblock %}
+{% block content %}
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>Status dos xApps e Apps</h5></div>
+            <div class="card-body">
+                <table class="table">
+                    {% for name in ['SLICER', 'ENERGY', 'VEHICLE'] %}
+                    {% if xapp_status[name] %}
+                    <tr>
+                        <td><strong>{{ name }}</strong></td>
+                        <td>
+                            {% if xapp_status[name].status == 'RUNNING' %}
+                                <span class="badge bg-success">RODANDO</span>
+                            {% elif xapp_status[name].status == 'UNRESPONSIVE' %}
+                                <span class="badge bg-warning">UNRESPONSIVE</span>
+                            {% else %}
+                                <span class="badge bg-danger">{{ xapp_status[name].status }}</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr><td>PID</td><td>{{ xapp_status[name].pid or 'N/A' }}</td></tr>
+                    <tr><td>Último Cycle</td><td>{{ xapp_status[name].last_cycle or 'N/A' }}</td></tr>
+                    <tr><td>Total Restarts</td><td>{{ xapp_status[name].total_restarts or 0 }}</td></tr>
+                    {% endif %}
+                    {% endfor %}
+                </table>
+                <hr>
+                <table class="table">
+                    <tr>
+                        <td><strong>APP1</strong></td>
+                        <td>
+                            <span class="badge {% if app1_monitoring and app1_monitoring.camera_sla and app1_monitoring.camera_sla.runtime_status == 'ok' %}bg-success{% elif app1_monitoring and app1_monitoring.camera_sla and app1_monitoring.camera_sla.runtime_status == 'warning' %}bg-warning text-dark{% else %}bg-danger{% endif %}">
+                                {{ (app1_monitoring.camera_sla.runtime_status if app1_monitoring and app1_monitoring.camera_sla else 'sem snapshot')|upper }}
+                            </span>
+                        </td>
+                    </tr>
+                    <tr><td>Endpoint</td><td><a href="{{ app1_url }}" target="_blank">{{ app1_url }}</a></td></tr>
+                    <tr><td>Câmeras ativas</td><td>{{ app1_monitoring.cameras.total if app1_monitoring and app1_monitoring.cameras else 0 }}</td></tr>
+                    <tr><td>Throughput mín</td><td>{{ "%.1f"|format(app1_monitoring.network.min_camera_throughput_mbps if app1_monitoring and app1_monitoring.network else 0) }} Mbps</td></tr>
+
+                    <tr><td><strong>APP2</strong></td><td>
+                        <span class="badge {% if app2_monitoring and app2_monitoring.app2_sla and app2_monitoring.app2_sla.runtime_status == 'ok' %}bg-success{% elif app2_monitoring and app2_monitoring.app2_sla and app2_monitoring.app2_sla.runtime_status == 'warning' %}bg-warning text-dark{% else %}bg-danger{% endif %}">
+                            {{ (app2_monitoring.app2_sla.runtime_status if app2_monitoring and app2_monitoring.app2_sla else 'sem snapshot')|upper }}
+                        </span>
+                    </td></tr>
+                    <tr><td>Endpoint</td><td>http://localhost:5200</td></tr>
+                    <tr><td>Sensores conectados</td><td>{{ (app2_monitoring.app2_sla.observed.connected_sensors if app2_monitoring and app2_monitoring.app2_sla and app2_monitoring.app2_sla.observed else 0) }}/{{ (app2_monitoring.app2_sla.observed.total_sensors if app2_monitoring and app2_monitoring.app2_sla and app2_monitoring.app2_sla.observed else 0) }}</td></tr>
+                    <tr><td>Packet loss</td><td>{{ "%.1f"|format(app2_monitoring.network.packet_loss_percent if app2_monitoring and app2_monitoring.network else 0) }}%</td></tr>
+
+                    <tr><td><strong>APP3</strong></td><td>
+                        <span class="badge {% if app3_monitoring and app3_monitoring.vehicle_sla and app3_monitoring.vehicle_sla.runtime_status == 'ok' %}bg-success{% elif app3_monitoring and app3_monitoring.vehicle_sla and app3_monitoring.vehicle_sla.runtime_status == 'warning' %}bg-warning text-dark{% else %}bg-danger{% endif %}">
+                            {{ (app3_monitoring.vehicle_sla.runtime_status if app3_monitoring and app3_monitoring.vehicle_sla else 'sem snapshot')|upper }}
+                        </span>
+                    </td></tr>
+                    <tr><td>Endpoint</td><td><a href="{{ app3_url }}" target="_blank">{{ app3_url }}</a></td></tr>
+                    <tr><td>Veículos ativos</td><td>{{ app3_monitoring.vehicles.total_vehicles if app3_monitoring and app3_monitoring.vehicles else 0 }}</td></tr>
+                    <tr><td>Latência máx</td><td>{{ "%.1f"|format(app3_monitoring.vehicles.max_latency_ms if app3_monitoring and app3_monitoring.vehicles else 0) }} ms</td></tr>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>Políticas A1</h5></div>
+            <div class="card-body">
+                <p><strong>Pendentes:</strong> {{ policy_status.pending|length if policy_status.pending else 0 }}</p>
+                {% if policy_status.pending %}
+                <table class="table table-sm table-bordered">
+                    <thead>
+                        <tr>
+                            <th>Política</th>
+                            <th>Status</th>
+                            <th>Policy ID</th>
+                            <th>Enviada em</th>
+                            <th>Tentativas</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for pol_name, pol_data in policy_status.pending.items() %}
+                        <tr>
+                            <td><strong>{{ pol_name|upper }}</strong></td>
+                            <td><span class="badge bg-warning">PENDENTE</span></td>
+                            <td>{{ pol_data.policy_id }}</td>
+                            <td>{{ pol_data.last_sent }}</td>
+                            <td>{{ pol_data.attempts }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                <details>
+                    <summary>JSON Completo</summary>
+                    <pre>{{ policy_status.pending|tojson(indent=2) }}</pre>
+                </details>
+                {% else %}
+                <p><span class="badge bg-success">Nenhuma política pendente</span></p>
+                {% endif %}
+
+                {% set armd = policy_status.armd if policy_status and policy_status.armd else {} %}
+                <hr>
+                <h6>ARMD-GreenRAN</h6>
+                {% if armd and armd.present %}
+                <div class="armd-mini-panel">
+                    <div class="armd-mini-top">
+                        <div>
+                            <div class="armd-mini-label">cenário ativo</div>
+                            <div class="armd-mini-scenario">{{ armd.scenario }}</div>
+                        </div>
+                        <div class="armd-mini-confidence">
+                            <div class="value" style="color: {% if (armd.confidence or 0) >= 0.95 %}#00ff88{% elif (armd.confidence or 0) >= 0.85 %}#ffaa00{% else %}#ff6b6b{% endif %};">
+                                {{ "%.2f"|format(armd.confidence or 0) }}
+                            </div>
+                            <div class="caption">confidence</div>
+                        </div>
+                    </div>
+                    <div class="armd-mini-badges">
+                        <span class="armd-mini-badge">domínio: {{ armd.domain or 'n/a' }}</span>
+                        <span class="armd-mini-badge">modo: {{ (armd.mode or 'n/a')|upper }}</span>
+                        <span class="armd-mini-badge">
+                            atenção:
+                            {% if armd.attention_level == 'override' %}
+                                <strong style="color:#ff6b6b;">OVERRIDE</strong>
+                            {% elif armd.attention_level == 'critical' %}
+                                <strong style="color:#ffbf69;">CRÍTICO</strong>
+                            {% elif armd.attention_level == 'guard' %}
+                                <strong style="color:#8fd3ff;">GUARDA</strong>
+                            {% else %}
+                                <strong>{{ (armd.attention_level or 'none')|upper }}</strong>
+                            {% endif %}
+                        </span>
+                        <span class="armd-mini-badge">
+                            override:
+                            <strong style="color: {% if armd.override_applied %}#ff6b6b{% else %}#00ff88{% endif %};">
+                                {{ 'SIM' if armd.override_applied else 'NÃO' }}
+                            </strong>
+                        </span>
+                    </div>
+                    <div class="armd-mini-grid">
+                        <div class="armd-mini-cell">
+                            <div class="k">Source</div>
+                            <div class="v">{{ armd.source or 'n/a' }}</div>
+                        </div>
+                        <div class="armd-mini-cell">
+                            <div class="k">Escopo</div>
+                            <div class="v">{{ (armd.policy_scope or [])|join(', ') if armd.policy_scope else 'n/a' }}</div>
+                        </div>
+                        <div class="armd-mini-cell">
+                            <div class="k">Ação</div>
+                            <div class="v">{{ armd.expected_action or 'n/a' }}</div>
+                        </div>
+                    </div>
+                    <div class="armd-mini-reason">
+                        {{ armd.reason or 'Sem motivo adicional.' }}
+                    </div>
+                </div>
+                {% else %}
+                <p><span class="badge bg-secondary">INATIVO</span> Sem contexto ARMD ativo nas políticas atuais.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+<div class="row">
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header"><h5>App1-Vigilância</h5></div>
+            <div class="card-body">
+                {% if app1_monitoring %}
+                <div class="row">
+                    <div class="col-md-3">
+                        <p><strong>Eventos</strong></p>
+                        <p>Total: {{ app1_monitoring.events.total }}</p>
+                        <p>Abertos: {{ app1_monitoring.events.open }}</p>
+                        <p>Validados: {{ app1_monitoring.events.validated }}</p>
+                    </div>
+                    <div class="col-md-3">
+                        <p><strong>Análises</strong></p>
+                        <p>Total: {{ app1_monitoring.analyses.total }}</p>
+                        <p>Críticas: {{ app1_monitoring.analyses.critical }}</p>
+                        <p>Risco visual: {{ "%.2f"|format(app1_monitoring.analyses.latest_visual_risk_score or 0) }}</p>
+                    </div>
+                    <div class="col-md-3">
+                        <p><strong>Vídeos</strong></p>
+                        <p>Uploads: {{ app1_monitoring.videos.uploaded }}</p>
+                        <p>Válidos: {{ app1_monitoring.videos.valid_videos }}</p>
+                        <p>Com artefatos: {{ app1_monitoring.videos.with_artifacts }}</p>
+                    </div>
+                    <div class="col-md-3">
+                        <p><strong>Observabilidade</strong></p>
+                        <p>Probe: {{ app1_monitoring.videos.latest_probe_status }}</p>
+                        <p>Artefatos: {{ app1_monitoring.videos.latest_artifact_status }}</p>
+                        <p><a href="{{ app1_url }}" target="_blank">Abrir App1</a></p>
+                        <p><a href="{{ grafana_url }}" target="_blank">Abrir Grafana</a></p>
+                    </div>
+                </div>
+                <details>
+                    <summary>Snapshot JSON</summary>
+                    <pre>{{ app1_monitoring|tojson(indent=2) }}</pre>
+                </details>
+                {% else %}
+                <p><span class="badge bg-warning">Sem snapshot</span> A App1 ainda não publicou monitoramento.</p>
+                <p><a href="{{ app1_url }}" target="_blank">Abrir App1</a></p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>App2-Sensores</h5></div>
+            <div class="card-body">
+                {% set app2_sla = app2_monitoring.app2_sla if app2_monitoring and app2_monitoring.app2_sla else {} %}
+                {% set app2_observed = app2_sla.observed if app2_sla and app2_sla.observed else {} %}
+                {% if app2_monitoring %}
+                <div class="row">
+                    <div class="col-md-6">
+                        <p><strong>Sensores</strong></p>
+                        <p>Total: {{ app2_observed.total_sensors or app2_monitoring.sensors.total or 0 }}</p>
+                        <p>Conectados: {{ app2_observed.connected_sensors or app2_monitoring.sensors.connected or 0 }}</p>
+                        <p>Erro: {{ app2_observed.error_sensors or app2_monitoring.sensors.error or 0 }}</p>
+                    </div>
+                    <div class="col-md-6">
+                        <p><strong>SLA</strong></p>
+                        <p>Status: <span class="badge {% if app2_sla.runtime_status == 'ok' %}bg-success{% elif app2_sla.runtime_status == 'warning' %}bg-warning{% else %}bg-danger{% endif %}">{{ app2_sla.status or 'INATIVA' }}</span></p>
+                        <p>Latência: {{ "%.1f"|format(app2_observed.avg_latency_ms or 0) }} ms</p>
+                        <p>Packet loss: {{ "%.1f"|format(app2_observed.packet_loss_percent or 0) }}%</p>
+                    </div>
+                </div>
+                <p><strong>Motivo:</strong> {{ app2_sla.reason or 'Sem dados' }}</p>
+                <details>
+                    <summary>Snapshot JSON</summary>
+                    <pre>{{ app2_monitoring|tojson(indent=2) }}</pre>
+                </details>
+                {% else %}
+                <p><span class="badge bg-warning">Sem snapshot</span> A App2 ainda não publicou monitoramento.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>App3-Veicular</h5></div>
+            <div class="card-body">
+                {% set app3_sla = app3_monitoring.vehicle_sla if app3_monitoring and app3_monitoring.vehicle_sla else {} %}
+                {% set app3_observed = app3_sla.observed if app3_sla and app3_sla.observed else {} %}
+                {% if app3_monitoring %}
+                <div class="row">
+                    <div class="col-md-6">
+                        <p><strong>Veículos</strong></p>
+                        <p>Total: {{ app3_observed.total_vehicles or app3_monitoring.vehicles.total_vehicles or 0 }}</p>
+                        <p>Risco alto: {{ app3_observed.high_risk_vehicles or app3_monitoring.vehicles.high_risk_vehicles or 0 }}</p>
+                        <p>Autonomia degradada: {{ app3_observed.degraded_autonomy_vehicles or app3_monitoring.vehicles.degraded_autonomy_vehicles or 0 }}</p>
+                    </div>
+                    <div class="col-md-6">
+                        <p><strong>SLA</strong></p>
+                        <p>Status: <span class="badge {% if app3_sla.runtime_status == 'ok' %}bg-success{% elif app3_sla.runtime_status == 'warning' %}bg-warning{% else %}bg-danger{% endif %}">{{ app3_sla.status or 'INATIVA' }}</span></p>
+                        <p>Latência máx: {{ "%.1f"|format(app3_observed.max_latency_ms or 0) }} ms</p>
+                        <p>Packet loss: {{ "%.1f"|format(app3_observed.max_packet_loss_percent or 0) }}%</p>
+                    </div>
+                </div>
+                <p><strong>Motivo:</strong> {{ app3_sla.reason or 'Sem dados' }}</p>
+                <p><a href="{{ app3_url }}" target="_blank">Abrir App3</a></p>
+                <details>
+                    <summary>Snapshot JSON</summary>
+                    <pre>{{ app3_monitoring|tojson(indent=2) }}</pre>
+                </details>
+                {% else %}
+                <p><span class="badge bg-warning">Sem snapshot</span> A App3 ainda não publicou monitoramento.</p>
+                <p><a href="{{ app3_url }}" target="_blank">Abrir App3</a></p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

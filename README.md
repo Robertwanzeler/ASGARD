@@ -1,54 +1,54 @@
-# ns-3: instalação e debug
+# Orange Nuclear / GreenRAN
 
-Este repositório foi reduzido ao necessário para instalar, compilar, testar e depurar o [ns-3](https://www.nsnam.org/).
+Entrada rápida para o projeto GreenRAN O-RAN.
 
-## Estrutura
+## Onde começar
 
-- `ns3-base/`: código-fonte do ns-3 mantido como submódulo.
-- `docs/INSTALL.md`: instalação no Ubuntu e compilação local.
-- `docs/DEBUG.md`: debug de C++, Python, memória, logs e testes.
-- `docker_project/`: ambiente reproduzível com Docker para desenvolvimento e GDB.
+- visão atual do projeto: `docs/README.md`
+- estado consolidado GreenRAN: `docs/README_GREENRAN.md`
+- progresso histórico: `docs/PROGRESSO.md`
 
-## Instalação local rápida
+## Estrutura principal
 
-```bash
-sudo apt update
-sudo apt install -y build-essential cmake ninja-build git \
-  python3 python3-dev python3-pip python3-venv pkg-config \
-  gdb valgrind libsqlite3-dev libxml2-dev libgtk-3-dev \
-  libgsl-dev libeigen3-dev
+- `src/`: núcleo do rApp, Data Lake, dashboard e integração de runtime
+- `apps/`: apps finais (`App1-Vigilancia`, `App2-Monitoramento`, `App3-Veicular`)
+- `scripts/`: automação de execução, coleta, treino e utilitários
+- `training/`: treinamento ML/GraphSAGE do core
+- `tests/`: testes centrais de integração/contrato
+- `docs/`: documentação técnica e experimental
+- `reports/`: relatórios finais curados, preservados fora de `runs/`
+- `config/`: configuração versionável do runtime e parâmetros
 
-git clone --recurse-submodules <URL_DO_REPOSITORIO>
-cd <diretorio-do-repositorio>/ns3-base
-./ns3 configure --build-profile=debug --enable-examples --enable-tests
-./ns3 build
-./test.py
-```
+## Comandos úteis
 
-O passo a passo completo está em [docs/INSTALL.md](docs/INSTALL.md).
-
-## Usando Docker
+Executar a suíte Python consolidada:
 
 ```bash
-cd docker_project
-make build
-make run
-make shell
+bash scripts/run_python_tests.sh
 ```
 
-Dentro do contêiner:
+Executar o runtime principal:
 
 ```bash
-cd /workspace/ns3
-./ns3 configure --build-profile=debug --enable-examples --enable-tests
-./ns3 build
-./ns3 run hello-simulator
+./scripts/run_greenran_v2.sh
 ```
 
-Para depurar um programa pelo GDB:
+Exportar dataset veicular e treinar o GraphSAGE direto para a trilha ARMD-GreenRAN:
 
 ```bash
-./ns3 run hello-simulator --gdb
+python3 scripts/run_vehicle_graphsage_pipeline.py --hours 24
 ```
 
-Consulte [docs/DEBUG.md](docs/DEBUG.md) para os comandos completos.
+O runner prefere `drlexp/.venv/bin/python` para o treino quando essa virtualenv existir.
+
+## Observações de repositório
+
+- `carla/`, `flexric/` e `ns-O-RAN-flexric/` são dependências grandes e aumentam muito o volume do repositório.
+- `runs/`, `charts/`, parte de `models/` e snapshots locais devem ser tratados como artefatos gerados, não como código-fonte principal.
+- relatórios finais que valem versionamento devem ir para `reports/`, não para `runs/`.
+- a documentação operacional mais atual está em `docs/`, não na raiz.
+
+# Submodules (pushed as branches)
+flexric -> branches/flexric
+ns-O-RAN-flexric -> branches/ns-O-RAN-flexric
+

@@ -1,0 +1,280 @@
+{
+  "scenario": "recuperacao",
+  "subset_size": 150,
+  "dataset_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_150/conflict_dataset_150.csv",
+  "graph_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/conflict_graph_full.json",
+  "output_dir": "runs/experimentos_conflitos/experimento_principal/recuperacao/subset_150",
+  "device": "cpu",
+  "rows": 150,
+  "train_rows": 108,
+  "test_rows": 42,
+  "nodes": 12,
+  "target_edges": 13,
+  "feature_dim": 32,
+  "epochs_requested": [
+    50,
+    100,
+    200,
+    400,
+    600
+  ],
+  "elapsed_seconds": 1.025,
+  "split_mode": "round_holdout",
+  "train_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "test_rounds": [
+    10,
+    11,
+    12,
+    13
+  ],
+  "contributing_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13
+  ],
+  "best_epoch": 600,
+  "best_metrics": {
+    "threshold": 0.5,
+    "tp": 13,
+    "fp": 0,
+    "fn": 0,
+    "tn": 119,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "predicted_edges": 13,
+    "target_edges": 13
+  },
+  "train_metrics_at_best": {
+    "threshold": 0.5,
+    "tp": 13,
+    "fp": 0,
+    "fn": 0,
+    "tn": 119,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "predicted_edges": 13,
+    "target_edges": 13
+  },
+  "history": [
+    {
+      "epoch": 50,
+      "loss": 1.103804,
+      "threshold": 0.5,
+      "tp": 10,
+      "fp": 33,
+      "fn": 3,
+      "tn": 86,
+      "precision": 0.232558,
+      "recall": 0.769231,
+      "f1": 0.357143,
+      "predicted_edges": 43,
+      "target_edges": 13,
+      "train_precision": 0.232558,
+      "train_recall": 0.769231,
+      "train_f1": 0.357143,
+      "train_tp": 10,
+      "train_fp": 33,
+      "train_fn": 3,
+      "train_tn": 86
+    },
+    {
+      "epoch": 100,
+      "loss": 0.891411,
+      "threshold": 0.5,
+      "tp": 12,
+      "fp": 30,
+      "fn": 1,
+      "tn": 89,
+      "precision": 0.285714,
+      "recall": 0.923077,
+      "f1": 0.436364,
+      "predicted_edges": 42,
+      "target_edges": 13,
+      "train_precision": 0.285714,
+      "train_recall": 0.923077,
+      "train_f1": 0.436364,
+      "train_tp": 12,
+      "train_fp": 30,
+      "train_fn": 1,
+      "train_tn": 89
+    },
+    {
+      "epoch": 200,
+      "loss": 0.436931,
+      "threshold": 0.5,
+      "tp": 13,
+      "fp": 13,
+      "fn": 0,
+      "tn": 106,
+      "precision": 0.5,
+      "recall": 1.0,
+      "f1": 0.666667,
+      "predicted_edges": 26,
+      "target_edges": 13,
+      "train_precision": 0.5,
+      "train_recall": 1.0,
+      "train_f1": 0.666667,
+      "train_tp": 13,
+      "train_fp": 13,
+      "train_fn": 0,
+      "train_tn": 106
+    },
+    {
+      "epoch": 400,
+      "loss": 0.2089,
+      "threshold": 0.5,
+      "tp": 13,
+      "fp": 7,
+      "fn": 0,
+      "tn": 112,
+      "precision": 0.65,
+      "recall": 1.0,
+      "f1": 0.787879,
+      "predicted_edges": 20,
+      "target_edges": 13,
+      "train_precision": 0.65,
+      "train_recall": 1.0,
+      "train_f1": 0.787879,
+      "train_tp": 13,
+      "train_fp": 7,
+      "train_fn": 0,
+      "train_tn": 112
+    },
+    {
+      "epoch": 600,
+      "loss": 0.082827,
+      "threshold": 0.5,
+      "tp": 13,
+      "fp": 0,
+      "fn": 0,
+      "tn": 119,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "predicted_edges": 13,
+      "target_edges": 13,
+      "train_precision": 1.0,
+      "train_recall": 1.0,
+      "train_f1": 1.0,
+      "train_tp": 13,
+      "train_fp": 0,
+      "train_fn": 0,
+      "train_tn": 119
+    }
+  ],
+  "predicted_edges_at_best": [
+    {
+      "source": "app2_connected_ratio",
+      "target": "App2-Monitoramento",
+      "score": 0.980465,
+      "baseline_relation": "belongs_to",
+      "is_true_edge": true
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "App1-Vigilancia",
+      "score": 0.979735,
+      "baseline_relation": "belongs_to",
+      "is_true_edge": true
+    },
+    {
+      "source": "energy_policy",
+      "target": "camera_throughput_mbps",
+      "score": 0.973029,
+      "baseline_relation": "affects",
+      "is_true_edge": true
+    },
+    {
+      "source": "app2_connected_ratio",
+      "target": "rApp-ResourceOptimizer",
+      "score": 0.9703,
+      "baseline_relation": "triggers_arbitration",
+      "is_true_edge": true
+    },
+    {
+      "source": "global_health_policy",
+      "target": "camera_throughput_mbps",
+      "score": 0.967367,
+      "baseline_relation": "affects",
+      "is_true_edge": true
+    },
+    {
+      "source": "rApp-CVaR/ML-Arbiter",
+      "target": "global_health_policy",
+      "score": 0.966262,
+      "baseline_relation": "controls",
+      "is_true_edge": true
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "App1-Vigilancia",
+      "score": 0.965196,
+      "baseline_relation": "protects",
+      "is_true_edge": true
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "App2-Monitoramento",
+      "score": 0.959822,
+      "baseline_relation": "protects",
+      "is_true_edge": true
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.957384,
+      "baseline_relation": "mitigates",
+      "is_true_edge": true
+    },
+    {
+      "source": "energy_policy",
+      "target": "app2_connected_ratio",
+      "score": 0.953835,
+      "baseline_relation": "affects",
+      "is_true_edge": true
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER",
+      "score": 0.948852,
+      "baseline_relation": "mitigates",
+      "is_true_edge": true
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "energy_policy",
+      "score": 0.940436,
+      "baseline_relation": "controls",
+      "is_true_edge": true
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-ResourceOptimizer",
+      "score": 0.938495,
+      "baseline_relation": "triggers_arbitration",
+      "is_true_edge": true
+    }
+  ]
+}

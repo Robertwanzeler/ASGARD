@@ -1,0 +1,150 @@
+{
+  "schema": "greenran.conflict_graph.v1",
+  "generated_at": 1777012618,
+  "window_events": 11,
+  "stats": {
+    "total_events": 11,
+    "by_conflict_type": {
+      "indirect": 11
+    },
+    "by_service": {
+      "App1-Vigilancia": 11
+    },
+    "by_kpi": {
+      "camera_throughput_mbps": 11
+    },
+    "by_mitigation": {
+      "FULL_POWER": 11
+    }
+  },
+  "nodes": [
+    {
+      "id": "xApp1-RANSlicer",
+      "label": "xApp1-RANSlicer",
+      "type": "agent",
+      "event_count": 11
+    },
+    {
+      "id": "xApp2-EnergySaver",
+      "label": "xApp2-EnergySaver",
+      "type": "agent",
+      "event_count": 11
+    },
+    {
+      "id": "rApp-ResourceOptimizer",
+      "label": "rApp-ResourceOptimizer",
+      "type": "arbiter",
+      "event_count": 11
+    },
+    {
+      "id": "camera_throughput_mbps",
+      "label": "camera_throughput_mbps",
+      "type": "kpi",
+      "event_count": 11
+    },
+    {
+      "id": "FULL_POWER",
+      "label": "FULL_POWER",
+      "type": "mitigation",
+      "event_count": 11
+    },
+    {
+      "id": "energy_policy",
+      "label": "energy_policy",
+      "type": "parameter",
+      "event_count": 11
+    },
+    {
+      "id": "App1-Vigilancia",
+      "label": "App1-Vigilancia",
+      "type": "service",
+      "event_count": 11
+    }
+  ],
+  "edges": [
+    {
+      "source": "FULL_POWER",
+      "target": "App1-Vigilancia",
+      "relation": "protects",
+      "weight": 11,
+      "conflict_types": {
+        "indirect": 11
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 11
+      },
+      "latest_timestamp": 1777012554,
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "App1-Vigilancia",
+      "relation": "belongs_to",
+      "weight": 11,
+      "conflict_types": {
+        "indirect": 11
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 11
+      },
+      "latest_timestamp": 1777012554,
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "weight": 11,
+      "conflict_types": {
+        "indirect": 11
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 11
+      },
+      "latest_timestamp": 1777012554,
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "energy_policy",
+      "target": "camera_throughput_mbps",
+      "relation": "affects",
+      "weight": 11,
+      "conflict_types": {
+        "indirect": 11
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 11
+      },
+      "latest_timestamp": 1777012554,
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER",
+      "relation": "mitigates",
+      "weight": 11,
+      "conflict_types": {
+        "indirect": 11
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 11
+      },
+      "latest_timestamp": 1777012554,
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "energy_policy",
+      "relation": "controls",
+      "weight": 11,
+      "conflict_types": {
+        "indirect": 11
+      },
+      "affected_kpis": {
+        "camera_throughput_mbps": 11
+      },
+      "latest_timestamp": 1777012554,
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    }
+  ]
+}

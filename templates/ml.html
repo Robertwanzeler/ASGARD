@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+
+{% block title %}GreenRAN - Machine Learning{% endblock %}
+
+{% block extra_head %}
+<style>
+    /* Garantir cores visíveis na página ML */
+    .metric-value { color: #00ff88 !important; }
+    .table { color: #eeeeee !important; }
+    .card-body p { color: #eeeeee !important; margin-bottom: 8px; }
+    .card-body strong { color: #ffffff !important; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col-12">
+        <h2 style="color: #00ff88;">Machine Learning Dashboard</h2>
+        <p class="refresh-indicator">Atualizado: {{ now }}</p>
+    </div>
+</div>
+
+<!-- ML Model Status -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">Modelo ML</div>
+            <div class="card-body text-center">
+                <div class="metric-value" style="color: {% if ml_status.loaded %}#00ff88{% else %}#ff4444{% endif %} !important;">
+                    {% if ml_status.loaded %}ATIVO{% else %}INATIVO{% endif %}
+                </div>
+                <p class="metric-label">{{ ml_status.model_type }}</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">Acurácia do Modelo</div>
+            <div class="card-body text-center">
+                <div class="metric-value">{{ "%.1f"|format(ml_status.accuracy * 100) }}%</div>
+                <p class="metric-label">Random Forest</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">Última Predição</div>
+            <div class="card-body text-center">
+                <div class="metric-value" style="color: {% if last_prediction.decision == 'ALLOWED' %}#00ff88{% elif last_prediction.decision == 'BLOCKED' %}#ff4444{% else %}#ffaa00{% endif %} !important;">
+                    {{ last_prediction.decision or 'N/A' }}
+                </div>
+                <p class="metric-label">Confiança: {{ "%.0f"|format((last_prediction.confidence or 0) * 100) }}%</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">CVaR Previsto</div>
+            <div class="card-body text-center">
+                <div class="metric-value">{{ "%.1f"|format(last_prediction.predicted_cvar_ms or 0) }} ms</div>
+                <p class="metric-label">Modelo de Regressão</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ML vs Rules Concordance -->
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">Concordância ML vs Regras</div>
+            <div class="card-body">
+                <canvas id="concordanceChart" height="200"></canvas>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">Feature Importance (Top 5)</div>
+            <div class="card-body">
+                <canvas id="featureChart" height="200"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Prediction History -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">Histórico de Predições ML</div>
+            <div class="card-body">
+                <table class="table table-dark">
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>Decisão ML</th>
+                            <th>Decisão Regras</th>
+                            <th>Conf. ML</th>
+                            <th>CVaR Previsto</th>
+                            <th>ML Influenciou</th>
+                            <th>Concordância</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for pred in prediction_history %}
+                        <tr>
+                            <td>{{ pred.timestamp }}</td>
+                            <td>
+                                <span class="badge {% if pred.ml_decision == 'ALLOWED' %}badge-ok{% elif pred.ml_decision == 'BLOCKED' %}badge-critical{% elif pred.ml_decision == 'N/A' %}badge-warning{% else %}badge-warning{% endif %}">
+                                    {{ pred.ml_decision }}
+                                </span>
+                            </td>
+                            <td>
+                                <span class="badge {% if pred.rule_decision == 'ALLOWED' %}badge-ok{% elif pred.rule_decision == 'BLOCKED' %}badge-critical{% else %}badge-warning{% endif %}">
+                                    {{ pred.rule_decision }}
+                                </span>
+                            </td>
+                            <td>{{ "%.0f"|format(pred.confidence * 100) }}%</td>
+                            <td>{{ "%.1f"|format(pred.predicted_cvar_ms) }} ms</td>
+                            <td>
+                                {% if pred.ml_influenced %}
+                                <span style="color: #00ff88;">Sim</span>
+                                {% else %}
+                                <span style="color: #888888;">Não</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if pred.concordance %}
+                                <span style="color: #00ff88;">✓</span>
+                                {% else %}
+                                <span style="color: #ffaa00;">✗</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Model Training Info -->
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">Informações do Modelo</div>
+            <div class="card-body">
+                <p><strong>Tipo:</strong> {{ ml_status.model_type }}</p>
+                <p><strong>Acurácia:</strong> {{ "%.2f"|format(ml_status.accuracy * 100) }}%</p>
+                <p><strong>Cross-validation:</strong> {{ "%.2f"|format(ml_status.cv_mean * 100) }}% ± {{ "%.2f"|format(ml_status.cv_std * 100) }}%</p>
+                <p><strong>Classes:</strong> {{ ml_status.classes|join(', ') }}</p>
+                <p><strong>Features:</strong> {{ ml_status.n_features }}</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">Regras de Influência ML</div>
+            <div class="card-body">
+                <p style="color: #00ff88 !important;">✓ ML ALLOWED (conf>80%) + Regras CONDITIONAL → ALLOWED</p>
+                <p style="color: #ffaa00 !important;">⚠ ML BLOCKED (conf>80%) + Regras ALLOWED → CONDITIONAL</p>
+                <p style="color: #888888 !important;">ℹ Regras de segurança (R1-R3) nunca são sobrescritas</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Concordance Chart
+const concordanceCtx = document.getElementById('concordanceChart').getContext('2d');
+new Chart(concordanceCtx, {
+    type: 'doughnut',
+    data: {
+        labels: ['Concordância', 'Discordância'],
+        datasets: [{
+            data: [{{ concordance_pct }}, {{ 100 - concordance_pct }}],
+            backgroundColor: ['#00ff88', '#ffaa00'],
+            borderWidth: 0
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            legend: {
+                labels: { color: '#ffffff' }
+            }
+        }
+    }
+});
+
+// Feature Importance Chart
+const featureCtx = document.getElementById('featureChart').getContext('2d');
+const featureData = {{ feature_importance|tojson }};
+new Chart(featureCtx, {
+    type: 'bar',
+    data: {
+        labels: Object.keys(featureData),
+        datasets: [{
+            data: Object.values(featureData),
+            backgroundColor: ['#00ff88', '#00aaff', '#ffaa00', '#ff6600', '#ff4444'],
+            borderWidth: 0
+        }]
+    },
+    options: {
+        indexAxis: 'y',
+        responsive: true,
+        plugins: {
+            legend: { display: false }
+        },
+        scales: {
+            x: {
+                ticks: { color: '#ffffff' },
+                grid: { color: '#333333' }
+            },
+            y: {
+                ticks: { color: '#ffffff' },
+                grid: { display: false }
+            }
+        }
+    }
+});
+</script>
+{% endblock %}

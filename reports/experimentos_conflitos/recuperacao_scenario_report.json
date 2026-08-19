@@ -1,0 +1,80 @@
+{
+  "scenario": "recuperacao",
+  "start_ts": 1777008536,
+  "end_ts": 1777013098,
+  "start_iso": "2026-04-24T02:28:56",
+  "end_iso": "2026-04-24T03:44:58",
+  "full_export": {
+    "rows": 455,
+    "dataset_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/conflict_dataset_full.csv",
+    "graph_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/conflict_graph_full.json",
+    "adjacency_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/conflict_adjacency_full.json",
+    "report_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/conflict_report_full.json",
+    "summary": {
+      "baseline_edges": 13,
+      "learned_edges": 13,
+      "confirmed_by_data": 7,
+      "weak_or_low_support": 6,
+      "spurious_in_baseline": 0,
+      "emergent_from_data": 0
+    }
+  },
+  "conflict_alignment": {
+    "dataset_sizes": [
+      50,
+      150,
+      450
+    ],
+    "threshold": 0.5,
+    "recommended_gnn_epochs": 600,
+    "epochs_applied_in_current_runner": null,
+    "note": "dataset sizes and threshold are aligned with conflitos; GraphSAGE epoch training is not implemented in the current heuristic learner"
+  },
+  "subsets": [
+    {
+      "requested_rows": 50,
+      "actual_rows": 50,
+      "dataset_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_50/conflict_dataset_50.csv",
+      "adjacency_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_50/conflict_adjacency_50.json",
+      "report_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_50/conflict_report_50.json",
+      "summary": {
+        "baseline_edges": 13,
+        "learned_edges": 6,
+        "confirmed_by_data": 6,
+        "weak_or_low_support": 0,
+        "spurious_in_baseline": 7,
+        "emergent_from_data": 0
+      }
+    },
+    {
+      "requested_rows": 150,
+      "actual_rows": 150,
+      "dataset_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_150/conflict_dataset_150.csv",
+      "adjacency_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_150/conflict_adjacency_150.json",
+      "report_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_150/conflict_report_150.json",
+      "summary": {
+        "baseline_edges": 13,
+        "learned_edges": 6,
+        "confirmed_by_data": 6,
+        "weak_or_low_support": 0,
+        "spurious_in_baseline": 7,
+        "emergent_from_data": 0
+      }
+    },
+    {
+      "requested_rows": 450,
+      "actual_rows": 450,
+      "dataset_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_450/conflict_dataset_450.csv",
+      "adjacency_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_450/conflict_adjacency_450.json",
+      "report_path": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/scenario_exports/subset_450/conflict_report_450.json",
+      "summary": {
+        "baseline_edges": 13,
+        "learned_edges": 13,
+        "confirmed_by_data": 7,
+        "weak_or_low_support": 6,
+        "spurious_in_baseline": 0,
+        "emergent_from_data": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}GreenRAN rApp Dashboard{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        body { background-color: #1a1a2e; color: #ffffff !important; }
+        .card { background-color: #16213e; border: none; margin-bottom: 20px; }
+        .card-header { background-color: #0f3460; border-bottom: none; }
+        .card-body { color: #ffffff !important; background-color: #16213e; }
+        .metric-value { font-size: 2rem; font-weight: bold; color: #00ff88 !important; }
+        .metric-label { font-size: 0.9rem; color: #aaaaaa !important; }
+        .status-ok { color: #00ff88 !important; }
+        .status-warning { color: #ffaa00 !important; }
+        .status-critical { color: #ff4444 !important; }
+        .navbar { background-color: #0f3460; }
+        .nav-link { color: #eeeeee; }
+        .nav-link:hover { color: #00ff88; }
+        .nav-link.active { color: #00ff88; }
+        .sidebar { background-color: #16213e; min-height: 100vh; }
+        .table { color: #eeeeee !important; background-color: transparent; }
+        .table-dark { --bs-table-bg: #16213e; }
+        .table > thead { color: #ffffff; }
+        .table > tbody > tr { color: #eeeeee; }
+        pre { background-color: #0f3460; padding: 10px; border-radius: 5px; color: #00ff88; }
+        .badge-ok { background-color: #00ff88; color: #000; }
+        .badge-warning { background-color: #ffaa00; color: #000; }
+        .badge-critical { background-color: #ff4444; color: #fff; }
+        .refresh-indicator { font-size: 0.8rem; color: #888888; }
+        .table td strong { color: #ffffff !important; }
+        p { color: #eeeeee !important; }
+        strong { color: #ffffff !important; }
+        .text-muted { color: #888888 !important; }
+        .card-text { color: #eeeeee !important; }
+        /* FORÇAR CORES VISÍVEIS EM TODO LUGAR */
+        td, th, span, div, li, label, h1, h2, h3, h4, h5, h6 { color: #eeeeee !important; }
+        .table td { color: #eeeeee !important; border-color: #333 !important; }
+        .table th { color: #ffffff !important; border-color: #333 !important; }
+        /* CORREÇÃO: Forçar cor branca nos nomes dos xApps */
+        .table-sm td:first-child { color: #ffffff !important; }
+        .table-sm td:first-child * { color: #ffffff !important; }
+        table.table.table-sm td { color: #eeeeee !important; }
+        td font b, td font { color: #eeeeee !important; }
+        /* NOVO: Tabelas dentro de card-body */
+        .card-body table { background-color: transparent !important; }
+        .card-body table td { color: #dddddd !important; background-color: transparent !important; }
+        .card-body table th { color: #ffffff !important; background-color: #0f3460 !important; }
+        .card-body .table-sm td { color: #cccccc !important; }
+        /* CORREÇÃO ESPECÍFICA para texto das tabelas */
+        .card-body td { color: #cccccc !important; }
+        .card-body th { color: #ffffff !important; }
+        /* Regras de coordenação específicas */
+        .coordenacao-tabela td { color: #eeeeee !important; }
+        /* Tabela de estatísticas */
+        .card-body .table td { color: #bbbbbb !important; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">
+                <span style="color: #ff6600;">GreenRAN</span> rApp Dashboard
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav">
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/' %}active{% endif %}" href="/">Dashboard</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/metrics' %}active{% endif %}" href="/metrics">Métricas</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/decisions' %}active{% endif %}" href="/decisions">Decisões</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/conflicts' %}active{% endif %}" href="/conflicts">Conflitos</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/pattern' %}active{% endif %}" href="/pattern">Padrões</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/xapps' %}active{% endif %}" href="/xapps">xApps</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/ml' %}active{% endif %}" href="/ml">ML</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/drl' %}active{% endif %}" href="/drl">DRL</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == '/ops' %}active{% endif %}" href="/ops">Ops Mobile</a></li>
+                </ul>
+                <span class="ms-auto refresh-indicator">
+                    Atualizado: <span id="lastUpdate">{{ timestamp }}</span>
+                    <button class="btn btn-sm btn-outline-light ms-2" onclick="location.reload()">↻</button>
+                </span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-4">
+        {% block content %}{% endblock %}
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Auto-refresh a cada 10 segundos
+        setTimeout(function() { location.reload(); }, 10000);
+        
+        // CORREÇÃO: Forçar cor branca nos nomes dos xApps após DOM carregado
+        document.addEventListener('DOMContentLoaded', function() {
+            var cells = document.querySelectorAll('.table-sm td:first-child');
+            cells.forEach(function(cell) {
+                cell.style.color = '#ffffff';
+                cell.style.fontWeight = 'bold';
+            });
+        });
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

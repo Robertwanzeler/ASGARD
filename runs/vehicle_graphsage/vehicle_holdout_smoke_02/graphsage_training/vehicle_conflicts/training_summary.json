@@ -1,0 +1,424 @@
+{
+  "scenario": "vehicle_conflicts",
+  "subset_size": 1403,
+  "dataset_path": "/home/robert/orange_nuclear/runs/vehicle_graphsage/vehicle_holdout_smoke_02/vehicle_conflict_dataset.csv",
+  "graph_path": "/home/robert/orange_nuclear/runs/vehicle_graphsage/vehicle_holdout_smoke_02/vehicle_conflict_graph.json",
+  "output_dir": "/home/robert/orange_nuclear/runs/vehicle_graphsage/vehicle_holdout_smoke_02/graphsage_training/vehicle_conflicts",
+  "device": "cpu",
+  "rows": 1403,
+  "train_rows": 1052,
+  "test_rows": 351,
+  "nodes": 11,
+  "target_edges": 12,
+  "train_target_edges": 12,
+  "eval_target_edges": 12,
+  "feature_dim": 32,
+  "epochs_requested": [
+    1
+  ],
+  "elapsed_seconds": 0.009,
+  "split_mode": "direct_row_holdout",
+  "train_rounds": [],
+  "test_rounds": [],
+  "contributing_rounds": [],
+  "best_epoch": 1,
+  "best_metrics": {
+    "threshold": 0.5,
+    "tp": 6,
+    "fp": 58,
+    "fn": 6,
+    "tn": 40,
+    "precision": 0.09375,
+    "recall": 0.5,
+    "f1": 0.157895,
+    "predicted_edges": 64,
+    "target_edges": 12
+  },
+  "train_metrics_at_best": {
+    "threshold": 0.5,
+    "tp": 10,
+    "fp": 54,
+    "fn": 2,
+    "tn": 44,
+    "precision": 0.15625,
+    "recall": 0.833333,
+    "f1": 0.263158,
+    "predicted_edges": 64,
+    "target_edges": 12
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "loss": 1.240515,
+      "threshold": 0.5,
+      "tp": 6,
+      "fp": 58,
+      "fn": 6,
+      "tn": 40,
+      "precision": 0.09375,
+      "recall": 0.5,
+      "f1": 0.157895,
+      "predicted_edges": 64,
+      "target_edges": 12,
+      "train_precision": 0.15625,
+      "train_recall": 0.833333,
+      "train_f1": 0.263158,
+      "train_tp": 10,
+      "train_fp": 54,
+      "train_fn": 2,
+      "train_tn": 44
+    }
+  ],
+  "predicted_edges_at_best": [
+    {
+      "source": "camera_latency_ms",
+      "target": "FULL_POWER",
+      "score": 0.516833,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.515444,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "camera_throughput_mbps",
+      "score": 0.514455,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "energy_policy",
+      "target": "FULL_POWER",
+      "score": 0.513577,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "rApp-CVaR/ML-Arbiter",
+      "score": 0.513332,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "global_health_policy",
+      "score": 0.513085,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.512384,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "global_health_policy",
+      "score": 0.511528,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "energy_policy",
+      "target": "global_health_policy",
+      "score": 0.510723,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "energy_policy",
+      "target": "rApp-CVaR/ML-Arbiter",
+      "score": 0.510015,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "App1-Vigilancia",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.509837,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "global_health_policy",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.508888,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "energy_policy",
+      "target": "xApp2-EnergySaver",
+      "score": 0.508452,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "rApp-CVaR/ML-Arbiter",
+      "score": 0.508334,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "global_health_policy",
+      "target": "rApp-CVaR/ML-Arbiter",
+      "score": 0.507981,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "global_health_policy",
+      "target": "FULL_POWER",
+      "score": 0.507898,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "App1-Vigilancia",
+      "target": "rApp-CVaR/ML-Arbiter",
+      "score": 0.507501,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "global_health_policy",
+      "score": 0.507478,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "App1-Vigilancia",
+      "target": "rApp-ResourceOptimizer",
+      "score": 0.507397,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.507296,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-CVaR/ML-Arbiter",
+      "score": 0.507282,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "rApp-CVaR/ML-Arbiter",
+      "score": 0.507245,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "energy_policy",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.507176,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "rApp-CVaR/ML-Arbiter",
+      "target": "global_health_policy",
+      "score": 0.506921,
+      "baseline_relation": "controls",
+      "is_true_edge": true
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "FULL_POWER",
+      "score": 0.506704,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "energy_policy",
+      "target": "xApp1-RANSlicer",
+      "score": 0.50667,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "App1-Vigilancia",
+      "target": "camera_throughput_mbps",
+      "score": 0.506406,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "FULL_POWER",
+      "score": 0.506248,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "camera_throughput_mbps",
+      "score": 0.506208,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "energy_policy",
+      "score": 0.505939,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "global_health_policy",
+      "score": 0.505743,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-ResourceOptimizer",
+      "score": 0.505662,
+      "baseline_relation": "triggers_arbitration",
+      "is_true_edge": true
+    },
+    {
+      "source": "rApp-CVaR/ML-Arbiter",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.505392,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "energy_policy",
+      "target": "camera_throughput_mbps",
+      "score": 0.505287,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "xApp1-RANSlicer",
+      "score": 0.505199,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "energy_policy",
+      "score": 0.505197,
+      "baseline_relation": "controls",
+      "is_true_edge": true
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.504986,
+      "baseline_relation": "mitigates",
+      "is_true_edge": true
+    },
+    {
+      "source": "App1-Vigilancia",
+      "target": "global_health_policy",
+      "score": 0.504814,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "App1-Vigilancia",
+      "target": "FULL_POWER",
+      "score": 0.504779,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "FULL_POWER",
+      "score": 0.504721,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "camera_throughput_mbps",
+      "score": 0.504468,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "camera_latency_ms",
+      "target": "rApp-ResourceOptimizer",
+      "score": 0.50412,
+      "baseline_relation": "triggers_arbitration",
+      "is_true_edge": true
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "energy_policy",
+      "score": 0.503875,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "global_health_policy",
+      "score": 0.503866,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "App1-Vigilancia",
+      "target": "camera_latency_ms",
+      "score": 0.503796,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "xApp1-RANSlicer",
+      "target": "global_health_policy",
+      "score": 0.503597,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "xApp1-RANSlicer",
+      "score": 0.503448,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "FULL_POWER_GUARD",
+      "score": 0.503387,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "xApp2-EnergySaver",
+      "target": "rApp-CVaR/ML-Arbiter",
+      "score": 0.503267,
+      "baseline_relation": null,
+      "is_true_edge": false
+    },
+    {
+      "source": "FULL_POWER_GUARD",
+      "target": "rApp-ResourceOptimizer",
+      "score": 0.503062,
+      "baseline_relation": null,
+      "is_true_edge": false
+    }
+  ]
+}

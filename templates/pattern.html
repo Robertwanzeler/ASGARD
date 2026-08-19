@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Padrões - GreenRAN rApp{% endblock %}
+{% block content %}
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>Padrão Atual</h5></div>
+            <div class="card-body">
+                {% if summary.current_analysis %}
+                <p><strong>Padrão:</strong> <span style="color: #00ff88;">{{ summary.current_analysis.pattern }}</span></p>
+                <p><strong>Hora:</strong> {{ summary.current_analysis.hour }}:00</p>
+                <p><strong>Dia:</strong> {{ summary.current_analysis.day_name }}</p>
+                <p><strong>Atividade:</strong> {% if summary.current_analysis.low_activity %}<span style="color: #00ff88;">Baixa</span>{% else %}<span style="color: #ffaa00;">Normal</span>{% endif %}</p>
+                <p><strong>Confiança:</strong> <span style="color: {% if summary.current_analysis.confidence >= 0.7 %}#00ff88{% elif summary.current_analysis.confidence >= 0.4 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.0f"|format(summary.current_analysis.confidence * 100) }}%</span></p>
+                {% else %}
+                <p class="text-muted">Sem dados</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><h5>Janela de Economia</h5></div>
+            <div class="card-body">
+                {% if window and window.window_start %}
+                <p><strong>Início:</strong> <span style="color: #00ff88;">{{ window.window_start }}</span></p>
+                <p><strong>Fim:</strong> {{ window.window_end }}</p>
+                <p><strong>Duração:</strong> {{ window.duration_hours }} horas</p>
+                <p><strong>Confiança:</strong> <span style="color: {% if window.confidence >= 0.7 %}#00ff88{% elif window.confidence >= 0.4 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.0f"|format(window.confidence * 100) }}%</span></p>
+                <p><strong>Dias:</strong> {{ window.day_names|join(', ') }}</p>
+                {% else %}
+                <p class="text-muted">Sem dados suficientes para definir janela</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

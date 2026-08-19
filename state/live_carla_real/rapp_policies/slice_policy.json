@@ -1,0 +1,28 @@
+{
+  "policy_type": "slice_priority",
+  "interface": "A1",
+  "timestamp": 1778679729,
+  "valid_until": 1778680029,
+  "source": "rApp-ResourceOptimizer",
+  "status": "BALANCED",
+  "policy_id": "slice_1778679729284",
+  "ack_required": true,
+  "waiting_ack": true,
+  "slicer_state": "UNKNOWN",
+  "slice_priority": {
+    "camera_slice": 1,
+    "ue_slice": 1
+  },
+  "prb_reserve": {
+    "camera_slice": 50,
+    "ue_slice": 50
+  },
+  "recommendations": {
+    "prioritize_cameras": false,
+    "reserve_prb": true,
+    "enforce_sla": false
+  },
+  "camera_demand": {
+    "active": 2
+  }
+}

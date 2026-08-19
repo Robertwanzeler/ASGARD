@@ -1,0 +1,32 @@
+{
+  "updated_at": "2026-05-13T10:41:52.427307",
+  "mode": "local_simulated_camera_sources",
+  "resolution": "3840x2160",
+  "duration_s": 2.0,
+  "cameras": [
+    {
+      "camera_id": "CAM-01",
+      "location": "Portao Principal",
+      "source_reference": "state://app1_vigilancia/camera_sources/CAM-01.mp4",
+      "transport": "state_file",
+      "simulates": "camera_4k_over_5g_fwa",
+      "video_profile": "4k_h264_high_bitrate_with_osd"
+    },
+    {
+      "camera_id": "CAM-02",
+      "location": "Biblioteca Central",
+      "source_reference": "state://app1_vigilancia/camera_sources/CAM-02.mp4",
+      "transport": "state_file",
+      "simulates": "camera_4k_over_5g_fwa",
+      "video_profile": "4k_h264_high_bitrate_with_osd"
+    },
+    {
+      "camera_id": "CAM-03",
+      "location": "Corredor de Acesso",
+      "source_reference": "state://app1_vigilancia/camera_sources/CAM-03.mp4",
+      "transport": "state_file",
+      "simulates": "camera_4k_over_5g_fwa",
+      "video_profile": "4k_h264_high_bitrate_with_osd"
+    }
+  ]
+}

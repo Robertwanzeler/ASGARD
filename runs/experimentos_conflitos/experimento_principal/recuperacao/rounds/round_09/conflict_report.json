@@ -1,0 +1,200 @@
+{
+  "schema": "greenran.conflict_learning_report.v1",
+  "generated_at": 1777009616,
+  "config": {
+    "dataset": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/rounds/round_09/conflict_dataset.csv",
+    "graph": "/home/robert/orange_nuclear/runs/experimentos_conflitos/experimento_principal/recuperacao/rounds/round_09/conflict_graph.json",
+    "min_count": 3,
+    "threshold": 0.5,
+    "rows": 12
+  },
+  "summary": {
+    "baseline_edges": 6,
+    "learned_edges": 6,
+    "confirmed_by_data": 6,
+    "weak_or_low_support": 0,
+    "spurious_in_baseline": 0,
+    "emergent_from_data": 0
+  },
+  "top_strong_edges": [
+    {
+      "source": "global_health_policy",
+      "target": "camera_throughput_mbps",
+      "relation": "affects",
+      "count": 12,
+      "normalized_count": 1.0,
+      "confidence": 1.0,
+      "avg_severity": 0.1,
+      "strength": 0.82,
+      "classification": "strong",
+      "conflict_types": {
+        "implicit": 12
+      },
+      "contexts": {
+        "App1-Vigilancia": 12
+      },
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "App1-Vigilancia",
+      "relation": "belongs_to",
+      "count": 12,
+      "normalized_count": 1.0,
+      "confidence": 1.0,
+      "avg_severity": 0.0,
+      "strength": 1.0,
+      "classification": "strong",
+      "conflict_types": {
+        "implicit": 12
+      },
+      "contexts": {
+        "FULL_POWER": 12
+      },
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "rApp-CVaR/ML-Arbiter",
+      "target": "global_health_policy",
+      "relation": "controls",
+      "count": 12,
+      "normalized_count": 1.0,
+      "confidence": 1.0,
+      "avg_severity": 0.1,
+      "strength": 1.0,
+      "classification": "strong",
+      "conflict_types": {
+        "implicit": 12
+      },
+      "contexts": {
+        "camera_throughput_mbps": 12
+      },
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER",
+      "relation": "mitigates",
+      "count": 12,
+      "normalized_count": 1.0,
+      "confidence": 1.0,
+      "avg_severity": 0.1,
+      "strength": 0.82,
+      "classification": "strong",
+      "conflict_types": {
+        "implicit": 12
+      },
+      "contexts": {
+        "App1-Vigilancia": 12
+      },
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "FULL_POWER",
+      "target": "App1-Vigilancia",
+      "relation": "protects",
+      "count": 12,
+      "normalized_count": 1.0,
+      "confidence": 1.0,
+      "avg_severity": 0.1,
+      "strength": 0.82,
+      "classification": "strong",
+      "conflict_types": {
+        "implicit": 12
+      },
+      "contexts": {
+        "camera_throughput_mbps": 12
+      },
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "count": 12,
+      "normalized_count": 1.0,
+      "confidence": 1.0,
+      "avg_severity": 0.1,
+      "strength": 0.82,
+      "classification": "strong",
+      "conflict_types": {
+        "implicit": 12
+      },
+      "contexts": {
+        "FULL_POWER": 12
+      },
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    }
+  ],
+  "confirmed_by_data": [
+    {
+      "source": "FULL_POWER",
+      "target": "App1-Vigilancia",
+      "relation": "protects",
+      "baseline_weight": 12,
+      "learned_count": 12,
+      "learned_strength": 0.82,
+      "learned_confidence": 1.0,
+      "classification": "strong",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "App1-Vigilancia",
+      "relation": "belongs_to",
+      "baseline_weight": 12,
+      "learned_count": 12,
+      "learned_strength": 1.0,
+      "learned_confidence": 1.0,
+      "classification": "strong",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "camera_throughput_mbps",
+      "target": "rApp-ResourceOptimizer",
+      "relation": "triggers_arbitration",
+      "baseline_weight": 12,
+      "learned_count": 12,
+      "learned_strength": 0.82,
+      "learned_confidence": 1.0,
+      "classification": "strong",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "global_health_policy",
+      "target": "camera_throughput_mbps",
+      "relation": "affects",
+      "baseline_weight": 12,
+      "learned_count": 12,
+      "learned_strength": 0.82,
+      "learned_confidence": 1.0,
+      "classification": "strong",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "rApp-CVaR/ML-Arbiter",
+      "target": "global_health_policy",
+      "relation": "controls",
+      "baseline_weight": 12,
+      "learned_count": 12,
+      "learned_strength": 1.0,
+      "learned_confidence": 1.0,
+      "classification": "strong",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    },
+    {
+      "source": "rApp-ResourceOptimizer",
+      "target": "FULL_POWER",
+      "relation": "mitigates",
+      "baseline_weight": 12,
+      "learned_count": 12,
+      "learned_strength": 0.82,
+      "learned_confidence": 1.0,
+      "classification": "strong",
+      "latest_reason": "CÂMERA SLA: Throughput 22.5Mbps < 25Mbps (mínimo)"
+    }
+  ],
+  "weak_or_low_support": [],
+  "spurious_in_baseline": [],
+  "emergent_from_data": []
+}

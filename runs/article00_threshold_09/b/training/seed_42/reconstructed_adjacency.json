@@ -1,0 +1,562 @@
+{
+  "schema": "greenran.article00_reconstructed_adjacency.v1",
+  "generated_at": "2026-05-04T13:55:28.080131+00:00",
+  "best_epoch": 100,
+  "selection_threshold": 0.9,
+  "parameter_kpi_truth_edges": [
+    [
+      "P1",
+      "K1"
+    ],
+    [
+      "P1",
+      "K2"
+    ],
+    [
+      "P2",
+      "K1"
+    ],
+    [
+      "P3",
+      "K2"
+    ],
+    [
+      "P4",
+      "K3"
+    ],
+    [
+      "P5",
+      "K3"
+    ],
+    [
+      "P6",
+      "K4"
+    ],
+    [
+      "P7",
+      "K4"
+    ]
+  ],
+  "parameter_kpi_predicted_edges": [
+    [
+      "P1",
+      "K2"
+    ],
+    [
+      "P3",
+      "K2"
+    ],
+    [
+      "P5",
+      "K3"
+    ]
+  ],
+  "full_truth_edges": [
+    [
+      "A1",
+      "K1"
+    ],
+    [
+      "A1",
+      "P1"
+    ],
+    [
+      "A1",
+      "P2"
+    ],
+    [
+      "A2",
+      "K1"
+    ],
+    [
+      "A2",
+      "K2"
+    ],
+    [
+      "A2",
+      "P2"
+    ],
+    [
+      "A2",
+      "P3"
+    ],
+    [
+      "A3",
+      "K2"
+    ],
+    [
+      "A3",
+      "K3"
+    ],
+    [
+      "A3",
+      "P4"
+    ],
+    [
+      "A3",
+      "P5"
+    ],
+    [
+      "A4",
+      "K3"
+    ],
+    [
+      "A4",
+      "K4"
+    ],
+    [
+      "A4",
+      "P6"
+    ],
+    [
+      "A4",
+      "P7"
+    ],
+    [
+      "P1",
+      "K1"
+    ],
+    [
+      "P1",
+      "K2"
+    ],
+    [
+      "P2",
+      "K1"
+    ],
+    [
+      "P3",
+      "K2"
+    ],
+    [
+      "P4",
+      "K3"
+    ],
+    [
+      "P5",
+      "K3"
+    ],
+    [
+      "P6",
+      "K4"
+    ],
+    [
+      "P7",
+      "K4"
+    ]
+  ],
+  "full_predicted_edges": [
+    [
+      "A1",
+      "K1"
+    ],
+    [
+      "A1",
+      "P1"
+    ],
+    [
+      "A1",
+      "P2"
+    ],
+    [
+      "A2",
+      "K1"
+    ],
+    [
+      "A2",
+      "K2"
+    ],
+    [
+      "A2",
+      "P2"
+    ],
+    [
+      "A2",
+      "P3"
+    ],
+    [
+      "A3",
+      "K2"
+    ],
+    [
+      "A3",
+      "K3"
+    ],
+    [
+      "A3",
+      "P4"
+    ],
+    [
+      "A3",
+      "P5"
+    ],
+    [
+      "A4",
+      "K3"
+    ],
+    [
+      "A4",
+      "K4"
+    ],
+    [
+      "A4",
+      "P6"
+    ],
+    [
+      "A4",
+      "P7"
+    ],
+    [
+      "P1",
+      "K2"
+    ],
+    [
+      "P3",
+      "K2"
+    ],
+    [
+      "P5",
+      "K3"
+    ]
+  ],
+  "no_threshold_metrics": {
+    "threshold": null,
+    "parameter_kpi_metrics": {
+      "tp": 8,
+      "fp": 20,
+      "fn": 0,
+      "tn": 0,
+      "precision": 0.285714,
+      "recall": 1.0,
+      "f1": 0.444444,
+      "predicted_edges": 28,
+      "target_edges": 8
+    },
+    "full_graph_metrics": {
+      "tp": 23,
+      "fp": 20,
+      "fn": 0,
+      "tn": 0,
+      "precision": 0.534884,
+      "recall": 1.0,
+      "f1": 0.69697,
+      "predicted_edges": 43,
+      "target_edges": 23
+    },
+    "conflict_metrics": {
+      "direct": {
+        "tp": 1,
+        "fp": 0,
+        "fn": 0,
+        "tn": 5,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "predicted_edges": 1,
+        "target_edges": 1
+      },
+      "indirect": {
+        "tp": 1,
+        "fp": 5,
+        "fn": 0,
+        "tn": 0,
+        "precision": 0.166667,
+        "recall": 1.0,
+        "f1": 0.285714,
+        "predicted_edges": 6,
+        "target_edges": 1
+      },
+      "implicit": {
+        "tp": 4,
+        "fp": 2,
+        "fn": 0,
+        "tn": 0,
+        "precision": 0.666667,
+        "recall": 1.0,
+        "f1": 0.8,
+        "predicted_edges": 6,
+        "target_edges": 4
+      }
+    },
+    "predicted_parameter_kpi_edges": [
+      [
+        "P1",
+        "K1"
+      ],
+      [
+        "P1",
+        "K2"
+      ],
+      [
+        "P1",
+        "K3"
+      ],
+      [
+        "P1",
+        "K4"
+      ],
+      [
+        "P2",
+        "K1"
+      ],
+      [
+        "P2",
+        "K2"
+      ],
+      [
+        "P2",
+        "K3"
+      ],
+      [
+        "P2",
+        "K4"
+      ],
+      [
+        "P3",
+        "K1"
+      ],
+      [
+        "P3",
+        "K2"
+      ],
+      [
+        "P3",
+        "K3"
+      ],
+      [
+        "P3",
+        "K4"
+      ],
+      [
+        "P4",
+        "K1"
+      ],
+      [
+        "P4",
+        "K2"
+      ],
+      [
+        "P4",
+        "K3"
+      ],
+      [
+        "P4",
+        "K4"
+      ],
+      [
+        "P5",
+        "K1"
+      ],
+      [
+        "P5",
+        "K2"
+      ],
+      [
+        "P5",
+        "K3"
+      ],
+      [
+        "P5",
+        "K4"
+      ],
+      [
+        "P6",
+        "K1"
+      ],
+      [
+        "P6",
+        "K2"
+      ],
+      [
+        "P6",
+        "K3"
+      ],
+      [
+        "P6",
+        "K4"
+      ],
+      [
+        "P7",
+        "K1"
+      ],
+      [
+        "P7",
+        "K2"
+      ],
+      [
+        "P7",
+        "K3"
+      ],
+      [
+        "P7",
+        "K4"
+      ]
+    ],
+    "predicted_conflicts": {
+      "direct": [
+        [
+          "A1",
+          "A2"
+        ]
+      ],
+      "indirect": [
+        [
+          "A1",
+          "A2"
+        ],
+        [
+          "A1",
+          "A3"
+        ],
+        [
+          "A1",
+          "A4"
+        ],
+        [
+          "A2",
+          "A3"
+        ],
+        [
+          "A2",
+          "A4"
+        ],
+        [
+          "A3",
+          "A4"
+        ]
+      ],
+      "implicit": [
+        [
+          "A1",
+          "A2"
+        ],
+        [
+          "A1",
+          "A3"
+        ],
+        [
+          "A1",
+          "A4"
+        ],
+        [
+          "A2",
+          "A3"
+        ],
+        [
+          "A2",
+          "A4"
+        ],
+        [
+          "A3",
+          "A4"
+        ]
+      ]
+    }
+  },
+  "selected_threshold_metrics": {
+    "threshold": 0.9,
+    "parameter_kpi_metrics": {
+      "tp": 3,
+      "fp": 0,
+      "fn": 5,
+      "tn": 20,
+      "precision": 1.0,
+      "recall": 0.375,
+      "f1": 0.545455,
+      "predicted_edges": 3,
+      "target_edges": 8
+    },
+    "full_graph_metrics": {
+      "tp": 18,
+      "fp": 0,
+      "fn": 5,
+      "tn": 20,
+      "precision": 1.0,
+      "recall": 0.782609,
+      "f1": 0.878049,
+      "predicted_edges": 18,
+      "target_edges": 23
+    },
+    "conflict_metrics": {
+      "direct": {
+        "tp": 1,
+        "fp": 0,
+        "fn": 0,
+        "tn": 5,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "predicted_edges": 1,
+        "target_edges": 1
+      },
+      "indirect": {
+        "tp": 1,
+        "fp": 0,
+        "fn": 0,
+        "tn": 5,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "predicted_edges": 1,
+        "target_edges": 1
+      },
+      "implicit": {
+        "tp": 4,
+        "fp": 0,
+        "fn": 0,
+        "tn": 2,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "predicted_edges": 4,
+        "target_edges": 4
+      }
+    },
+    "predicted_parameter_kpi_edges": [
+      [
+        "P1",
+        "K2"
+      ],
+      [
+        "P3",
+        "K2"
+      ],
+      [
+        "P5",
+        "K3"
+      ]
+    ],
+    "predicted_conflicts": {
+      "direct": [
+        [
+          "A1",
+          "A2"
+        ]
+      ],
+      "indirect": [
+        [
+          "A1",
+          "A2"
+        ]
+      ],
+      "implicit": [
+        [
+          "A1",
+          "A2"
+        ],
+        [
+          "A1",
+          "A3"
+        ],
+        [
+          "A2",
+          "A3"
+        ],
+        [
+          "A3",
+          "A4"
+        ]
+      ]
+    }
+  }
+}

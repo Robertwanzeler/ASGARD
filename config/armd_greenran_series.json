@@ -1,0 +1,100 @@
+{
+  "schema": "greenran.armd_greenran_series.v1",
+  "description": "Editable ARMD-GreenRAN curves. Keep config/article00_reference_fixed.json frozen and update only this file. GreenRAN series refreshed from the final hybrid package that closed 10/10 scenarios at threshold 0.5, subset 450, target epoch 200.",
+  "charts": {
+    "reconstruction_threshold_0_5": {
+      "series": {
+        "ARMD-GreenRAN chosen (450 samples)": {
+          "group": "armd_450",
+          "y": [0.963636, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+      }
+    },
+    "reconstruction_dataset_450_thresholds": {
+      "series": {
+        "ARMD-GreenRAN No Threshold": {
+          "group": "armd_no_threshold",
+          "y": [0.17931, 0.17931, 0.17931, 0.17931, 0.17931, 0.17931, 0.17931],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.2": {
+          "group": "armd_threshold_02",
+          "y": [0.8, 0.916044, 1.0, 1.0, 1.0, 1.0, 1.0],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.5": {
+          "group": "armd_threshold_05",
+          "y": [0.963636, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.9": {
+          "group": "armd_threshold_09",
+          "y": [0.0, 0.214286, 0.941818, 1.0, 1.0, 1.0, 1.0],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+      }
+    },
+    "indirect_threshold_0_5": {
+      "series": {
+        "ARMD-GreenRAN chosen (450 samples)": {
+          "group": "armd_450",
+          "y": [0.883636, 0.96, 1.0, 1.0, 1.0, 1.0, 1.0],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+      }
+    },
+    "indirect_dataset_450_thresholds": {
+      "series": {
+        "ARMD-GreenRAN No Threshold": {
+          "group": "armd_no_threshold",
+          "y": [0.086957, 0.086957, 0.086957, 0.086957, 0.086957, 0.086957, 0.086957],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.2": {
+          "group": "armd_threshold_02",
+          "y": [0.8, 0.811429, 0.984615, 0.984615, 0.984615, 0.984615, 0.984615],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.5": {
+          "group": "armd_threshold_05",
+          "y": [0.883636, 0.96, 1.0, 1.0, 1.0, 1.0, 1.0],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        },
+        "ARMD-GreenRAN 0.9": {
+          "group": "armd_threshold_09",
+          "y": [0.0, 0.057143, 0.758961, 0.96, 0.96, 0.96, 0.96],
+          "yerr": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+      }
+    }
+  },
+  "implicit_450_series": {
+    "no_threshold": [0.086957, 0.086957, 0.086957],
+    "0.20": [0.8, 0.916044, 1.0],
+    "0.50": [0.963636, 1.0, 1.0],
+    "0.90": [0.0, 0.214286, 0.941818]
+  },
+  "sample_series": {
+    "50": {
+      "0.50": {
+        "parameter_kpi_f1": [0.861818, 0.96, 0.945455],
+        "parameter_kpi_f1_std": [0.0, 0.0, 0.0],
+        "indirect_f1": [0.861818, 0.927273, 0.945455],
+        "indirect_f1_std": [0.0, 0.0, 0.0],
+        "implicit_f1": [0.861818, 0.96, 0.945455],
+        "implicit_f1_std": [0.0, 0.0, 0.0]
+      }
+    },
+    "150": {
+      "0.50": {
+        "parameter_kpi_f1": [0.861818, 0.909091, 0.887273],
+        "parameter_kpi_f1_std": [0.0, 0.0, 0.0],
+        "indirect_f1": [0.847273, 0.887273, 0.872727],
+        "indirect_f1_std": [0.0, 0.0, 0.0],
+        "implicit_f1": [0.861818, 0.909091, 0.887273],
+        "implicit_f1_std": [0.0, 0.0, 0.0]
+      }
+    }
+  }
+}

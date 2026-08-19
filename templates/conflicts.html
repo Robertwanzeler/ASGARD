@@ -1,0 +1,605 @@
+{% extends "base.html" %}
+{% block title %}Conflitos O-RAN - GreenRAN rApp{% endblock %}
+{% block content %}
+<style>
+    .conflict-hero {
+        background:
+            radial-gradient(circle at 8% 20%, rgba(0, 255, 136, 0.16), transparent 26%),
+            radial-gradient(circle at 86% 8%, rgba(255, 170, 0, 0.14), transparent 28%),
+            linear-gradient(135deg, #101a32 0%, #16213e 52%, #0b1325 100%);
+        border: 1px solid rgba(0, 255, 136, 0.18);
+        border-radius: 16px;
+        padding: 20px;
+        margin-bottom: 20px;
+    }
+
+    .conflict-hero h4 {
+        color: #ffffff !important;
+        margin-bottom: 8px;
+    }
+
+    .conflict-subtitle {
+        color: #b8c7d9 !important;
+        max-width: 980px;
+        margin-bottom: 0;
+    }
+
+    .graph-shell {
+        background: linear-gradient(180deg, rgba(15, 52, 96, 0.55), rgba(9, 18, 35, 0.85));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 16px;
+        padding: 14px;
+        overflow-x: auto;
+    }
+
+    .conflict-graph {
+        width: 100%;
+        min-width: 980px;
+        height: 420px;
+        display: block;
+    }
+
+    .graph-node rect {
+        fill: #16213e;
+        stroke-width: 2;
+        rx: 14;
+    }
+
+    .graph-node text {
+        fill: #ffffff !important;
+        font-weight: 700;
+        font-size: 13px;
+    }
+
+    .graph-node .node-small {
+        fill: #b8c7d9 !important;
+        font-size: 11px;
+        font-weight: 500;
+    }
+
+    .node-agent rect { stroke: #00ff88; }
+    .node-param rect { stroke: #4db8ff; }
+    .node-kpi rect { stroke: #ffaa00; }
+    .node-rapp rect { stroke: #ff6600; }
+    .node-action rect { stroke: #ff4444; }
+
+    .graph-edge {
+        stroke: rgba(255, 255, 255, 0.55);
+        stroke-width: 2.4;
+        fill: none;
+        marker-end: url(#arrow);
+    }
+
+    .graph-edge-hot {
+        stroke: #ffaa00;
+        stroke-width: 3;
+    }
+
+    .edge-label {
+        fill: #d7e4f2 !important;
+        font-size: 11px;
+        font-weight: 700;
+        paint-order: stroke;
+        stroke: #0b1325;
+        stroke-width: 4px;
+        stroke-linejoin: round;
+    }
+
+    .conflict-type-card {
+        min-height: 140px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 16px;
+        background: rgba(15, 52, 96, 0.42);
+    }
+
+    .conflict-type-card h6 {
+        color: #ffffff !important;
+        margin-bottom: 8px;
+    }
+
+    .conflict-type-card p {
+        color: #b8c7d9 !important;
+        font-size: 0.92rem;
+        margin-bottom: 0;
+    }
+
+    .live-conflict {
+        border-left: 4px solid #ffaa00;
+        background: rgba(255, 170, 0, 0.08);
+        border-radius: 12px;
+        padding: 14px;
+    }
+
+    .live-conflict strong {
+        color: #ffffff !important;
+    }
+
+    .graph-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 18px;
+        margin-top: 12px;
+        color: #b8c7d9 !important;
+        font-size: 0.9rem;
+    }
+
+    .legend-dot {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 6px;
+    }
+
+    .learning-stat {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 14px;
+        padding: 14px;
+        height: 100%;
+    }
+
+    .learning-stat .metric-value {
+        font-size: 1.6rem;
+    }
+
+    .pill-strong {
+        background: rgba(0, 255, 136, 0.15);
+        color: #00ff88 !important;
+        border: 1px solid rgba(0, 255, 136, 0.35);
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 0.8rem;
+    }
+
+    .pill-weak {
+        background: rgba(255, 170, 0, 0.12);
+        color: #ffaa00 !important;
+        border: 1px solid rgba(255, 170, 0, 0.25);
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 0.8rem;
+    }
+
+    .sla-presence-card {
+        background: linear-gradient(180deg, rgba(15, 52, 96, 0.45), rgba(9, 18, 35, 0.88));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 16px;
+        height: 100%;
+    }
+
+    .sla-presence-card h6 {
+        color: #ffffff !important;
+        margin-bottom: 10px;
+    }
+
+    .sla-presence-card p {
+        color: #b8c7d9 !important;
+        margin-bottom: 6px;
+        font-size: 0.92rem;
+    }
+</style>
+
+<div class="conflict-hero">
+    <h4>Gestão de Conflitos O-RAN</h4>
+    <p class="conflict-subtitle">
+        Esta visão acompanha relações entre agentes, parâmetros de controle e KPIs críticos.
+        O rApp usa esse grafo operacional para impedir que energia, ML ou DRL sobrescrevam
+        os SLAs de App1-Vigilância e App2-Monitoramento.
+    </p>
+</div>
+
+<div class="card">
+    <div class="card-header"><h5>Estado Atual das Aplicações</h5></div>
+    <div class="card-body">
+        {% set camera_sla = service_slas.camera if service_slas else {} %}
+        {% set app3_sla = service_slas.app3 if service_slas else {} %}
+        {% set app2_sla = service_slas.app2 if service_slas else {} %}
+        <div class="row g-3">
+            <div class="col-lg-4">
+                <div class="sla-presence-card">
+                    <h6>App1-Vigilância</h6>
+                    <p>
+                        <span class="badge" style="background: {% if camera_sla.status == 'PROTEGIDA' %}#00ff88{% elif camera_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000;">
+                            {{ camera_sla.status or 'INATIVA' }}
+                        </span>
+                    </p>
+                    <p>Câmeras ativas: <strong>{{ camera_sla.active or 0 }}</strong></p>
+                    <p>Throughput mín: <strong>{{ "%.1f"|format(camera_sla.throughput_mbps or 0) }} Mbps</strong></p>
+                    <p>Latência máx: <strong>{{ "%.1f"|format(camera_sla.latency_ms or 0) }} ms</strong></p>
+                    <p>Motivo: <strong>{{ camera_sla.reason or 'Sem dados' }}</strong></p>
+                </div>
+            </div>
+            <div class="col-lg-4">
+                <div class="sla-presence-card">
+                    <h6>App2-Monitoramento</h6>
+                    <p>
+                        <span class="badge" style="background: {% if app2_sla.status == 'PROTEGIDA' %}#00ff88{% elif app2_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000;">
+                            {{ app2_sla.status or 'INATIVA' }}
+                        </span>
+                    </p>
+                    <p>Sensores: <strong>{{ app2_sla.connected or 0 }}/{{ app2_sla.active or 0 }}</strong></p>
+                    <p>Packet loss: <strong>{{ "%.1f"|format(app2_sla.packet_loss_percent or 0) }}%</strong></p>
+                    <p>Latência média: <strong>{{ "%.1f"|format(app2_sla.latency_ms or 0) }} ms</strong></p>
+                    <p>Motivo: <strong>{{ app2_sla.reason or 'Sem dados' }}</strong></p>
+                </div>
+            </div>
+            <div class="col-lg-4">
+                <div class="sla-presence-card">
+                    <h6>App3-Veicular</h6>
+                    <p>
+                        <span class="badge" style="background: {% if app3_sla.status == 'PROTEGIDA' %}#00ff88{% elif app3_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000;">
+                            {{ app3_sla.status or 'INATIVA' }}
+                        </span>
+                    </p>
+                    <p>Veículos ativos: <strong>{{ app3_sla.active or 0 }}</strong></p>
+                    <p>Risco alto / degr.: <strong>{{ app3_sla.high_risk or 0 }} / {{ app3_sla.degraded or 0 }}</strong></p>
+                    <p>Latência máx: <strong>{{ "%.1f"|format(app3_sla.latency_ms or 0) }} ms</strong></p>
+                    <p>Motivo: <strong>{{ app3_sla.reason or 'Sem dados' }}</strong></p>
+                </div>
+            </div>
+        </div>
+        <p class="mt-3 mb-0" style="color:#b8c7d9 !important;">
+            Apps saudáveis podem não aparecer nos eventos recentes abaixo. Esta faixa mostra o estado vivo de App1, App2 e App3 mesmo quando só um deles está em conflito.
+        </p>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header"><h6>Total 24h</h6></div>
+            <div class="card-body"><div class="metric-value">{{ conflict_stats.total }}</div></div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header"><h6>Diretos</h6></div>
+            <div class="card-body"><div class="metric-value">{{ conflict_stats.direct }}</div></div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header"><h6>Indiretos</h6></div>
+            <div class="card-body"><div class="metric-value">{{ conflict_stats.indirect }}</div></div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header"><h6>Implícitos</h6></div>
+            <div class="card-body"><div class="metric-value">{{ conflict_stats.implicit }}</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><h5>Grafo Operacional do Cenário</h5></div>
+    <div class="card-body">
+        <div class="graph-shell">
+            <svg class="conflict-graph" viewBox="0 0 1120 420" role="img" aria-label="Grafo de conflitos O-RAN do GreenRAN">
+                <defs>
+                    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z" fill="#d7e4f2"></path>
+                    </marker>
+                    <filter id="softGlow">
+                        <feGaussianBlur stdDeviation="3" result="coloredBlur"></feGaussianBlur>
+                        <feMerge>
+                            <feMergeNode in="coloredBlur"></feMergeNode>
+                            <feMergeNode in="SourceGraphic"></feMergeNode>
+                        </feMerge>
+                    </filter>
+                </defs>
+
+                <path class="graph-edge" d="M 190 115 C 260 115, 285 85, 345 85"></path>
+                <path class="graph-edge" d="M 190 220 C 260 220, 285 250, 345 250"></path>
+                <path class="graph-edge" d="M 535 85 C 610 85, 630 115, 700 115"></path>
+                <path class="graph-edge" d="M 535 250 C 610 250, 630 300, 700 300"></path>
+                <path class="graph-edge graph-edge-hot" d="M 885 115 C 940 130, 945 205, 985 205"></path>
+                <path class="graph-edge graph-edge-hot" d="M 885 300 C 940 290, 945 230, 985 230"></path>
+                <path class="graph-edge" d="M 190 335 C 390 375, 740 375, 985 255"></path>
+                <path class="graph-edge graph-edge-hot" d="M 985 185 C 935 160, 900 105, 885 105"></path>
+                <path class="graph-edge graph-edge-hot" d="M 985 245 C 940 270, 910 300, 885 300"></path>
+
+                <text class="edge-label" x="248" y="103">controla</text>
+                <text class="edge-label" x="248" y="238">recomenda</text>
+                <text class="edge-label" x="590" y="74">afeta</text>
+                <text class="edge-label" x="590" y="270">afeta</text>
+                <text class="edge-label" x="918" y="150">conflito</text>
+                <text class="edge-label" x="914" y="286">conflito</text>
+                <text class="edge-label" x="470" y="390">CVaR global pode mascarar KPI específico</text>
+                <text class="edge-label" x="920" y="95">mitiga</text>
+                <text class="edge-label" x="920" y="332">mitiga</text>
+
+                <g class="graph-node node-agent" transform="translate(35,70)">
+                    <rect width="155" height="90"></rect>
+                    <text x="18" y="32">xApp Slicer</text>
+                    <text class="node-small" x="18" y="56">slice / prioridade</text>
+                </g>
+                <g class="graph-node node-agent" transform="translate(35,190)">
+                    <rect width="155" height="90"></rect>
+                    <text x="18" y="32">Energy Saver</text>
+                    <text class="node-small" x="18" y="56">potência / economia</text>
+                </g>
+                <g class="graph-node node-agent" transform="translate(35,305)">
+                    <rect width="155" height="70"></rect>
+                    <text x="18" y="30">ML / DRL</text>
+                    <text class="node-small" x="18" y="52">predição e ação</text>
+                </g>
+
+                <g class="graph-node node-param" transform="translate(345,45)">
+                    <rect width="190" height="80"></rect>
+                    <text x="18" y="30">slice_policy</text>
+                    <text class="node-small" x="18" y="52">recursos para câmeras</text>
+                </g>
+                <g class="graph-node node-param" transform="translate(345,210)">
+                    <rect width="190" height="80"></rect>
+                    <text x="18" y="30">energy_policy</text>
+                    <text class="node-small" x="18" y="52">POWER_DOWN / FULL</text>
+                </g>
+
+                <g class="graph-node node-kpi" transform="translate(700,65)" filter="url(#softGlow)">
+                    <rect width="185" height="100"></rect>
+                    <text x="18" y="30">App1 KPIs</text>
+                    <text class="node-small" x="18" y="54">câmera >=25 Mbps</text>
+                    <text class="node-small" x="18" y="74">latência <100 ms</text>
+                </g>
+                <g class="graph-node node-kpi" transform="translate(700,250)" filter="url(#softGlow)">
+                    <rect width="185" height="105"></rect>
+                    <text x="18" y="30">App2 KPIs</text>
+                    <text class="node-small" x="18" y="54">sensores / gateways</text>
+                    <text class="node-small" x="18" y="74">loss / entrega / bateria</text>
+                </g>
+
+                <g class="graph-node node-rapp" transform="translate(985,175)" filter="url(#softGlow)">
+                    <rect width="115" height="90"></rect>
+                    <text x="18" y="32">rApp</text>
+                    <text class="node-small" x="18" y="56">arbiter</text>
+                    <text class="node-small" x="18" y="74">Non-RT RIC</text>
+                </g>
+
+                <g class="graph-node node-action" transform="translate(962,22)">
+                    <rect width="138" height="70"></rect>
+                    <text x="18" y="30">CAMERA</text>
+                    <text class="node-small" x="18" y="52">GUARD / BLOCK</text>
+                </g>
+                <g class="graph-node node-action" transform="translate(962,320)">
+                    <rect width="138" height="70"></rect>
+                    <text x="18" y="30">APP2</text>
+                    <text class="node-small" x="18" y="52">GUARD / BLOCK</text>
+                </g>
+            </svg>
+        </div>
+        <div class="graph-legend">
+            <span><span class="legend-dot" style="background:#00ff88;"></span>Agente/xApp</span>
+            <span><span class="legend-dot" style="background:#4db8ff;"></span>Parâmetro controlado</span>
+            <span><span class="legend-dot" style="background:#ffaa00;"></span>KPI afetado</span>
+            <span><span class="legend-dot" style="background:#ff6600;"></span>Arbitragem do rApp</span>
+            <span><span class="legend-dot" style="background:#ff4444;"></span>Mitigação</span>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-4">
+        <div class="conflict-type-card">
+            <h6>Conflito Direto</h6>
+            <p>Dois agentes tentam controlar o mesmo parâmetro. Exemplo do cenário: decisões concorrentes sobre política de energia.</p>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="conflict-type-card">
+            <h6>Conflito Indireto</h6>
+            <p>Um parâmetro muda um KPI usado por outro serviço. Exemplo: economia reduz margem e App2 perde entrega ou conectividade.</p>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="conflict-type-card">
+            <h6>Conflito Implícito</h6>
+            <p>CVaR global parece saudável, mas um KPI específico de App1/App2 entra em risco. O rApp bloqueia ML/DRL nesse caso.</p>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><h5>Leitura Operacional do Último Conflito</h5></div>
+    <div class="card-body">
+        {% if recent_conflicts %}
+            {% set c = recent_conflicts[0] %}
+            <div class="live-conflict">
+                <strong>{{ c.conflict_type|upper }}</strong> em <strong>{{ c.affected_service }}</strong>:
+                KPI <strong>{{ c.affected_kpi }}</strong> observado em
+                <strong>{{ "%.2f"|format(c.observed_value or 0) }}</strong>
+                contra limiar <strong>{{ "%.2f"|format(c.threshold_value or 0) }}</strong>.
+                Mitigação aplicada: <strong>{{ c.mitigation_action }}</strong>.
+                <div class="mt-2 text-muted">{{ c.graph_path }}</div>
+            </div>
+        {% else %}
+            <div class="text-muted">Nenhum conflito recente para interpretar.</div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><h5>Grafo Aprendido pelos Dados</h5></div>
+    <div class="card-body">
+        {% if learned_report and learned_report.summary %}
+            <div class="row">
+                <div class="col-md-2">
+                    <div class="learning-stat">
+                        <div class="metric-label">Arestas base</div>
+                        <div class="metric-value">{{ learned_report.summary.baseline_edges }}</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="learning-stat">
+                        <div class="metric-label">Arestas aprendidas</div>
+                        <div class="metric-value">{{ learned_report.summary.learned_edges }}</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="learning-stat">
+                        <div class="metric-label">Confirmadas</div>
+                        <div class="metric-value">{{ learned_report.summary.confirmed_by_data }}</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="learning-stat">
+                        <div class="metric-label">Fracas</div>
+                        <div class="metric-value">{{ learned_report.summary.weak_or_low_support }}</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="learning-stat">
+                        <div class="metric-label">Espúrias</div>
+                        <div class="metric-value">{{ learned_report.summary.spurious_in_baseline }}</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="learning-stat">
+                        <div class="metric-label">Emergentes</div>
+                        <div class="metric-value">{{ learned_report.summary.emergent_from_data }}</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="row mt-3">
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header"><h6>Arestas Confirmadas</h6></div>
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table table-sm align-middle">
+                                    <thead>
+                                        <tr>
+                                            <th>Relação</th>
+                                            <th>Base</th>
+                                            <th>Count</th>
+                                            <th>Strength</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                    {% for edge in learned_report.confirmed_by_data[:8] %}
+                                        <tr>
+                                            <td>
+                                                <strong>{{ edge.source }}</strong>
+                                                <div class="text-muted small">{{ edge.relation }} → {{ edge.target }}</div>
+                                            </td>
+                                            <td>{{ edge.baseline_weight }}</td>
+                                            <td>{{ edge.learned_count }}</td>
+                                            <td><span class="pill-strong">{{ "%.2f"|format(edge.learned_strength or 0) }}</span></td>
+                                        </tr>
+                                    {% else %}
+                                        <tr><td colspan="4" class="text-muted">Nenhuma aresta confirmada.</td></tr>
+                                    {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header"><h6>Arestas com Baixo Suporte</h6></div>
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table table-sm align-middle">
+                                    <thead>
+                                        <tr>
+                                            <th>Relação</th>
+                                            <th>Base</th>
+                                            <th>Count</th>
+                                            <th>Strength</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                    {% for edge in learned_report.weak_or_low_support[:8] %}
+                                        <tr>
+                                            <td>
+                                                <strong>{{ edge.source }}</strong>
+                                                <div class="text-muted small">{{ edge.relation }} → {{ edge.target }}</div>
+                                            </td>
+                                            <td>{{ edge.baseline_weight }}</td>
+                                            <td>{{ edge.learned_count }}</td>
+                                            <td><span class="pill-weak">{{ "%.2f"|format(edge.learned_strength or 0) }}</span></td>
+                                        </tr>
+                                    {% else %}
+                                        <tr><td colspan="4" class="text-muted">Nenhuma aresta fraca.</td></tr>
+                                    {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="live-conflict mt-3">
+                O grafo operacional continua sendo a verdade de execução do rApp. O grafo aprendido atua como
+                validação: ele mostra quais relações já foram realmente observadas com força suficiente nos dados
+                e quais ainda precisam de mais amostras do cenário.
+            </div>
+        {% else %}
+            <div class="text-muted">
+                O pipeline de aprendizado ainda não foi executado. Gere os artefatos com
+                <code>python3 scripts/export_conflict_dataset.py</code> e
+                <code>python3 scripts/learn_conflict_matrix.py</code>.
+            </div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><h5>Eventos de Conflito Recentes (60 min)</h5></div>
+    <div class="card-body">
+        <div class="table-responsive">
+        <table class="table align-middle">
+            <thead>
+                <tr>
+                    <th>Timestamp</th>
+                    <th>Tipo</th>
+                    <th>Agente</th>
+                    <th>Serviço</th>
+                    <th>KPI</th>
+                    <th>Valor</th>
+                    <th>Limiar</th>
+                    <th>Mitigação</th>
+                    <th>Razão</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for c in recent_conflicts %}
+                <tr>
+                    <td>{{ c.datetime }}</td>
+                    <td>
+                        {% if c.conflict_type == 'implicit' %}
+                            <span class="badge badge-warning">IMPLICIT</span>
+                        {% elif c.conflict_type == 'indirect' %}
+                            <span class="badge badge-critical">INDIRECT</span>
+                        {% else %}
+                            <span class="badge badge-ok">{{ c.conflict_type|upper }}</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ c.source_agent }}</td>
+                    <td>{{ c.affected_service }}</td>
+                    <td>{{ c.affected_kpi }}</td>
+                    <td>{{ "%.2f"|format(c.observed_value or 0) }}</td>
+                    <td>{{ "%.2f"|format(c.threshold_value or 0) }}</td>
+                    <td>{{ c.mitigation_action }}</td>
+                    <td>
+                        {{ c.reason[:70] }}{% if c.reason|length > 70 %}...{% endif %}
+                        {% if c.graph_path %}
+                            <div class="text-muted small">{{ c.graph_path[:90] }}{% if c.graph_path|length > 90 %}...{% endif %}</div>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% else %}
+                <tr><td colspan="9" class="text-muted">Nenhum conflito registrado no período.</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
