@@ -42,6 +42,7 @@ PROFILES = (
     "postfix_clean",
     "rapp_online_trainable",
     "rapp_online_controlled_trainable",
+    "judge_credit_trainable",
 )
 
 
@@ -158,6 +159,23 @@ def profile_rules(profile: str) -> dict[str, Any]:
             "expected_stage_decisions": dict(POSTFIX_CLEAN_EXPECTED_DECISION),
             "strict_stage_reasons": True,
         }
+    if profile == "judge_credit_trainable":
+        return {
+            "allowed_stages": set(POSTFIX_CLEAN_ALLOWED_STAGES),
+            "require_valid": True,
+            "require_pdcp_real": True,
+            "require_proxy_free": True,
+            "since_ts": POSTFIX_CLEAN_SINCE_TS,
+            "require_metrics": True,
+            # SAC consumes the next state vectors. A final real observation
+            # may have no later extended_metrics row without being an invalid
+            # RL transition, so next_metrics is not mandatory here.
+            "require_next_metrics": False,
+            "require_next_state": True,
+            "require_judge_feedback": True,
+            "expected_stage_decisions": dict(POSTFIX_CLEAN_EXPECTED_DECISION),
+            "strict_stage_reasons": True,
+        }
     return {
         "allowed_stages": {"baseline_healthy"},
         "require_valid": True,
@@ -175,6 +193,9 @@ def should_keep(record: dict[str, Any], rules: dict[str, Any], args: argparse.Na
     quality = record.get("collection_quality") or {}
     metrics = record.get("metrics") or {}
     next_metrics = record.get("next_metrics") or {}
+    next_global_state = record.get("next_global_state") or {}
+    next_slice_state = record.get("next_slice_state") or {}
+    next_du_states = record.get("next_du_states") or []
     stage = str(record.get("scenario_stage") or "unknown")
     timestamp = int(record.get("timestamp") or 0)
     decision = str((record.get("decision") or {}).get("decision") or "unknown")
@@ -185,6 +206,12 @@ def should_keep(record: dict[str, Any], rules: dict[str, Any], args: argparse.Na
         return False, "missing_metrics"
     if bool(rules.get("require_next_metrics")) and not next_metrics:
         return False, "missing_next_metrics"
+    if bool(rules.get("require_next_state")) and not (
+        next_global_state and next_slice_state and next_du_states
+    ):
+        return False, "missing_next_state"
+    if bool(rules.get("require_judge_feedback")) and not bool(record.get("judge_feedback_observed")):
+        return False, "missing_judge_feedback"
 
     if rules["allowed_stages"] is not None and stage not in rules["allowed_stages"]:
         if bool(rules.get("strict_stage_reasons")):
@@ -286,6 +313,8 @@ def main() -> int:
             "since_ts": int(rules.get("since_ts", 0) or 0),
             "require_metrics": bool(rules.get("require_metrics", False)),
             "require_next_metrics": bool(rules.get("require_next_metrics", False)),
+            "require_next_state": bool(rules.get("require_next_state", False)),
+            "require_judge_feedback": bool(rules.get("require_judge_feedback", False)),
             "expected_stage_decisions": dict(expected_stage_decisions),
             "max_p95_ms": args.max_p95_ms,
             "max_cvar_ms": args.max_cvar_ms,

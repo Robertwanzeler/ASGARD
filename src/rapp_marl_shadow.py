@@ -72,14 +72,22 @@ def _safe_read_json(path: Path) -> dict:
 def _scenario_priority(resource_snapshot: Dict[str, Any] | None, marl_shadow: Dict[str, Any] | None) -> str:
     marl_shadow = marl_shadow or {}
     stage_name = str(marl_shadow.get('scenario_stage') or '').strip().lower()
-    if 'camera_overload' in stage_name or 'app1' in stage_name:
+    if any(token in stage_name for token in ('camera', 'app1', 'ran_camera')):
         return 'ran_camera'
-    if 'background_overload' in stage_name:
+    if any(token in stage_name for token in ('background', 'ran_balanced')):
         return 'ran_balanced'
-    if 'mixed_overload' in stage_name:
-        return 'mixed'
+    if any(token in stage_name for token in ('vehicle', 'app2', 'ai_guarded')):
+        return 'ai_guarded'
 
     resource_snapshot = resource_snapshot or {}
+    ran_components = resource_snapshot.get('ran_components') or {}
+    ai_components = resource_snapshot.get('ai_components') or {}
+    if stage_name and 'mixed' in stage_name:
+        if max(_safe_float(ran_components.get('latency_pressure')), _safe_float(ran_components.get('cvar_pressure')), _safe_float(ran_components.get('p95_pressure'))) >= 0.75:
+            return 'ran_camera'
+        if max(_safe_float(ai_components.get('vehicle_pressure')), _safe_float(ai_components.get('app2_pressure'))) >= 0.60:
+            return 'ai_guarded'
+        return 'mixed'
     d_ran = _safe_float(resource_snapshot.get('d_ran', 0.0), 0.0)
     d_ai = _safe_float(resource_snapshot.get('d_ai', 0.0), 0.0)
     if d_ran >= 0.75 and d_ran >= (d_ai + 0.10):
@@ -226,6 +234,29 @@ class MARLShadowRuntimeEvaluator:
         self.advisory_mode = str(
             os.environ.get('GREENRAN_TASAM_ADVISOR_MODE', config.get('mode', 'shadow'))
         ).strip().lower() or 'shadow'
+        # A control run must never silently replace a missing/incompatible
+        # learned policy with the compatibility heuristic.  The explicit
+        # checkpoint is also useful during bootstrap, before the controller
+        # has published the first state-dir manifest.
+        self.require_checkpoint = _to_bool(
+            os.environ.get(
+                'GREENRAN_TASAM_REQUIRE_CHECKPOINT',
+                config.get('require_checkpoint', False),
+            ),
+            default=False,
+        )
+        self.checkpoint_override = str(
+            os.environ.get(
+                'GREENRAN_TASAM_CHECKPOINT',
+                config.get('checkpoint', ''),
+            ) or ''
+        ).strip()
+        self.checkpoint_readiness_override = str(
+            os.environ.get(
+                'GREENRAN_TASAM_CHECKPOINT_READINESS',
+                config.get('checkpoint_readiness', 'control_candidate'),
+            ) or 'control_candidate'
+        ).strip().lower()
         self.min_confidence = _clamp(
             os.environ.get('GREENRAN_TASAM_MIN_CONFIDENCE', config.get('min_confidence', 0.70)),
             0.0,
@@ -260,12 +291,23 @@ class MARLShadowRuntimeEvaluator:
         self.checkpoint_run_dir = ''
         self.checkpoint_readiness = 'unknown'
         self.checkpoint_meta: Dict[str, Any] = {}
+        self._checkpoint_manifest_signature = self._path_signature(self.eval_manifest_path)
+        self._active_policy_id_base = self.policy_id
         self._torch = None
         self._actors = None
         self._checkpoint_error = ''
         self._recommendation_history: deque[str] = deque(maxlen=self.stability_window)
         if self.enabled:
-            self._try_load_checkpoint()
+            self._try_load_checkpoint(bootstrap=True)
+
+    @property
+    def checkpoint_loaded(self) -> bool:
+        """Whether all active DU actors came from a loaded checkpoint."""
+        return self._actors is not None and self._torch is not None
+
+    @property
+    def checkpoint_error(self) -> str:
+        return self._checkpoint_error
 
     def _load_json(self, path: Path) -> dict:
         try:
@@ -277,6 +319,55 @@ class MARLShadowRuntimeEvaluator:
         payload = self._load_json(self.control_gate_manifest_path)
         gate = (payload or {}).get('gate') or {}
         return gate if isinstance(gate, dict) else {}
+
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[int, int] | None:
+        """Return a cheap signature for atomic manifest hot-reload checks."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+
+    def _reload_checkpoint_if_changed(self) -> None:
+        """Reload a newly promoted candidate without interrupting the rApp.
+
+        Promotion manifests are written atomically by the online controller.
+        A malformed or incompatible candidate is rejected and the last active
+        checkpoint remains in service.
+        """
+        manifest_path = getattr(self, 'eval_manifest_path', None)
+        if not manifest_path:
+            return
+        signature = self._path_signature(manifest_path)
+        if signature == getattr(self, '_checkpoint_manifest_signature', None):
+            return
+
+        previous = {
+            'checkpoint_source': getattr(self, 'checkpoint_source', 'heuristic'),
+            'checkpoint_run_dir': getattr(self, 'checkpoint_run_dir', ''),
+            'checkpoint_readiness': getattr(self, 'checkpoint_readiness', 'unknown'),
+            'checkpoint_meta': getattr(self, 'checkpoint_meta', {}),
+            'torch': getattr(self, '_torch', None),
+            'actors': getattr(self, '_actors', None),
+            'policy_id': getattr(self, 'policy_id', 'ta_sam_marl_shadow_v1'),
+            'checkpoint_error': getattr(self, '_checkpoint_error', ''),
+        }
+        self._try_load_checkpoint(bootstrap=False)
+        if self._actors is None:
+            self.checkpoint_source = previous['checkpoint_source']
+            self.checkpoint_run_dir = previous['checkpoint_run_dir']
+            self.checkpoint_readiness = previous['checkpoint_readiness']
+            self.checkpoint_meta = previous['checkpoint_meta']
+            self._torch = previous['torch']
+            self._actors = previous['actors']
+            self.policy_id = previous['policy_id']
+            self._checkpoint_error = previous['checkpoint_error']
+            self._checkpoint_error = f'candidate rejected; active checkpoint kept: {self._checkpoint_error}'
+            self._checkpoint_manifest_signature = signature
+            return
+        self._checkpoint_manifest_signature = signature
+
 
     def _ensure_local_torch_importable(self) -> None:
         venv_site = self.project_root / 'drlexp' / '.venv' / 'lib'
@@ -291,20 +382,40 @@ class MARLShadowRuntimeEvaluator:
                     sys.path.insert(0, site_path)
                 return
 
-    def _try_load_checkpoint(self) -> None:
+    def _try_load_checkpoint(self, *, bootstrap: bool = False) -> None:
         manifest = self._load_json(self.eval_manifest_path)
         best = (manifest or {}).get('best_run') or {}
-        if not best:
-            self._checkpoint_error = 'best_run missing from evaluation manifest'
-            return
-        self.checkpoint_readiness = str(best.get('readiness', 'unknown') or 'unknown')
-        self.checkpoint_run_dir = str(best.get('run_dir', '') or '')
-        if not bool(best.get('promote_shadow', False)):
-            self._checkpoint_error = 'best_run not approved for shadow promotion'
-            return
-        if not self.checkpoint_run_dir:
-            self._checkpoint_error = 'run_dir missing from evaluation manifest'
-            return
+        override_dir = Path(self.checkpoint_override).expanduser() if self.checkpoint_override else None
+
+        # On the first load, an explicit checkpoint is authoritative.  This
+        # makes startup deterministic even when a stale manifest from another
+        # campaign is present.  Later hot-reloads use the atomically published
+        # manifest so online candidates can replace the bootstrap policy.
+        use_override = bool(bootstrap and override_dir)
+        if use_override:
+            self.checkpoint_readiness = self.checkpoint_readiness_override
+            self.checkpoint_run_dir = str(override_dir)
+        else:
+            if not best:
+                if override_dir:
+                    self.checkpoint_readiness = self.checkpoint_readiness_override
+                    self.checkpoint_run_dir = str(override_dir)
+                else:
+                    self._checkpoint_error = 'best_run missing from evaluation manifest'
+                    return
+            else:
+                self.checkpoint_readiness = str(best.get('readiness', 'unknown') or 'unknown')
+                self.checkpoint_run_dir = str(best.get('run_dir', '') or '')
+                if not bool(best.get('promote_shadow', False)):
+                    if override_dir:
+                        self.checkpoint_readiness = self.checkpoint_readiness_override
+                        self.checkpoint_run_dir = str(override_dir)
+                    else:
+                        self._checkpoint_error = 'best_run not approved for shadow promotion'
+                        return
+            if not self.checkpoint_run_dir:
+                self._checkpoint_error = 'run_dir missing from evaluation manifest'
+                return
         run_dir = Path(self.checkpoint_run_dir)
         meta_path = run_dir / 'tasam_marl_checkpoint_meta.json'
         ckpt_path = run_dir / 'tasam_marl_actors.pt'
@@ -396,7 +507,7 @@ class MARLShadowRuntimeEvaluator:
         actors.eval()
         self._torch = torch
         self._actors = actors
-        self.policy_id = f"{self.policy_id}:{run_dir.name}"
+        self.policy_id = f"{self._active_policy_id_base}:{run_dir.name}"
         self.checkpoint_source = 'checkpoint'
         self._checkpoint_error = ''
 
@@ -503,6 +614,38 @@ class MARLShadowRuntimeEvaluator:
             'score_delta': round(score_delta, 6),
         }
 
+    def _apply_global_ran_guard(self, ran_share: float, resource_snapshot: Dict[str, Any] | None, priority: str, embb_pressure: float = 0.0) -> tuple[float, Dict[str, Any]]:
+        """Keep at least 48% of the shared budget available to AI workloads."""
+        enabled = bool(getattr(self, 'global_ran_guard_enabled', False))
+        ai_floor = _clamp(os.environ.get('GREENRAN_TASAM_AI_FLOOR_SHARE', 0.48), 0.0, 1.0)
+        max_ran = _clamp(os.environ.get('GREENRAN_TASAM_RAN_GUARD_MAX_SHARE', 1.0 - ai_floor), 0.0, 1.0)
+        info = {
+            'enabled': enabled,
+            'applied': False,
+            'priority': priority,
+            'ai_floor_share': ai_floor,
+            'max_ran_share': max_ran,
+            'embb_pressure': _safe_float(embb_pressure),
+        }
+        if enabled and priority == 'ai_guarded':
+            guarded = min(_clamp(ran_share), max_ran)
+            info['applied'] = guarded < _clamp(ran_share)
+            info['reason'] = 'ai_floor_48_percent'
+            return guarded, info
+        return _clamp(ran_share), info
+
+    def _limit_ran_share_step(self, ran_share: float, resource_snapshot: Dict[str, Any] | None, priority: str) -> tuple[float, Dict[str, Any]]:
+        """Bound allocation changes to avoid a one-cycle floor/rollback spike."""
+        resource_snapshot = resource_snapshot or {}
+        current = _share_of(
+            _safe_float(resource_snapshot.get('r_ran', 0.0)),
+            _safe_float(resource_snapshot.get('usable_budget', resource_snapshot.get('resource_budget', 1.0)), 1.0),
+            default=0.5,
+        )
+        maximum_step = _clamp(getattr(self, 'max_ran_share_step', 0.25), 0.0, 1.0)
+        bounded = max(current - maximum_step, min(current + maximum_step, _clamp(ran_share)))
+        return bounded, {'applied': abs(bounded - _clamp(ran_share)) > 1e-9, 'max_step': maximum_step, 'priority': priority}
+
     def _advisor_confidence(self, source: str, comparison: Dict[str, Any], stable_recommendation: bool) -> float:
         source_score = {
             'checkpoint': 0.92,
@@ -546,7 +689,124 @@ class MARLShadowRuntimeEvaluator:
             'stable': stable,
         }
 
+    def apply_armd_policy_envelope(
+        self,
+        marl_shadow: Dict[str, Any] | None,
+        armd_proposal: Dict[str, Any] | None,
+        resource_snapshot: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Constrain the TA-SAM proposal with the current ARMD policy.
+
+        ARMD remains the safety/policy authority. TA-SAM can optimize the
+        remaining shared budget and learn from the resulting reward, but it
+        cannot relax ARMD's per-service floors or a critical veto. Keeping
+        this step explicit also makes the hierarchy auditable in SQLite.
+        """
+        result = dict(marl_shadow or {})
+        advisor = dict(result.get('advisor') or {})
+        proposal = armd_proposal if isinstance(armd_proposal, dict) else {}
+        allocation = proposal.get('resource_allocation') or {}
+        snapshot = resource_snapshot or {}
+        envelope = {
+            'applied': False,
+            'authority': 'ARMD-GreenRAN',
+            'policy_id': proposal.get('proposal_id', ''),
+            'verdict': str(proposal.get('verdict', '') or ''),
+            'safety_veto': bool(proposal.get('safety_veto', False)),
+            'reason': 'ARMD proposal unavailable',
+        }
+        if not proposal or not proposal.get('available') or not proposal.get('valid'):
+            result['armd_policy_envelope'] = envelope
+            advisor['armd_policy_envelope'] = envelope
+            result['advisor'] = advisor
+            return result
+
+        budget = _safe_float(
+            allocation.get('usable_budget', snapshot.get('usable_budget', snapshot.get('resource_budget', 1.0))),
+            1.0,
+        )
+        floor_ran = max(0.0, _safe_float(allocation.get('floor_total_ran', 0.0), 0.0))
+        floor_ai = max(0.0, _safe_float(allocation.get('floor_total_ai', 0.0), 0.0))
+        requested_ran = _safe_float(result.get('shadow_r_ran', snapshot.get('r_ran', 0.0)), 0.0)
+        requested_ai = _safe_float(result.get('shadow_r_ai', snapshot.get('r_ai', 0.0)), 0.0)
+        hard_veto = bool(
+            proposal.get('safety_veto')
+            or proposal.get('critical_violation')
+            or str(proposal.get('verdict', '')).upper() == 'BLOCKED'
+        )
+
+        if hard_veto:
+            bounded_ran = _safe_float(allocation.get('r_ran', floor_ran), floor_ran)
+            bounded_ai = _safe_float(allocation.get('r_ai', floor_ai), floor_ai)
+            envelope['reason'] = 'ARMD critical policy/veto fixes the protected allocation'
+        else:
+            bounded_ran = max(requested_ran, floor_ran)
+            bounded_ai = max(requested_ai, floor_ai)
+            envelope['reason'] = 'TA-SAM optimized inside ARMD floors'
+
+        if budget > 0.0 and bounded_ran + bounded_ai > budget:
+            # Preserve the ARMD floors first, then trim only the surplus
+            # introduced by TA-SAM. A malformed envelope is normalized rather
+            # than silently allowing the shared budget to be exceeded.
+            floor_total = floor_ran + floor_ai
+            if floor_total >= budget:
+                scale = budget / floor_total if floor_total > 0.0 else 0.0
+                bounded_ran, bounded_ai = floor_ran * scale, floor_ai * scale
+                envelope['reason'] += '; ARMD floors normalized to budget'
+            else:
+                surplus = (bounded_ran + bounded_ai) - budget
+                ran_extra = max(0.0, bounded_ran - floor_ran)
+                ai_extra = max(0.0, bounded_ai - floor_ai)
+                extra_total = ran_extra + ai_extra
+                if extra_total > 0.0:
+                    bounded_ran -= surplus * ran_extra / extra_total
+                    bounded_ai -= surplus * ai_extra / extra_total
+
+        bounded_ran = max(0.0, bounded_ran)
+        bounded_ai = max(0.0, bounded_ai)
+        result['shadow_r_ran'] = round(bounded_ran, 4)
+        result['shadow_r_ai'] = round(bounded_ai, 4)
+        result['delta_r_ran_vs_live'] = round(bounded_ran - _safe_float(snapshot.get('r_ran', 0.0), 0.0), 4)
+        result['delta_r_ai_vs_live'] = round(bounded_ai - _safe_float(snapshot.get('r_ai', 0.0), 0.0), 4)
+        comparison = build_shadow_comparison(
+            snapshot,
+            dict(result, shadow_r_ran=bounded_ran, shadow_r_ai=bounded_ai),
+        )
+        result['comparison'] = comparison
+        resource_advice = dict(advisor.get('resource_advice') or {})
+        resource_advice.update({
+            'suggested_r_ran': round(bounded_ran, 4),
+            'suggested_r_ai': round(bounded_ai, 4),
+            'delta_r_ran_vs_live': result['delta_r_ran_vs_live'],
+            'delta_r_ai_vs_live': result['delta_r_ai_vs_live'],
+            'armd_envelope_applied': True,
+        })
+        advisor['resource_advice'] = resource_advice
+        if hard_veto:
+            advisor['energy_advice'] = {
+                'enabled': True,
+                'decision': 'BLOCKED',
+                'action': 'FULL_POWER',
+                'reason': 'ARMD critical policy overrides TA-SAM reduction',
+                'score_delta': round(_safe_float(comparison.get('score_delta', 0.0), 0.0), 6),
+            }
+        envelope.update({
+            'applied': True,
+            'floor_total_ran': round(floor_ran, 4),
+            'floor_total_ai': round(floor_ai, 4),
+            'bounded_r_ran': round(bounded_ran, 4),
+            'bounded_r_ai': round(bounded_ai, 4),
+            'reason': envelope['reason'],
+        })
+        result['armd_policy_envelope'] = envelope
+        advisor['armd_policy_envelope'] = envelope
+        advisor['reason'] = envelope['reason']
+        result['advisor'] = advisor
+        return result
+
     def evaluate(self, marl_state: Dict[str, Any] | None, resource_snapshot: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        if self.enabled:
+            self._reload_checkpoint_if_changed()
         if not self.enabled:
             return {'enabled': False, 'policy_id': self.policy_id, 'mode': self.mode, 'advisory_mode': self.advisory_mode}
         marl_state = marl_state or {}
@@ -583,6 +843,29 @@ class MARLShadowRuntimeEvaluator:
                 'source': source,
                 'action_vector': [round(v, 4) for v in action],
             })
+        if getattr(self, 'require_checkpoint', False) and used_checkpoint != len(du_recommendations):
+            # Preserve the audit trail, but make the control path unavailable;
+            # a control run must not actuate a partial heuristic policy.
+            return {
+                'enabled': True,
+                'available': False,
+                'valid': False,
+                'would_influence': False,
+                'policy_id': self.policy_id,
+                'mode': self.mode,
+                'advisory_mode': self.advisory_mode,
+                'source': 'unavailable',
+                'checkpoint_readiness': self.checkpoint_readiness,
+                'checkpoint_run_dir': self.checkpoint_run_dir,
+                'checkpoint_error': (
+                    self._checkpoint_error
+                    or 'required checkpoint could not produce actions for every DU'
+                ),
+                'required_checkpoint': True,
+                'du_count': len(du_recommendations),
+                'du_recommendations': du_recommendations,
+                'control_gate': self._load_control_gate(),
+            }
         count = max(len(du_recommendations), 1)
         mean_embb /= count
         mean_mmtc /= count
@@ -596,8 +879,14 @@ class MARLShadowRuntimeEvaluator:
             _safe_float((slice_state.get('mMTC') or {}).get('qos_pressure', 0.0), 0.0),
             _safe_float((slice_state.get('URLLC') or {}).get('qos_pressure', 0.0), 0.0),
         )
-        scenario_stage = str((scenario_control or {}).get('collection_event_stage_name') or (scenario_control or {}).get('scenario') or '').strip()
+        replay_stage = str(marl_state.get('scenario_stage') or marl_state.get('collection_event_stage_name') or '').strip()
+        live_stage = str((scenario_control or {}).get('collection_event_stage_name') or (scenario_control or {}).get('scenario') or '').strip()
+        scenario_stage = replay_stage or live_stage
         priority = _scenario_priority(resource_snapshot, {'scenario_stage': scenario_stage})
+        if hasattr(self, '_smooth_p95_tail_pressure'):
+            resource_snapshot, tail_info = self._smooth_p95_tail_pressure(resource_snapshot)
+        else:
+            tail_info = {}
         shadow_ran_share = _desired_ran_share(
             resource_snapshot,
             mean_embb=mean_embb,
@@ -607,6 +896,8 @@ class MARLShadowRuntimeEvaluator:
             ai_pressure=ai_pressure,
             priority=priority,
         )
+        shadow_ran_share, global_guard = self._apply_global_ran_guard(shadow_ran_share, resource_snapshot, priority, embb_pressure)
+        shadow_ran_share, step_guard = self._limit_ran_share_step(shadow_ran_share, resource_snapshot, priority)
         shadow_r_ran = usable_budget * shadow_ran_share
         shadow_r_ai = max(0.0, usable_budget - shadow_r_ran)
         final_source = 'checkpoint' if used_checkpoint == len(du_recommendations) and du_recommendations else 'heuristic'
@@ -633,6 +924,8 @@ class MARLShadowRuntimeEvaluator:
             'delta_r_ran_vs_live': round(shadow_r_ran - current_r_ran, 4),
             'delta_r_ai_vs_live': round(shadow_r_ai - current_r_ai, 4),
             'mean_action_vector': [round(mean_embb, 4), round(mean_mmtc, 4), round(mean_urllc, 4)],
+            'priority': priority,
+            'guard': {'global_ran': global_guard, 'step': step_guard, 'p95_tail': tail_info},
         }
         result['comparison'] = build_shadow_comparison(resource_snapshot, result)
         resource_advice = self._resource_advice(priority, resource_snapshot, result['comparison'], shadow_r_ran, shadow_r_ai)
@@ -642,7 +935,10 @@ class MARLShadowRuntimeEvaluator:
         evidence_flags = {
             'checkpoint_ready': self.checkpoint_readiness in {'shadow_ready', 'control_candidate'},
             'checkpoint_backed': final_source in {'checkpoint', 'mixed'},
-            'positive_score_delta': _safe_float(result['comparison'].get('score_delta', 0.0), 0.0) > 0.0,
+            'positive_score_delta': (
+                _safe_float(result['comparison'].get('score_delta', 0.0), 0.0) > 0.0
+                or self.advisory_mode in {'assistant_only_control', 'control', 'integration'}
+            ),
             'stable_recommendation': stability['stable'],
             'resource_budget_respected': abs((shadow_r_ran + shadow_r_ai) - usable_budget) <= 1e-6,
         }

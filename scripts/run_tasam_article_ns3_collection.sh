@@ -18,6 +18,7 @@ export GREENRAN_COLLECTION_EVENT_TIME_SOURCE="${GREENRAN_COLLECTION_EVENT_TIME_S
 # Article track default: GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES="1".
 export GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES="${GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES:-1}"
 export GREENRAN_START_RIC="${GREENRAN_START_RIC:-0}"
+export GREENRAN_XAPP_MODE="${GREENRAN_XAPP_MODE:-file}"
 
 . "$SCRIPT_DIR/core_runtime.sh"
 load_greenran_runtime
@@ -45,6 +46,8 @@ export GREENRAN_NS3_ENABLE_E2_FILE_LOGGING="${GREENRAN_NS3_ENABLE_E2_FILE_LOGGIN
 export GREENRAN_NS3_BEARER_STATS_EPOCH_MS="${GREENRAN_NS3_BEARER_STATS_EPOCH_MS:-100}"
 export GREENRAN_COLLECTION_EVENT_LOG="${GREENRAN_COLLECTION_EVENT_LOG:-$GREENRAN_STATE_DIR/collection_event_alternator.log}"
 export GREENRAN_COLLECTION_EVENT_PID="${GREENRAN_COLLECTION_EVENT_PID:-$GREENRAN_STATE_DIR/collection_event_alternator.pid}"
+export GREENRAN_COLLECTION_STARTUP_WAIT_SECONDS="${GREENRAN_COLLECTION_STARTUP_WAIT_SECONDS:-120}"
+export GREENRAN_NS3_SUPERVISOR_LAUNCH_LOG="${GREENRAN_NS3_SUPERVISOR_LAUNCH_LOG:-$GREENRAN_STATE_DIR/ns3_supervisor_launch.log}"
 
 mkdir -p "$GREENRAN_STATE_DIR/xapp_metrics" "$GREENRAN_STATE_DIR/xapp_intents" "$GREENRAN_STATE_DIR/rapp_policies" "$GREENRAN_NS3_CWD"
 mkdir -p "$GREENRAN_DB_SNAPSHOT_DIR" "$GREENRAN_TASAM_EXPORT_DIR"
@@ -118,11 +121,12 @@ start_ns3() {
     GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH="$GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH" \
     GREENRAN_NS3_USE_MC_UE_DEVICES="$GREENRAN_NS3_USE_MC_UE_DEVICES" \
     GREENRAN_NS3_E2NR_ENABLED="$GREENRAN_NS3_E2NR_ENABLED" \
+    GREENRAN_NS3_E2DU_ENABLED="$GREENRAN_NS3_E2DU_ENABLED" \
     GREENRAN_NS3_E2CUUP_ENABLED="$GREENRAN_NS3_E2CUUP_ENABLED" \
     GREENRAN_NS3_ENABLE_E2_FILE_LOGGING="$GREENRAN_NS3_ENABLE_E2_FILE_LOGGING" \
     GREENRAN_NS3_BEARER_STATS_EPOCH_MS="$GREENRAN_NS3_BEARER_STATS_EPOCH_MS" \
     GREENRAN_RAN_PRESSURE_PROFILE="$GREENRAN_RAN_PRESSURE_PROFILE" \
-    "$PROJECT_ROOT/scripts/start_ns3_supervisor.sh" >/dev/null 2>&1 &
+    "$PROJECT_ROOT/scripts/start_ns3_supervisor.sh" > "$GREENRAN_NS3_SUPERVISOR_LAUNCH_LOG" 2>&1 &
   sleep 1
 }
 
@@ -145,6 +149,11 @@ start_db_snapshot_service() {
 }
 
 start_tasam_export_service() {
+  if [[ "${GREENRAN_TASAM_EXPORT_ENABLED:-1}" != "1" ]]; then
+    rm -f "$GREENRAN_TASAM_EXPORT_PID"
+    printf '[TASAM_EXPORT] disabled by runtime config; targeted monitor remains authoritative\n' > "$GREENRAN_TASAM_EXPORT_LOG"
+    return 0
+  fi
   setsid /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_TASAM_EXPORT_DIR='$GREENRAN_TASAM_EXPORT_DIR' GREENRAN_TASAM_EXPORT_LIMIT='$GREENRAN_TASAM_EXPORT_LIMIT' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/run_tasam_article_export.py --db '$GREENRAN_DB_PATH' --output-dir '$GREENRAN_TASAM_EXPORT_DIR'; code=\$?; else echo \"[TASAM_EXPORT] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[TASAM_EXPORT] cycle finished with code \$code at \$(date -Is); sleeping ${GREENRAN_TASAM_EXPORT_INTERVAL}s\"; sleep '$GREENRAN_TASAM_EXPORT_INTERVAL'; done" > "$GREENRAN_TASAM_EXPORT_LOG" 2>&1 &
   echo $! > "$GREENRAN_TASAM_EXPORT_PID"
   sleep 1
@@ -158,7 +167,7 @@ start_tasam_true_online_real_service() {
 EOF
     return 0
   fi
-  setsid /bin/bash -lc "cd '$PROJECT_ROOT' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/run_tasam_true_online_real.py --db '$GREENRAN_DB_PATH' --output-root '$GREENRAN_TASAM_TRUE_ONLINE_DIR' --train-python '$GREENRAN_TASAM_TRUE_ONLINE_TRAIN_PYTHON' --min-new-snapshots '$GREENRAN_TASAM_TRUE_ONLINE_MIN_NEW_SNAPSHOTS' --min-trainable-transitions '$GREENRAN_TASAM_TRUE_ONLINE_MIN_TRAINABLE_TRANSITIONS' --bootstrap-epochs '$GREENRAN_TASAM_TRUE_ONLINE_BOOTSTRAP_EPOCHS' --epochs-per-update '$GREENRAN_TASAM_TRUE_ONLINE_EPOCHS_PER_UPDATE' --poll-seconds '$GREENRAN_TASAM_TRUE_ONLINE_INTERVAL'; code=\$?; else echo \"[TASAM_TRUE_ONLINE_REAL] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[TASAM_TRUE_ONLINE_REAL] runner exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_TASAM_TRUE_ONLINE_LOG" 2>&1 &
+  setsid /bin/bash -lc "cd '$PROJECT_ROOT' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/run_tasam_true_online_real.py --db '$GREENRAN_DB_PATH' --output-root '$GREENRAN_TASAM_TRUE_ONLINE_DIR' --train-python '$GREENRAN_TASAM_TRUE_ONLINE_TRAIN_PYTHON' --init-checkpoint-dir '$GREENRAN_TASAM_TRUE_ONLINE_INIT_CHECKPOINT' --seed '$GREENRAN_TASAM_TRUE_ONLINE_SEED' --min-new-snapshots '$GREENRAN_TASAM_TRUE_ONLINE_MIN_NEW_SNAPSHOTS' --min-trainable-transitions '$GREENRAN_TASAM_TRUE_ONLINE_MIN_TRAINABLE_TRANSITIONS' --bootstrap-epochs '$GREENRAN_TASAM_TRUE_ONLINE_BOOTSTRAP_EPOCHS' --epochs-per-update '$GREENRAN_TASAM_TRUE_ONLINE_EPOCHS_PER_UPDATE' --poll-seconds '$GREENRAN_TASAM_TRUE_ONLINE_INTERVAL'; code=\$?; else echo \"[TASAM_TRUE_ONLINE_REAL] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[TASAM_TRUE_ONLINE_REAL] runner exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_TASAM_TRUE_ONLINE_LOG" 2>&1 &
   echo $! > "$GREENRAN_TASAM_TRUE_ONLINE_PID"
   sleep 1
 }
@@ -207,11 +216,12 @@ else
 fi
 start_if_missing "$GREENRAN_COLLECTION_EVENT_PID" start_collection_event_service
 
-for _ in $(seq 1 60); do
+startup_deadline=$((SECONDS + GREENRAN_COLLECTION_STARTUP_WAIT_SECONDS))
+while (( SECONDS < startup_deadline )); do
   if [[ -f "$GREENRAN_DB_PATH" && -f "$GREENRAN_STATE_DIR/xapp_metrics/extended_metrics.json" ]]; then
     break
   fi
-  sleep 2
+  sleep 1
 done
 
 echo "TA-SAM article ns-3 collection"
@@ -225,7 +235,7 @@ echo "  mmWaveDU: $GREENRAN_NS3_MMWAVE_ENB_NODES"
 echo "  speed:    ${GREENRAN_NS3_UE_SPEED_MIN}-${GREENRAN_NS3_UE_SPEED_MAX} m/s"
 echo "  traces:   $GREENRAN_NS3_CWD"
 echo "  snapshots:$GREENRAN_DB_SNAPSHOT_DIR"
-echo "  exports:  $GREENRAN_TASAM_EXPORT_DIR"
+echo "  exports:  $GREENRAN_TASAM_EXPORT_DIR (enabled=${GREENRAN_TASAM_EXPORT_ENABLED:-1})"
 if [[ "${GREENRAN_TASAM_TRUE_ONLINE_ENABLED:-1}" == "1" ]]; then
   echo "  online:   real cadence=+${GREENRAN_TASAM_TRUE_ONLINE_MIN_NEW_SNAPSHOTS} snapshots min=${GREENRAN_TASAM_TRUE_ONLINE_MIN_TRAINABLE_TRANSITIONS} transicoes epochs=${GREENRAN_TASAM_TRUE_ONLINE_BOOTSTRAP_EPOCHS}/+${GREENRAN_TASAM_TRUE_ONLINE_EPOCHS_PER_UPDATE}"
 else
@@ -242,3 +252,25 @@ echo
 echo "Acompanhar:"
 echo "  GREENRAN_STATE_DIR='$GREENRAN_STATE_DIR' python3 scripts/status.py"
 echo "  watch -n 5 \"GREENRAN_STATE_DIR='$GREENRAN_STATE_DIR' python3 scripts/status.py\""
+
+if [[ "${GREENRAN_WAIT_FOR_DECISION_TARGET:-0}" == "1" ]]; then
+  target_pid=""
+  if [[ -f "$GREENRAN_STATE_DIR/decision_target_supervisor.pid" ]]; then
+    target_pid="$(cat "$GREENRAN_STATE_DIR/decision_target_supervisor.pid" 2>/dev/null || true)"
+  fi
+  while [[ -n "$target_pid" ]] && kill -0 "$target_pid" 2>/dev/null; do
+    sleep 2
+  done
+fi
+
+# Some launchers intentionally keep the runtime parent alive so that system
+# supervisors/PTYs do not reap the detached collectors.  The default remains
+# the historical one-shot launcher behaviour.
+if [[ "${GREENRAN_KEEP_FOREGROUND:-0}" == "1" ]]; then
+  while [[ -f "$GREENRAN_NS3_SUPERVISOR_PID" ]]; do
+    supervisor_pid="$(cat "$GREENRAN_NS3_SUPERVISOR_PID" 2>/dev/null || true)"
+    [[ -n "$supervisor_pid" ]] || break
+    kill -0 "$supervisor_pid" 2>/dev/null || break
+    sleep 5
+  done
+fi

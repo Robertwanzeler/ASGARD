@@ -32,6 +32,9 @@ def _record(
         "decision": {"decision": decision},
         "metrics": metrics if metrics is not None else {"latency_p95_us": 24000.0, "cvar_per_ue_us": 32000.0},
         "next_metrics": next_metrics if next_metrics is not None else {"latency_p95_us": 24000.0, "cvar_per_ue_us": 32000.0},
+        "next_global_state": {"state_vector": [0.1]},
+        "next_slice_state": {"URLLC": {}},
+        "next_du_states": [{"du_id": "du0"}],
         "collection_quality": {
             "valid_for_training": valid_for_training,
             "collector_mode": "pdcp_real",
@@ -42,6 +45,43 @@ def _record(
 
 
 class TestFilterTasamTrace(unittest.TestCase):
+    def test_judge_credit_profile_requires_observed_feedback(self):
+        rules = profile_rules("judge_credit_trainable")
+        args = mock.Mock(max_p95_ms=None, max_cvar_ms=None)
+        record = _record(
+            timestamp=POSTFIX_CLEAN_SINCE_TS,
+            stage="vehicle_blocked",
+            decision="BLOCKED",
+        )
+        keep, reason = should_keep(record, rules, args)
+        self.assertFalse(keep)
+        self.assertEqual(reason, "missing_judge_feedback")
+
+        record["judge_feedback_observed"] = True
+        record["tasam_credit"] = 1.0
+        keep, reason = should_keep(record, rules, args)
+        self.assertTrue(keep)
+        self.assertEqual(reason, "kept")
+
+    def test_judge_credit_profile_accepts_final_real_transition_without_next_metrics(self):
+        rules = profile_rules("judge_credit_trainable")
+        args = mock.Mock(max_p95_ms=None, max_cvar_ms=None)
+        record = _record(
+            timestamp=POSTFIX_CLEAN_SINCE_TS,
+            stage="vehicle_blocked",
+            decision="BLOCKED",
+            next_metrics={},
+        )
+        record.update({
+            "next_global_state": {"state_vector": [0.1]},
+            "next_slice_state": {"URLLC": {}},
+            "next_du_states": [{"du_id": "du0"}],
+            "judge_feedback_observed": True,
+        })
+        keep, reason = should_keep(record, rules, args)
+        self.assertTrue(keep)
+        self.assertEqual(reason, "kept")
+
     def test_rapp_online_trainable_keeps_controlled_runtime_samples(self):
         rules = profile_rules("rapp_online_trainable")
         self.assertTrue(rules["require_pdcp_real"])

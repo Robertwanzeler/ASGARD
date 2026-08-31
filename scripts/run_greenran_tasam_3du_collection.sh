@@ -25,7 +25,10 @@ export GREENRAN_REQUIRE_REAL_PDCP="${GREENRAN_REQUIRE_REAL_PDCP:-0}"
 export GREENRAN_START_RIC="${GREENRAN_START_RIC:-1}"
 # The GreenRAN line-2 collector must receive real PDCP/E2 observations.  The
 # article reproduction keeps its conservative E2 defaults in the parent script.
-export GREENRAN_NS3_E2NR_ENABLED="${GREENRAN_NS3_E2NR_ENABLED:-true}"
+# This build's NR E2 path aborts during initialization (SIGSEGV), while the
+# DU report path is stable and still provides E2 PM telemetry to the RIC.
+# Keep NR opt-in until the mmWave-LENA E2-NR module is rebuilt/fixed.
+export GREENRAN_NS3_E2NR_ENABLED="${GREENRAN_NS3_E2NR_ENABLED:-false}"
 export GREENRAN_NS3_E2DU_ENABLED="${GREENRAN_NS3_E2DU_ENABLED:-true}"
 export GREENRAN_NS3_E2CUUP_ENABLED="${GREENRAN_NS3_E2CUUP_ENABLED:-false}"
 export GREENRAN_NS3_E2CUCP_ENABLED="${GREENRAN_NS3_E2CUCP_ENABLED:-false}"

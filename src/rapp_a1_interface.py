@@ -167,11 +167,18 @@ class A1PolicyInterface:
             'domain': decision.get('armd_domain', ''),
             'source': decision.get('armd_source', ''),
             'confidence': float(decision.get('armd_confidence', 0.0) or 0.0),
+            'proposal_present': bool(decision.get('armd_proposal_present', False)),
+            'proposal_valid': bool(decision.get('armd_proposal_valid', False)),
+            'proposal_kind': decision.get('armd_proposal_kind', 'missing'),
             'override_applied': bool(decision.get('armd_override_applied', False)),
             'expected_energy_saver': decision.get('armd_expected_energy_saver', ''),
             'expected_action': decision.get('armd_expected_action', ''),
             'reason': decision.get('armd_reason', ''),
             'evidence': decision.get('armd_evidence', []),
+            'selected_assistant': decision.get('selected_assistant', ''),
+            'selected_proposal_id': decision.get('selected_proposal_id', ''),
+            'rapp_judge_conflict_type': decision.get('rapp_judge_conflict_type', ''),
+            'proposal_applied_exactly': bool(decision.get('proposal_applied_exactly', False)),
         }
     
     def check_ack(self, policy_type):
@@ -346,7 +353,15 @@ class A1PolicyInterface:
             print(f"[A1] ERRO ao enviar política de energia: {e}")
             return None
     
-    def send_slice_policy(self, slicer_state, cameras_demand=None, prb_allocation=None, armd_info=None):
+    def send_slice_policy(
+        self,
+        slicer_state,
+        cameras_demand=None,
+        prb_allocation=None,
+        armd_info=None,
+        per_ue_allocation=None,
+        per_ue_context=None,
+    ):
         """
         Envia política de fatiamento para Near-RT RIC.
         
@@ -354,6 +369,12 @@ class A1PolicyInterface:
             slicer_state: Estado do SLICER
             cameras_demand: Dict opcional com demanda de câmeras
             prb_allocation: Dict opcional com alocação de PRBs
+            per_ue_allocation: Lista de reservas individuais calculada pelos
+                assistentes. A aplicação física fica pendente de ACK do
+                consumidor da política.
+            per_ue_context: Totais agregados da alocação calculada. O
+                consumidor usa esses totais para validar que a soma das
+                reservas individuais não foi alterada no transporte A1.
         
         Returns:
             Dict com política enviada.
@@ -407,6 +428,28 @@ class A1PolicyInterface:
                 'armd_attention_domain': (armd_info or {}).get('domain', ''),
             }
         }
+
+        if per_ue_allocation:
+            per_ue_context = per_ue_context if isinstance(per_ue_context, dict) else {}
+            policy['per_ue_resource_policy'] = {
+                'version': 'per_ue_floor_v1',
+                'application_status': 'pending_ack',
+                'ack_required': True,
+                'policy_id': policy_id,
+                'floor_policy': 'sla_per_ue_v1',
+                'allocations': per_ue_allocation,
+                'allocation_count': len(per_ue_allocation),
+                'floor_violation_count': sum(
+                    1 for item in per_ue_allocation
+                    if not bool((item or {}).get('floor_met', False))
+                ),
+                'r_ran': float(per_ue_context.get('r_ran', 0.0) or 0.0),
+                'r_ai': float(per_ue_context.get('r_ai', 0.0) or 0.0),
+                'usable_budget': float(per_ue_context.get('usable_budget', 0.0) or 0.0),
+                'allocation_state': str(
+                    per_ue_context.get('allocation_state', slicer_state) or slicer_state
+                ).upper(),
+            }
 
         if armd_info:
             policy['armd'] = {

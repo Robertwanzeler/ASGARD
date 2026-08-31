@@ -145,7 +145,26 @@ class ARMDRuntimeAdvisor:
         candidates.extend(self._vehicle_candidates(vehicle_metrics, vehicle_state, global_healthy))
 
         if not candidates:
-            advice["reason"] = "no validated ARMD scenario matched current metrics"
+            # A healthy/no-match cycle is still an ARMD proposal. It is a
+            # neutral recommendation, not an absence of the assistant.
+            advice.update(
+                {
+                    "available": True,
+                    "proposal_present": True,
+                    "proposal_valid": True,
+                    "proposal_kind": "neutral_noop",
+                    "scenario": "greenran_global_noop",
+                    "domain": "global",
+                    "expected_energy_saver": str(
+                        decision.get("energy_saver", "CONDITIONAL") or "CONDITIONAL"
+                    ).upper(),
+                    "expected_action": str(
+                        decision.get("action", "FULL_POWER_GUARD") or "FULL_POWER_GUARD"
+                    ),
+                    "source": "runtime_neutral",
+                    "reason": "no validated ARMD risk matched; neutral proposal",
+                }
+            )
             return advice
 
         best = max(candidates, key=self._candidate_sort_key)
@@ -158,6 +177,9 @@ class ARMDRuntimeAdvisor:
             {
                 "loaded": True,
                 "available": True,
+                "proposal_present": True,
+                "proposal_valid": True,
+                "proposal_kind": "contextual",
                 "scenario": best["scenario"],
                 "domain": best["domain"],
                 "expected_energy_saver": best["energy_saver"],
@@ -181,10 +203,21 @@ class ARMDRuntimeAdvisor:
         )
         return advice
 
-    def apply(self, decision: Dict, advice: Dict) -> Dict:
+    def apply(self, decision: Dict, advice: Dict, *, mutate: bool = True) -> Dict:
+        """Attach ARMD metadata and optionally apply its protection.
+
+        In assistant-judge mode ``mutate`` is false: ARMD is a proposer and
+        the rApp judge decides whether its complete proposal is applied.
+        The legacy path keeps the original protection-only behavior.
+        """
         decision["armd_enabled"] = self.enabled
         decision["armd_mode"] = self.mode
         decision["armd_loaded"] = advice.get("loaded", False)
+        decision["armd_proposal_present"] = bool(
+            self.enabled and advice.get("proposal_present", advice.get("available", False))
+        )
+        decision["armd_proposal_valid"] = bool(advice.get("proposal_valid", False))
+        decision["armd_proposal_kind"] = advice.get("proposal_kind", "missing")
         decision["armd_scenario"] = advice.get("scenario", "")
         decision["armd_domain"] = advice.get("domain", "")
         decision["armd_source"] = advice.get("source", "")
@@ -198,7 +231,7 @@ class ARMDRuntimeAdvisor:
         decision["armd_subset_size"] = advice.get("subset_size", self.subset_size)
         decision["armd_evidence"] = advice.get("evidence", [])
 
-        if not advice.get("available"):
+        if not mutate or not advice.get("available"):
             return decision
 
         if advice.get("confidence", 0.0) < self.min_confidence:
@@ -510,6 +543,9 @@ class ARMDRuntimeAdvisor:
             "mode": self.mode,
             "loaded": self.loaded,
             "available": False,
+            "proposal_present": False,
+            "proposal_valid": False,
+            "proposal_kind": "missing",
             "scenario": "",
             "domain": "",
             "expected_energy_saver": "",

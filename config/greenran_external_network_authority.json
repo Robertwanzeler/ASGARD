@@ -1,0 +1,56 @@
+{
+  "schema": "greenran.rapp.policy.v1",
+  "policy_id": "greenran_external_network_authority_v1",
+  "scenario": "greenran_real_only",
+  "description": "Fonte externa editável pelo operador. Atua somente como juiz final em empate, baixa confiança ou ausência de proposta válida.",
+  "mode": "shadow_only",
+  "data_source": "real_only",
+  "authority": {
+    "kind": "operator_editable_json",
+    "precedence": "last_resort_only",
+    "primary_decision_makers": ["armd", "ta_sam"],
+    "fallback": "live_allocator"
+  },
+  "arbitration": {
+    "enabled": true,
+    "tie_margin": 0.02,
+    "low_confidence_margin": 0.70,
+    "last_resort": {
+      "energy": "armd",
+      "resources": "ta_sam",
+      "unresolved": "live_allocator"
+    }
+  },
+  "network_policy": {
+    "priorities": {
+      "camera": 1,
+      "vehicle_safety": 1,
+      "sensor_critical": 2,
+      "vehicle": 2,
+      "ue": 3,
+      "background": 4
+    },
+    "shared_resources": {
+      "ran_min_share": 0.35,
+      "ai_min_share": 0.15,
+      "ran_priority_bias": 1.35,
+      "camera_throughput_target_mbps": 25.0,
+      "camera_latency_target_ms": 100.0,
+      "vehicle_safety_priority": 1,
+      "vehicle_latency_warning_ms": 10.0,
+      "vehicle_latency_target_ms": 20.0,
+      "vehicle_loss_warning_pct": 0.5,
+      "vehicle_loss_target_pct": 1.0
+    }
+  },
+  "safety": {
+    "allow_control": false,
+    "use_proxy": false,
+    "fallback": "live_allocator"
+  },
+  "audit": {
+    "save_decisions": true,
+    "save_proposals": true,
+    "save_policy_version": true
+  }
+}

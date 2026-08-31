@@ -41,7 +41,11 @@ from greenran_paths import (
     XAPP_ENERGY_PID_PATH,
     XAPP_VEHICLE_PID_PATH,
     STATE_DIR,
+    XAPP_SOCKET_DIR,
+    SLICER_SOCKET_PATH,
+    ENERGY_SOCKET_PATH,
     as_str,
+    ensure_runtime_dirs,
 )
 
 BASE_DIR = as_str(PROJECT_ROOT)
@@ -102,7 +106,7 @@ class XAppManager:
         
         self.config_file = f"{base_dir}/flexric/flexric.conf"
         
-        os.makedirs(as_str(STATE_DIR), exist_ok=True)
+        ensure_runtime_dirs()
         
         print("[XAppManager] Inicializado")
     
@@ -110,6 +114,8 @@ class XAppManager:
         """Retorna environment com LD_LIBRARY_PATH configurado."""
         env = os.environ.copy()
         env['LD_LIBRARY_PATH'] = self.ld_library_path
+        env['GREENRAN_SLICER_SOCKET_PATH'] = as_str(SLICER_SOCKET_PATH)
+        env['GREENRAN_ENERGY_SOCKET_PATH'] = as_str(ENERGY_SOCKET_PATH)
         return env
 
     def _candidate_binary_paths(self, xapp_name):
@@ -276,6 +282,20 @@ class XAppManager:
         
         # Verificar se o processo é zumbi/defunct
         try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                cmdline = f.read().decode(errors='ignore').replace('\x00', ' ')
+            expected = {
+                'slicer': 'xapp_slicer',
+                'energy_saver': 'xapp_energy_saver',
+                'vehicle_control': 'xapp_vehicle_control.py',
+            }.get(xapp_name, '')
+            if expected and expected not in cmdline:
+                self._cleanup(xapp_name)
+                return False
+        except (FileNotFoundError, PermissionError):
+            self._cleanup(xapp_name)
+            return False
+        try:
             with open(f'/proc/{pid}/status', 'r') as f:
                 status = f.read()
                 # Processos zumbis têm "State: Z (zombie)"
@@ -350,7 +370,7 @@ class XAppManager:
         import subprocess
         print("[XAppManager] Limpando processos zumbis...")
 
-        if os.environ.get("GREENRAN_CLEAN_SCOPE", "global") != "instance":
+        if os.environ.get("GREENRAN_CLEAN_SCOPE", "instance") != "instance":
             for pattern in ['xapp_slicer', 'xapp_energy_sav', 'xapp_vehicle_control.py', 'run_slicer', 'run_energy', 'VehicleControl']:
                 try:
                     subprocess.run(['pkill', '-9', '-f', pattern],
@@ -397,7 +417,9 @@ class XAppManager:
         for xapp_name in XAPP_PATHS.keys():
             status[xapp_name] = {
                 'running': self.is_running(xapp_name),
-                'pid': self.get_pid(xapp_name)
+                'pid': self.get_pid(xapp_name),
+                'transport_mode': os.environ.get('GREENRAN_XAPP_MODE', 'socket'),
+                'socket_required': os.environ.get('GREENRAN_XAPP_MODE', 'socket').strip().lower() in {'socket', 'integration', 'socket/integration'},
             }
         return status
     

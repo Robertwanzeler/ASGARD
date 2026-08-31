@@ -42,6 +42,9 @@ DEFAULT_RUNTIME_CONFIG: Dict[str, Any] = {
         "enable_resource_advice": True,
         "enable_energy_advice": True,
     },
+    "xapps": {
+        "mode": "socket",
+    },
     "monitoring": {
         "grafana_port": 3001,
         "influxdb_host": "localhost",
@@ -74,8 +77,10 @@ DEFAULT_RUNTIME_CONFIG: Dict[str, Any] = {
         "cvar_target_ms": 120.0,
         "p95_target_ms": 80.0,
         "app2_latency_target_ms": 1000.0,
-        "vehicle_latency_target_ms": 120.0,
-        "vehicle_loss_target_pct": 10.0,
+        "vehicle_latency_warning_ms": 10.0,
+        "vehicle_latency_target_ms": 20.0,
+        "vehicle_loss_warning_pct": 0.5,
+        "vehicle_loss_target_pct": 1.0,
         "ran_min_active_demand": 0.15,
         "ai_min_active_demand": 0.15
     },
@@ -110,6 +115,7 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         "GREENRAN_TASAM_STABILITY_WINDOW": ("tasam_advisor", "stability_window", int),
         "GREENRAN_TASAM_RESOURCE_ADVICE": ("tasam_advisor", "enable_resource_advice", _parse_bool),
         "GREENRAN_TASAM_ENERGY_ADVICE": ("tasam_advisor", "enable_energy_advice", _parse_bool),
+        "GREENRAN_XAPP_MODE": ("xapps", "mode", str),
         "GREENRAN_PUSH_INTERVAL": ("monitoring", "push_interval_seconds", int),
         "GREENRAN_INFLUXDB_HOST": ("monitoring", "influxdb_host", str),
         "GREENRAN_INFLUXDB_PORT": ("monitoring", "influxdb_port", int),
@@ -143,3 +149,10 @@ def load_runtime_config() -> Dict[str, Any]:
             print(f"[RuntimeConfig] AVISO: falha ao carregar {RUNTIME_CONFIG_PATH}: {exc}")
 
     return _apply_env_overrides(config)
+
+
+def get_xapp_transport_mode(config: Dict[str, Any] | None = None) -> str:
+    """Return the explicit xApp transport contract for this process."""
+    value = str((config or {}).get("xapps", {}).get("mode", "socket") or "socket").strip().lower()
+    aliases = {"file": "file", "shadow": "file", "file/shadow": "file", "socket": "socket", "integration": "socket", "socket/integration": "socket"}
+    return aliases.get(value, "socket")

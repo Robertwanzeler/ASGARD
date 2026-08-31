@@ -38,6 +38,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from greenran_paths import RAPP_DB_PATH
+try:
+    from .energy_calibration import integrate_energy_events, load_calibration, state_power_w
+except ImportError:
+    from energy_calibration import integrate_energy_events, load_calibration, state_power_w
 
 DEFAULT_DB_PATH = str(RAPP_DB_PATH)
 
@@ -110,17 +114,32 @@ class DataLake:
                 agent_override INTEGER DEFAULT 0,
                 energy_state TEXT,
                 slicer_state TEXT,
+                collection_event_stage_name TEXT,
+                collection_event_target_domain TEXT,
+                collection_event_cycle INTEGER DEFAULT 0,
+                collection_event_stage_index INTEGER DEFAULT 0,
+                collection_event_generated_at INTEGER DEFAULT 0,
+                collection_event_stage_authoritative INTEGER DEFAULT 0,
                 ml_decision TEXT,
                 ml_confidence REAL,
                 ml_predicted_cvar_ms REAL,
                 ml_influenced INTEGER DEFAULT 0,
                 armd_enabled INTEGER DEFAULT 0,
+                armd_proposal_present INTEGER DEFAULT 0,
+                armd_proposal_valid INTEGER DEFAULT 0,
+                armd_proposal_kind TEXT,
+                armd_actuation_applied INTEGER DEFAULT 0,
+                armd_proposal_json TEXT,
                 armd_mode TEXT,
                 armd_scenario TEXT,
                 armd_source TEXT,
                 armd_confidence REAL DEFAULT 0,
                 armd_override_applied INTEGER DEFAULT 0,
                 tasam_enabled INTEGER DEFAULT 0,
+                tasam_proposal_present INTEGER DEFAULT 0,
+                tasam_proposal_valid INTEGER DEFAULT 0,
+                tasam_proposal_kind TEXT,
+                tasam_proposal_json TEXT,
                 tasam_mode TEXT,
                 tasam_policy_id TEXT,
                 tasam_source TEXT,
@@ -130,8 +149,20 @@ class DataLake:
                 tasam_energy_decision TEXT,
                 tasam_energy_action TEXT,
                 advisor_arbitration_mode TEXT,
+                advisor_arbitration_present INTEGER DEFAULT 0,
+                advisor_proposal_pair_complete INTEGER DEFAULT 0,
+                advisor_rapp_final_decision TEXT,
+                advisor_rapp_final_action TEXT,
                 advisor_arbitration_winner TEXT,
                 advisor_arbitration_score REAL DEFAULT 0,
+                rapp_judge_mode TEXT,
+                rapp_judge_conflict_type TEXT,
+                rapp_judge_reason TEXT,
+                selected_assistant TEXT,
+                selected_proposal_id TEXT,
+                proposal_applied_exactly INTEGER DEFAULT 0,
+                external_last_resort_used INTEGER DEFAULT 0,
+                selected_proposal_json TEXT,
                 rl_policy_id TEXT,
                 rl_policy_family TEXT,
                 rl_policy_algorithm TEXT,
@@ -145,6 +176,15 @@ class DataLake:
                 ran_completion_ratio REAL DEFAULT 0,
                 ai_completion_ratio REAL DEFAULT 0,
                 utilization_ratio REAL DEFAULT 0,
+                allocation_state TEXT DEFAULT 'ALLOWED',
+                healthy_streak INTEGER DEFAULT 0,
+                floor_total_ran REAL DEFAULT 0,
+                floor_total_ai REAL DEFAULT 0,
+                reinforcement_ran REAL DEFAULT 0,
+                reinforcement_ai REAL DEFAULT 0,
+                floor_feasible INTEGER DEFAULT 1,
+                per_ue_floor_json TEXT DEFAULT '{}',
+                resource_floor_policy TEXT DEFAULT 'sla_per_ue_v1',
                 network_improvement_pct REAL DEFAULT 0,
                 cvar_improvement_pct REAL DEFAULT 0,
                 p95_improvement_pct REAL DEFAULT 0,
@@ -152,6 +192,17 @@ class DataLake:
                 baseline_p95_us REAL DEFAULT 0,
                 improvement_source TEXT,
                 improvement_valid INTEGER DEFAULT 0,
+                ta_sam_actuation_applied INTEGER DEFAULT 0,
+                tasam_actuation_applied INTEGER DEFAULT 0,
+                training_run_invalid INTEGER DEFAULT 0,
+                invalid_reason TEXT DEFAULT '',
+                tasam_policy_envelope_applied INTEGER DEFAULT 0,
+                tasam_policy_envelope_source TEXT,
+                tasam_policy_envelope_json TEXT DEFAULT '{}',
+                control_trial_mode TEXT,
+                effective_policy_algorithm TEXT,
+                effective_policy_source TEXT,
+                control_trial_reason TEXT,
                 UNIQUE(timestamp)
             )
         """)
@@ -160,12 +211,27 @@ class DataLake:
         }
         for column_name, column_def in (
             ("armd_enabled", "INTEGER DEFAULT 0"),
+            ("collection_event_stage_name", "TEXT"),
+            ("collection_event_target_domain", "TEXT"),
+            ("collection_event_cycle", "INTEGER DEFAULT 0"),
+            ("collection_event_stage_index", "INTEGER DEFAULT 0"),
+            ("collection_event_generated_at", "INTEGER DEFAULT 0"),
+            ("collection_event_stage_authoritative", "INTEGER DEFAULT 0"),
+            ("armd_proposal_present", "INTEGER DEFAULT 0"),
+            ("armd_proposal_valid", "INTEGER DEFAULT 0"),
+            ("armd_proposal_kind", "TEXT"),
+            ("armd_actuation_applied", "INTEGER DEFAULT 0"),
+            ("armd_proposal_json", "TEXT"),
             ("armd_mode", "TEXT"),
             ("armd_scenario", "TEXT"),
             ("armd_source", "TEXT"),
             ("armd_confidence", "REAL DEFAULT 0"),
             ("armd_override_applied", "INTEGER DEFAULT 0"),
             ("tasam_enabled", "INTEGER DEFAULT 0"),
+            ("tasam_proposal_present", "INTEGER DEFAULT 0"),
+            ("tasam_proposal_valid", "INTEGER DEFAULT 0"),
+            ("tasam_proposal_kind", "TEXT"),
+            ("tasam_proposal_json", "TEXT"),
             ("tasam_mode", "TEXT"),
             ("tasam_policy_id", "TEXT"),
             ("tasam_source", "TEXT"),
@@ -175,8 +241,20 @@ class DataLake:
             ("tasam_energy_decision", "TEXT"),
             ("tasam_energy_action", "TEXT"),
             ("advisor_arbitration_mode", "TEXT"),
+            ("advisor_arbitration_present", "INTEGER DEFAULT 0"),
+            ("advisor_proposal_pair_complete", "INTEGER DEFAULT 0"),
+            ("advisor_rapp_final_decision", "TEXT"),
+            ("advisor_rapp_final_action", "TEXT"),
             ("advisor_arbitration_winner", "TEXT"),
             ("advisor_arbitration_score", "REAL DEFAULT 0"),
+            ("rapp_judge_mode", "TEXT"),
+            ("rapp_judge_conflict_type", "TEXT"),
+            ("rapp_judge_reason", "TEXT"),
+            ("selected_assistant", "TEXT"),
+            ("selected_proposal_id", "TEXT"),
+            ("proposal_applied_exactly", "INTEGER DEFAULT 0"),
+            ("external_last_resort_used", "INTEGER DEFAULT 0"),
+            ("selected_proposal_json", "TEXT"),
             ("rl_policy_id", "TEXT"),
             ("rl_policy_family", "TEXT"),
             ("rl_policy_algorithm", "TEXT"),
@@ -190,6 +268,15 @@ class DataLake:
             ("ran_completion_ratio", "REAL DEFAULT 0"),
             ("ai_completion_ratio", "REAL DEFAULT 0"),
             ("utilization_ratio", "REAL DEFAULT 0"),
+            ("allocation_state", "TEXT DEFAULT 'ALLOWED'"),
+            ("healthy_streak", "INTEGER DEFAULT 0"),
+            ("floor_total_ran", "REAL DEFAULT 0"),
+            ("floor_total_ai", "REAL DEFAULT 0"),
+            ("reinforcement_ran", "REAL DEFAULT 0"),
+            ("reinforcement_ai", "REAL DEFAULT 0"),
+            ("floor_feasible", "INTEGER DEFAULT 1"),
+            ("per_ue_floor_json", "TEXT DEFAULT '{}'"),
+            ("resource_floor_policy", "TEXT DEFAULT 'sla_per_ue_v1'"),
             ("network_improvement_pct", "REAL DEFAULT 0"),
             ("cvar_improvement_pct", "REAL DEFAULT 0"),
             ("p95_improvement_pct", "REAL DEFAULT 0"),
@@ -197,6 +284,17 @@ class DataLake:
             ("baseline_p95_us", "REAL DEFAULT 0"),
             ("improvement_source", "TEXT"),
             ("improvement_valid", "INTEGER DEFAULT 0"),
+            ("ta_sam_actuation_applied", "INTEGER DEFAULT 0"),
+            ("tasam_actuation_applied", "INTEGER DEFAULT 0"),
+            ("training_run_invalid", "INTEGER DEFAULT 0"),
+            ("invalid_reason", "TEXT DEFAULT ''"),
+            ("tasam_policy_envelope_applied", "INTEGER DEFAULT 0"),
+            ("tasam_policy_envelope_source", "TEXT"),
+            ("tasam_policy_envelope_json", "TEXT DEFAULT '{}'"),
+            ("control_trial_mode", "TEXT"),
+            ("effective_policy_algorithm", "TEXT"),
+            ("effective_policy_source", "TEXT"),
+            ("control_trial_reason", "TEXT"),
         ):
             if column_name not in existing_decision_columns:
                 cursor.execute(f"ALTER TABLE decisions_history ADD COLUMN {column_name} {column_def}")
@@ -385,9 +483,22 @@ class DataLake:
                 power_percent INTEGER DEFAULT 100,
                 ru_count INTEGER DEFAULT 2,
                 mmwave_count INTEGER DEFAULT 1,
-                reason TEXT
+                reason TEXT,
+                timestamp_ns INTEGER,
+                power_w REAL,
+                calibration_version TEXT
             )
         """)
+        existing_energy_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(energy_commands)").fetchall()
+        }
+        for column_name, column_def in (
+            ("timestamp_ns", "INTEGER"),
+            ("power_w", "REAL"),
+            ("calibration_version", "TEXT"),
+        ):
+            if column_name not in existing_energy_columns:
+                cursor.execute(f"ALTER TABLE energy_commands ADD COLUMN {column_name} {column_def}")
         
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_energy_timestamp 
@@ -414,6 +525,21 @@ class DataLake:
                 ran_completion_ratio REAL DEFAULT 0,
                 ai_completion_ratio REAL DEFAULT 0,
                 utilization_ratio REAL DEFAULT 0,
+                allocation_state TEXT DEFAULT 'ALLOWED',
+                healthy_streak INTEGER DEFAULT 0,
+                floor_total_ran REAL DEFAULT 0,
+                floor_total_ai REAL DEFAULT 0,
+                reinforcement_ran REAL DEFAULT 0,
+                reinforcement_ai REAL DEFAULT 0,
+                floor_feasible INTEGER DEFAULT 1,
+                per_ue_floor_json TEXT DEFAULT '{}',
+                per_ue_allocation_json TEXT DEFAULT '[]',
+                per_ue_floor_violation_count INTEGER DEFAULT 0,
+                per_ue_application_status TEXT DEFAULT 'not_applicable',
+                per_ue_policy_id TEXT DEFAULT '',
+                per_ue_ack_timestamp REAL DEFAULT 0,
+                per_ue_ack_reason TEXT DEFAULT '',
+                resource_floor_policy TEXT DEFAULT 'sla_per_ue_v1',
                 snapshot_json TEXT,
                 UNIQUE(timestamp)
             )
@@ -427,6 +553,21 @@ class DataLake:
         }
         for column_name, column_def in (
             ("usable_budget", "REAL DEFAULT 0"),
+            ("allocation_state", "TEXT DEFAULT 'ALLOWED'"),
+            ("healthy_streak", "INTEGER DEFAULT 0"),
+            ("floor_total_ran", "REAL DEFAULT 0"),
+            ("floor_total_ai", "REAL DEFAULT 0"),
+            ("reinforcement_ran", "REAL DEFAULT 0"),
+            ("reinforcement_ai", "REAL DEFAULT 0"),
+            ("floor_feasible", "INTEGER DEFAULT 1"),
+            ("per_ue_floor_json", "TEXT DEFAULT '{}'"),
+            ("per_ue_allocation_json", "TEXT DEFAULT '[]'"),
+            ("per_ue_floor_violation_count", "INTEGER DEFAULT 0"),
+            ("per_ue_application_status", "TEXT DEFAULT 'not_applicable'"),
+            ("per_ue_policy_id", "TEXT DEFAULT ''"),
+            ("per_ue_ack_timestamp", "REAL DEFAULT 0"),
+            ("per_ue_ack_reason", "TEXT DEFAULT ''"),
+            ("resource_floor_policy", "TEXT DEFAULT 'sla_per_ue_v1'"),
         ):
             if column_name not in existing_resource_columns:
                 cursor.execute(f"ALTER TABLE resource_allocation_history ADD COLUMN {column_name} {column_def}")
@@ -655,6 +796,62 @@ class DataLake:
             ON conflict_events(conflict_type)
         """)
 
+        # Delayed feedback from the rApp judge.  The outcome is stored in a
+        # separate table because the real observation arrives after the
+        # original decision has already been persisted.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS judge_outcome_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_timestamp INTEGER NOT NULL,
+                observed_timestamp INTEGER NOT NULL,
+                selected_assistant TEXT DEFAULT '',
+                correct_verdict TEXT DEFAULT 'UNKNOWN',
+                observed INTEGER DEFAULT 0,
+                outcome_reward REAL DEFAULT 0,
+                severity_penalty REAL DEFAULT 0,
+                armd_credit REAL DEFAULT 0,
+                tasam_credit REAL DEFAULT 0,
+                armd_state_credit REAL DEFAULT 0,
+                tasam_state_credit REAL DEFAULT 0,
+                tasam_resource_credit REAL DEFAULT 0,
+                tasam_observed_error REAL DEFAULT 0,
+                tasam_continuous_reward REAL DEFAULT 0,
+                tasam_reward_source TEXT DEFAULT '',
+                tasam_error_components_json TEXT DEFAULT '{}',
+                tasam_action_applied INTEGER DEFAULT 0,
+                tasam_category_credit REAL DEFAULT 0,
+                tasam_category_penalty REAL DEFAULT 0,
+                tasam_category_error INTEGER DEFAULT 0,
+                tasam_predicted_verdict TEXT DEFAULT '',
+                tasam_observed_verdict TEXT DEFAULT '',
+                credit_assignment TEXT DEFAULT '',
+                reason TEXT DEFAULT '',
+                feedback_json TEXT,
+                UNIQUE(decision_timestamp)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_judge_outcome_decision_timestamp
+            ON judge_outcome_history(decision_timestamp)
+        """)
+        existing_judge_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(judge_outcome_history)").fetchall()
+        }
+        for column_name, column_def in (
+            ("tasam_observed_error", "REAL DEFAULT 0"),
+            ("tasam_continuous_reward", "REAL DEFAULT 0"),
+            ("tasam_reward_source", "TEXT DEFAULT ''"),
+            ("tasam_error_components_json", "TEXT DEFAULT '{}'"),
+            ("tasam_action_applied", "INTEGER DEFAULT 0"),
+            ("tasam_category_credit", "REAL DEFAULT 0"),
+            ("tasam_category_penalty", "REAL DEFAULT 0"),
+            ("tasam_category_error", "INTEGER DEFAULT 0"),
+            ("tasam_predicted_verdict", "TEXT DEFAULT ''"),
+            ("tasam_observed_verdict", "TEXT DEFAULT ''"),
+        ):
+            if column_name not in existing_judge_columns:
+                cursor.execute(f"ALTER TABLE judge_outcome_history ADD COLUMN {column_name} {column_def}")
+
         # Additional indexes for performance
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_extended_metrics_timestamp
@@ -749,6 +946,21 @@ class DataLake:
         agent_override = 1 if decision.get('agent_override', False) else 0
         energy_state = decision.get('energy_state', '')
         slicer_state = decision.get('slicer_state', '')
+        collection_event_stage_name = str(decision.get('collection_event_stage_name', '') or '')
+        collection_event_target_domain = str(decision.get('collection_event_target_domain', '') or '')
+        try:
+            collection_event_cycle = int(decision.get('collection_event_cycle', 0) or 0)
+        except (TypeError, ValueError):
+            collection_event_cycle = 0
+        try:
+            collection_event_stage_index = int(decision.get('collection_event_stage_index', 0) or 0)
+        except (TypeError, ValueError):
+            collection_event_stage_index = 0
+        try:
+            collection_event_generated_at = int(decision.get('collection_event_generated_at', 0) or 0)
+        except (TypeError, ValueError):
+            collection_event_generated_at = 0
+        collection_event_stage_authoritative = 1 if decision.get('collection_event_stage_authoritative', False) else 0
 
         # ML prediction data
         ml_prediction = decision.get('ml_rf_prediction', {})
@@ -757,6 +969,11 @@ class DataLake:
         ml_predicted_cvar = ml_prediction.get('predicted_cvar_ms', 0.0)
         ml_influenced = 1 if decision.get('ml_influenced', False) else 0
         armd_enabled = 1 if decision.get('armd_enabled', False) else 0
+        armd_proposal_present = 1 if decision.get('armd_proposal_present', False) else 0
+        armd_proposal_valid = 1 if decision.get('armd_proposal_valid', False) else 0
+        armd_proposal_kind = decision.get('armd_proposal_kind', '')
+        armd_actuation_applied = 1 if decision.get('armd_actuation_applied', False) else 0
+        armd_proposal_json = json.dumps(decision.get('armd_proposal') or {}, ensure_ascii=False, sort_keys=True)
         armd_mode = decision.get('armd_mode', '')
         armd_scenario = decision.get('armd_scenario', '')
         armd_source = decision.get('armd_source', '')
@@ -765,6 +982,10 @@ class DataLake:
         tasam_advisor = decision.get('tasam_advisor', {}) or {}
         advisor_arbitration = decision.get('advisor_arbitration', {}) or {}
         tasam_enabled = 1 if decision.get('tasam_enabled', tasam_advisor.get('enabled', False)) else 0
+        tasam_proposal_present = 1 if decision.get('tasam_proposal_present', False) else 0
+        tasam_proposal_valid = 1 if decision.get('tasam_proposal_valid', False) else 0
+        tasam_proposal_kind = decision.get('tasam_proposal_kind', '')
+        tasam_proposal_json = json.dumps(decision.get('tasam_proposal') or {}, ensure_ascii=False, sort_keys=True)
         tasam_mode = decision.get('tasam_mode', tasam_advisor.get('mode', ''))
         tasam_policy_id = decision.get('tasam_policy_id', tasam_advisor.get('policy_id', ''))
         tasam_source = decision.get('tasam_source', tasam_advisor.get('source', ''))
@@ -774,6 +995,10 @@ class DataLake:
         tasam_energy_decision = decision.get('tasam_energy_decision', ((tasam_advisor.get('energy_advice') or {}).get('decision', '')))
         tasam_energy_action = decision.get('tasam_energy_action', ((tasam_advisor.get('energy_advice') or {}).get('action', '')))
         advisor_arbitration_mode = advisor_arbitration.get('mode', '')
+        advisor_arbitration_present = 1 if advisor_arbitration.get('arbitration_present', False) else 0
+        advisor_proposal_pair_complete = 1 if advisor_arbitration.get('proposal_pair_complete', False) else 0
+        advisor_rapp_final_decision = advisor_arbitration.get('rapp_final_decision', '')
+        advisor_rapp_final_action = advisor_arbitration.get('rapp_final_action', '')
         advisor_arbitration_winner = advisor_arbitration.get('winner', '')
         advisor_arbitration_score = float(
             max(
@@ -781,6 +1006,14 @@ class DataLake:
                 advisor_arbitration.get('tasam_score', 0.0) or 0.0,
             )
         )
+        rapp_judge_mode = str((decision.get('rapp_judge_result') or {}).get('mode', '') or '')
+        rapp_judge_conflict_type = str(decision.get('rapp_judge_conflict_type', '') or '')
+        rapp_judge_reason = str(decision.get('rapp_judge_reason', '') or '')
+        selected_assistant = str(decision.get('selected_assistant', '') or '')
+        selected_proposal_id = str(decision.get('selected_proposal_id', '') or '')
+        proposal_applied_exactly = 1 if decision.get('proposal_applied_exactly', False) else 0
+        external_last_resort_used = 1 if decision.get('external_last_resort_used', False) else 0
+        selected_proposal_json = json.dumps(decision.get('selected_assistant_proposal') or {}, ensure_ascii=False, sort_keys=True)
         rl_policy_runtime = decision.get('rl_policy_runtime', {}) or {}
         resource_allocation = decision.get('resource_allocation', {}) or {}
         rl_policy_id = rl_policy_runtime.get('policy_id', '')
@@ -796,6 +1029,15 @@ class DataLake:
         ran_completion_ratio = float(resource_allocation.get('ran_completion_ratio', 0.0) or 0.0)
         ai_completion_ratio = float(resource_allocation.get('ai_completion_ratio', 0.0) or 0.0)
         utilization_ratio = float(resource_allocation.get('utilization_ratio', 0.0) or 0.0)
+        allocation_state = str(resource_allocation.get('allocation_state', decision.get('energy_saver', 'ALLOWED')) or 'ALLOWED').upper()
+        healthy_streak = int(resource_allocation.get('healthy_streak', 0) or 0)
+        floor_total_ran = float(resource_allocation.get('floor_total_ran', 0.0) or 0.0)
+        floor_total_ai = float(resource_allocation.get('floor_total_ai', 0.0) or 0.0)
+        reinforcement_ran = float(resource_allocation.get('reinforcement_ran', 0.0) or 0.0)
+        reinforcement_ai = float(resource_allocation.get('reinforcement_ai', 0.0) or 0.0)
+        floor_feasible = 1 if resource_allocation.get('floor_feasible', True) else 0
+        per_ue_floor_json = json.dumps(resource_allocation.get('per_ue_floor') or [], ensure_ascii=False, sort_keys=True)
+        resource_floor_policy = str(resource_allocation.get('floor_policy', decision.get('resource_floor_policy', 'sla_per_ue_v1')) or 'sla_per_ue_v1')
         network_health = decision.get('network_health', {}) or {}
         network_improvement_pct = float(network_health.get('network_improvement_pct', 0.0) or 0.0)
         cvar_improvement_pct = float(network_health.get('cvar_improvement_pct', 0.0) or 0.0)
@@ -804,6 +1046,24 @@ class DataLake:
         baseline_p95_us = float(network_health.get('baseline_p95_us', 0.0) or 0.0)
         improvement_source = str(network_health.get('improvement_source', '') or '')
         improvement_valid = 1 if network_health.get('improvement_valid', False) else 0
+        ta_sam_actuation_applied = 1 if decision.get('ta_sam_actuation_applied', False) else 0
+        tasam_actuation_applied = 1 if decision.get('tasam_actuation_applied', decision.get('ta_sam_actuation_applied', False)) else 0
+        training_run_invalid = 1 if decision.get('training_run_invalid', False) else 0
+        invalid_reason = str(decision.get('invalid_reason', '') or '')
+        tasam_policy_envelope = decision.get('tasam_policy_envelope') or (
+            (decision.get('tasam_advisor') or {}).get('armd_policy_envelope') or {}
+        )
+        tasam_policy_envelope_applied = 1 if (
+            decision.get('tasam_policy_envelope_applied', tasam_policy_envelope.get('applied', False))
+        ) else 0
+        tasam_policy_envelope_source = str(
+            decision.get('tasam_policy_envelope_source', 'armd' if tasam_policy_envelope_applied else '') or ''
+        )
+        tasam_policy_envelope_json = json.dumps(tasam_policy_envelope, ensure_ascii=False, sort_keys=True)
+        control_trial_mode = str(decision.get('control_trial_mode', '') or '')
+        effective_policy_algorithm = str(decision.get('effective_policy_algorithm', '') or '')
+        effective_policy_source = str(decision.get('effective_policy_source', '') or '')
+        control_trial_reason = str(decision.get('control_trial_reason', '') or '')
 
         # DEBUG: Log dos dados de ML que chegam
         if ml_decision:
@@ -823,30 +1083,66 @@ class DataLake:
             columns = [
                 'timestamp', 'datetime', 'decision', 'reason', 'confidence', 'pattern',
                 'agent_override', 'energy_state', 'slicer_state',
+                'collection_event_stage_name', 'collection_event_target_domain',
+                'collection_event_cycle', 'collection_event_stage_index',
+                'collection_event_generated_at', 'collection_event_stage_authoritative',
                 'ml_decision', 'ml_confidence', 'ml_predicted_cvar_ms', 'ml_influenced',
-                'armd_enabled', 'armd_mode', 'armd_scenario', 'armd_source', 'armd_confidence', 'armd_override_applied',
-                'tasam_enabled', 'tasam_mode', 'tasam_policy_id', 'tasam_source', 'tasam_confidence',
+                'armd_enabled', 'armd_proposal_present', 'armd_proposal_valid', 'armd_proposal_kind', 'armd_actuation_applied', 'armd_proposal_json',
+                'armd_mode', 'armd_scenario', 'armd_source', 'armd_confidence', 'armd_override_applied',
+                'tasam_enabled', 'tasam_proposal_present', 'tasam_proposal_valid', 'tasam_proposal_kind', 'tasam_proposal_json',
+                'tasam_mode', 'tasam_policy_id', 'tasam_source', 'tasam_confidence',
                 'tasam_valid', 'tasam_would_influence', 'tasam_energy_decision', 'tasam_energy_action',
-                'advisor_arbitration_mode', 'advisor_arbitration_winner', 'advisor_arbitration_score',
+                'advisor_arbitration_mode', 'advisor_arbitration_present', 'advisor_proposal_pair_complete',
+                'advisor_rapp_final_decision', 'advisor_rapp_final_action',
+                'advisor_arbitration_winner', 'advisor_arbitration_score',
+                'rapp_judge_mode', 'rapp_judge_conflict_type', 'rapp_judge_reason',
+                'selected_assistant', 'selected_proposal_id', 'proposal_applied_exactly',
+                'external_last_resort_used', 'selected_proposal_json',
                 'rl_policy_id', 'rl_policy_family', 'rl_policy_algorithm', 'resource_controller_id',
                 'resource_budget', 'usable_budget', 'ran_demand', 'ai_demand', 'ran_allocation', 'ai_allocation',
                 'ran_completion_ratio', 'ai_completion_ratio', 'utilization_ratio',
+                'allocation_state', 'healthy_streak', 'floor_total_ran', 'floor_total_ai',
+                'reinforcement_ran', 'reinforcement_ai', 'floor_feasible', 'per_ue_floor_json',
+                'resource_floor_policy',
                 'network_improvement_pct', 'cvar_improvement_pct', 'p95_improvement_pct',
                 'baseline_cvar_us', 'baseline_p95_us', 'improvement_source', 'improvement_valid',
+                'ta_sam_actuation_applied', 'tasam_policy_envelope_applied',
+                'tasam_actuation_applied', 'training_run_invalid', 'invalid_reason',
+                'tasam_policy_envelope_source', 'tasam_policy_envelope_json',
+                'control_trial_mode', 'effective_policy_algorithm',
+                'effective_policy_source', 'control_trial_reason',
             ]
             values = [
                 timestamp, dt_str, decision_str, reason, confidence, pattern,
                 agent_override, energy_state, slicer_state,
+                collection_event_stage_name, collection_event_target_domain,
+                collection_event_cycle, collection_event_stage_index,
+                collection_event_generated_at, collection_event_stage_authoritative,
                 ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced,
-                armd_enabled, armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied,
-                tasam_enabled, tasam_mode, tasam_policy_id, tasam_source, tasam_confidence,
+                armd_enabled, armd_proposal_present, armd_proposal_valid, armd_proposal_kind, armd_actuation_applied, armd_proposal_json,
+                armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied,
+                tasam_enabled, tasam_proposal_present, tasam_proposal_valid, tasam_proposal_kind, tasam_proposal_json,
+                tasam_mode, tasam_policy_id, tasam_source, tasam_confidence,
                 tasam_valid, tasam_would_influence, tasam_energy_decision, tasam_energy_action,
-                advisor_arbitration_mode, advisor_arbitration_winner, advisor_arbitration_score,
+                advisor_arbitration_mode, advisor_arbitration_present, advisor_proposal_pair_complete,
+                advisor_rapp_final_decision, advisor_rapp_final_action,
+                advisor_arbitration_winner, advisor_arbitration_score,
+                rapp_judge_mode, rapp_judge_conflict_type, rapp_judge_reason,
+                selected_assistant, selected_proposal_id, proposal_applied_exactly,
+                external_last_resort_used, selected_proposal_json,
                 rl_policy_id, rl_policy_family, rl_policy_algorithm, resource_controller_id,
                 resource_budget, usable_budget, ran_demand, ai_demand, ran_allocation, ai_allocation,
                 ran_completion_ratio, ai_completion_ratio, utilization_ratio,
+                allocation_state, healthy_streak, floor_total_ran, floor_total_ai,
+                reinforcement_ran, reinforcement_ai, floor_feasible, per_ue_floor_json,
+                resource_floor_policy,
                 network_improvement_pct, cvar_improvement_pct, p95_improvement_pct,
                 baseline_cvar_us, baseline_p95_us, improvement_source, improvement_valid,
+                ta_sam_actuation_applied, tasam_policy_envelope_applied,
+                tasam_actuation_applied, training_run_invalid, invalid_reason,
+                tasam_policy_envelope_source, tasam_policy_envelope_json,
+                control_trial_mode, effective_policy_algorithm,
+                effective_policy_source, control_trial_reason,
             ]
             placeholders = ', '.join('?' for _ in columns)
             cursor.execute(
@@ -878,8 +1174,13 @@ class DataLake:
                 (timestamp, datetime, controller_id, target_policy_id, decision_domain,
                  action_semantics, resource_budget, usable_budget, d_ran, d_ai, r_ran, r_ai,
                  delta_r_ran, delta_r_ai, ran_completion_ratio, ai_completion_ratio,
-                 utilization_ratio, snapshot_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 utilization_ratio, allocation_state, healthy_streak, floor_total_ran,
+                 floor_total_ai, reinforcement_ran, reinforcement_ai, floor_feasible,
+                 per_ue_floor_json, per_ue_allocation_json,
+                 per_ue_floor_violation_count, per_ue_application_status,
+                 per_ue_policy_id, per_ue_ack_timestamp, per_ue_ack_reason,
+                 resource_floor_policy, snapshot_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp,
                 dt_str,
@@ -898,6 +1199,21 @@ class DataLake:
                 float(snapshot.get('ran_completion_ratio', 0.0) or 0.0),
                 float(snapshot.get('ai_completion_ratio', 0.0) or 0.0),
                 float(snapshot.get('utilization_ratio', 0.0) or 0.0),
+                str(snapshot.get('allocation_state', 'ALLOWED') or 'ALLOWED').upper(),
+                int(snapshot.get('healthy_streak', 0) or 0),
+                float(snapshot.get('floor_total_ran', 0.0) or 0.0),
+                float(snapshot.get('floor_total_ai', 0.0) or 0.0),
+                float(snapshot.get('reinforcement_ran', 0.0) or 0.0),
+                float(snapshot.get('reinforcement_ai', 0.0) or 0.0),
+                1 if snapshot.get('floor_feasible', True) else 0,
+                json.dumps(snapshot.get('per_ue_floor') or [], ensure_ascii=False, sort_keys=True),
+                json.dumps(snapshot.get('per_ue_allocation') or [], ensure_ascii=False, sort_keys=True),
+                int(snapshot.get('per_ue_floor_violation_count', 0) or 0),
+                str(snapshot.get('per_ue_application_status', 'not_applicable') or 'not_applicable'),
+                str(snapshot.get('per_ue_policy_id', '') or ''),
+                float(snapshot.get('per_ue_ack_timestamp', 0.0) or 0.0),
+                str(snapshot.get('per_ue_ack_reason', '') or ''),
+                str(snapshot.get('floor_policy', 'sla_per_ue_v1') or 'sla_per_ue_v1'),
                 json.dumps(snapshot, ensure_ascii=False),
             ))
             self.conn.commit()
@@ -905,6 +1221,70 @@ class DataLake:
             self.record_marl_shadow_comparison(snapshot, timestamp=timestamp)
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar snapshot de recursos: {e}")
+
+    def record_judge_outcome(self, decision, feedback, observation=None, observed_timestamp=None):
+        """Persist delayed ARMD/TA-SAM credit after a real observation."""
+        if not isinstance(decision, dict) or not isinstance(feedback, dict):
+            return
+        decision_timestamp = int(decision.get('timestamp', 0) or 0)
+        if decision_timestamp <= 0:
+            return
+        observation = observation if isinstance(observation, dict) else {}
+        if observed_timestamp is None:
+            observed_timestamp = int(observation.get('timestamp', time.time()) or time.time())
+        judge_result = decision.get('rapp_judge_result') or {}
+        selected = str(
+            decision.get('selected_assistant')
+            or judge_result.get('selected_advocate', '')
+            or ''
+        )
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO judge_outcome_history
+                (decision_timestamp, observed_timestamp, selected_assistant,
+                correct_verdict, observed, outcome_reward, severity_penalty,
+                 armd_credit, tasam_credit, armd_state_credit,
+                 tasam_state_credit, tasam_resource_credit, tasam_observed_error,
+                 tasam_continuous_reward, tasam_reward_source,
+                 tasam_error_components_json, tasam_action_applied,
+                 tasam_category_credit, tasam_category_penalty,
+                 tasam_category_error, tasam_predicted_verdict,
+                 tasam_observed_verdict,
+                 credit_assignment, reason, feedback_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                decision_timestamp,
+                int(observed_timestamp),
+                selected,
+                str(feedback.get('correct_verdict', 'UNKNOWN') or 'UNKNOWN'),
+                1 if feedback.get('outcome_observed', False) else 0,
+                float(feedback.get('outcome_reward', 0.0) or 0.0),
+                float(feedback.get('severity_penalty', 0.0) or 0.0),
+                float(feedback.get('armd_credit', 0.0) or 0.0),
+                float(feedback.get('tasam_credit', 0.0) or 0.0),
+                float(feedback.get('armd_state_credit', 0.0) or 0.0),
+                float(feedback.get('tasam_state_credit', 0.0) or 0.0),
+                float(feedback.get('tasam_resource_credit', 0.0) or 0.0),
+                float(feedback.get('tasam_observed_error', 0.0) or 0.0),
+                float(feedback.get('tasam_continuous_reward', 0.0) or 0.0),
+                str(feedback.get('tasam_reward_source', '') or ''),
+                json.dumps(feedback.get('tasam_error_components') or {}, ensure_ascii=False, sort_keys=True),
+                1 if feedback.get('tasam_action_applied', decision.get('ta_sam_actuation_applied', False)) else 0,
+                float(feedback.get('tasam_category_credit', feedback.get('tasam_state_credit', 0.0)) or 0.0),
+                float(feedback.get('tasam_category_penalty', 0.0) or 0.0),
+                1 if feedback.get('tasam_category_error', False) else 0,
+                str(feedback.get('tasam_predicted_verdict', '') or ''),
+                str(feedback.get('tasam_observed_verdict', feedback.get('correct_verdict', '')) or ''),
+                str(feedback.get('credit_assignment', '') or ''),
+                str(observation.get('reason', '') or ''),
+                json.dumps({
+                    'feedback': feedback,
+                    'observation': observation,
+                }, ensure_ascii=False, sort_keys=True),
+            ))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DataLake] ERRO ao registrar feedback do juiz: {e}")
 
     def record_marl_shadow_comparison(self, snapshot, timestamp=None):
         """Persist runtime comparison between live allocator and MARL shadow allocator."""
@@ -1432,7 +1812,15 @@ class DataLake:
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar métricas de UE: {e}")
     
-    def record_energy_command(self, command, power_percent=100, ru_count=2, mmwave_count=1, reason=""):
+    def record_energy_command(
+        self,
+        command,
+        power_percent=100,
+        ru_count=2,
+        mmwave_count=1,
+        reason="",
+        timestamp_ns=None,
+    ):
         """
         Registra comando de energia enviado ao xApp Energy Saver.
         
@@ -1443,17 +1831,28 @@ class DataLake:
             mmwave_count: Número de mmWave ativas
             reason: Motivo do comando
         """
-        timestamp = int(time.time())
+        timestamp_ns = int(timestamp_ns or time.time_ns())
+        timestamp = timestamp_ns // 1_000_000_000
         dt = datetime.fromtimestamp(timestamp)
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            calibration = load_calibration()
+            power_w = state_power_w(calibration, ru_count, mmwave_count, power_percent)
+            calibration_version = str(calibration.get("calibration_version", ""))
+        except ValueError as exc:
+            print(f"[DataLake] WRN: calibração energética indisponível: {exc}")
+            power_w = None
+            calibration_version = ""
         
         try:
             cursor = self.conn.cursor()
             cursor.execute("""
                 INSERT INTO energy_commands 
-                (timestamp, datetime, command, power_percent, ru_count, mmwave_count, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (timestamp, dt_str, command, power_percent, ru_count, mmwave_count, reason))
+                (timestamp, datetime, command, power_percent, ru_count, mmwave_count, reason,
+                 timestamp_ns, power_w, calibration_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (timestamp, dt_str, command, power_percent, ru_count, mmwave_count, reason,
+                  timestamp_ns, power_w, calibration_version))
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar comando de energia: {e}")
@@ -1799,7 +2198,34 @@ class DataLake:
             results['avg_power'] = total_power / results['total_commands']
             baseline_power = 100
             results['total_savings_percent'] = baseline_power - results['avg_power']
-        
+
+        # Calibrated RU/mmWave estimate for the dashboard. The estimate is
+        # explicitly marked as a model and never presented as a wattmeter.
+        try:
+            energy_rows = cursor.execute(
+                "SELECT * FROM energy_commands WHERE timestamp >= ? ORDER BY timestamp, id",
+                (int(time.time()) - (hours * 3600),),
+            ).fetchall()
+            calibration = load_calibration()
+            end_ns = time.time_ns()
+            energy = integrate_energy_events(energy_rows, calibration, end_timestamp_ns=end_ns)
+            results['calibrated_energy'] = {
+                **energy,
+                'kind': 'calibrated_ru_mmwave_power_model',
+                'physical_meter_available': False,
+            }
+            results['energy_j'] = energy.get('energy_j', 0.0)
+            results['average_power_w'] = energy.get('average_power_w', 0.0)
+            results['energy_duration_s'] = energy.get('duration_s', 0.0)
+            results['calibration_version'] = calibration.get('calibration_version', '')
+        except (sqlite3.Error, ValueError) as exc:
+            results['calibrated_energy'] = {
+                'valid': False,
+                'kind': 'calibrated_ru_mmwave_power_model',
+                'physical_meter_available': False,
+                'reason': str(exc),
+            }
+
         return results
     
     def record_extended_from_json(self, extended_json, energy_state=None, slicer_state=None):

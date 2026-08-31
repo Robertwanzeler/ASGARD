@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block title %}ARMD · GreenRAN{% endblock %}
+
+{% block content %}
+<div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
+    <div>
+        <div class="text-muted small text-uppercase">Assistente de proteção do rApp</div>
+        <h1 class="mb-1">ARMD <span class="text-muted">· GreenRAN</span></h1>
+        <p class="text-muted mb-0">Prioridades, guardrails de SLA, energia e segurança operacional do cenário.</p>
+    </div>
+    <div class="d-flex gap-2">
+        <a class="btn btn-sm btn-outline-light" href="/">Visão geral</a>
+        <a class="btn btn-sm btn-outline-light" href="/drl">TA-SAM (DRL)</a>
+    </div>
+</div>
+
+{% if armd.override_applied %}
+<div class="alert alert-danger"><strong>Override ARMD ativo.</strong> O ARMD assumiu a proteção da decisão: {{ armd.reason }}</div>
+{% elif armd.present %}
+<div class="alert alert-success"><strong>ARMD ativo.</strong> Atua como guardião de SLA/prioridade; o TA-SAM faz a recomendação de alocação nos casos elegíveis.</div>
+{% else %}
+<div class="alert alert-warning"><strong>Sem contexto ARMD persistido.</strong> A página continua monitorando os SLAs, mas não há política ARMD ativa no snapshot atual.</div>
+{% endif %}
+
+<div class="row g-3">
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Estado</div><div class="card-body"><div class="metric-value {% if armd.present %}status-ok{% else %}status-warning{% endif %}">{{ 'ATIVO' if armd.present else 'INATIVO' }}</div><div class="metric-label">modo {{ armd.mode|upper }}</div></div></div></div>
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Atenção</div><div class="card-body"><div class="metric-value {% if armd.attention_level in ['critical', 'override'] %}status-critical{% elif armd.attention_level == 'guard' %}status-warning{% else %}status-ok{% endif %}">{{ armd.attention_level|upper }}</div><div class="metric-label">override: {{ 'SIM' if armd.override_applied else 'NÃO' }}</div></div></div></div>
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Confiança</div><div class="card-body"><div class="metric-value">{{ armd.confidence }}</div><div class="metric-label">fonte: {{ armd.source }}</div></div></div></div>
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Políticas pendentes</div><div class="card-body"><div class="metric-value">{{ armd.pending_policies }}</div><div class="metric-label">aguardando confirmação A1</div></div></div></div>
+</div>
+
+<div class="row g-3 mt-1">
+    <div class="col-lg-5"><div class="card h-100"><div class="card-header">Contexto ARMD</div><div class="card-body">
+        <div class="kv"><span>Cenário</span><span>{{ armd.scenario }}</span></div>
+        <div class="kv"><span>Domínio</span><span>{{ armd.domain }}</span></div>
+        <div class="kv"><span>Escopo</span><span>{{ armd.policy_scope|join(', ') if armd.policy_scope else 'não informado' }}</span></div>
+        <div class="kv"><span>Ação esperada</span><span>{{ armd.expected_action or 'monitorar e proteger' }}</span></div>
+        <div class="decision-reason mt-3">{{ armd.reason }}</div>
+        <div class="text-muted small mt-3">O ARMD não substitui o TA-SAM: ele propõe proteção em cada ciclo e o rApp arbitra a decisão final.</div>
+        <div class="kv mt-2"><span>Proposta</span><span>{{ 'REGISTRADA' if armd.proposal_present else 'AUSENTE' }} · {{ (armd.proposal_kind or 'missing')|upper }}</span></div>
+    </div></div></div>
+    <div class="col-lg-7"><div class="card h-100"><div class="card-header">Proteção por serviço</div><div class="card-body p-0"><div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>Serviço</th><th>Estado</th><th>Observado</th><th>Motivo</th></tr></thead><tbody>
+        <tr><td><strong>Câmeras 4K</strong></td><td class="{{ 'status-ok' if armd.service_slas.camera.status in ['PROTEGIDA', 'ATIVA', 'ok'] else 'status-warning' }}">{{ armd.service_slas.camera.status }}</td><td>{{ armd.service_slas.camera.throughput_mbps }} Mbps · {{ armd.service_slas.camera.latency_ms }} ms</td><td>{{ armd.service_slas.camera.reason }}</td></tr>
+        <tr><td><strong>Sensores</strong></td><td class="{{ 'status-ok' if armd.service_slas.app2.status in ['PROTEGIDA', 'ATIVA', 'ok'] else 'status-warning' }}">{{ armd.service_slas.app2.status }}</td><td>{{ armd.service_slas.app2.connected }}/{{ armd.service_slas.app2.active }} · {{ armd.service_slas.app2.latency_ms }} ms</td><td>{{ armd.service_slas.app2.reason }}</td></tr>
+        <tr><td><strong>Veículos autônomos</strong></td><td class="{{ 'status-ok' if armd.service_slas.app3.status in ['PROTEGIDA', 'ATIVA', 'ok'] else 'status-warning' }}">{{ armd.service_slas.app3.status }}</td><td>{{ armd.service_slas.app3.active }} ativos · {{ armd.service_slas.app3.latency_ms }} ms</td><td>{{ armd.service_slas.app3.reason }}</td></tr>
+        </tbody></table></div></div></div></div>
+</div>
+
+<div class="row g-3 mt-1">
+    <div class="col-lg-6"><div class="card h-100"><div class="card-header">Última decisão do rApp</div><div class="card-body">
+        <div class="metric-value {% if armd.latest_decision.decision == 'ALLOWED' %}status-ok{% elif armd.latest_decision.decision == 'BLOCKED' %}status-critical{% else %}status-warning{% endif %}">{{ armd.latest_decision.decision|default('aguardando') }}</div>
+        <p class="text-muted mb-2">{{ armd.latest_decision.datetime|default('sem registro') }}</p>
+        <div class="decision-reason">{{ armd.latest_decision.reason|default('Ainda não há decisão persistida.') }}</div>
+    </div></div></div>
+    <div class="col-lg-6"><div class="card h-100"><div class="card-header">Última alocação</div><div class="card-body">
+        <div class="row g-3"><div class="col-6"><div class="text-muted small">RAN</div><div class="metric-value">{{ armd.latest_allocation.r_ran|default(0) }}</div></div><div class="col-6"><div class="text-muted small">IA</div><div class="metric-value">{{ armd.latest_allocation.r_ai|default(0) }}</div></div><div class="col-6"><div class="text-muted small">Utilização</div><div class="metric-value">{{ ((armd.latest_allocation.utilization_ratio|default(0)) * 100)|round(1) }}%</div></div><div class="col-6"><div class="text-muted small">Wall-clock</div><div class="metric-value">{{ armd.wall_clock.phase_label }}</div></div></div>
+    </div></div></div>
+</div>
+{% endblock %}

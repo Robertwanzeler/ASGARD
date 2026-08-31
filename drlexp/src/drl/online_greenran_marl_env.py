@@ -49,6 +49,110 @@ def _normalize(raw: Sequence[float]) -> list[float]:
     return [value / total for value in cleaned]
 
 
+def build_balanced_vehicle_energy_reward(
+    slice_state: dict[str, dict[str, Any]],
+    metrics: dict[str, Any],
+    resource_action: dict[str, Any],
+) -> tuple[float, dict[str, float]]:
+    """Reward GreenRAN priorities while discouraging unnecessary full allocation.
+
+    URLLC is the vehicle slice in the fixed GreenRAN topology.  The reward
+    keeps cameras and sensors in the objective, gives vehicles the largest
+    service weight, and applies a moderate resource-use penalty only above
+    80% of the usable budget.  Energy remains a proxy: no hardware power
+    meter is available in the training trace.
+    """
+    embb = slice_state["eMBB"]
+    mmtc = slice_state["mMTC"]
+    urllc = slice_state["URLLC"]
+    embb_qos = 0.55 * _clamp(embb.get("completion_ratio")) + 0.45 * (1.0 - _clamp(embb.get("qos_pressure")))
+    mmtc_qos = 0.55 * _clamp(mmtc.get("completion_ratio")) + 0.45 * (1.0 - _clamp(mmtc.get("qos_pressure")))
+
+    # Vehicle SLA and global tail latency are different signals.  The old
+    # fallback used global CVaR as vehicle latency, which saturated the
+    # vehicle score for every overloaded stage and hid the allocation
+    # gradient.  The environment now exports the real vehicle metric; CVaR
+    # is handled separately as a network-wide tail-risk term below.
+    vehicle_latency_ms = _safe_float(
+        metrics.get("vehicle_latency_ms", metrics.get("cvar_per_ue_us", 0.0) / 1000.0),
+        0.0,
+    )
+    vehicle_loss_pct = _safe_float(
+        metrics.get("vehicle_packet_loss_percent", metrics.get("global_packet_loss_rate", 0.0) * 100.0),
+        0.0,
+    )
+    vehicle_latency_score = (
+        1.0
+        if vehicle_latency_ms <= 10.0
+        else 0.0
+        if vehicle_latency_ms >= 20.0
+        else 1.0 - ((vehicle_latency_ms - 10.0) / 10.0)
+    )
+    vehicle_loss_score = 1.0 - _clamp(vehicle_loss_pct / 1.0)
+    vehicle_qos = (
+        0.60 * _clamp(urllc.get("completion_ratio"))
+        + 0.20 * vehicle_latency_score
+        + 0.20 * vehicle_loss_score
+    )
+    # Vehicles receive the largest service weight; cameras remain second and
+    # sensors remain protected rather than being ignored under contention.
+    qos_score = (0.25 * embb_qos) + (0.20 * mmtc_qos) + (0.55 * vehicle_qos)
+
+    usable = max(_safe_float(resource_action.get("usable_budget", 1.0), 1.0), 1e-9)
+    allocations = resource_action.get("slice_allocation") or {}
+    alloc_sum = sum(_safe_float(allocations.get(sid, 0.0), 0.0) for sid in SLICE_ORDER)
+    demand_sum = sum(_safe_float(slice_state[sid].get("demand"), 0.0) for sid in SLICE_ORDER)
+    utilization_ratio = alloc_sum / usable
+    over_alloc_penalty = max(0.0, (alloc_sum - usable) / usable)
+    shortage_penalty = max(0.0, (demand_sum - alloc_sum) / max(demand_sum, 1e-9))
+    min_qos_penalty = sum(1.0 - _clamp(slice_state[sid].get("min_qos_met")) for sid in SLICE_ORDER) / len(SLICE_ORDER)
+    # Full-budget actions are not automatically wrong, but allocation above
+    # 80% is penalized progressively so the policy learns to release unused
+    # capacity when service targets are already met.
+    resource_use_penalty = _clamp((utilization_ratio - 0.80) / 0.20)
+    vehicle_sla_penalty = 1.0 - vehicle_qos
+    loss_penalty = min(0.20, _safe_float(metrics.get("global_packet_loss_rate", 0.0), 0.0) * 20.0)
+    cvar_ms = max(0.0, _safe_float(metrics.get("cvar_per_ue_us", 0.0), 0.0) / 1000.0)
+    cvar_reference_ms = max(0.001, _safe_float(metrics.get("cvar_reference_ms", cvar_ms), cvar_ms))
+    cvar_target_ms = max(0.001, _safe_float(metrics.get("cvar_target_ms", 120.0), 120.0))
+    relative_tail_excess = max(0.0, (cvar_ms / cvar_reference_ms) - 1.0)
+    target_tail_excess = max(0.0, (cvar_ms - cvar_target_ms) / cvar_target_ms)
+    # Relative excess detects regressions even when absolute CVaR is below a
+    # legacy SLA threshold.  The absolute term prevents the policy from
+    # accepting a persistently high tail merely because its reference is high.
+    # CVaR is a hard safety objective for this campaign: relative tail
+    # regressions dominate small energy/resource gains.
+    tail_risk_penalty = min(2.0, (0.80 * relative_tail_excess) + (0.20 * target_tail_excess))
+    reward = (
+        qos_score
+        - (0.15 * over_alloc_penalty)
+        - (0.15 * shortage_penalty)
+        - (0.25 * min_qos_penalty)
+        - (0.25 * vehicle_sla_penalty)
+        - (0.10 * resource_use_penalty)
+        - (0.40 * tail_risk_penalty)
+        - loss_penalty
+    )
+    return float(reward), {
+        "qos_score": float(qos_score),
+        "embb_qos": float(embb_qos),
+        "mmtc_qos": float(mmtc_qos),
+        "vehicle_qos": float(vehicle_qos),
+        "vehicle_latency_score": float(vehicle_latency_score),
+        "vehicle_loss_score": float(vehicle_loss_score),
+        "vehicle_sla_penalty": float(vehicle_sla_penalty),
+        "over_alloc_penalty": float(over_alloc_penalty),
+        "shortage_penalty": float(shortage_penalty),
+        "min_qos_penalty": float(min_qos_penalty),
+        "resource_use_penalty": float(resource_use_penalty),
+        "cvar_ms": float(cvar_ms),
+        "cvar_reference_ms": float(cvar_reference_ms),
+        "relative_tail_excess": float(relative_tail_excess),
+        "tail_risk_penalty": float(tail_risk_penalty),
+        "loss_penalty": float(loss_penalty),
+    }
+
+
 def _split_ai_demands(ai_total: float, ai_components: dict[str, Any] | None) -> tuple[float, float]:
     components = ai_components or {}
     app2_pressure = _clamp(_safe_float(components.get("app2_pressure", 0.5), 0.5))
@@ -214,10 +318,12 @@ DEFAULT_SHARED_RESOURCE_CONFIG = {
     "camera_latency_warning_ms": 80.0,
     "camera_latency_target_ms": 100.0,
     "cvar_target_ms": 120.0,
+    "cvar_guard_relative_regression_pct": 5.0,
+    "cvar_guard_required_windows": 2,
     "p95_target_ms": 80.0,
     "app2_latency_target_ms": 1000.0,
-    "vehicle_latency_target_ms": 120.0,
-    "vehicle_loss_target_pct": 10.0,
+    "vehicle_latency_target_ms": 20.0,
+    "vehicle_loss_target_pct": 1.0,
     "ran_min_active_demand": 0.15,
     "ai_min_active_demand": 0.15,
 }
@@ -243,12 +349,14 @@ class OnlineGreenRANMARLEnv:
         self._stage_elapsed = 0
         self._last_allocation = {"r_ran": 0.5, "r_ai": 0.5}
         self._current_payload: dict[str, Any] = {}
+        self._cvar_reference_us = 0.0
 
     def reset(self) -> tuple[dict[str, Any], dict[str, Any]]:
         self._step_count = 0
         self._stage_index = 0
         self._stage_elapsed = 0
         self._last_allocation = {"r_ran": 0.5, "r_ai": 0.5}
+        self._cvar_reference_us = 0.0
         self._current_payload = self._build_payload(self.stage_profile[self._stage_index], bootstrap=True)
         return self._current_payload, {"scenario_stage": self._current_payload["scenario_stage"]}
 
@@ -528,43 +636,27 @@ class OnlineGreenRANMARLEnv:
         latency_scale = 1.0 + max(0.0, 1.0 - urllc_completion)
         vehicle_loss = _safe_float(vehicle_metrics.get("max_packet_loss_percent", 0.0), 0.0) / 100.0
         sensor_loss = _safe_float(app2_metrics.get("packet_loss_percent", 0.0), 0.0) / 100.0
+        cvar_us = _safe_float(network_health.get("cvar_us", 0.0), 0.0)
+        # ``baseline_cvar_us`` is a historical reporting baseline (often the
+        # old 484.7 ms pre-fix run), not a live reward reference.  Only an
+        # explicitly supplied live reference may override the local EWMA.
+        explicit_reference_us = _safe_float(network_health.get("reference_cvar_us", 0.0), 0.0)
+        cvar_reference_us = explicit_reference_us or self._cvar_reference_us or cvar_us
         return {
             "throughput_kbps": _safe_float(camera_metrics.get("throughput_mbps", 0.0), 0.0) * 1000.0 * embb_completion,
-            "cvar_per_ue_us": _safe_float(network_health.get("cvar_us", 0.0), 0.0) * latency_scale,
+            "cvar_per_ue_us": cvar_us * latency_scale,
+            "cvar_observed_us": cvar_us,
+            "cvar_reference_ms": cvar_reference_us / 1000.0,
+            "cvar_target_ms": _safe_float(DEFAULT_SHARED_RESOURCE_CONFIG.get("cvar_target_ms"), 120.0),
+            "vehicle_latency_ms": _safe_float(vehicle_metrics.get("max_latency_ms", 0.0), 0.0),
+            "vehicle_packet_loss_percent": _safe_float(vehicle_metrics.get("max_packet_loss_percent", 0.0), 0.0),
             "global_packet_loss_rate": min(0.25, (0.55 * vehicle_loss * (1.0 - urllc_completion)) + (0.45 * sensor_loss * (1.0 - mmtc_completion))),
             "total_active_ues": sum(_safe_int(slice_state[sid]["ue_count"], 0) for sid in SLICE_ORDER),
             "total_active_cameras": _safe_int(camera_metrics.get("active_cameras", 0), 0),
         }
 
     def _build_reward(self, slice_state: dict[str, dict[str, Any]], metrics: dict[str, Any], resource_action: dict[str, Any]) -> tuple[float, dict[str, float]]:
-        embb = slice_state["eMBB"]
-        mmtc = slice_state["mMTC"]
-        urllc = slice_state["URLLC"]
-        embb_qos = 0.55 * _clamp(embb["completion_ratio"]) + 0.45 * (1.0 - _clamp(embb["qos_pressure"]))
-        mmtc_qos = 0.55 * _clamp(mmtc["completion_ratio"]) + 0.45 * (1.0 - _clamp(mmtc["qos_pressure"]))
-        urllc_latency_ms = _safe_float(metrics.get("cvar_per_ue_us", 0.0), 0.0) / 1000.0
-        urllc_latency_score = 1.0 - (1.0 / (1.0 + np.exp(-((urllc_latency_ms - 80.0) / 20.0))))
-        urllc_qos = 0.45 * _clamp(urllc["completion_ratio"]) + 0.35 * (1.0 - _clamp(urllc["qos_pressure"])) + 0.20 * urllc_latency_score
-        qos_score = (0.40 * embb_qos) + (0.25 * mmtc_qos) + (0.35 * urllc_qos)
-
-        usable = max(_safe_float(resource_action.get("usable_budget", 1.0), 1.0), 1e-9)
-        alloc_sum = sum(_safe_float((resource_action.get("slice_allocation") or {}).get(sid, 0.0), 0.0) for sid in SLICE_ORDER)
-        demand_sum = sum(_safe_float(slice_state[sid]["demand"], 0.0) for sid in SLICE_ORDER)
-        over_alloc_penalty = max(0.0, (alloc_sum - usable) / usable)
-        shortage_penalty = max(0.0, (demand_sum - alloc_sum) / max(demand_sum, 1e-9))
-        min_qos_penalty = sum(1.0 - _clamp(slice_state[sid]["min_qos_met"]) for sid in SLICE_ORDER) / len(SLICE_ORDER)
-        loss_penalty = min(0.20, _safe_float(metrics.get("global_packet_loss_rate", 0.0), 0.0) * 20.0)
-        reward = qos_score - (0.25 * over_alloc_penalty) - (0.20 * shortage_penalty) - (0.30 * min_qos_penalty) - loss_penalty
-        return float(reward), {
-            "qos_score": float(qos_score),
-            "embb_qos": float(embb_qos),
-            "mmtc_qos": float(mmtc_qos),
-            "urllc_qos": float(urllc_qos),
-            "over_alloc_penalty": float(over_alloc_penalty),
-            "shortage_penalty": float(shortage_penalty),
-            "min_qos_penalty": float(min_qos_penalty),
-            "loss_penalty": float(loss_penalty),
-        }
+        return build_balanced_vehicle_energy_reward(slice_state, metrics, resource_action)
 
     def _build_transition_record(
         self,
@@ -591,6 +683,14 @@ class OnlineGreenRANMARLEnv:
             slice_state=slice_state,
         )
         reward, reward_components = self._build_reward(slice_state, metrics, next_allocation)
+        # Keep a slowly moving pre-action reference.  This makes the reward
+        # sensitive to regressions between stages while avoiding a noisy
+        # one-sample baseline.
+        current_cvar_us = _safe_float(metrics.get("cvar_observed_us", 0.0), 0.0)
+        if current_cvar_us > 0.0 and not self._cvar_reference_us:
+            self._cvar_reference_us = current_cvar_us
+        elif current_cvar_us > 0.0:
+            self._cvar_reference_us = (0.90 * self._cvar_reference_us) + (0.10 * current_cvar_us)
         return {
             "scenario_stage": payload["scenario_stage"],
             "global_state": global_state,

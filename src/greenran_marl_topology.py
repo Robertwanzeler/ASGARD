@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List
 
 try:
@@ -46,6 +47,29 @@ def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     if value > upper:
         return upper
     return value
+
+
+def _explicit_state_features(resource_snapshot: Dict[str, Any] | None) -> List[float]:
+    """Optionally expose the authoritative 3-way operating state to MARL.
+
+    The historical article-compatible vector remains 10-dimensional by
+    default.  New state-aware rounds opt in through an environment flag and
+    append a one-hot ALLOWED/CONDITIONAL/BLOCKED context, so old checkpoints
+    keep their original input shape and remain loadable.
+    """
+    if os.environ.get('GREENRAN_TASAM_EXPLICIT_STATE_FEATURE', '0').strip() != '1':
+        return []
+    snapshot = resource_snapshot or {}
+    state = str(snapshot.get('allocation_state') or '').strip().upper()
+    if state == 'CRITICAL':
+        state = 'BLOCKED'
+    if state not in {'ALLOWED', 'CONDITIONAL', 'BLOCKED'}:
+        state = 'ALLOWED'
+    return [
+        1.0 if state == 'ALLOWED' else 0.0,
+        1.0 if state == 'CONDITIONAL' else 0.0,
+        1.0 if state == 'BLOCKED' else 0.0,
+    ]
 
 
 def load_logical_du_topology() -> dict:
@@ -233,6 +257,7 @@ def build_du_state_snapshot(
             _clamp(allocation_share / max(usable_budget, 1e-9)),
             _clamp(allocation_share / max(demand_share, 1e-9)) if demand_share > 1e-9 else 1.0,
         ]
+        state_vector.extend(_explicit_state_features(resource_snapshot))
         du_states.append({
             'du_id': str(du.get('du_id', 'unknown') or 'unknown'),
             'role': str(du.get('role', 'unknown') or 'unknown'),
@@ -262,6 +287,7 @@ def build_du_state_snapshot(
             _clamp(total_demand / max(usable_budget, 1e-9)) if usable_budget > 1e-9 else 0.0,
         ],
     }
+    global_state['state_vector'].extend(_explicit_state_features(resource_snapshot))
 
     return {
         'topology_id': topology.get('topology_id', 'greenran_fixed_marl_v1'),

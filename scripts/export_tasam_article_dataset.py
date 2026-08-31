@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from greenran_paths import RAPP_DB_PATH  # noqa: E402
+from rapp_judge import RAppJudge  # noqa: E402
 
 SLICE_ORDER = ("eMBB", "mMTC", "URLLC")
 EXTENDED_METRICS_PREFERRED_COLUMNS = (
@@ -48,7 +49,15 @@ EXTENDED_METRICS_PREFERRED_COLUMNS = (
     "mac_trace_age_s",
     "pdcp_latest_sim_time_s",
 )
-METRICS_TIMESTAMP_TOLERANCE_S = 3
+# The real metrics publisher is independent from the rApp and currently emits
+# snapshots every 5-6 seconds, with occasional 11-12 second gaps. A nearest
+# match can therefore be at most 6 seconds away without accepting a stale
+# snapshot from a wider window.
+METRICS_TIMESTAMP_TOLERANCE_S = 6
+# The Judge callback can persist its outcome on the following real
+# observation, which is 5-6 seconds after the rApp decision in this runtime.
+# Keep the join bounded and audit the matched timestamp below.
+JUDGE_TIMESTAMP_TOLERANCE_S = 6
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,7 +226,7 @@ def extended_metrics_available_columns(cursor: sqlite3.Cursor) -> list[str]:
     return [row[1] for row in rows]
 
 
-def fetch_metrics(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
+def fetch_metrics(cursor: sqlite3.Cursor, timestamp: int) -> tuple[dict[str, Any], dict[str, Any]]:
     available_columns = set(extended_metrics_available_columns(cursor))
     selected_columns = [
         column_name
@@ -225,11 +234,12 @@ def fetch_metrics(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
         if column_name in available_columns
     ]
     if not selected_columns:
-        return {}
+        return {}, {}
+    selected_sql = ", ".join(selected_columns)
     row = fetch_one(
         cursor,
         f"""
-        select {", ".join(selected_columns)}
+        select timestamp as _source_timestamp, {selected_sql}
         from extended_metrics
         where timestamp=?
         """,
@@ -243,7 +253,7 @@ def fetch_metrics(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
         row = fetch_one(
             cursor,
             f"""
-            select {", ".join(selected_columns)}
+            select timestamp as _source_timestamp, {selected_sql}
             from extended_metrics
             where timestamp between ? and ?
             order by abs(timestamp - ?) asc
@@ -256,13 +266,112 @@ def fetch_metrics(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
             ),
         )
     if not row:
-        return {}
-    return {key: row[key] for key in row.keys()}
+        return {}, {}
+    source_timestamp = int(row["_source_timestamp"])
+    alignment = {
+        "requested_timestamp": int(timestamp),
+        "source_timestamp": source_timestamp,
+        "skew_s": abs(source_timestamp - int(timestamp)),
+        "within_tolerance": abs(source_timestamp - int(timestamp)) <= METRICS_TIMESTAMP_TOLERANCE_S,
+    }
+    return (
+        {key: row[key] for key in selected_columns},
+        alignment,
+    )
 
 
 def fetch_decision(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
     row = fetch_one(cursor, "select * from decisions_history where timestamp=?", (timestamp,))
     return dict(row) if row else {}
+
+
+def fetch_judge_outcome(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
+    """Load delayed judge feedback associated with one decision.
+
+    The rApp persists the decision first and scores it on the next real
+    observation.  Keeping this join in the exporter lets the DRL trace use
+    the actual ARMD/TA-SAM credit without changing the runtime database.
+    """
+    if not table_exists(cursor, "judge_outcome_history"):
+        return {}
+    row = fetch_one(
+        cursor,
+        "select * from judge_outcome_history where decision_timestamp=?",
+        (timestamp,),
+    )
+    if not row:
+        # Decision and Judge timestamps are produced by independent runtime
+        # callbacks. A bounded nearest match recovers the delayed outcome
+        # without accepting a feedback record farther than one rApp cadence.
+        row = fetch_one(
+            cursor,
+            """
+            select * from judge_outcome_history
+            where decision_timestamp between ? and ?
+            order by abs(decision_timestamp - ?) asc
+            limit 1
+            """,
+            (
+                int(timestamp) - JUDGE_TIMESTAMP_TOLERANCE_S,
+                int(timestamp) + JUDGE_TIMESTAMP_TOLERANCE_S,
+                int(timestamp),
+            ),
+        )
+    if not row:
+        return {}
+    outcome = dict(row)
+    outcome["judge_alignment"] = {
+        "requested_timestamp": int(timestamp),
+        "source_timestamp": int(row["decision_timestamp"]),
+        "skew_s": abs(int(row["decision_timestamp"]) - int(timestamp)),
+        "within_tolerance": abs(int(row["decision_timestamp"]) - int(timestamp)) <= JUDGE_TIMESTAMP_TOLERANCE_S,
+    }
+    payload = load_json(outcome.get("feedback_json"), {})
+    outcome["feedback"] = payload.get("feedback", {}) if isinstance(payload, dict) else {}
+    outcome["observation"] = payload.get("observation", {}) if isinstance(payload, dict) else {}
+    feedback = outcome["feedback"]
+    observation = outcome["observation"]
+    # Repair feedback persisted by runtimes predating the nested TA-SAM state
+    # normalization in RAppJudge.  The old record contains both complete
+    # proposals and the observed outcome, so this is a deterministic,
+    # read-only migration performed at export time; the SQLite database is
+    # intentionally left untouched.
+    if (
+        isinstance(feedback, dict)
+        and isinstance(observation, dict)
+        and feedback.get("outcome_observed")
+        and isinstance(feedback.get("armd_proposal"), dict)
+        and isinstance(feedback.get("tasam_proposal"), dict)
+    ):
+        judge_result = {
+            "armd_proposal": feedback.get("armd_proposal"),
+            "tasam_proposal": feedback.get("tasam_proposal"),
+            "selected_proposal": feedback.get("selected_proposal") or {},
+        }
+        repaired = RAppJudge({"enabled": True, "production": True}).evaluate_outcome(
+            judge_result,
+            observation,
+        )
+        for key in (
+            "correct_verdict",
+            "severity_penalty",
+            "outcome_reward",
+            "armd_credit",
+            "tasam_credit",
+            "armd_state_credit",
+            "tasam_state_credit",
+            "tasam_resource_credit",
+            "proposal_errors",
+            "proposal_penalties",
+            "credit_assignment",
+            "resource_reward",
+            "outcome_observed",
+            "feedback_status",
+        ):
+            if key in repaired:
+                feedback[key] = repaired[key]
+        feedback["feedback_repaired_at_export"] = True
+    return outcome
 
 
 def fetch_resource_action(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
@@ -295,6 +404,9 @@ def scenario_stage_from_shadow(
     conflict: dict[str, Any],
     metrics: dict[str, Any],
 ) -> str:
+    authoritative_stage = str(decision.get("collection_event_stage_name") or "").strip()
+    if authoritative_stage and bool(decision.get("collection_event_stage_authoritative", 0)):
+        return authoritative_stage
     controlled_stage = controlled_stage_label(decision)
     if controlled_stage:
         return controlled_stage
@@ -338,6 +450,31 @@ def collection_quality(metrics: dict[str, Any], current: dict[str, Any], nxt: di
     sim_next = safe_float(nxt.get("metrics", {}).get("sim_time_s"), sim_now)
     ts_gap = int(nxt["timestamp"]) - int(current["timestamp"])
     sim_reset = sim_next + args.max_sim_reset_gap_s < sim_now
+    max_metric_skew_s = int(getattr(args, "max_metric_skew_s", METRICS_TIMESTAMP_TOLERANCE_S))
+    current_alignment = current.get("metrics_alignment") or {}
+    next_alignment = nxt.get("metrics_alignment") or {}
+    # Keep hand-built/unit snapshots backward compatible. Live exports always
+    # carry explicit alignment metadata from fetch_metrics().
+    if metrics and not current_alignment:
+        current_alignment = {
+            "source_timestamp": current.get("timestamp"),
+            "skew_s": 0.0,
+        }
+    if nxt.get("metrics") and not next_alignment:
+        next_alignment = {
+            "source_timestamp": nxt.get("timestamp"),
+            "skew_s": 0.0,
+        }
+    current_skew_s = safe_float(current_alignment.get("skew_s"), 0.0)
+    next_skew_s = safe_float(next_alignment.get("skew_s"), 0.0)
+    metric_alignment_valid = bool(
+        metrics
+        and nxt.get("metrics")
+        and current_alignment.get("source_timestamp") is not None
+        and next_alignment.get("source_timestamp") is not None
+        and current_skew_s <= max_metric_skew_s
+        and next_skew_s <= max_metric_skew_s
+    )
     suspected_stale_proxy = (
         collector_mode == ""
         and proxy_count <= 0.0
@@ -360,11 +497,17 @@ def collection_quality(metrics: dict[str, Any], current: dict[str, Any], nxt: di
         "pdcp_real": pdcp_real,
         "has_proxy": proxy_count > 0 or suspected_stale_proxy,
         "timestamp_gap_s": ts_gap,
+        "metric_alignment_valid": metric_alignment_valid,
+        "current_metric_timestamp": current_alignment.get("source_timestamp"),
+        "current_metric_skew_s": current_skew_s,
+        "next_metric_timestamp": next_alignment.get("source_timestamp"),
+        "next_metric_skew_s": next_skew_s,
         "sim_reset": sim_reset,
         "valid_for_training": (
             (args.allow_proxy or proxy_count <= 0)
             and (pdcp_real or args.allow_proxy)
             and ts_gap <= args.max_step_gap_s
+            and metric_alignment_valid
             and not sim_reset
             and not suspected_stale_proxy
         ),
@@ -461,8 +604,9 @@ def build_snapshot(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any] | N
     slice_state = fetch_slice_state(cursor, timestamp)
     if not du_states or len(slice_state) < 3:
         return None
-    metrics = fetch_metrics(cursor, timestamp)
+    metrics, metrics_alignment = fetch_metrics(cursor, timestamp)
     decision = fetch_decision(cursor, timestamp)
+    judge_outcome = fetch_judge_outcome(cursor, timestamp)
     action = fetch_resource_action(cursor, timestamp)
     shadow = fetch_shadow(cursor, timestamp)
     conflict = fetch_conflict_context(cursor, timestamp)
@@ -482,7 +626,9 @@ def build_snapshot(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any] | N
         "slice_state": slice_state,
         "du_states": du_states,
         "metrics": metrics,
+        "metrics_alignment": metrics_alignment,
         "decision": decision,
+        "judge_outcome": judge_outcome,
         "action": action,
         "shadow_comparison": shadow,
         "conflict_context": conflict,
@@ -493,7 +639,74 @@ def build_snapshot(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any] | N
 
 def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     reward = compute_reward(current)
+    judge_outcome = current.get("judge_outcome") or {}
+    judge_feedback = judge_outcome.get("feedback") or {}
+    judge_observed = bool(
+        judge_feedback.get("outcome_observed")
+        or judge_outcome.get("observed")
+    )
+    if judge_observed:
+        # Integral online training uses the continuous error from the next
+        # real observation.  Categorical Judge credit remains audit context
+        # and is retained as a compatibility fallback for older databases.
+        continuous_reward = judge_feedback.get("tasam_continuous_reward")
+        category_credit = judge_feedback.get("tasam_category_credit")
+        # Only records carrying the explicit category field are new-format
+        # feedback.  Keep the legacy source label for old databases that only
+        # contain tasam_state_credit.
+        explicit_category_credit = category_credit is not None
+        if category_credit is None and (
+            "tasam_category_penalty" in judge_feedback
+            or "tasam_category_error" in judge_feedback
+        ):
+            category_credit = judge_feedback.get("tasam_state_credit")
+        if (
+            continuous_reward is not None
+            and category_credit is not None
+            and judge_feedback.get("tasam_reward_source") == "observed_real_metrics"
+        ):
+            # A category mistake is an unavoidable negative training signal;
+            # a good continuous metric cannot compensate for it.
+            reward_hint = min(
+                clamp(continuous_reward, -1.0, 1.0),
+                clamp(category_credit, -1.0, 1.0),
+            )
+            reward_source = "observed_real_metrics_with_categorical_penalty"
+        elif continuous_reward is not None and judge_feedback.get("tasam_reward_source") == "observed_real_metrics":
+            reward_hint = clamp(continuous_reward, -1.0, 1.0)
+            reward_source = "observed_real_metrics"
+        else:
+            reward_hint = clamp(category_credit if category_credit is not None else judge_feedback.get("tasam_credit", 0.0), -1.0, 1.0)
+            reward_source = (
+                "rapp_judge_category_credit"
+                if explicit_category_credit
+                else "rapp_judge_tasam_credit"
+            )
+        reward_components = dict(reward["components"])
+        reward_components.update({
+            "judge_outcome_reward": safe_float(judge_feedback.get("outcome_reward")),
+            "judge_state_credit": safe_float(judge_feedback.get("tasam_state_credit")),
+            "judge_resource_credit": safe_float(judge_feedback.get("tasam_resource_credit")),
+            "judge_tasam_credit": safe_float(judge_feedback.get("tasam_credit")),
+            "tasam_observed_error": safe_float(judge_feedback.get("tasam_observed_error")),
+            "tasam_continuous_reward": safe_float(judge_feedback.get("tasam_continuous_reward")),
+            "tasam_reward_source": judge_feedback.get("tasam_reward_source", ""),
+            "tasam_action_applied": bool(judge_feedback.get("tasam_action_applied", False)),
+            "tasam_category_credit": safe_float(judge_feedback.get("tasam_category_credit", category_credit)),
+            "tasam_category_penalty": safe_float(judge_feedback.get("tasam_category_penalty")),
+            "tasam_category_error": bool(judge_feedback.get("tasam_category_error", False)),
+            "tasam_predicted_verdict": judge_feedback.get("tasam_predicted_verdict", ""),
+            "tasam_observed_verdict": judge_feedback.get("tasam_observed_verdict", judge_feedback.get("correct_verdict", "")),
+        })
+    else:
+        reward_hint = reward["reward"]
+        reward_source = "article_network_reward_unobserved_judge"
+        reward_components = reward["components"]
     quality = collection_quality(current.get("metrics", {}), current, nxt, args)
+    current_decision = current.get("decision") or {}
+    if current_decision.get("training_run_invalid"):
+        quality["valid_for_training"] = False
+        quality["invalid_reason"] = current_decision.get("invalid_reason", "invalid_tasam_proposal")
     return {
         "schema": "greenran.tasam_article_transition.v1",
         "timestamp": current["timestamp"],
@@ -501,17 +714,43 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
         "next_timestamp": nxt["timestamp"],
         "topology_id": current.get("topology_id"),
         "scenario_stage": current.get("scenario_stage"),
+        "next_scenario_stage": nxt.get("scenario_stage"),
         "global_state": current["global_state"],
         "slice_state": current["slice_state"],
         "du_states": current["du_states"],
         "action": current["action"],
         "decision": current["decision"],
+        "training_run_invalid": bool(current_decision.get("training_run_invalid", False)),
+        "judge_feedback": judge_feedback,
+        "judge_observation": judge_outcome.get("observation", {}),
+        "judge_feedback_observed": judge_observed,
+        "judge_alignment": judge_outcome.get("judge_alignment") or {},
+        "selected_assistant": (current.get("decision") or {}).get("selected_assistant", ""),
+        "credit_assignment": judge_feedback.get("credit_assignment", ""),
+        "armd_credit": safe_float(judge_feedback.get("armd_credit")),
+        "tasam_credit": safe_float(judge_feedback.get("tasam_credit")),
+        "judge_reward": safe_float(judge_feedback.get("outcome_reward")),
+        "tasam_observed_error": safe_float(judge_feedback.get("tasam_observed_error")),
+        "tasam_continuous_reward": safe_float(judge_feedback.get("tasam_continuous_reward")),
+        "tasam_reward_source": judge_feedback.get("tasam_reward_source", ""),
+        "tasam_error_components": judge_feedback.get("tasam_error_components") or {},
+        "tasam_action_applied": bool(judge_feedback.get("tasam_action_applied", False)),
+        "tasam_category_credit": safe_float(judge_feedback.get("tasam_category_credit")),
+        "tasam_category_penalty": safe_float(judge_feedback.get("tasam_category_penalty")),
+        "tasam_category_error": bool(judge_feedback.get("tasam_category_error", False)),
+        "tasam_predicted_verdict": judge_feedback.get("tasam_predicted_verdict", ""),
+        "tasam_observed_verdict": judge_feedback.get("tasam_observed_verdict", judge_feedback.get("correct_verdict", "")),
         "metrics": current["metrics"],
+        "metrics_alignment": {
+            "current": current.get("metrics_alignment") or {},
+            "next": nxt.get("metrics_alignment") or {},
+        },
         "armd_context": current["armd_context"],
         "conflict_context": current["conflict_context"],
         "shadow_comparison": current["shadow_comparison"],
-        "reward_hint": reward["reward"],
-        "reward_components": reward["components"],
+        "reward_hint": reward_hint,
+        "reward_source": reward_source,
+        "reward_components": reward_components,
         "next_global_state": nxt["global_state"],
         "next_slice_state": nxt["slice_state"],
         "next_du_states": nxt["du_states"],
@@ -571,6 +810,10 @@ def main() -> int:
     written_invalid = 0
     stage_counts: dict[str, int] = {}
     decision_counts: dict[str, int] = {}
+    reward_source_counts: dict[str, int] = {}
+    credit_assignment_counts: dict[str, int] = {}
+    judge_feedback_observed = 0
+    tasam_credits: list[float] = []
     with out_path.open("w", encoding="utf-8") as fh:
         for current, nxt in zip(snapshots, snapshots[1:]):
             record = transition_record(current, nxt, args)
@@ -584,6 +827,13 @@ def main() -> int:
             decision = str((record.get("decision") or {}).get("decision") or "unknown")
             stage_counts[stage] = stage_counts.get(stage, 0) + 1
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
+            source = str(record.get("reward_source") or "unknown")
+            reward_source_counts[source] = reward_source_counts.get(source, 0) + 1
+            assignment = str(record.get("credit_assignment") or "unobserved")
+            credit_assignment_counts[assignment] = credit_assignment_counts.get(assignment, 0) + 1
+            if record.get("judge_feedback_observed"):
+                judge_feedback_observed += 1
+                tasam_credits.append(safe_float(record.get("tasam_credit")))
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             written += 1
             if args.limit and written >= args.limit:
@@ -599,6 +849,11 @@ def main() -> int:
         "written_invalid_transitions": written_invalid,
         "stage_counts": stage_counts,
         "decision_counts": decision_counts,
+        "judge_feedback_observed": judge_feedback_observed,
+        "judge_feedback_coverage": judge_feedback_observed / max(written, 1),
+        "reward_source_counts": reward_source_counts,
+        "credit_assignment_counts": credit_assignment_counts,
+        "tasam_credit_mean": sum(tasam_credits) / max(len(tasam_credits), 1),
         "armd_policy": "read_only_context_no_runtime_mutation",
         "include_invalid": bool(args.include_invalid),
     }

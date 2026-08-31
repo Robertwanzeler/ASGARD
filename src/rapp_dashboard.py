@@ -46,6 +46,7 @@ from rapp_data_lake import DataLake
 from rapp_pattern_engine import PatternRecognition
 from rapp_alerts import AlertManager
 from rapp_policy_consumer import load_current_policies
+from energy_calibration import load_calibration, state_power_w
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -74,6 +75,9 @@ DEVICE_ROLES_FILE = as_str(STATE_DIR / "xapp_metrics" / "device_roles.json")
 CONFLICT_LEARNED_REPORT_FILE = as_str(STATE_DIR / "greenran_conflict_report.json")
 CONFLICT_LEARNED_ADJ_FILE = as_str(STATE_DIR / "greenran_conflict_adjacency.json")
 SCENARIO_CONTROL_FILE = as_str(ARTICLE00_SCENARIO_CONTROL_PATH)
+ONLINE_STATUS_FILE = as_str(STATE_DIR / "online_status.json")
+ONLINE_STATE_FILE = as_str(STATE_DIR / "online_state.json")
+TRUE_ONLINE_STATUS_FILE = as_str(STATE_DIR / "tasam_true_online_real" / "true_online_status.json")
 TASAM_EVAL_FILE = as_str(Path(PROJECT_DIR) / 'runs' / 'sac_bootstrap' / 'tasam_candidate_evaluation_latest.json')
 MARL_CONTROL_GATE_FILE = as_str(Path(PROJECT_DIR) / 'runs' / 'sac_bootstrap' / 'marl_control_gate_latest.json')
 MARL_GATE_WATCH_STATUS_FILE = as_str(Path(PROJECT_DIR) / 'runs' / 'sac_bootstrap' / 'marl_runtime_gate_watch_status.json')
@@ -897,6 +901,8 @@ def get_latest_resource_allocation():
                 datetime,
                 controller_id,
                 target_policy_id,
+                resource_budget,
+                usable_budget,
                 d_ran,
                 d_ai,
                 r_ran,
@@ -915,22 +921,41 @@ def get_latest_resource_allocation():
             return {}
         shadow = {}
         try:
-            payload = json.loads(row[10] or '{}') if row[10] else {}
+            payload = json.loads(row[12] or '{}') if row[12] else {}
             shadow = (payload.get('marl_shadow') or {}) if isinstance(payload, dict) else {}
         except (TypeError, ValueError, json.JSONDecodeError):
             shadow = {}
         comparison = (shadow.get('comparison') or {}) if isinstance(shadow, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
         return {
             'datetime': row[0],
             'controller_id': row[1],
             'target_policy_id': row[2],
-            'd_ran': round(float(row[3] or 0.0), 4),
-            'd_ai': round(float(row[4] or 0.0), 4),
-            'r_ran': round(float(row[5] or 0.0), 4),
-            'r_ai': round(float(row[6] or 0.0), 4),
-            'ran_completion_ratio': round(float(row[7] or 0.0), 4),
-            'ai_completion_ratio': round(float(row[8] or 0.0), 4),
-            'utilization_ratio': round(float(row[9] or 0.0), 4),
+            'resource_budget': round(float(row[3] or 0.0), 4),
+            'usable_budget': round(float(row[4] or 0.0), 4),
+            'd_ran': round(float(row[5] or 0.0), 4),
+            'd_ai': round(float(row[6] or 0.0), 4),
+            'r_ran': round(float(row[7] or 0.0), 4),
+            'r_ai': round(float(row[8] or 0.0), 4),
+            'ran_completion_ratio': round(float(row[9] or 0.0), 4),
+            'ai_completion_ratio': round(float(row[10] or 0.0), 4),
+            'utilization_ratio': round(float(row[11] or 0.0), 4),
+            'allocation_state': str(payload.get('allocation_state', 'ALLOWED') or 'ALLOWED').upper(),
+            'healthy_streak': int(payload.get('healthy_streak', 0) or 0),
+            'floor_total_ran': round(float(payload.get('floor_total_ran', 0.0) or 0.0), 4),
+            'floor_total_ai': round(float(payload.get('floor_total_ai', 0.0) or 0.0), 4),
+            'reinforcement_ran': round(float(payload.get('reinforcement_ran', 0.0) or 0.0), 4),
+            'reinforcement_ai': round(float(payload.get('reinforcement_ai', 0.0) or 0.0), 4),
+            'floor_feasible': bool(payload.get('floor_feasible', True)),
+            'floor_policy': payload.get('floor_policy', 'sla_per_ue_v1'),
+            'per_ue_allocation': payload.get('per_ue_allocation', []),
+            'per_ue_floor_applied': bool(payload.get('per_ue_floor_applied', False)),
+            'per_ue_floor_violation_count': int(payload.get('per_ue_floor_violation_count', 0) or 0),
+            'per_ue_floor_feasible': bool(payload.get('per_ue_floor_feasible', payload.get('floor_feasible', True))),
+            'per_ue_application_status': payload.get('per_ue_application_status', 'not_applicable'),
+            'per_ue_policy_id': payload.get('per_ue_policy_id', ''),
+            'per_ue_ack_timestamp': float(payload.get('per_ue_ack_timestamp', 0.0) or 0.0),
+            'per_ue_ack_reason': payload.get('per_ue_ack_reason', ''),
             'marl_shadow': {
                 'policy_id': shadow.get('policy_id', ''),
                 'available': bool(shadow.get('available', False)),
@@ -955,6 +980,66 @@ def get_latest_resource_allocation():
     except Exception as e:
         print(f"Erro ao obter alocação mais recente: {e}")
         return {}
+
+
+def get_resource_summary():
+    """Resumo de recursos separado do painel de energia.
+
+    A dashboard runtime has the rApp allocation budget and delivered
+    throughput.  Physical PRB/RB allocation is intentionally reported as
+    unavailable unless the scheduler trace exposes it explicitly.
+    """
+    latest = get_latest_resource_allocation()
+    metrics = get_current_metrics() or {}
+    global_metrics = metrics.get('global_metrics', {}) if isinstance(metrics, dict) else {}
+    try:
+        row = DATA_LAKE.conn.execute(
+            """
+            SELECT COUNT(*) AS samples,
+                   AVG(resource_budget) AS resource_budget,
+                   AVG(usable_budget) AS usable_budget,
+                   AVG(r_ran) AS r_ran,
+                   AVG(r_ai) AS r_ai,
+                   AVG(utilization_ratio) AS utilization_ratio,
+                   AVG(ran_completion_ratio) AS ran_completion_ratio,
+                   AVG(ai_completion_ratio) AS ai_completion_ratio
+                   ,AVG(floor_total_ran) AS floor_total_ran
+                   ,AVG(floor_total_ai) AS floor_total_ai
+                   ,AVG(reinforcement_ran) AS reinforcement_ran
+                   ,AVG(reinforcement_ai) AS reinforcement_ai
+            FROM resource_allocation_history
+            WHERE timestamp >= strftime('%s', 'now') - 3600
+            """
+        ).fetchone()
+        samples = int(row['samples'] or 0) if row else 0
+        window = {
+            'samples': samples,
+            'resource_budget': round(float(row['resource_budget'] or 0.0), 4) if row else 0.0,
+            'usable_budget': round(float(row['usable_budget'] or 0.0), 4) if row else 0.0,
+            'r_ran': round(float(row['r_ran'] or 0.0), 4) if row else 0.0,
+            'r_ai': round(float(row['r_ai'] or 0.0), 4) if row else 0.0,
+            'utilization_ratio': round(float(row['utilization_ratio'] or 0.0), 4) if row else 0.0,
+            'ran_completion_ratio': round(float(row['ran_completion_ratio'] or 0.0), 4) if row else 0.0,
+            'ai_completion_ratio': round(float(row['ai_completion_ratio'] or 0.0), 4) if row else 0.0,
+            'floor_total_ran': round(float(row['floor_total_ran'] or 0.0), 4) if row else 0.0,
+            'floor_total_ai': round(float(row['floor_total_ai'] or 0.0), 4) if row else 0.0,
+            'reinforcement_ran': round(float(row['reinforcement_ran'] or 0.0), 4) if row else 0.0,
+            'reinforcement_ai': round(float(row['reinforcement_ai'] or 0.0), 4) if row else 0.0,
+        }
+    except Exception as e:
+        print(f"Erro ao obter resumo de recursos: {e}")
+        window = {'samples': 0}
+    return {
+        'latest': latest,
+        'window_1h': window,
+        'resource_headroom': round(max(0.0, 1.0 - float(window.get('utilization_ratio', 0.0) or 0.0)), 4),
+        'delivered_bandwidth_mbps': round(float(global_metrics.get('throughput_kbps', 0.0) or 0.0) / 1000.0, 3),
+        'direct_bandwidth_allocation_available': False,
+        'resource_unit': 'rApp budget share',
+        'allocation_state': latest.get('allocation_state', 'ALLOWED') if latest else 'ALLOWED',
+        'floor_feasible': latest.get('floor_feasible', True) if latest else True,
+        'note': 'PRB/RB físico indisponível no trace atual; throughput é banda entregue, não banda alocada.',
+    }
 
 
 def get_marl_shadow_runtime_summary(window=200):
@@ -1131,6 +1216,362 @@ def get_collection_health_summary():
         return summary
 
 
+def _live_file_info(path):
+    """Read a runtime JSON file and expose freshness without failing the panel."""
+    info = {
+        'path': str(path),
+        'exists': False,
+        'age_s': None,
+        'updated_at': 0,
+        'data': {},
+    }
+    try:
+        stat = os.stat(path)
+        info['exists'] = True
+        info['age_s'] = round(max(0.0, time.time() - stat.st_mtime), 1)
+        with open(path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict):
+            info['data'] = payload
+            try:
+                info['updated_at'] = int(payload.get('updated_at', 0) or payload.get('generated_at', 0) or 0)
+            except (TypeError, ValueError):
+                info['updated_at'] = 0
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return info
+
+
+def _live_db_snapshot():
+    """Return small, read-only slices of the active data lake for live polling."""
+    result = {
+        'counts': {},
+        'latest_metric': {},
+        'latest_decision': {},
+        'latest_allocation': {},
+        'stage_counts': {},
+        'recent_metrics': [],
+        'recent_allocations': [],
+        'recent_decisions': [],
+        'rows_last_minute': 0,
+        'decisions_last_minute': 0,
+    }
+    tables = (
+        'extended_metrics',
+        'decisions_history',
+        'resource_allocation_history',
+        'marl_global_state_history',
+        'marl_shadow_comparison_history',
+        'judge_outcome_history',
+    )
+    try:
+        cursor = DATA_LAKE.conn.cursor()
+        for table in tables:
+            try:
+                result['counts'][table] = int(cursor.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] or 0)
+            except Exception:
+                result['counts'][table] = 0
+
+        row = cursor.execute(
+            """
+            SELECT timestamp, datetime, sim_time_s, latency_p95_us, cvar_per_ue_us,
+                   throughput_kbps, total_active_ues, total_active_cameras,
+                   collector_mode, throughput_source, real_latency_sample_count,
+                   proxy_latency_sample_count, pdcp_stale, pdcp_latest_sim_time_s
+            FROM extended_metrics ORDER BY timestamp DESC LIMIT 1
+            """
+        ).fetchone()
+        if row:
+            result['latest_metric'] = {
+                'timestamp': int(row[0] or 0),
+                'datetime': row[1] or '',
+                'sim_time_s': round(float(row[2] or 0.0), 3),
+                'p95_ms': round(float(row[3] or 0.0) / 1000.0, 3),
+                'cvar_ms': round(float(row[4] or 0.0) / 1000.0, 3),
+                'throughput_kbps': round(float(row[5] or 0.0), 3),
+                'active_ues': int(row[6] or 0),
+                'active_cameras': int(row[7] or 0),
+                'collector_mode': row[8] or '',
+                'throughput_source': row[9] or '',
+                'real_latency_sample_count': int(row[10] or 0),
+                'proxy_latency_sample_count': int(row[11] or 0),
+                'pdcp_stale': bool(row[12] or 0),
+                'pdcp_latest_sim_time_s': round(float(row[13] or 0.0), 3),
+            }
+
+        row = cursor.execute(
+            """
+            SELECT timestamp, datetime, decision, reason, confidence,
+                   collection_event_stage_name, allocation_state,
+                   floor_total_ran, floor_total_ai, healthy_streak
+            FROM decisions_history ORDER BY timestamp DESC LIMIT 1
+            """
+        ).fetchone()
+        if row:
+            result['latest_decision'] = {
+                'timestamp': int(row[0] or 0),
+                'datetime': row[1] or '',
+                'decision': row[2] or '',
+                'reason': row[3] or '',
+                'confidence': round(float(row[4] or 0.0), 4),
+                'stage': row[5] or '',
+                'allocation_state': row[6] or '',
+                'floor_total_ran': round(float(row[7] or 0.0), 4),
+                'floor_total_ai': round(float(row[8] or 0.0), 4),
+                'healthy_streak': int(row[9] or 0),
+            }
+
+        row = cursor.execute(
+            """
+            SELECT timestamp, allocation_state, r_ran, r_ai, floor_total_ran,
+                   floor_total_ai, per_ue_floor_violation_count, floor_feasible,
+                   per_ue_application_status
+            FROM resource_allocation_history ORDER BY timestamp DESC LIMIT 1
+            """
+        ).fetchone()
+        if row:
+            result['latest_allocation'] = {
+                'timestamp': int(row[0] or 0),
+                'allocation_state': row[1] or '',
+                'r_ran': round(float(row[2] or 0.0), 4),
+                'r_ai': round(float(row[3] or 0.0), 4),
+                'floor_total_ran': round(float(row[4] or 0.0), 4),
+                'floor_total_ai': round(float(row[5] or 0.0), 4),
+                'floor_violations': int(row[6] or 0),
+                'floor_feasible': bool(row[7] if row[7] is not None else 1),
+                'per_ue_application_status': row[8] or '',
+            }
+
+        try:
+            stage_rows = cursor.execute(
+                """
+                SELECT COALESCE(collection_event_stage_name, ''), COUNT(*)
+                FROM decisions_history
+                GROUP BY collection_event_stage_name
+                """
+            ).fetchall()
+            result['stage_counts'] = {str(row[0] or 'unknown'): int(row[1] or 0) for row in stage_rows}
+        except Exception:
+            result['stage_counts'] = {}
+
+        now = int(time.time())
+        result['rows_last_minute'] = int(cursor.execute(
+            'SELECT COUNT(*) FROM extended_metrics WHERE timestamp >= ?', (now - 60,)
+        ).fetchone()[0] or 0)
+        result['decisions_last_minute'] = int(cursor.execute(
+            'SELECT COUNT(*) FROM decisions_history WHERE timestamp >= ?', (now - 60,)
+        ).fetchone()[0] or 0)
+
+        rows = cursor.execute(
+            """
+            SELECT timestamp, sim_time_s, latency_p95_us, cvar_per_ue_us,
+                   throughput_kbps, real_latency_sample_count,
+                   proxy_latency_sample_count
+            FROM extended_metrics ORDER BY timestamp DESC LIMIT 90
+            """
+        ).fetchall()
+        result['recent_metrics'] = [
+            {
+                'timestamp': int(row[0] or 0),
+                'sim_time_s': round(float(row[1] or 0.0), 3),
+                'p95_ms': round(float(row[2] or 0.0) / 1000.0, 3),
+                'cvar_ms': round(float(row[3] or 0.0) / 1000.0, 3),
+                'throughput_kbps': round(float(row[4] or 0.0), 3),
+                'real': int(row[5] or 0),
+                'proxy': int(row[6] or 0),
+            }
+            for row in reversed(rows)
+        ]
+        rows = cursor.execute(
+            """
+            SELECT timestamp, r_ran, r_ai, allocation_state
+            FROM resource_allocation_history ORDER BY timestamp DESC LIMIT 90
+            """
+        ).fetchall()
+        result['recent_allocations'] = [
+            {
+                'timestamp': int(row[0] or 0),
+                'ran': round(float(row[1] or 0.0), 4),
+                'ai': round(float(row[2] or 0.0), 4),
+                'state': row[3] or '',
+            }
+            for row in reversed(rows)
+        ]
+        rows = cursor.execute(
+            """
+            SELECT timestamp, decision, collection_event_stage_name, reason
+            FROM decisions_history ORDER BY timestamp DESC LIMIT 12
+            """
+        ).fetchall()
+        result['recent_decisions'] = [
+            {
+                'timestamp': int(row[0] or 0),
+                'decision': row[1] or '',
+                'stage': row[2] or '',
+                'reason': row[3] or '',
+            }
+            for row in rows
+        ]
+    except Exception as exc:
+        result['error'] = str(exc)
+    return result
+
+
+def build_live_collection_snapshot():
+    """Compose the compact, polling-friendly view of the active online run."""
+    status_info = _live_file_info(ONLINE_STATUS_FILE)
+    state_info = _live_file_info(ONLINE_STATE_FILE)
+    training_info = _live_file_info(TRUE_ONLINE_STATUS_FILE)
+    control = _safe_read_json(SCENARIO_CONTROL_FILE, {})
+    metrics = get_current_metrics() or {}
+    global_metrics = metrics.get('global_metrics', {}) if isinstance(metrics, dict) else {}
+    db = _live_db_snapshot()
+    online = status_info['data'] or state_info['data'] or {}
+    training = training_info['data'] or {}
+    latest_metric = db.get('latest_metric') or {}
+    if not latest_metric:
+        latest_metric = {
+            'p95_ms': round(float(global_metrics.get('latency_p95_us', 0.0) or 0.0) / 1000.0, 3),
+            'cvar_ms': round(float(global_metrics.get('cvar_per_ue_us', 0.0) or 0.0) / 1000.0, 3),
+            'throughput_kbps': round(float(global_metrics.get('throughput_kbps', 0.0) or 0.0), 3),
+            'active_ues': int(global_metrics.get('total_active_ues', 0) or 0),
+            'active_cameras': int(metrics.get('active_cameras', 0) or 0),
+            'collector_mode': global_metrics.get('collector_mode', ''),
+            'throughput_source': global_metrics.get('throughput_source', ''),
+            'real_latency_sample_count': int(global_metrics.get('real_latency_sample_count', 0) or 0),
+            'proxy_latency_sample_count': int(global_metrics.get('proxy_latency_sample_count', 0) or 0),
+            'pdcp_stale': bool(global_metrics.get('pdcp_stale', False)),
+        }
+
+    target = int(
+        training.get('min_trainable_transitions')
+        or training.get('target_transitions')
+        or online.get('min_trainable_transitions')
+        or 1500
+    )
+    written = int(training.get('written_transitions', 0) or 0)
+    if written <= 0:
+        written = int(db['counts'].get('decisions_history', 0) or 0)
+    progress = min(1.0, max(0.0, written / target)) if target > 0 else 0.0
+
+    guard = online.get('guard', {}) or {}
+    allocation = db.get('latest_allocation') or {}
+    stage_names = [
+        'allowed_bootstrap', 'allowed_stable', 'camera_conditional',
+        'camera_blocked', 'vehicle_conditional', 'vehicle_blocked',
+        'app2_conditional', 'app2_blocked', 'allowed_recovery',
+    ]
+    current_stage = (
+        control.get('collection_event_stage_name')
+        or control.get('scenario')
+        or (db.get('latest_decision') or {}).get('stage')
+        or online.get('stage')
+        or 'unknown'
+    )
+    stages = [
+        {
+            'name': name,
+            'count': int(db.get('stage_counts', {}).get(name, 0) or 0),
+            'active': name == current_stage,
+        }
+        for name in stage_names
+    ]
+    xapps = get_xapp_status() or {}
+    xapp_view = {}
+    for name in ('SLICER', 'ENERGY', 'VEHICLE'):
+        payload = xapps.get(name, {}) or {}
+        xapp_view[name] = {
+            'status': payload.get('status', 'UNKNOWN'),
+            'transport_mode': payload.get('transport_mode', 'unknown'),
+            'socket_required': bool(payload.get('socket_required', False)),
+            'socket_status': payload.get('socket_status', payload.get('socket', '')),
+            'last_cycle': payload.get('last_cycle'),
+            'pid': payload.get('pid'),
+        }
+
+    ages = [info['age_s'] for info in (status_info, training_info) if info['exists'] and info['age_s'] is not None]
+    freshest_age = min(ages) if ages else None
+    status = str(online.get('status') or ('running' if latest_metric else 'unknown')).lower()
+    if status == 'running' and freshest_age is not None and freshest_age > 90:
+        status = 'stale'
+    return {
+        'generated_at': int(time.time()),
+        'run_dir': str(STATE_DIR),
+        'status': status,
+        'status_label': {
+            'running': 'RODANDO', 'stale': 'SEM PULSO', 'stopped': 'PARADA',
+        }.get(status, status.upper()),
+        'freshness': {
+            'status_age_s': status_info.get('age_s'),
+            'training_age_s': training_info.get('age_s'),
+            'metrics_age_s': _live_file_info(Path(METRICS_FILE)).get('age_s'),
+            'state_age_s': state_info.get('age_s'),
+        },
+        'online': {
+            'stage': online.get('stage', ''),
+            'rollout_fraction': float(online.get('rollout_fraction', 0.0) or 0.0),
+            'updates_completed': int(online.get('updates_completed', 0) or 0),
+            'rollback_count': int(online.get('rollback_count', 0) or 0),
+            'active_checkpoint': online.get('active_checkpoint', ''),
+            'guard': {
+                'floor_violations': int(guard.get('floor_violations', 0) or 0),
+                'critical_streak': int(guard.get('critical_streak', 0) or 0),
+                'avg_score_delta': round(float(guard.get('avg_score_delta', 0.0) or 0.0), 5),
+                'rollback': bool(guard.get('rollback', False)),
+                'reason': guard.get('reason', ''),
+            },
+        },
+        'training': {
+            'status': training.get('status', 'unknown'),
+            'reason': training.get('reason', ''),
+            'written_transitions': written,
+            'target_transitions': target,
+            'progress': round(progress, 4),
+            'updates_completed': int(training.get('updates_completed', online.get('updates_completed', 0)) or 0),
+            'trace_jsonl': training.get('trace_jsonl', ''),
+        },
+        'collection': {
+            'profile': control.get('collection_event_profile', ''),
+            'cycle': int(control.get('collection_event_cycle', 0) or 0),
+            'stage': current_stage,
+            'stage_index': int(control.get('collection_event_stage_index', 0) or 0),
+            'stage_remaining_s': round(float(control.get('stage_remaining_s', 0.0) or 0.0), 2),
+            'stages': stages,
+            'rows_last_minute': int(db.get('rows_last_minute', 0) or 0),
+            'decisions_last_minute': int(db.get('decisions_last_minute', 0) or 0),
+        },
+        'telemetry': latest_metric,
+        'provenance': {
+            'collector_mode': latest_metric.get('collector_mode') or global_metrics.get('collector_mode', ''),
+            'pdcp_real': bool(global_metrics.get('pdcp_real', latest_metric.get('real_latency_sample_count', 0) > 0)),
+            'pdcp_provenance': global_metrics.get('pdcp_provenance', 'pdcp_real' if latest_metric.get('real_latency_sample_count', 0) > 0 else ''),
+            'scenario_override_active': bool(global_metrics.get('scenario_override_active', False)),
+            'effective_source': global_metrics.get('effective_source', 'pdcp_real'),
+            'real_samples': int(global_metrics.get('real_latency_sample_count', latest_metric.get('real_latency_sample_count', 0)) or 0),
+            'proxy_samples': int(global_metrics.get('proxy_latency_sample_count', latest_metric.get('proxy_latency_sample_count', 0)) or 0),
+        },
+        'guards': {
+            'floor_violations': int(guard.get('floor_violations', 0) or 0),
+            'rollback': bool(guard.get('rollback', False)),
+            'rollback_count': int(online.get('rollback_count', 0) or 0),
+            'allocation_state': allocation.get('allocation_state', ''),
+            'floor_feasible': allocation.get('floor_feasible', True),
+            'per_ue_floor_violations': int(allocation.get('floor_violations', 0) or 0),
+            'r_ran': allocation.get('r_ran', 0.0),
+            'r_ai': allocation.get('r_ai', 0.0),
+        },
+        'database': {
+            'path': str(Path(STATE_DIR) / 'rapp_data_lake.db'),
+            'counts': db.get('counts', {}),
+        },
+        'latest_decision': db.get('latest_decision', {}),
+        'xapps': xapp_view,
+        'recent_metrics': db.get('recent_metrics', []),
+        'recent_allocations': db.get('recent_allocations', []),
+        'recent_decisions': db.get('recent_decisions', []),
+    }
+
+
 
 
 def get_marl_gate_watch_status():
@@ -1200,6 +1641,7 @@ def build_mobile_ops_snapshot():
     service_slas = get_service_sla_status()
     latest_decision = get_latest_decision_snapshot()
     latest_alloc = get_latest_resource_allocation()
+    resource_summary = get_resource_summary()
     collection = get_collection_health_summary()
     xapp_status = get_xapp_status()
     fixed_scenario = get_fixed_scenario_metadata()
@@ -1231,6 +1673,7 @@ def build_mobile_ops_snapshot():
         'service_slas': service_slas,
         'latest_decision': latest_decision,
         'latest_allocation': latest_alloc,
+        'resource_summary': resource_summary,
         'tasam_evaluation': tasam_eval,
         'marl_shadow_runtime': marl_shadow_runtime,
         'marl_control_gate': marl_control_gate,
@@ -1389,6 +1832,7 @@ def index():
     # NOVO: Obter proteção das câmeras
     camera_protection = get_camera_protection()
     service_slas = get_service_sla_status()
+    resource_summary = get_resource_summary()
     
     # NOVO: Obter histórico de CVaR para gráfico
     cvar_history = get_cvar_history(50)
@@ -1424,6 +1868,7 @@ def index():
         vehicle_history=vehicle_history,
         scenario_counts=scenario_counts,
         service_slas=service_slas,
+        resource_summary=resource_summary,
         fixed_scenario=fixed_scenario,
     )
 
@@ -1686,6 +2131,14 @@ def api_ops():
     return jsonify(build_mobile_ops_snapshot())
 
 
+@app.route('/api/collection/live')
+def api_collection_live():
+    """API: visão ao vivo da coleta online e do treinador TA-SAM."""
+    response = jsonify(build_live_collection_snapshot())
+    response.headers['Cache-Control'] = 'no-store, max-age=0'
+    return response
+
+
 @app.route('/api/extended')
 def api_extended():
     """API: Métricas estendidas."""
@@ -1794,6 +2247,12 @@ def api_energy():
     return jsonify(stats)
 
 
+@app.route('/api/resources')
+def api_resources():
+    """API: alocação e utilização de recursos separadas da energia."""
+    return jsonify(get_resource_summary())
+
+
 @app.route('/api/energy/current')
 def api_energy_current():
     """API: Estado atual de energia."""
@@ -1806,15 +2265,38 @@ def api_energy_current():
                 power = cmd.get('power_level', 100)
                 savings = 100 - power
                 action = cmd.get('action', 'UNKNOWN')
+                try:
+                    calibration = load_calibration()
+                    model_power_w = state_power_w(
+                        calibration,
+                        cmd.get('ru_count', 1),
+                        cmd.get('mmwave_count', 1),
+                        power,
+                    )
+                    calibration_version = calibration.get('calibration_version', '')
+                except ValueError:
+                    model_power_w = None
+                    calibration_version = ''
                 return jsonify({
                     'action': action,
                     'power_percent': power,
                     'savings_percent': savings,
-                    'timestamp': cmd.get('timestamp')
+                    'timestamp': cmd.get('timestamp'),
+                    'model_power_w': model_power_w,
+                    'energy_metric_kind': 'calibrated_ru_mmwave_power_model',
+                    'calibration_version': calibration_version,
+                    'physical_meter_available': False,
                 })
         except:
             pass
-    return jsonify({'action': 'UNKNOWN', 'power_percent': 100, 'savings_percent': 0})
+    return jsonify({
+        'action': 'UNKNOWN',
+        'power_percent': 100,
+        'savings_percent': 0,
+        'model_power_w': None,
+        'energy_metric_kind': 'calibrated_ru_mmwave_power_model',
+        'physical_meter_available': False,
+    })
 
 
 def main():
@@ -1840,6 +2322,7 @@ def main():
     print("    /decisions  - Histórico de decisões")
     print("    /pattern    - Análise de padrões")
     print("    /xapps      - Status dos xApps")
+    print("    /api/collection/live - Coleta online ao vivo")
     print("    /api/*      - API REST")
     print()
     print("  Pressione Ctrl+C para encerrar")

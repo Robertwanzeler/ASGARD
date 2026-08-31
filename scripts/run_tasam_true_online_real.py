@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status-json", default=None, help="Status JSON path")
     parser.add_argument("--state-json", default=None, help="Persistent runner state JSON path")
     parser.add_argument("--train-python", default=None, help="Python executable used to run train_tasam_marl.py")
+    parser.add_argument("--init-checkpoint-dir", default=os.environ.get("GREENRAN_TASAM_TRUE_ONLINE_INIT_CHECKPOINT"), help="Validated actor checkpoint used to initialize the first online update")
+    parser.add_argument("--seed", type=int, default=_env_int("GREENRAN_TASAM_TRUE_ONLINE_SEED", 45), help="Seed for online updates")
     parser.add_argument("--min-new-snapshots", type=int, default=500, help="Minimum new marl_global_state_history rows required to trigger another update")
     parser.add_argument("--min-trainable-transitions", type=int, default=1500, help="Minimum exported valid transitions required before training")
     parser.add_argument("--bootstrap-epochs", type=int, default=5, help="Target epochs for the first real-data update")
@@ -260,13 +262,16 @@ def build_train_command(args: argparse.Namespace, target_epochs: int) -> list[st
         "--batch-size",
         "128",
         "--seed",
-        "42",
+        str(args.seed),
         "--article-hidden",
         "--activation",
         "tanh",
         "--resume",
         "--resume-ignore-early-stop",
     ]
+    if args.init_checkpoint_dir:
+        cmd.extend(["--init-checkpoint-dir", str(args.init_checkpoint_dir)])
+    return cmd
 
 
 def run_command(cmd: list[str], *, cwd: Path, dry_run: bool) -> None:
@@ -282,6 +287,9 @@ def load_export_summary(path: Path) -> dict[str, Any]:
 
 def write_status(args: argparse.Namespace, payload: dict[str, Any]) -> None:
     status = dict(payload)
+    status.setdefault("training_mode", "online")
+    status.setdefault("replay_source", "live_sqlite")
+    status.setdefault("min_trainable_transitions", int(args.min_trainable_transitions))
     status["updated_at"] = int(time.time())
     save_json(args.status_json, status)
 

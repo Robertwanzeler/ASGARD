@@ -44,12 +44,12 @@ import time
 import os
 import socket
 
-from greenran_paths import ENERGY_COMMAND_PATH, ENERGY_INTENT_PATH, as_str
+from greenran_paths import ENERGY_COMMAND_PATH, ENERGY_INTENT_PATH, ENERGY_SOCKET_PATH, as_str
 
 # Caminhos de comunicação
 ENERGY_COMMAND_PATH = as_str(ENERGY_COMMAND_PATH)
 ENERGY_INTENT_PATH = as_str(ENERGY_INTENT_PATH)
-SOCKET_PATH = "/tmp/energy_saver.sock"
+SOCKET_PATH = as_str(ENERGY_SOCKET_PATH)
 
 # ... (ACTIONS definition remains the same) ...
 
@@ -118,6 +118,10 @@ class EnergyCommand:
         self.command_path = command_path or ENERGY_COMMAND_PATH
         self.intent_path = ENERGY_INTENT_PATH
         self.data_lake = data_lake
+        # File is the safe standalone default; integration is opt-in and has
+        # a strict socket/ACK contract with no silent fallback.
+        mode = os.environ.get('GREENRAN_XAPP_MODE', 'file').strip().lower()
+        self.socket_enabled = mode in {'socket', 'integration', 'socket/integration'}
         
         # Criar diretório se não existir
         os.makedirs(os.path.dirname(self.command_path), exist_ok=True)
@@ -139,23 +143,29 @@ class EnergyCommand:
         if ttl is None:
             ttl = action_info.get('ttl_seconds', DEFAULT_TTL)
         
+        timestamp_ns = time.time_ns()
         command = {
             'action': action,
             'power_level': power_level,
             'ru_count': action_info['ru_count'],
             'mmwave_count': action_info['mmwave_count'],
-            'timestamp': int(time.time()),
+            'timestamp': timestamp_ns // 1_000_000_000,
+            'timestamp_ns': timestamp_ns,
             'ttl_seconds': ttl,
             'reason': reason,
             'version': '1.0'
         }
         
         try:
-            # Enviar via Socket
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(SOCKET_PATH)
-            sock.sendall(json.dumps(command).encode('utf-8'))
-            sock.close()
+            if not self.socket_enabled:
+                raise FileNotFoundError('file/shadow mode disables socket transport')
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                sock.connect(SOCKET_PATH)
+                sock.sendall(json.dumps(command).encode('utf-8'))
+                ack = json.loads(sock.recv(256).decode('utf-8'))
+                if not ack.get('ack'):
+                    raise RuntimeError('xApp ENERGY não confirmou ACK')
             
             print(f"[EnergyProtocol] Comando enviado via Socket: {action}")
             
@@ -166,14 +176,17 @@ class EnergyCommand:
                     power_percent=power_level,
                     ru_count=action_info['ru_count'],
                     mmwave_count=action_info['mmwave_count'],
-                    reason=reason
+                    reason=reason,
+                    timestamp_ns=timestamp_ns,
                 )
             
             return True
             
         except Exception as e:
-            print(f"[EnergyProtocol] ERRO ao enviar comando via Socket: {e}. Fallback para arquivo.")
-            # Fallback para o modo arquivo original
+            if self.socket_enabled:
+                print(f"[EnergyProtocol] ERRO: socket obrigatório indisponível: {e}")
+                return False
+            # Modo file/shadow: persistência em arquivo é o transporte oficial.
             try:
                 temp_path = self.command_path + '.tmp'
                 with open(temp_path, 'w') as f:
@@ -186,7 +199,8 @@ class EnergyCommand:
                         power_percent=power_level,
                         ru_count=action_info['ru_count'],
                         mmwave_count=action_info['mmwave_count'],
-                        reason=reason
+                        reason=reason,
+                        timestamp_ns=timestamp_ns,
                     )
                 return True
             except Exception as e2:

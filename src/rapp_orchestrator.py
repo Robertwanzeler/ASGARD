@@ -41,6 +41,7 @@ import signal
 import json
 import re
 import socket
+import hashlib
 from datetime import datetime
 from collections import deque
 from greenran_paths import (
@@ -55,12 +56,14 @@ from greenran_paths import (
     EXTENDED_METRICS_JSON_PATH,
     XAPP_HEALTH_PATH,
     XAPP_INTENTS_DIR,
+    SLICER_SOCKET_PATH,
+    ENERGY_SOCKET_PATH,
     ensure_runtime_dirs,
     as_str,
     get_fixed_active_cameras,
     get_fixed_total_ues,
 )
-from greenran_runtime import load_runtime_config
+from greenran_runtime import load_runtime_config, get_xapp_transport_mode
 
 # Add drlexp venv to path for DRL imports
 DRL_VENV_PATH = as_str(DRL_VENV_SITE_PACKAGES)
@@ -80,9 +83,11 @@ from rapp_online_retrain_runtime import (
 )
 from rapp_armd_runtime import ARMDRuntimeAdvisor
 from rapp_rl_policy import build_runtime_rl_policy
-from rapp_sac_resource_model import compute_shared_resource_snapshot
+from rapp_sac_resource_model import apply_baseline_resource_band, apply_per_ue_allocation, compute_shared_resource_snapshot, enforce_resource_state
 from rapp_marl_shadow import MARLShadowRuntimeEvaluator
 from rapp_network_improvement import build_network_improvement
+from rapp_judge import RAppJudge
+from rapp_policy_source import RAppPolicySource
 
 # from rapp_synthetic_generator import SyntheticDataGenerator  # Removed - not available
 from rapp_xapp_manager import XAppManager
@@ -123,6 +128,44 @@ def _safe_read_json_file(path):
             return json.load(f)
     except Exception:
         return {}
+
+
+def _load_collection_event_context():
+    """Capture the event stage used for this decision.
+
+    The alternator is the source of truth for collection labels.  Persisting
+    the stage beside the decision avoids reconstructing it later from a
+    free-form reason, which can mention a secondary priority (for example a
+    vehicle guard during a camera event).
+    """
+    control = _safe_read_json_file(ARTICLE00_SCENARIO_CONTROL_PATH)
+    if not isinstance(control, dict):
+        return {}
+    stage = str(control.get('collection_event_stage_name') or '').strip()
+    if not stage:
+        return {}
+    try:
+        cycle = int(control.get('collection_event_cycle', 0) or 0)
+    except (TypeError, ValueError):
+        cycle = 0
+    try:
+        stage_index = int(control.get('collection_event_stage_index', 0) or 0)
+    except (TypeError, ValueError):
+        stage_index = 0
+    try:
+        generated_at = int(control.get('generated_at', 0) or 0)
+    except (TypeError, ValueError):
+        generated_at = 0
+    return {
+        'collection_event_stage_name': stage,
+        'collection_event_target_domain': str(
+            control.get('collection_event_target_domain') or ''
+        ).strip(),
+        'collection_event_cycle': cycle,
+        'collection_event_stage_index': stage_index,
+        'collection_event_generated_at': generated_at,
+        'collection_event_stage_authoritative': True,
+    }
 
 
 def _load_app1_camera_override():
@@ -242,6 +285,14 @@ class RappResourceOptimizer:
         self.interval = max(1, interval)
         self.running = True
         self.cycle = 0
+        # Isolated stress/A-B runs can provide a decision target.  Enforce it
+        # inside the rApp loop as well as in the external watcher: signaling
+        # the process from another thread/process has a small race window in
+        # which several cycles could otherwise be persisted after the target.
+        try:
+            self.decision_target = max(0, int(os.environ.get('GREENRAN_DECISION_TARGET', '0') or 0))
+        except (TypeError, ValueError):
+            self.decision_target = 0
         
         # Estatísticas
         self.stats = {
@@ -263,8 +314,40 @@ class RappResourceOptimizer:
         self.ml_history = deque(maxlen=50)  # Mantém últimas 50 predições
         self.history_display_interval = 1  # Exibir a cada ciclo (mais frequente)
         self.app2_connectivity_history = deque(maxlen=3)
-        self._resource_allocation_prev = {'r_ran': 0.5, 'r_ai': 0.5}
+        self._resource_allocation_prev = {
+            'r_ran': 0.5,
+            'r_ai': 0.5,
+            'allocation_state': 'ALLOWED',
+            'healthy_streak': 0,
+            'floor_total_ran': 0.0,
+            'floor_total_ai': 0.0,
+        }
         self.marl_shadow_evaluator = MARLShadowRuntimeEvaluator(RUNTIME_CONFIG.get('tasam_advisor', {}))
+        if self.marl_shadow_evaluator.require_checkpoint and not self.marl_shadow_evaluator.checkpoint_loaded:
+            raise RuntimeError(
+                'TA-SAM checkpoint required but not loaded: '
+                f'{self.marl_shadow_evaluator.checkpoint_error or "unknown checkpoint error"}'
+            )
+        if self.marl_shadow_evaluator.checkpoint_loaded:
+            print(
+                '[rApp] TA-SAM checkpoint active: '
+                f'{self.marl_shadow_evaluator.checkpoint_run_dir} '
+                f'(readiness={self.marl_shadow_evaluator.checkpoint_readiness})'
+            )
+        self.rapp_policy_source = RAppPolicySource()
+        self.rapp_judge = RAppJudge({
+            'enabled': True,
+            'production': True,
+            # Opt-in so the active v7 collection keeps its frozen arbitration
+            # contract. Future operational runs can enable the cooperative
+            # hierarchy with GREENRAN_ASSISTANT_DECISION_MODE.
+            'composition_mode': os.environ.get(
+                'GREENRAN_ASSISTANT_DECISION_MODE', 'competitive'
+            ),
+        })
+        # The judge receives delayed real observations on the next cycle so
+        # an assistant is penalized for an overreaction in a healthy network.
+        self._pending_judge_decision = None
         
         # Inicializa componentes
         print("[rApp] Inicializando componentes...")
@@ -297,10 +380,10 @@ class RappResourceOptimizer:
             self.ml_predictor = MLPredictor(data_lake=self.data_lake)
             print("[rApp] ML runtime enabled")
         else:
-            print("[rApp] ML runtime disabled by config; DRL/rules only")
+            print("[rApp] Legacy ML runtime disabled by config; TA-SAM checkpoint path remains active")
 
-        # Runtime RL policy selection. The live allocator remains heuristic while
-        # TA-SAM MARL stays in shadow/control-gated evaluation.
+        # Runtime RL compatibility hook. The effective live resource decision
+        # is produced later by the ARMD envelope + TA-SAM Judge path.
         self.rl_policy = None
         self.drl_predictor = None
         try:
@@ -315,7 +398,7 @@ class RappResourceOptimizer:
                 self.drl_predictor = self.rl_policy
                 print("[rApp] RL policy attached to legacy energy runtime")
             else:
-                print("[rApp] RL policy attached to heuristic live path with TA-SAM shadow support")
+                print("[rApp] RL compatibility hook loaded; ARMD + TA-SAM owns effective resource control")
         except Exception as e:
             print(f"[rApp] RL policy load failed: {e}")
             self.rl_policy = None
@@ -328,6 +411,7 @@ class RappResourceOptimizer:
 
         # XApp Manager (controla ciclo de vida dos xApps)
         self.xapp_manager = XAppManager()
+        self.xapp_transport_mode = get_xapp_transport_mode(RUNTIME_CONFIG)
         self.armd_runtime = ARMDRuntimeAdvisor()
         if self.armd_runtime.loaded and self.armd_runtime.enabled:
             print(
@@ -356,8 +440,11 @@ class RappResourceOptimizer:
         # Slicer SEMPRE inicia com rApp (prioridade)
         self._energy_xapp_disabled = False
         self._vehicle_xapp_disabled = False
-        self._start_slicer()
-        self._start_vehicle_control()
+        if self.xapp_transport_mode == 'socket':
+            self._start_slicer()
+            self._start_vehicle_control()
+        else:
+            print('[rApp] xApps em modo file/shadow: sockets não são obrigatórios')
 
         # Energy Saver NÃO inicia automaticamente - rApp decide quando ativar
         self._energy_active = False
@@ -466,6 +553,15 @@ class RappResourceOptimizer:
         # ENERGY SAVER: controlado pelo rApp
         # CONDITIONAL agora ATIVA o Energy Saver (economia moderada ativa)
         energy_decision = decision.get('energy_saver')
+
+        if getattr(self, 'xapp_transport_mode', 'socket') == 'file':
+            return {
+                'slicer_active': False,
+                'energy_active': False,
+                'vehicle_active': False,
+                'transport_mode': 'file',
+                'socket_required': False,
+            }
         
         if energy_decision in ['ALLOWED', 'CONDITIONAL']:
             # Slicer OK ou CONDITIONAL → Energy pode ativar/continuar
@@ -490,10 +586,9 @@ class RappResourceOptimizer:
         if not os.path.exists(socket_path):
             return "MISSING"
         try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(0.1)
-            sock.connect(socket_path)
-            sock.close()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.1)
+                sock.connect(socket_path)
             return "OK"
         except:
             return "UNRESPONSIVE"
@@ -506,8 +601,11 @@ class RappResourceOptimizer:
         slicer_pid = self.xapp_manager.get_pid('slicer')
         slicer_running = self.xapp_manager.is_running('slicer')
         status['SLICER'] = {
-            'status': 'RUNNING' if slicer_running else 'STOPPED',
-            'socket': self._check_socket("/tmp/slicer.sock"),
+            'status': ('RUNNING' if slicer_running else 'STOPPED') if getattr(self, 'xapp_transport_mode', 'socket') == 'socket' else 'FILE_ONLY',
+            'socket': self._check_socket(as_str(SLICER_SOCKET_PATH)) if getattr(self, 'xapp_transport_mode', 'socket') == 'socket' else 'NOT_REQUIRED',
+            'socket_path': as_str(SLICER_SOCKET_PATH),
+            'transport_mode': getattr(self, 'xapp_transport_mode', 'socket'),
+            'socket_required': getattr(self, 'xapp_transport_mode', 'socket') == 'socket',
             'pid': slicer_pid,
             'last_cycle': getattr(self, 'cycle', 0),
             'total_restarts': 0,
@@ -518,8 +616,11 @@ class RappResourceOptimizer:
         energy_pid = self.xapp_manager.get_pid('energy_saver')
         energy_running = self.xapp_manager.is_running('energy_saver')
         status['ENERGY'] = {
-            'status': 'RUNNING' if energy_running else 'STOPPED',
-            'socket': self._check_socket("/tmp/energy_saver.sock"),
+            'status': ('RUNNING' if energy_running else 'STOPPED') if getattr(self, 'xapp_transport_mode', 'socket') == 'socket' else 'FILE_ONLY',
+            'socket': self._check_socket(as_str(ENERGY_SOCKET_PATH)) if getattr(self, 'xapp_transport_mode', 'socket') == 'socket' else 'NOT_REQUIRED',
+            'socket_path': as_str(ENERGY_SOCKET_PATH),
+            'transport_mode': getattr(self, 'xapp_transport_mode', 'socket'),
+            'socket_required': getattr(self, 'xapp_transport_mode', 'socket') == 'socket',
             'pid': energy_pid,
             'last_cycle': getattr(self, 'cycle', 0),
             'total_restarts': 0,
@@ -547,13 +648,15 @@ class RappResourceOptimizer:
     
     def read_slicer_intent(self):
         """Lê intenção do SLICER via Socket com fallback para arquivo."""
-        # 1. Tentar ler via socket
+        # Socket só faz parte do contrato de integração.
         try:
+            if getattr(self, 'xapp_transport_mode', 'socket') != 'socket':
+                raise FileNotFoundError('file/shadow mode')
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(0.1) # 100ms
-            sock.connect("/tmp/slicer.sock")
-            data = sock.recv(1024)
-            sock.close()
+            with sock:
+                sock.connect(as_str(SLICER_SOCKET_PATH))
+                data = sock.recv(1024)
             return json.loads(data.decode('utf-8'))
         except Exception as e:
             # Fallback para leitura de arquivo
@@ -1011,6 +1114,582 @@ class RappResourceOptimizer:
             return (sorted_lat[n//2 - 1] + sorted_lat[n//2]) / 2
         else:
             return sorted_lat[n//2]
+
+    @staticmethod
+    def _tasam_full_control_enabled() -> bool:
+        mode = os.environ.get('GREENRAN_TASAM_ADVISOR_MODE', '').strip().lower()
+        return mode in {'tasam_full_control', 'tasam-full-control'}
+
+    @staticmethod
+    def _assistant_judge_enabled() -> bool:
+        mode = os.environ.get('GREENRAN_ASSISTANT_DECISION_MODE', '').strip().lower()
+        tasam_mode = os.environ.get('GREENRAN_TASAM_ADVISOR_MODE', '').strip().lower()
+        return mode in {
+            'assistant_judge', 'judge', 'production', 'cooperative_hierarchy',
+            'hierarchical', 'cooperative',
+        } or tasam_mode in {'assistant_only_control', 'tasam_full_control', 'tasam-full-control'}
+
+    @staticmethod
+    def _online_rollout_fraction(decision) -> float:
+        """Read the online promotion fraction without restarting the rApp."""
+        if RappResourceOptimizer._tasam_full_control_enabled():
+            return 1.0
+        default = os.environ.get('GREENRAN_TASAM_ONLINE_ROLLOUT_FRACTION', '1.0')
+        try:
+            fraction = float(default)
+        except (TypeError, ValueError):
+            fraction = 1.0
+        manifest_path = os.environ.get('GREENRAN_TASAM_ONLINE_ROLLOUT_MANIFEST', '').strip()
+        if manifest_path:
+            try:
+                payload = json.loads(open(manifest_path, encoding='utf-8').read())
+                rollout = payload.get('rollout') if isinstance(payload, dict) else {}
+                if isinstance(rollout, dict) and rollout.get('fraction') is not None:
+                    fraction = float(rollout.get('fraction'))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        return min(max(fraction, 0.0), 1.0)
+
+    @classmethod
+    def _online_rollout_allows(cls, decision, fraction: float) -> bool:
+        if cls._tasam_full_control_enabled():
+            return True
+        if fraction >= 1.0:
+            return True
+        if fraction <= 0.0:
+            return False
+        identity = f"{decision.get('timestamp', '')}:{decision.get('cycle', '')}:{decision.get('collection_event_cycle', '')}"
+        bucket = int(hashlib.sha256(identity.encode('utf-8')).hexdigest()[:8], 16) / 0xFFFFFFFF
+        return bucket < fraction
+
+    def _build_armd_proposal(self, decision, advice, resource_snapshot):
+        """Build ARMD's complete proposal without using the live allocator."""
+        cfg = RUNTIME_CONFIG.get('shared_resources', {}) or {}
+        advice = advice or {}
+        snapshot = resource_snapshot or {}
+        usable_budget = float(snapshot.get('usable_budget', snapshot.get('resource_budget', 1.0)) or 1.0)
+        resource_budget = float(snapshot.get('resource_budget', usable_budget) or usable_budget)
+        ran_demand = float(snapshot.get('d_ran', 0.0) or 0.0)
+        ai_demand = float(snapshot.get('d_ai', 0.0) or 0.0)
+        domain = str(advice.get('domain', '') or '').lower()
+        scenario = str(advice.get('scenario', '') or '')
+        # ARMD uses app1/app3 vocabulary while the network policy uses
+        # camera/vehicle. Normalize once so safety and allocation priorities
+        # cannot diverge.
+        priority_domain = domain
+        if domain in {'camera', 'app1', 'video'} or 'camera' in scenario or 'app1' in scenario:
+            priority_domain = 'camera'
+        elif domain in {'vehicle', 'app3'} or 'vehicle' in scenario:
+            priority_domain = 'vehicle'
+        elif domain in {'app2', 'sensor', 'sensor_critical'}:
+            priority_domain = 'sensor'
+        else:
+            priority_domain = 'global'
+        if priority_domain in {'camera', 'vehicle'}:
+            ran_share = 0.75 if priority_domain == 'camera' else 0.70
+        elif priority_domain == 'sensor':
+            ran_share = 0.55
+        else:
+            ran_share = 0.50
+        ran_min = float(cfg.get('ran_min_share', 0.35) or 0.35)
+        ai_min = float(cfg.get('ai_min_share', 0.15) or 0.15)
+        ran_share = max(ran_min, min(1.0 - ai_min, ran_share))
+        allocation = dict(snapshot)
+        allocation.update({
+            'resource_budget': resource_budget,
+            'usable_budget': usable_budget,
+            'd_ran': ran_demand,
+            'd_ai': ai_demand,
+            'r_ran': round(usable_budget * ran_share, 6),
+            'r_ai': round(usable_budget * (1.0 - ran_share), 6),
+            'controller_id': 'armd_greenran_assistant',
+            'source': 'armd_proposal',
+            'proposal_priority': priority_domain,
+        })
+        allocation['ran_completion_ratio'] = min(1.0, allocation['r_ran'] / ran_demand) if ran_demand > 0 else 1.0
+        allocation['ai_completion_ratio'] = min(1.0, allocation['r_ai'] / ai_demand) if ai_demand > 0 else 1.0
+        allocation['utilization_ratio'] = min(1.0, (allocation['r_ran'] + allocation['r_ai']) / usable_budget) if usable_budget > 0 else 0.0
+        allocation = enforce_resource_state(allocation)
+        verdict = str(advice.get('expected_energy_saver') or decision.get('energy_saver') or 'CONDITIONAL').upper()
+        action = str(advice.get('expected_action') or decision.get('action') or 'FULL_POWER_GUARD')
+        priority_violation = str(
+            advice.get('priority_violation')
+            or decision.get('priority_violation', '')
+            or ''
+        ).upper()
+        hard_priority_violation = priority_violation in {
+            'THROUGHPUT', 'LATENCY', 'APP2_MTC_CRITICAL',
+            'VEHICLE_CRITICAL', 'CVAR_CRITICAL', 'P95_CRITICAL',
+        }
+        guarded_priority_violation = priority_violation in {
+            'THROUGHPUT_WARNING', 'LATENCY_WARNING', 'THROUGHPUT_WARMUP',
+            'VEHICLE_WARNING',
+        }
+        # A warning keeps the service in a protected energy state, but it is
+        # not an absolute resource veto while the hard SLA is still met. This
+        # lets TA-SAM optimize the shared budget inside the ARMD envelope.
+        # Only a confirmed critical violation may create an absolute veto.
+        # Predictive warnings and proactive guards remain proposals that the
+        # rApp judge can compare with TA-SAM and later score against reality.
+        explicit_critical_veto = bool(
+            advice.get('critical_violation', False)
+            or (advice.get('safety_veto', False) and hard_priority_violation)
+        )
+        if hard_priority_violation or explicit_critical_veto:
+            priority_score = 1.0 if priority_domain in {'camera', 'vehicle'} else 0.75 if priority_domain == 'sensor' else 0.50
+        elif guarded_priority_violation:
+            priority_score = 0.25
+        else:
+            priority_score = 0.50
+        if priority_domain in {'camera', 'vehicle'} and hard_priority_violation:
+            # The safety advocate must carry the hard decision into its
+            # complete proposal; otherwise selecting ARMD would still apply a
+            # weaker CONDITIONAL state and the veto would be cosmetic.
+            verdict = 'BLOCKED'
+            action = 'FULL_POWER'
+        elif priority_domain in {'camera', 'vehicle'} and guarded_priority_violation:
+            verdict = 'CONDITIONAL'
+            action = 'FULL_POWER_GUARD'
+        # A camera/vehicle guard is an absolute safety envelope. TA-SAM may
+        # propose the allocation, but cannot relax this live protection.
+        safety_veto = bool(
+            hard_priority_violation
+            or explicit_critical_veto
+            or (
+                priority_domain in {'camera', 'vehicle'}
+                and hard_priority_violation
+            )
+        )
+        # ARMD and TA-SAM must share the same per-UE minimum. A safety
+        # proposal may request reinforcement only for a genuinely
+        # BLOCKED/critical state; ALLOWED and CONDITIONAL proposals are
+        # deliberately reduced to the common SLA floor so the safety advisor
+        # cannot consume extra energy merely by being conservative.
+        allocation_state = 'BLOCKED' if (safety_veto or verdict == 'BLOCKED') else verdict
+        allocation_state = (
+            allocation_state
+            if allocation_state in {'ALLOWED', 'CONDITIONAL', 'BLOCKED'}
+            else 'CONDITIONAL'
+        )
+        allocation['allocation_state'] = allocation_state
+        if allocation_state in {'ALLOWED', 'CONDITIONAL'}:
+            allocation['r_ran'] = float(allocation.get('floor_total_ran', 0.0) or 0.0)
+            allocation['r_ai'] = float(allocation.get('floor_total_ai', 0.0) or 0.0)
+            allocation['reinforcement_scale'] = 0.0
+            allocation['reinforcement_scale_state'] = allocation_state
+            allocation['reinforcement_ran'] = 0.0
+            allocation['reinforcement_ai'] = 0.0
+        allocation = enforce_resource_state(allocation)
+        allocation['armd_resource_mode'] = (
+            'floor_only'
+            if allocation_state in {'ALLOWED', 'CONDITIONAL'}
+            else 'critical_reinforcement'
+        )
+        return {
+            'proposal_id': f"armd:{decision.get('timestamp', int(time.time()))}:{self.cycle}",
+            'source': 'armd',
+            'available': bool(advice.get('proposal_present', advice.get('available', False))),
+            'valid': bool(advice.get('proposal_valid', False)),
+            'feasible': True,
+            'verdict': verdict,
+            'action': action,
+            'expected_energy_saver': verdict,
+            'expected_action': action,
+            'confidence': float(advice.get('confidence', 0.0) or 0.0),
+            'proposal_score': round((0.55 * priority_score) + (0.45 * float(advice.get('confidence', 0.0) or 0.0)), 6),
+            'priority_score': priority_score,
+            'resource_score': priority_score,
+            'resource_allocation': allocation,
+            'resource_advice': dict(allocation),
+            'resource_mode': allocation.get('armd_resource_mode', 'floor_only'),
+            'sla_protection': {
+                'camera_throughput_mbps': float(cfg.get('camera_throughput_target_mbps', 25.0) or 25.0),
+                'camera_latency_ms': float(cfg.get('camera_latency_target_ms', 100.0) or 100.0),
+                'vehicle_latency_ms': float(cfg.get('vehicle_latency_target_ms', 20.0) or 20.0),
+                'priority_domain': priority_domain,
+            },
+            'priority_constraints': cfg,
+            'scenario': scenario or 'greenran_global_noop',
+            'proposal_kind': str(advice.get('proposal_kind', '') or ''),
+            'reason': str(advice.get('reason', '') or 'ARMD proposal'),
+            'evidence': advice.get('evidence', []) or [],
+            'safety_veto': safety_veto,
+            'critical_violation': safety_veto,
+            'priority_violation': priority_violation,
+            'proactive_sla_guard': bool(advice.get('proactive_sla_guard', False)),
+        }
+
+    @staticmethod
+    def _safe_float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _build_proactive_sla_guard_advice(self, decision, armd_advice, tasam_proposal):
+        """Turn a risky TA-SAM RAN reduction into a contextual ARMD proposal.
+
+        TA-SAM is allowed to optimize the shared RAN/AI budget, but the
+        assistant contract cannot let a resource reduction silently remove
+        the safety margin of active camera or autonomous-vehicle services.
+        The rApp remains the final judge; this method only makes the ARMD
+        safety proposal explicit so the judge can select it deterministically.
+        """
+        base = dict(armd_advice or {})
+        tasam = tasam_proposal if isinstance(tasam_proposal, dict) else {}
+        if not tasam.get('valid') or not tasam.get('feasible'):
+            return base
+
+        # A global CVaR regression is a valid assistant-level safety signal,
+        # but it must be relative to the previous real window.  The historic
+        # 484.7 ms comparison baseline is for reporting only and must not be
+        # used as a live guard reference.  ARMD intervenes after two
+        # consecutive relative regressions, or immediately at the configured
+        # absolute critical limit. The paired campaign accepts at most a 5%
+        # tail increase, so the live guard uses the same strict margin.
+        network = decision.get('network_health') or {}
+        current_cvar_us = self._safe_float(network.get('cvar_us'), 0.0)
+        previous_cvar_us = self._safe_float(getattr(self, '_prev_cvar_us', 0.0), 0.0)
+        reference_cvar_us = self._safe_float(network.get('reference_cvar_us'), 0.0) or previous_cvar_us
+        cfg = RUNTIME_CONFIG.get('shared_resources', {}) or {}
+        cvar_regression_pct = self._safe_float(cfg.get('cvar_guard_relative_regression_pct'), 5.0)
+        cvar_required_windows = max(1, int(self._safe_float(cfg.get('cvar_guard_required_windows'), 2.0)))
+        cvar_regression = False
+        cvar_ratio = 0.0
+        cvar_streak = int(getattr(self, '_cvar_risk_streak', 0) or 0)
+        if current_cvar_us > 0.0 and reference_cvar_us > 0.0:
+            cvar_ratio = current_cvar_us / reference_cvar_us
+            cvar_regression = current_cvar_us > reference_cvar_us * (1.0 + cvar_regression_pct / 100.0)
+        if cvar_regression:
+            cvar_streak += 1
+        else:
+            cvar_streak = 0
+        self._cvar_risk_streak = cvar_streak
+        cvar_target_ms = self._safe_float((RUNTIME_CONFIG.get('shared_resources', {}) or {}).get('cvar_target_ms'), 120.0)
+        cvar_hard_risk = (
+            current_cvar_us >= max(1.0, cvar_target_ms) * 1000.0
+            or cvar_streak >= cvar_required_windows
+        )
+
+        resource_advice = tasam.get('resource_advice') or {}
+        delta_ran = self._safe_float(resource_advice.get('delta_r_ran_vs_live'), 0.0)
+
+        def floor_proposal(reason):
+            """Make ARMD's healthy-cycle floor contract explicit.
+
+            A healthy cycle is not a missing ARMD decision: the safety
+            assistant still recommends the common per-UE SLA floor.  Keeping
+            this as a proposal (instead of mutating the live decision) lets
+            the rApp judge compare it with TA-SAM while guaranteeing that an
+            ARMD selection cannot request extra resources in a normal state.
+            """
+            verdict = str(
+                base.get('expected_energy_saver')
+                or decision.get('energy_saver')
+                or 'ALLOWED'
+            ).upper()
+            if verdict not in {'ALLOWED', 'CONDITIONAL', 'BLOCKED'}:
+                verdict = 'ALLOWED'
+            if verdict == 'BLOCKED':
+                # A genuinely blocked state is handled by the critical
+                # reinforcement path in _build_armd_proposal.  The healthy
+                # floor conversion only applies to non-critical cycles.
+                return base
+            base.update({
+                'available': True,
+                'proposal_present': True,
+                'proposal_valid': True,
+                'proposal_kind': 'resource_floor',
+                'scenario': 'greenran_floor_minimum',
+                'domain': 'global',
+                'expected_energy_saver': verdict,
+                'expected_action': (
+                    'REDUCE_POWER' if verdict == 'ALLOWED' else 'FULL_POWER_GUARD'
+                ),
+                'reason': reason,
+                'source': 'runtime_floor',
+                'safety_veto': False,
+                'critical_violation': False,
+                'proactive_sla_guard': False,
+                'priority_violation': str(base.get('priority_violation', '') or ''),
+                'evidence': list(base.get('evidence') or []) + [
+                    'armd_floor_only',
+                    'shared_per_ue_minimum',
+                ],
+            })
+            return base
+
+        # A CVaR guard is independent of the proposed RAN delta: the model can
+        # keep the same nominal allocation and still move the tail into a
+        # worse contention stage. Skip the contextual guard only when both
+        # allocation and tail risk are healthy.
+        if delta_ran >= -0.01 and not cvar_hard_risk:
+            if str(base.get('scenario', '') or '') == 'greenran_global_noop':
+                return floor_proposal(
+                    'ARMD floor proposal: estado sem risco crítico; aplicar somente o mínimo por UE'
+                )
+            return base
+
+        camera = decision.get('camera_metrics') or {}
+        vehicle = decision.get('vehicle_metrics') or {}
+        active_cameras = self._safe_float(camera.get('active_cameras'), 0.0)
+        vehicles_available = bool(vehicle.get('available'))
+        active_vehicles = self._safe_float(vehicle.get('total_vehicles'), 0.0)
+        camera_active = active_cameras > 0.0
+        vehicle_active = vehicles_available and active_vehicles > 0.0
+        if not camera_active and not vehicle_active and not cvar_hard_risk:
+            if str(base.get('scenario', '') or '') == 'greenran_global_noop':
+                return floor_proposal(
+                    'ARMD floor proposal: nenhum serviço prioritário em risco; aplicar somente o mínimo por UE'
+                )
+            return base
+
+        camera_target = self._safe_float(cfg.get('camera_throughput_target_mbps'), 25.0)
+        camera_guard = self._safe_float(cfg.get('camera_throughput_guard_mbps'), 30.0)
+        camera_latency_warning = self._safe_float(cfg.get('camera_latency_warning_ms'), 80.0)
+        camera_latency_target = self._safe_float(cfg.get('camera_latency_target_ms'), 100.0)
+        vehicle_latency_warning = self._safe_float(cfg.get('vehicle_latency_warning_ms'), 10.0)
+        vehicle_latency_target = self._safe_float(cfg.get('vehicle_latency_target_ms'), 20.0)
+        vehicle_loss_warning = self._safe_float(cfg.get('vehicle_loss_warning_pct'), 0.5)
+        vehicle_loss_target = self._safe_float(cfg.get('vehicle_loss_target_pct'), 1.0)
+
+        camera_throughput = self._safe_float(camera.get('throughput_mbps'), 0.0)
+        camera_latency = self._safe_float(camera.get('latency_ms'), 0.0)
+        vehicle_latency = self._safe_float(vehicle.get('max_latency_ms'), 0.0)
+        vehicle_loss = self._safe_float(vehicle.get('max_packet_loss_percent'), 0.0)
+        camera_hard_risk = camera_active and (
+            not camera.get('throughput_ready', False)
+            or camera_throughput < camera_target
+            or camera_latency >= camera_latency_target
+        )
+        vehicle_hard_risk = vehicle_active and (
+            vehicle_latency >= vehicle_latency_target
+            or vehicle_loss >= vehicle_loss_target
+            or self._safe_float(vehicle.get('high_risk_vehicles'), 0.0) > 0.0
+            or self._safe_float(vehicle.get('degraded_autonomy_vehicles'), 0.0) > 0.0
+        )
+        # Warning margins remain visible in the rApp energy/SLA decision, but
+        # they must not turn every healthy-under-target cycle into an ARMD
+        # resource veto. Only a hard SLA risk creates the contextual guard.
+        if not camera_hard_risk and not vehicle_hard_risk and not cvar_hard_risk:
+            if str(base.get('scenario', '') or '') == 'greenran_global_noop':
+                return floor_proposal(
+                    'ARMD floor proposal: métricas dentro da proteção; aplicar somente o mínimo por UE'
+                )
+            return base
+
+        evidence = list(base.get('evidence') or [])
+        reasons = []
+        if camera_active:
+            throughput = self._safe_float(camera.get('throughput_mbps'), 0.0)
+            latency = self._safe_float(camera.get('latency_ms'), 0.0)
+            if not camera.get('throughput_ready', False):
+                reasons.append('camera throughput ainda sem janela validada')
+            elif throughput < camera_target:
+                reasons.append(f'camera throughput {throughput:.1f} < {camera_target:.1f} Mbps')
+            elif throughput < camera_guard:
+                reasons.append(f'camera throughput {throughput:.1f} < margem {camera_guard:.1f} Mbps')
+            if latency >= camera_latency_target:
+                reasons.append(f'camera latência {latency:.1f} >= {camera_latency_target:.1f} ms')
+            elif latency >= camera_latency_warning:
+                reasons.append(f'camera latência {latency:.1f} >= guarda {camera_latency_warning:.1f} ms')
+            evidence.append(f'camera_active={active_cameras:.0f}')
+            evidence.append(f'camera_sla={camera_target:.1f}Mbps/{camera_latency_target:.1f}ms')
+
+        if vehicle_active:
+            latency = self._safe_float(vehicle.get('max_latency_ms'), 0.0)
+            loss = self._safe_float(vehicle.get('max_packet_loss_percent'), 0.0)
+            if latency >= vehicle_latency_target:
+                reasons.append(f'vehicle latência {latency:.1f} >= {vehicle_latency_target:.1f} ms')
+            elif latency >= vehicle_latency_warning:
+                reasons.append(f'vehicle latência {latency:.1f} >= guarda {vehicle_latency_warning:.1f} ms')
+            if loss >= vehicle_loss_target:
+                reasons.append(f'vehicle loss {loss:.2f} >= {vehicle_loss_target:.2f}%')
+            elif loss >= vehicle_loss_warning:
+                reasons.append(f'vehicle loss {loss:.2f} >= guarda {vehicle_loss_warning:.2f}%')
+            evidence.append(f'vehicle_active={active_vehicles:.0f}')
+            evidence.append(f'vehicle_sla={vehicle_latency_target:.1f}ms/{vehicle_loss_target:.2f}%')
+
+        if cvar_hard_risk:
+            if current_cvar_us >= cvar_target_ms * 1000.0:
+                reasons.append(f'CVaR {current_cvar_us / 1000.0:.2f} ms >= limite crítico {cvar_target_ms:.2f} ms')
+            else:
+                reasons.append(
+                    f'CVaR subiu para {current_cvar_us / 1000.0:.2f} ms '
+                    f'({cvar_ratio:.2f}x da referência, {cvar_streak} janelas)'
+                )
+            evidence.extend([
+                f'cvar_current_ms={current_cvar_us / 1000.0:.3f}',
+                f'cvar_reference_ms={reference_cvar_us / 1000.0:.3f}',
+                f'cvar_ratio={cvar_ratio:.3f}',
+                f'cvar_risk_streak={cvar_streak}',
+            ])
+
+        # Camera/eMBB and vehicle safety share the top priority.  Camera is
+        # selected when both are active because its proposal reserves the
+        # larger RAN share; the vehicle SLA still remains in the evidence and
+        # is never relaxed by the TA-SAM proposal.
+        domain = 'camera' if camera_active else 'vehicle' if vehicle_active else 'network'
+        original_verdict = str(base.get('expected_energy_saver', '') or 'CONDITIONAL').upper()
+        guarded_verdict = 'BLOCKED' if original_verdict == 'BLOCKED' else 'CONDITIONAL'
+        guard_reason = (
+            'SLA guard preventivo: TA-SAM propôs reduzir RAN em '
+            f'{abs(delta_ran):.4f}; proteção preservada para '
+            f"{'câmera e veículo' if camera_active and vehicle_active else domain}"
+        )
+        if reasons:
+            guard_reason += ' (' + '; '.join(reasons) + ')'
+        critical_violation = bool(camera_hard_risk or vehicle_hard_risk or cvar_hard_risk)
+        original_violation = str(base.get('priority_violation', '') or '').upper()
+        if cvar_hard_risk and not (camera_hard_risk or vehicle_hard_risk):
+            guard_violation = 'CVAR_CRITICAL'
+        elif original_violation in {
+            'THROUGHPUT', 'LATENCY', 'APP2_MTC_CRITICAL', 'VEHICLE_CRITICAL',
+            'CVAR_CRITICAL', 'P95_CRITICAL',
+        }:
+            guard_violation = original_violation
+        else:
+            guard_violation = 'PROACTIVE_SLA_PROTECTION'
+
+        base.update({
+            'available': True,
+            'proposal_present': True,
+            'proposal_valid': True,
+            'proposal_kind': 'contextual_sla_guard',
+            'scenario': 'proactive_sla_guard',
+            'domain': domain,
+            'expected_energy_saver': guarded_verdict,
+            'expected_action': 'FULL_POWER' if guarded_verdict == 'BLOCKED' else 'FULL_POWER_GUARD',
+            'confidence': max(self._safe_float(base.get('confidence'), 0.0), 0.99),
+            'reason': guard_reason,
+            'evidence': evidence + [f'tasam_delta_r_ran={delta_ran:.4f}'],
+            'priority_violation': guard_violation,
+            'safety_veto': critical_violation,
+            'critical_violation': critical_violation,
+            'proactive_sla_guard': True,
+            'guard_thresholds': {
+                'camera_throughput_target_mbps': camera_target,
+                'camera_latency_target_ms': camera_latency_target,
+                'vehicle_latency_target_ms': vehicle_latency_target,
+                'vehicle_loss_target_pct': vehicle_loss_target,
+                'cvar_target_ms': cvar_target_ms,
+                'cvar_relative_regression_pct': cvar_regression_pct,
+                'cvar_required_consecutive_windows': cvar_required_windows,
+            },
+        })
+        return base
+
+    def _build_tasam_proposal(self, decision, tasam_advisor, resource_snapshot):
+        """Normalize TA-SAM's checkpoint output into the complete proposal contract."""
+        tasam_advisor = tasam_advisor or {}
+        shadow = (resource_snapshot or {}).get('marl_shadow') or {}
+        resource_advice = tasam_advisor.get('resource_advice') or {}
+        energy = tasam_advisor.get('energy_advice') or {}
+        verdict = str(energy.get('decision', 'CONDITIONAL') or 'CONDITIONAL').upper()
+        action = str(energy.get('action', 'MONITOR') or 'MONITOR')
+        confidence = float(tasam_advisor.get('confidence', 0.0) or 0.0)
+        shadow_ran = shadow.get('shadow_r_ran')
+        shadow_ai = shadow.get('shadow_r_ai')
+        allocation = dict(resource_snapshot or {})
+        if shadow_ran is not None and shadow_ai is not None:
+            allocation.update({
+                'r_ran': float(shadow_ran),
+                'r_ai': float(shadow_ai),
+                'controller_id': 'ta_sam_marl_assistant',
+                'source': 'tasam_proposal',
+            })
+        allocation['allocation_state'] = verdict
+        if not self._tasam_full_control_enabled():
+            allocation = enforce_resource_state(allocation)
+        structural_valid = bool(
+            tasam_advisor.get('enabled')
+            and tasam_advisor.get('source') in {'checkpoint', 'mixed'}
+            and resource_advice.get('enabled')
+            and shadow_ran is not None
+            and shadow_ai is not None
+        )
+        return {
+            'proposal_id': f"tasam:{decision.get('timestamp', int(time.time()))}:{self.cycle}",
+            'source': 'ta_sam',
+            'available': structural_valid,
+            'valid': structural_valid,
+            'feasible': bool(resource_advice.get('enabled', False)),
+            'verdict': verdict,
+            'action': action,
+            'confidence': confidence,
+            'proposal_score': round(
+                (0.55 * float(tasam_advisor.get('arbitration_score', 0.0) or 0.0))
+                + (0.45 * confidence), 6
+            ),
+            'priority_score': float(tasam_advisor.get('arbitration_score', 0.0) or 0.0),
+            'resource_score': float(resource_advice.get('score_delta', 0.0) or 0.0),
+            'resource_allocation': allocation,
+            'resource_advice': resource_advice,
+            'sla_protection': {
+                'priority_domain': resource_advice.get('priority', 'mixed'),
+                'evidence_flags': tasam_advisor.get('evidence_flags', {}),
+            },
+            'priority_constraints': {'source': 'tasam_checkpoint'},
+            'scenario': shadow.get('scenario_stage', 'greenran_runtime'),
+            'reason': str(tasam_advisor.get('reason', '') or energy.get('reason', '') or 'TA-SAM proposal'),
+            'evidence': [key for key, value in (tasam_advisor.get('evidence_flags') or {}).items() if value],
+            'safety_veto': False,
+        }
+
+    def _apply_selected_assistant_proposal(self, decision, judge_result, armd_proposal, tasam_proposal):
+        selected = judge_result.get('selected_proposal') or {}
+        source = str(selected.get('source', '') or '')
+        decision['rapp_judge_result'] = judge_result
+        decision['selected_assistant'] = source
+        decision['selected_proposal_id'] = selected.get('proposal_id', '')
+        decision['external_last_resort_used'] = bool(judge_result.get('external_last_resort_used', False))
+        decision['rapp_judge_conflict_type'] = judge_result.get('conflict_type', '')
+        decision['rapp_judge_reason'] = judge_result.get('reason', '')
+        decision['proactive_sla_guard'] = bool(judge_result.get('proactive_sla_guard', False))
+        decision['proactive_sla_guard_reason'] = judge_result.get('proactive_sla_guard_reason', '')
+        if source not in {'armd', 'ta_sam', 'joint'} or not selected.get('valid'):
+            decision['assistant_only_failure'] = True
+            decision['proposal_applied_exactly'] = False
+            decision['ta_sam_actuation_applied'] = False
+            decision['tasam_actuation_applied'] = False
+            if self._tasam_full_control_enabled():
+                decision['training_run_invalid'] = True
+                decision['invalid_reason'] = 'invalid_or_missing_tasam_proposal'
+                decision['effective_policy_algorithm'] = 'TA-SAM-MARL-INVALID'
+                decision['effective_policy_source'] = 'invalid_tasam_proposal'
+                decision['energy_saver'] = 'UNKNOWN'
+                decision['action'] = 'NONE'
+                decision['reason'] = 'TA-SAM proposal invalid; no heuristic/live fallback applied'
+                decision['resource_allocation'] = {}
+            decision['control_trial_mode'] = 'assistant_judge_invalid'
+            decision['control_trial_reason'] = 'no valid assistant proposal selected'
+            return decision
+        allocation = selected.get('resource_allocation') or selected.get('resource_advice') or {}
+        decision['energy_saver'] = selected.get('verdict', 'CONDITIONAL')
+        decision['action'] = selected.get('action', 'FULL_POWER_GUARD')
+        decision['reason'] = f"rApp Judge: {selected.get('reason', '')} | vencedor={source}"
+        decision['confidence'] = float(selected.get('confidence', 0.0) or 0.0)
+        decision['resource_allocation'] = dict(allocation)
+        # In cooperative mode the Judge returns the composed package; keeping
+        # that package in the audit record is essential because neither raw
+        # proposal alone describes what was actually applied.
+        decision['selected_assistant_proposal'] = dict(
+            selected if source == 'joint'
+            else armd_proposal if source == 'armd' else tasam_proposal
+        )
+        decision['proposal_applied_exactly'] = True
+        decision['assistant_only_failure'] = False
+        decision['control_trial_mode'] = 'assistant_judge'
+        decision['control_trial_reason'] = f"rApp Judge selected {source} proposal"
+        decision['effective_policy_algorithm'] = 'ARMD-GreenRAN' if source == 'armd' else 'TA-SAM-MARL'
+        decision['effective_policy_source'] = selected.get('source', source)
+        decision['ta_sam_actuation_applied'] = source in {'ta_sam', 'joint'}
+        decision['tasam_actuation_applied'] = decision['ta_sam_actuation_applied']
+        decision['armd_actuation_applied'] = source in {'armd', 'joint'}
+        if source == 'joint':
+            decision['effective_policy_algorithm'] = 'ARMD+TA-SAM-HIERARCHICAL'
+            decision['effective_policy_source'] = 'cooperative_hierarchy'
+        return decision
     
     def make_decision(self, slicer_intent, energy_intent, vehicle_intent=None):
         """
@@ -1056,8 +1735,25 @@ class RappResourceOptimizer:
             'resource_allocation': {},
             'rl_policy_runtime': {},
             'tasam_advisor': {},
+            'tasam_proposal_present': False,
+            'tasam_proposal_valid': False,
+            'tasam_proposal_kind': 'missing',
             'advisor_arbitration': {},
+            'rapp_judge_result': {},
+            'selected_assistant': '',
+            'selected_proposal_id': '',
+            'selected_assistant_proposal': {},
+            'proposal_applied_exactly': False,
+            'external_last_resort_used': False,
+            'armd_actuation_applied': False,
+            'assistant_only_failure': False,
+            'ta_sam_actuation_applied': False,
+            'control_trial_mode': 'baseline',
+            'effective_policy_algorithm': 'live_allocator',
+            'effective_policy_source': 'heuristic_baseline',
+            'control_trial_reason': 'assistant control disabled',
         }
+        decision.update(_load_collection_event_context())
 
         if self.rl_policy is not None:
             meta = self.rl_policy.metadata
@@ -1498,6 +2194,7 @@ class RappResourceOptimizer:
             network_health=decision.get('network_health'),
             shared_resource_config=RUNTIME_CONFIG.get('shared_resources', {}),
             previous_allocation=self._resource_allocation_prev,
+            allocation_state=decision.get('energy_saver'),
         )
         if (
             self.rl_policy is not None
@@ -1518,7 +2215,13 @@ class RappResourceOptimizer:
                 )
                 resource_candidate = rl_resource_result.get('resource_allocation') or {}
                 if resource_candidate:
-                    resource_allocation = resource_candidate
+                    # The learned policy is allowed to propose a different
+                    # split, but it must inherit the audited SLA-floor ledger
+                    # from the baseline snapshot.  Replacing the whole dict
+                    # here would silently discard the per-UE guarantees.
+                    resource_allocation = dict(resource_allocation)
+                    resource_allocation.update(resource_candidate)
+                    resource_allocation = enforce_resource_state(resource_allocation)
                     decision['rl_policy_runtime']['resource_policy_applied'] = (
                         rl_resource_result.get('final_decision') == 'RESOURCE_REALLOCATED'
                     )
@@ -1556,9 +2259,65 @@ class RappResourceOptimizer:
         decision['tasam_source'] = tasam_advisor.get('source', marl_shadow.get('source', ''))
         decision['tasam_confidence'] = float(tasam_advisor.get('confidence', marl_shadow.get('confidence', 0.0)) or 0.0)
         decision['tasam_valid'] = bool(tasam_advisor.get('valid', marl_shadow.get('valid', False)))
+        decision['tasam_proposal_present'] = bool(
+            tasam_advisor and tasam_advisor.get('enabled', marl_shadow.get('enabled', False))
+        )
+        decision['tasam_proposal_valid'] = bool(
+            decision['tasam_proposal_present'] and tasam_advisor.get('valid', False)
+        )
+        decision['tasam_proposal_kind'] = (
+            'checkpoint' if decision['tasam_proposal_present'] and decision['tasam_source'] else
+            ('unavailable' if decision['tasam_proposal_present'] else 'missing')
+        )
         decision['tasam_would_influence'] = bool(tasam_advisor.get('would_influence', marl_shadow.get('would_influence', False)))
         decision['tasam_energy_decision'] = ((tasam_advisor.get('energy_advice') or {}).get('decision', ''))
         decision['tasam_energy_action'] = ((tasam_advisor.get('energy_advice') or {}).get('action', ''))
+
+        # In assistant-only evaluation mode the rApp applies the checkpoint
+        # backed TA-SAM resource vector.  ARMD remains the safety assistant;
+        # this block only replaces the live heuristic resource split when a
+        # real checkpoint proposal is available, so a silent fallback cannot
+        # be counted as TA-SAM actuation.
+        control_mode = os.environ.get('GREENRAN_TASAM_ADVISOR_MODE', '').strip().lower()
+        if control_mode == 'assistant_only_control':
+            # In judge mode TA-SAM is a proposer. Its vector is copied into
+            # the final decision only after the rApp judge selects TA-SAM.
+            if self._assistant_judge_enabled():
+                decision['control_trial_mode'] = 'assistant_judge_pending'
+            else:
+                decision['control_trial_mode'] = 'assistant_only_control'
+            shadow_source = str(tasam_advisor.get('source', marl_shadow.get('source', '')) or '')
+            shadow_r_ran = marl_shadow.get('shadow_r_ran')
+            shadow_r_ai = marl_shadow.get('shadow_r_ai')
+            if (
+                not self._assistant_judge_enabled()
+                and marl_shadow.get('available')
+                and shadow_source in {'checkpoint', 'mixed'}
+                and shadow_r_ran is not None
+                and shadow_r_ai is not None
+            ):
+                resource_allocation['r_ran'] = float(shadow_r_ran)
+                resource_allocation['r_ai'] = float(shadow_r_ai)
+                resource_allocation['controller_id'] = 'ta_sam_marl_assistant'
+                resource_allocation['source'] = 'ta_sam_marl_assistant'
+                budget = float(resource_allocation.get('usable_budget', resource_allocation.get('resource_budget', 1.0)) or 1.0)
+                d_ran = float(resource_allocation.get('d_ran', 0.0) or 0.0)
+                d_ai = float(resource_allocation.get('d_ai', 0.0) or 0.0)
+                resource_allocation['ran_completion_ratio'] = min(1.0, float(shadow_r_ran) / d_ran) if d_ran > 0 else 1.0
+                resource_allocation['ai_completion_ratio'] = min(1.0, float(shadow_r_ai) / d_ai) if d_ai > 0 else 1.0
+                resource_allocation['utilization_ratio'] = min(1.0, (float(shadow_r_ran) + float(shadow_r_ai)) / budget) if budget > 0 else 0.0
+                resource_allocation = enforce_resource_state(resource_allocation)
+                decision['rl_policy_runtime']['algorithm'] = 'TA-SAM-MARL'
+                decision['rl_policy_runtime']['policy_id'] = tasam_advisor.get('policy_id', marl_shadow.get('policy_id', 'TA-SAM-MARL'))
+                decision['ta_sam_actuation_applied'] = True
+                decision['effective_policy_algorithm'] = 'TA-SAM-MARL'
+                decision['effective_policy_source'] = shadow_source
+                decision['control_trial_reason'] = 'checkpoint proposal applied by rApp arbitration'
+            elif not self._assistant_judge_enabled():
+                decision['effective_policy_algorithm'] = 'TA-SAM-MARL'
+                decision['effective_policy_source'] = 'fallback_after_tasam_error'
+                decision['control_trial_reason'] = 'checkpoint proposal unavailable; run invalid'
+        decision['resource_allocation'] = resource_allocation
         decision['resource_allocation'] = resource_allocation
         self._resource_allocation_prev = {
             'r_ran': float(resource_allocation.get('r_ran', 0.5) or 0.5),
@@ -1937,8 +2696,8 @@ class RappResourceOptimizer:
 
         # ========================================
         # ETAPA 2B: LEGACY DRL PREDICTOR PATH
-        # Mantido apenas como guarda morta; a linha oficial usa
-        # heuristica ao vivo com TA-SAM em shadow/control gate.
+        # Mantido apenas como compatibilidade; a linha oficial usa
+        # ARMD + TA-SAM no caminho de decisão efetiva.
         # ========================================
         
         prev_cvar_for_drl = getattr(self, '_prev_cvar_us', 0) or 0
@@ -2147,13 +2906,233 @@ class RappResourceOptimizer:
             network_health=decision.get('network_health'),
         )
         decision['armd_analysis'] = armd_advice
-        decision = self.armd_runtime.apply(decision, armd_advice)
-        decision['advisor_arbitration'] = self._build_advisor_arbitration(decision)
+        full_control_mode = self._tasam_full_control_enabled()
+        assistant_judge_mode = self._assistant_judge_enabled()
+        decision = self.armd_runtime.apply(
+            decision,
+            armd_advice,
+            mutate=not assistant_judge_mode,
+        )
+        if assistant_judge_mode:
+            tasam_proposal = self._build_tasam_proposal(
+                decision,
+                decision.get('tasam_advisor') or {},
+                decision.get('resource_allocation') or {},
+            )
+            armd_advice_for_proposal = self._build_proactive_sla_guard_advice(
+                decision,
+                armd_advice,
+                tasam_proposal,
+            )
+            # Keep the original runtime diagnosis available for audit while
+            # exposing the contextual safety proposal to the rApp judge.
+            decision['armd_base_analysis'] = armd_advice
+            decision['armd_analysis'] = armd_advice_for_proposal
+            # The persisted ARMD fields must describe the proposal that the
+            # judge actually receives.  Otherwise the decision log would say
+            # ``neutral_noop`` while the applied proposal was a safety guard.
+            decision['armd_scenario'] = armd_advice_for_proposal.get('scenario', '')
+            decision['armd_domain'] = armd_advice_for_proposal.get('domain', '')
+            decision['armd_source'] = armd_advice_for_proposal.get('source', 'armd')
+            decision['armd_confidence'] = armd_advice_for_proposal.get('confidence', 0.0)
+            decision['armd_reason'] = armd_advice_for_proposal.get('reason', '')
+            decision['armd_expected_energy_saver'] = armd_advice_for_proposal.get('expected_energy_saver', '')
+            decision['armd_expected_action'] = armd_advice_for_proposal.get('expected_action', '')
+            armd_proposal = self._build_armd_proposal(
+                decision,
+                armd_advice_for_proposal,
+                decision.get('resource_allocation') or {},
+            )
+            if full_control_mode:
+                # Integral online control deliberately bypasses the ARMD
+                # envelope: the raw TA-SAM proposal is the action applied to
+                # the simulator, including during critical states.
+                tasam_shadow = dict(
+                    decision.get('rl_policy_runtime', {}).get('marl_shadow') or {}
+                )
+                tasam_shadow.pop('armd_policy_envelope', None)
+                tasam_shadow['armd_policy_envelope'] = {
+                    'applied': False,
+                    'source': 'disabled_tasam_full_control',
+                    'reason': 'full-control training mode owns the complete action',
+                }
+            else:
+                # Protected validation modes retain the ARMD envelope.
+                tasam_shadow = self.marl_shadow_evaluator.apply_armd_policy_envelope(
+                    decision.get('rl_policy_runtime', {}).get('marl_shadow') or {},
+                    armd_proposal,
+                    decision.get('resource_allocation') or {},
+                )
+            tasam_advisor = tasam_shadow.get('advisor', {}) if isinstance(tasam_shadow, dict) else {}
+            decision['tasam_advisor'] = tasam_advisor
+            decision['rl_policy_runtime']['marl_shadow'] = tasam_shadow
+            decision['resource_allocation']['marl_shadow'] = tasam_shadow
+            decision['resource_allocation']['tasam_advisor'] = tasam_advisor
+            decision['tasam_mode'] = tasam_advisor.get('mode', decision.get('tasam_mode', 'shadow'))
+            decision['tasam_source'] = tasam_advisor.get('source', decision.get('tasam_source', ''))
+            decision['tasam_confidence'] = float(tasam_advisor.get('confidence', decision.get('tasam_confidence', 0.0)) or 0.0)
+            decision['tasam_valid'] = bool(tasam_advisor.get('valid', decision.get('tasam_valid', False)))
+            decision['tasam_would_influence'] = bool(tasam_advisor.get('would_influence', decision.get('tasam_would_influence', False)))
+            decision['tasam_energy_decision'] = (tasam_advisor.get('energy_advice') or {}).get('decision', decision.get('tasam_energy_decision', ''))
+            decision['tasam_energy_action'] = (tasam_advisor.get('energy_advice') or {}).get('action', decision.get('tasam_energy_action', ''))
+            tasam_proposal = self._build_tasam_proposal(
+                decision,
+                tasam_advisor,
+                decision.get('resource_allocation') or {},
+            )
+            decision['armd_proposal'] = armd_proposal
+            decision['tasam_proposal'] = tasam_proposal
+            decision['tasam_policy_envelope'] = dict(
+                tasam_shadow.get('armd_policy_envelope') or {}
+            )
+            decision['tasam_policy_envelope_source'] = (
+                'disabled_tasam_full_control' if full_control_mode else 'armd'
+            )
+            decision['tasam_policy_envelope_applied'] = bool(
+                tasam_shadow.get('armd_policy_envelope', {}).get('applied', False)
+            )
+            decision['armd_proposal_present'] = bool(armd_proposal.get('available'))
+            decision['armd_proposal_valid'] = bool(armd_proposal.get('valid'))
+            decision['armd_proposal_kind'] = (
+                armd_advice_for_proposal.get('proposal_kind')
+                or ('contextual' if armd_advice_for_proposal.get('scenario') != 'greenran_global_noop' else 'neutral_noop')
+            )
+            decision['tasam_proposal_present'] = bool(tasam_proposal.get('available'))
+            decision['tasam_proposal_valid'] = bool(tasam_proposal.get('valid'))
+            decision['tasam_proposal_kind'] = 'checkpoint' if tasam_proposal.get('available') else 'missing'
+            policy_status = self.rapp_policy_source.refresh()
+            policy = policy_status.get('policy') or {}
+            arbitration_cfg = policy.get('arbitration') or {}
+            self.rapp_judge.external_last_resort_winner = str(
+                (arbitration_cfg.get('last_resort') or {}).get('energy', '') or ''
+            ).lower()
+            self.rapp_judge.external_policy_id = policy_status.get('policy_id', '')
+            self.rapp_judge.tie_margin = float(arbitration_cfg.get('tie_margin', 0.02) or 0.02)
+            judge_result = self.rapp_judge.decide(
+                priorities=(policy.get('network_policy') or {}).get('priorities') or {},
+                armd_proposal=armd_proposal,
+                tasam_proposal=tasam_proposal,
+                fallback_proposal=None,
+            )
+            if full_control_mode:
+                # Keep the categorical Judge decision for audit/comparison,
+                # but force the training action to TA-SAM whenever its
+                # proposal is valid.  Invalid proposals remain invalid and
+                # are never replaced by a live allocator action.
+                decision['rapp_judge_arbitration_result'] = dict(judge_result)
+                selected_tasam = dict(tasam_proposal)
+                forced_result = dict(judge_result)
+                forced_result.update({
+                    'selected_advocate': 'ta_sam',
+                    'winner': 'ta_sam',
+                    'resource_winner': 'ta_sam',
+                    'selected_proposal': selected_tasam,
+                    'mode': 'tasam_full_control',
+                    'composition_mode': 'tasam_full_control',
+                    'reason': 'TA-SAM integral online control; Judge retained for audit',
+                })
+                judge_result = forced_result
+            rollout_fraction = self._online_rollout_fraction(decision)
+            rollout_allowed = self._online_rollout_allows(decision, rollout_fraction)
+            decision['assistant_rollout_fraction'] = rollout_fraction
+            decision['assistant_rollout_allowed'] = rollout_allowed
+            if rollout_allowed:
+                decision = self._apply_selected_assistant_proposal(
+                    decision,
+                    judge_result,
+                    armd_proposal,
+                    tasam_proposal,
+                )
+                decision['assistant_rollout_applied'] = bool(decision.get('proposal_applied_exactly', False))
+                decision['control_trial_mode'] = (
+                    ('tasam_full_control' if decision.get('proposal_applied_exactly', False)
+                     else 'tasam_full_control_invalid') if full_control_mode
+                    else decision.get('control_trial_mode', 'assistant_judge')
+                )
+                decision['control_trial_reason'] = (
+                    'TA-SAM proposal applied directly; no ARMD envelope, fallback, or rollback'
+                    if full_control_mode else decision.get('control_trial_reason', '')
+                )
+            else:
+                # Shadow/canary hold: keep the live rApp allocation in force,
+                # but retain both proposals and the Judge verdict for scoring.
+                selected = judge_result.get('selected_proposal') or {}
+                decision['rapp_judge_result'] = judge_result
+                decision['selected_assistant'] = str(selected.get('source', '') or '')
+                decision['selected_proposal_id'] = selected.get('proposal_id', '')
+                decision['external_last_resort_used'] = bool(judge_result.get('external_last_resort_used', False))
+                decision['rapp_judge_conflict_type'] = judge_result.get('conflict_type', '')
+                decision['rapp_judge_reason'] = judge_result.get('reason', '')
+                decision['proposal_applied_exactly'] = False
+                decision['assistant_only_failure'] = False
+                decision['control_trial_mode'] = 'shadow' if rollout_fraction <= 0.0 else 'canary_hold'
+                decision['control_trial_reason'] = (
+                    f'assistant proposals scored but not applied; rollout={rollout_fraction:.3f}'
+                )
+                decision['effective_policy_algorithm'] = 'rApp-live'
+                decision['effective_policy_source'] = 'live_allocator'
+                decision['ta_sam_actuation_applied'] = False
+                decision['armd_actuation_applied'] = False
+                decision['assistant_rollout_applied'] = False
+            decision['advisor_arbitration'] = self._build_advisor_arbitration(decision)
+            decision['advisor_arbitration'].update({
+                'mode': 'tasam_full_control' if full_control_mode else 'rapp_judge_v1',
+                'judge': 'rapp',
+                'selected_assistant': decision.get('selected_assistant', ''),
+                'selected_proposal_id': decision.get('selected_proposal_id', ''),
+                'proposal_applied_exactly': decision.get('proposal_applied_exactly', False),
+                'external_last_resort_used': decision.get('external_last_resort_used', False),
+                'winner': decision.get('selected_assistant', 'none'),
+                'rapp_final_decision': decision.get('energy_saver', 'UNKNOWN'),
+                'rapp_final_action': decision.get('action', ''),
+                'judge_result': judge_result,
+                'categorical_judge_result': decision.get('rapp_judge_arbitration_result', {}),
+            })
+        else:
+            decision['advisor_arbitration'] = self._build_advisor_arbitration(decision)
+
+        # Persist the state machine after the rApp judge has produced the
+        # final verdict.  The selected proposal already carries the SLA floor;
+        # this audit state drives the two-cycle recovery on the next cycle.
+        resource_allocation = dict(decision.get('resource_allocation') or {})
+        final_state = str(decision.get('energy_saver', 'ALLOWED') or 'ALLOWED').upper()
+        resource_allocation['allocation_state'] = final_state
+        assistant_runtime_active = bool(
+            self._assistant_judge_enabled()
+            or decision.get('tasam_enabled')
+            or decision.get('armd_enabled')
+            or os.environ.get('GREENRAN_AB_MODE', '').strip().lower() == 'joint'
+        )
+        if assistant_runtime_active:
+            if full_control_mode:
+                resource_allocation['resource_floor_policy'] = 'disabled_tasam_full_control'
+                resource_allocation['floor_policy'] = 'disabled_tasam_full_control'
+                resource_allocation['per_ue_application_status'] = 'disabled_full_control'
+            else:
+                resource_allocation = enforce_resource_state(resource_allocation)
+                resource_allocation = apply_per_ue_allocation(resource_allocation)
+        else:
+            resource_allocation = apply_baseline_resource_band(
+                resource_allocation,
+                final_state,
+                RUNTIME_CONFIG.get('shared_resources', {}) or {},
+            )
+        decision['resource_allocation'] = resource_allocation
+        decision['allocation_state'] = final_state
+        decision['resource_floor_policy'] = resource_allocation.get('floor_policy', 'sla_per_ue_v1')
+        self._resource_allocation_prev = {
+            'r_ran': float(resource_allocation.get('r_ran', 0.5) or 0.5),
+            'r_ai': float(resource_allocation.get('r_ai', 0.5) or 0.5),
+            'allocation_state': final_state,
+            'healthy_streak': int(resource_allocation.get('healthy_streak', 0) or 0),
+            'floor_total_ran': float(resource_allocation.get('floor_total_ran', 0.0) or 0.0),
+            'floor_total_ai': float(resource_allocation.get('floor_total_ai', 0.0) or 0.0),
+        }
         
         return decision
 
     def _build_advisor_arbitration(self, decision):
-        """Build a shadow-only scoreboard between ARMD and TA-SAM advisors."""
+        """Build the auditable ARMD/TA-SAM scoreboard judged by the rApp."""
         severity_rank = {
             'UNKNOWN': 0,
             'ALLOWED': 1,
@@ -2162,6 +3141,13 @@ class RappResourceOptimizer:
         }
         armd = decision.get('armd_analysis') or {}
         tasam = decision.get('tasam_advisor') or {}
+
+        armd_proposal_present = bool(
+            decision.get('armd_proposal_present', armd.get('proposal_present', False))
+        )
+        tasam_proposal_present = bool(
+            decision.get('tasam_proposal_present', tasam.get('proposal_present', False))
+        )
 
         armd_valid = bool(armd.get('available')) and float(armd.get('confidence', 0.0) or 0.0) >= float(self.armd_runtime.min_confidence)
         tasam_valid = bool(tasam.get('valid', False))
@@ -2198,8 +3184,41 @@ class RappResourceOptimizer:
         else:
             winner = 'ta_sam'
 
+        # Keep legacy policy-source fields in the audit record. They are
+        # diagnostic only; the rApp decision above remains the final result.
+        legacy_external_available = False
+        legacy_external_used = False
+        legacy_energy_winner = winner if winner in {'armd', 'ta_sam'} else 'none'
+        if hasattr(self, 'rapp_policy_source'):
+            try:
+                policy_status = self.rapp_policy_source.refresh()
+                legacy_external_available = bool(policy_status.get('available', False))
+                policy = policy_status.get('policy') or {}
+                arbitration = policy.get('arbitration') or {}
+                tie_margin = float(arbitration.get('tie_margin', 0.02) or 0.02)
+                same_target = armd_target == tasam_target and armd_target != 'UNKNOWN'
+                score_tie = abs(armd_score - tasam_score) <= tie_margin
+                if armd_valid and tasam_valid and (same_target or score_tie):
+                    legacy_energy_winner = str(
+                        (arbitration.get('last_resort') or {}).get('energy', legacy_energy_winner)
+                    )
+                    legacy_external_used = legacy_energy_winner in {'armd', 'ta_sam'}
+            except Exception:
+                legacy_external_available = False
+
         return {
             'mode': 'shadow_scoreboard',
+            'judge': 'rapp',
+            'rapp_final_decision': str(decision.get('energy_saver', 'UNKNOWN') or 'UNKNOWN').upper(),
+            'rapp_final_action': decision.get('action', ''),
+            'proposal_pair_complete': armd_proposal_present and tasam_proposal_present,
+            'arbitration_present': True,
+            'armd_proposal_present': armd_proposal_present,
+            'armd_proposal_valid': bool(decision.get('armd_proposal_valid', armd.get('proposal_valid', armd_valid))),
+            'armd_proposal_kind': decision.get('armd_proposal_kind', armd.get('proposal_kind', 'missing')),
+            'tasam_proposal_present': tasam_proposal_present,
+            'tasam_proposal_valid': bool(decision.get('tasam_proposal_valid', tasam.get('valid', tasam_valid))),
+            'tasam_proposal_kind': decision.get('tasam_proposal_kind', tasam.get('proposal_kind', 'missing')),
             'winner': winner,
             'armd_valid': armd_valid,
             'tasam_valid': tasam_valid,
@@ -2209,6 +3228,10 @@ class RappResourceOptimizer:
             'armd_target': armd_target,
             'tasam_target': tasam_target,
             'would_apply': False,
+            'energy_winner': legacy_energy_winner,
+            'resource_winner': 'ta_sam' if tasam_valid else ('armd' if armd_valid else 'none'),
+            'external_policy_available': legacy_external_available,
+            'energy_external_used': legacy_external_used,
         }
     
     def write_decision(self, decision):
@@ -2422,11 +3445,23 @@ class RappResourceOptimizer:
             }
         
         self.a1.send_energy_policy(decision, pattern_info)
-        self.a1.send_slice_policy(
+        slice_policy = self.a1.send_slice_policy(
             decision['slicer_state'],
             {'active': int(decision['pattern_analysis']['current_cameras'])} if decision.get('pattern_analysis') else None,
             armd_info=armd_info,
+            per_ue_allocation=(decision.get('resource_allocation') or {}).get('per_ue_allocation') or None,
+            per_ue_context=decision.get('resource_allocation') or {},
         )
+        per_ue = (decision.get('resource_allocation') or {}).get('per_ue_allocation') or []
+        if per_ue and isinstance(slice_policy, dict):
+            per_ue_policy = slice_policy.get('per_ue_resource_policy') or {}
+            decision['resource_allocation']['per_ue_policy_id'] = str(
+                per_ue_policy.get('policy_id') or slice_policy.get('policy_id') or ''
+            )
+            decision['resource_allocation']['per_ue_application_status'] = str(
+                per_ue_policy.get('application_status')
+                or 'pending_ack'
+            )
     
     def send_energy_command(self, decision):
         """
@@ -2494,7 +3529,53 @@ class RappResourceOptimizer:
                 self.stats['ack_pending'] += 1
                 if info['attempts'] >= 3:
                     self.stats['ack_timeout'] += 1
-    
+
+    def _observe_pending_judge_outcome(self, current_decision):
+        """Score the previous assistant pair using the next real snapshot."""
+        previous = self._pending_judge_decision
+        if not isinstance(previous, dict) or not isinstance(current_decision, dict):
+            return
+        judge_result = previous.get('rapp_judge_result') or {}
+        if not judge_result:
+            self._pending_judge_decision = None
+            return
+
+        outcome = RAppJudge.derive_observed_outcome(current_decision, RUNTIME_CONFIG)
+        if outcome.get('correct_verdict') == 'UNKNOWN':
+            # Keep the decision pending through warm-up/no-data cycles.
+            return
+        feedback = self.rapp_judge.evaluate_outcome(judge_result, outcome)
+        continuous = RAppJudge.compute_observed_error(previous, current_decision, RUNTIME_CONFIG)
+        if self._tasam_full_control_enabled() and not (
+            previous.get('tasam_proposal_valid') and previous.get('ta_sam_actuation_applied')
+        ):
+            # A missing/invalid TA-SAM action is an experimental failure.  It
+            # is never converted into a heuristic action and receives the
+            # maximum training penalty even if the next snapshot is healthy.
+            continuous = {
+                **continuous,
+                'tasam_observed_error': 1.0,
+                'tasam_continuous_reward': -1.0,
+                'tasam_reward_source': 'invalid_tasam_proposal_max_penalty',
+            }
+        feedback.update(continuous)
+        feedback['tasam_action_applied'] = bool(previous.get('ta_sam_actuation_applied', False))
+        previous['rapp_judge_feedback'] = feedback
+        self.data_lake.record_judge_outcome(
+            previous,
+            feedback,
+            observation=outcome,
+            observed_timestamp=current_decision.get('timestamp'),
+        )
+        print(
+            '[rApp Judge] feedback: '
+            f"correto={feedback.get('correct_verdict')} "
+            f"ARMD={feedback.get('armd_credit', 0):+.2f} "
+            f"TA-SAM={feedback.get('tasam_credit', 0):+.2f} "
+            f"({outcome.get('reason', '')})"
+        )
+        self._pending_judge_decision = None
+
     def record_decision(self, decision):
         """Registra decisão no Data Lake e log estruturado."""
         self.data_lake.record_decision(decision)
@@ -2566,6 +3647,17 @@ class RappResourceOptimizer:
                 'tasam_would_influence': decision.get('tasam_would_influence', False),
                 'tasam_energy_decision': decision.get('tasam_energy_decision', ''),
                 'tasam_energy_action': decision.get('tasam_energy_action', ''),
+                'ta_sam_actuation_applied': decision.get('ta_sam_actuation_applied', False),
+                'control_trial_mode': decision.get('control_trial_mode', ''),
+                'effective_policy_algorithm': decision.get('effective_policy_algorithm', ''),
+                'effective_policy_source': decision.get('effective_policy_source', ''),
+                'control_trial_reason': decision.get('control_trial_reason', ''),
+                'collection_event_stage_name': decision.get('collection_event_stage_name', ''),
+                'collection_event_target_domain': decision.get('collection_event_target_domain', ''),
+                'collection_event_cycle': decision.get('collection_event_cycle', 0),
+                'collection_event_stage_index': decision.get('collection_event_stage_index', 0),
+                'collection_event_generated_at': decision.get('collection_event_generated_at', 0),
+                'collection_event_stage_authoritative': decision.get('collection_event_stage_authoritative', False),
                 'advisor_arbitration_mode': (decision.get('advisor_arbitration') or {}).get('mode', ''),
                 'advisor_arbitration_winner': (decision.get('advisor_arbitration') or {}).get('winner', ''),
                 'advisor_arbitration_armd_score': (decision.get('advisor_arbitration') or {}).get('armd_score', 0),
@@ -2944,6 +4036,20 @@ class RappResourceOptimizer:
         self.last_sim_time_for_reset = None
         
         while self.running:
+            if self.decision_target > 0:
+                try:
+                    decision_count = int(
+                        self.data_lake.get_database_stats().get('decisions_count', 0) or 0
+                    )
+                except Exception:
+                    decision_count = 0
+                if decision_count >= self.decision_target:
+                    print(
+                        f"[rApp] Alvo de decisões atingido internamente: "
+                        f"{decision_count}/{self.decision_target}"
+                    )
+                    self.running = False
+                    break
             self.cycle += 1
             
             # ========================================
@@ -3016,6 +4122,11 @@ class RappResourceOptimizer:
             
             # 3. Toma decisão estratégica
             decision = self.make_decision(slicer_intent, energy_intent, vehicle_intent)
+
+            # A decisão anterior é avaliada somente agora, com a próxima
+            # observação real disponível. Isso evita premiar um ARMD
+            # conservador apenas por ter imposto um veto preventivo.
+            self._observe_pending_judge_outcome(decision)
             
             # 3.1 Controla xApps baseado na decisão
             xapp_status = self.decide_xapp_activation(decision)
@@ -3034,6 +4145,8 @@ class RappResourceOptimizer:
             
             # 6. Registra decisão no Data Lake
             self.record_decision(decision)
+            if decision.get('rapp_judge_result'):
+                self._pending_judge_decision = decision
             
             # 7. Atualiza estatísticas
             self.update_stats(decision)
@@ -3064,10 +4177,7 @@ class RappResourceOptimizer:
         # Para Energy Saver (rApp controla)
         self._stop_energy_saver()
         
-        # Mantém Slicer rodando (fallback de segurança)
-        # Slicer é prioridade e deve continuar mesmo se rApp morrer
-        if self.xapp_manager.is_running("slicer"):
-            print("[rApp] Mantendo xApp SLICER ativo (fallback de segurança)")
+        self.xapp_manager.stop_all()
         
         self.print_final_stats()
         
@@ -3075,7 +4185,7 @@ class RappResourceOptimizer:
         self.data_lake.close()
         self.agent.clear_intent()
         
-        print("[rApp] Encerrado (Slicer continua rodando)")
+        print("[rApp] Encerrado; xApps e PID files finalizados")
 
 
 def main():

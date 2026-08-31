@@ -1,0 +1,24 @@
+{
+  "schema": "greenran.energy_calibration.v1",
+  "calibration_version": "provisional_ru_mmwave_20260820",
+  "status": "provisional_model_requires_lab_or_vendor_calibration",
+  "scope": ["ru", "mmwave"],
+  "power_model": "idle_plus_dynamic_scaled_by_power_level",
+  "components": {
+    "ru": {
+      "idle_w": 80.0,
+      "active_w": 250.0,
+      "source": "provisional_configurable_value"
+    },
+    "mmwave": {
+      "idle_w": 40.0,
+      "active_w": 180.0,
+      "source": "provisional_configurable_value"
+    }
+  },
+  "notes": [
+    "Valores iniciais são calibração provisória, não leitura de wattímetro.",
+    "Substituir pelos watts nominais do laboratório ou fabricante antes da conclusão física.",
+    "A potência total é RU/mmWave; consumo de DU, transporte e UE fica fora desta versão."
+  ]
+}

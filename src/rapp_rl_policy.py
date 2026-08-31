@@ -2,9 +2,9 @@
 """
 Runtime RL policy abstraction for GreenRAN.
 
-The DRL stack is restricted to the TA-SAM MARL family. In the live runtime,
-the heuristic allocator remains the only actuation path while TA-SAM stays in
-shadow/control-gated evaluation.
+The DRL stack is restricted to the TA-SAM MARL family.  The legacy RL hook
+still exposes a baseline object for compatibility, while the effective live
+resource decision is produced by the ARMD envelope + TA-SAM Judge path.
 
 [1] Lotfi, F., Rajoli, H. & Afghah, F. "Task-Specific Sharpness-Aware O-RAN
     Resource Management using Multi-Agent Reinforcement Learning".
@@ -47,7 +47,7 @@ class BaseRLPolicy:
 
 
 class HeuristicResourcePolicy(BaseRLPolicy):
-    """No-op runtime policy that leaves the heuristic allocator in control."""
+    """Compatibility baseline used before the effective TA-SAM decision."""
 
     metadata = RLPolicyMetadata(
         policy_id="heuristic_resource_allocator",
@@ -71,7 +71,7 @@ class HeuristicResourcePolicy(BaseRLPolicy):
             "final_decision": "FALLBACK_HEURISTIC",
             "confidence": 0.0,
             "policy_action": None,
-            "reason": "TA-SAM remains shadow/control-gated; heuristic allocator stays live",
+            "reason": "legacy baseline hook; effective allocation is decided by ARMD + TA-SAM Judge",
             "resource_allocation": baseline,
         }
 

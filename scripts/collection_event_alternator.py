@@ -14,7 +14,7 @@ import os
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -193,6 +193,7 @@ VEHICLE_CRITICAL = {
 class Stage:
     name: str
     duration_s: int
+    target_domain: str
     app1: dict[str, Any]
     app2: dict[str, Any]
     vehicle: dict[str, Any]
@@ -228,9 +229,18 @@ def _stage(
     vehicle: dict[str, Any] | None = None,
     note: str = "",
 ) -> Stage:
+    if name.startswith("camera_"):
+        target_domain = "camera"
+    elif name.startswith("vehicle_"):
+        target_domain = "vehicle"
+    elif name.startswith("app2_"):
+        target_domain = "app2"
+    else:
+        target_domain = "global"
     return Stage(
         name=name,
         duration_s=max(1, int(duration_s)),
+        target_domain=target_domain,
         app1=(app1 or APP1_HEALTHY).copy(),
         app2=(app2 or APP2_HEALTHY).copy(),
         vehicle=(vehicle or VEHICLE_HEALTHY).copy(),
@@ -483,6 +493,19 @@ PROFILES: dict[str, list[Stage]] = {
     ],
 }
 
+# The v2 training manifest uses the same nine-stage GreenRAN event schedule
+# as the restored v1 alternator. Keep both names explicit so the training,
+# collection, and external-validation pipelines cannot silently diverge.
+PROFILES["tasam_training_balanced_v2"] = PROFILES["tasam_training_balanced_v1"]
+
+# v3 keeps the exact event payloads from v1/v2, but gives every stage enough
+# wall-clock time for the rApp decision and its following real-PDCP metric
+# snapshot to be paired into a trainable transition. The former 3-second
+# BLOCKED windows routinely produced raw records without next_metrics.
+PROFILES["tasam_training_balanced_v3"] = [
+    replace(stage, duration_s=12) for stage in PROFILES["tasam_training_balanced_v1"]
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alternate collection events by updating the GreenRAN scenario-control file.")
@@ -653,6 +676,7 @@ def write_payload(path: Path, profile_name: str, position: StagePosition) -> Non
         "collection_event_cycle": position.cycle_index,
         "collection_event_stage_index": position.stage_index,
         "collection_event_stage_name": position.stage.name,
+        "collection_event_target_domain": position.stage.target_domain,
         "duration_s": position.stage.duration_s,
         "note": position.stage.note,
         "sim_time_s": position.sim_time_s,

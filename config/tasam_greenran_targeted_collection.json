@@ -1,0 +1,39 @@
+{
+  "schema": "greenran.tasam_targeted_collection_config.v1",
+  "topology_id": "greenran_fixed_marl_v1",
+  "du_count": 3,
+  "profile": "tasam_training_balanced_v3",
+  "real_only": true,
+  "proxy_allowed": false,
+  "target_valid_transitions": {
+    "allowed_bootstrap": 500,
+    "allowed_stable": 500,
+    "camera_conditional": 500,
+    "camera_blocked": 500,
+    "vehicle_conditional": 500,
+    "vehicle_blocked": 500,
+    "app2_conditional": 500,
+    "app2_blocked": 500,
+    "allowed_recovery": 500
+  },
+  "target_stage_membership": {
+    "allowed_bootstrap": ["allowed_bootstrap"],
+    "allowed_stable": ["allowed_stable"],
+    "camera_conditional": ["camera_conditional"],
+    "camera_blocked": ["camera_blocked"],
+    "vehicle_conditional": ["vehicle_conditional"],
+    "vehicle_blocked": ["vehicle_blocked"],
+    "app2_conditional": ["app2_conditional"],
+    "app2_blocked": ["app2_blocked"],
+    "allowed_recovery": ["allowed_recovery"]
+  },
+  "validity": [
+    "collection_quality.valid_for_training=true",
+    "collection_quality.collector_mode=pdcp_real",
+    "collection_quality.pdcp_real=true",
+    "collection_quality.proxy_latency_sample_count=0",
+    "decision.collection_event_stage_authoritative=true",
+    "current and next metrics present",
+    "stage/decision mismatches are retained and scored by rApp Judge"
+  ]
+}

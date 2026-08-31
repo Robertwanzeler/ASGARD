@@ -34,6 +34,8 @@ class RappNetworkImprovementTests(unittest.TestCase):
             self.assertIn("baseline_p95_us", columns)
             self.assertIn("improvement_source", columns)
             self.assertIn("improvement_valid", columns)
+            self.assertIn("collection_event_stage_name", columns)
+            self.assertIn("collection_event_stage_authoritative", columns)
 
             lake.record_decision(
                 {
@@ -48,6 +50,12 @@ class RappNetworkImprovementTests(unittest.TestCase):
                         "improvement_source": "scenario_control_override",
                         "improvement_valid": True,
                     },
+                    "collection_event_stage_name": "allowed_stable",
+                    "collection_event_target_domain": "global",
+                    "collection_event_cycle": 3,
+                    "collection_event_stage_index": 2,
+                    "collection_event_generated_at": 1782930600,
+                    "collection_event_stage_authoritative": True,
                 },
                 timestamp=1782930635,
             )
@@ -55,6 +63,7 @@ class RappNetworkImprovementTests(unittest.TestCase):
                 """
                 select network_improvement_pct, cvar_improvement_pct, p95_improvement_pct,
                        baseline_cvar_us, baseline_p95_us, improvement_source, improvement_valid
+                       ,collection_event_stage_name, collection_event_stage_authoritative
                 from decisions_history
                 where timestamp=?
                 """,
@@ -68,6 +77,8 @@ class RappNetworkImprovementTests(unittest.TestCase):
             self.assertAlmostEqual(float(row[4] or 0.0), 484700.0, places=3)
             self.assertEqual(row[5], "scenario_control_override")
             self.assertEqual(int(row[6] or 0), 1)
+            self.assertEqual(row[7], "allowed_stable")
+            self.assertEqual(int(row[8] or 0), 1)
             lake.close()
 
 

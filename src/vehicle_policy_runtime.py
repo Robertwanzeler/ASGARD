@@ -261,14 +261,16 @@ def evaluate_vehicle_policy(vehicle_metrics: dict[str, Any]) -> dict[str, Any]:
         critical_reasons.append(f"veículos em risco alto={high_risk}")
     if degraded_autonomy > 0:
         critical_reasons.append(f"autonomia degradada em {degraded_autonomy} veículo(s)")
-    if ego_present and vehicle_latency_ms >= 100:
-        critical_reasons.append(f"latência veicular {vehicle_latency_ms:.0f}ms >= 100ms")
-    elif ego_present and vehicle_latency_ms >= 50:
-        warning_reasons.append(f"latência veicular {vehicle_latency_ms:.0f}ms >= 50ms")
-    if vehicle_packet_loss >= 5:
-        critical_reasons.append(f"packet loss veicular {vehicle_packet_loss:.1f}% >= 5%")
-    elif vehicle_packet_loss >= 2:
-        warning_reasons.append(f"packet loss veicular {vehicle_packet_loss:.1f}% >= 2%")
+    # GreenRAN QoS: autonomous vehicles have a 20 ms target, 10 ms warning,
+    # and at most 1% packet loss (0.5% warning).
+    if ego_present and vehicle_latency_ms >= 20:
+        critical_reasons.append(f"latência veicular {vehicle_latency_ms:.0f}ms >= 20ms")
+    elif ego_present and vehicle_latency_ms >= 10:
+        warning_reasons.append(f"latência veicular {vehicle_latency_ms:.0f}ms >= 10ms")
+    if vehicle_packet_loss >= 1:
+        critical_reasons.append(f"packet loss veicular {vehicle_packet_loss:.1f}% >= 1%")
+    elif vehicle_packet_loss >= 0.5:
+        warning_reasons.append(f"packet loss veicular {vehicle_packet_loss:.1f}% >= 0.5%")
     if medium_risk > 0 and not critical_reasons:
         warning_reasons.append(f"veículos em risco médio={medium_risk}")
 

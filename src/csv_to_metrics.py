@@ -404,6 +404,8 @@ class ExtendedMetricsCollector:
         }
 
     def _load_app2_sensor_override(self):
+        if self.require_real_pdcp:
+            return {}
         try:
             if not self.scenario_control_path.exists():
                 return {}
@@ -418,6 +420,8 @@ class ExtendedMetricsCollector:
             return {}
 
     def _load_app1_camera_override(self):
+        if self.require_real_pdcp:
+            return {}
         try:
             if not self.scenario_control_path.exists():
                 return {}
@@ -491,6 +495,8 @@ class ExtendedMetricsCollector:
         return sensor_entries, snapshot
 
     def _load_vehicle_override(self):
+        if self.require_real_pdcp:
+            return {}
         try:
             if not self.scenario_control_path.exists():
                 return {}
@@ -755,10 +761,15 @@ class ExtendedMetricsCollector:
         self.write_metrics(snapshot, self.app2_snapshot_file)
 
     def export_device_roles_snapshot(self, extended_metrics):
-        """Persist a coherent device role map even when the scenario did not write one."""
-        roles = {}
+        """Persist observed roles without dropping configured, quiet UEs."""
+        self._refresh_device_role_map()
+        roles = {
+            str(imsi): dict(meta)
+            for imsi, meta in (self.device_role_map or {}).items()
+            if isinstance(meta, dict)
+        }
         for imsi, ue_data in (extended_metrics.get("ue_metrics", {}) or {}).items():
-            meta = dict(self.get_device_meta(imsi) or {})
+            meta = dict(roles.get(str(imsi)) or self.get_device_meta(imsi) or {})
             meta.setdefault("device_type", ue_data.get("device_type", "background"))
             roles[str(imsi)] = meta
 
@@ -1380,7 +1391,7 @@ class ExtendedMetricsCollector:
         observed_sensor_imsis = {str(imsi) for imsi in imsis if self.get_device_type(imsi) == 'sensor'}
         expanded_sensor_imsis = set()
         target_sensor_count = len(DEFAULT_SENSOR_PROFILES)
-        if len(observed_sensor_imsis) < target_sensor_count:
+        if not self.require_real_pdcp and len(observed_sensor_imsis) < target_sensor_count:
             for sensor_imsi in range(SENSOR_IMSI_RANGE[0], SENSOR_IMSI_RANGE[0] + target_sensor_count):
                 imsi_text = str(sensor_imsi)
                 if self.get_device_type(imsi_text) == 'sensor' and imsi_text not in imsis:
@@ -1390,7 +1401,7 @@ class ExtendedMetricsCollector:
                     break
 
         virtual_vehicle_imsis = set()
-        if not carla_vehicle_imsis:
+        if not self.require_real_pdcp and not carla_vehicle_imsis:
             vehicle_base = get_fixed_vehicle_base_imsi()
             vehicle_count_target = max(1, min(get_fixed_max_vehicles(), 5))
             for offset in range(vehicle_count_target):
@@ -1615,6 +1626,11 @@ class ExtendedMetricsCollector:
         result['global_metrics']['latency_sample_source_counts'] = dict(latency_source_counts)
         result['global_metrics']['real_latency_sample_count'] = real_latency_sample_count
         result['global_metrics']['proxy_latency_sample_count'] = proxy_latency_sample_count
+        result['global_metrics']['collector_mode'] = 'no_pdcp_proxy_latency'
+        result['global_metrics']['pdcp_provenance'] = 'pdcp_real' if proxy_latency_sample_count == 0 and real_latency_sample_count > 0 else 'proxy'
+        result['global_metrics']['pdcp_real'] = proxy_latency_sample_count == 0 and real_latency_sample_count > 0
+        result['global_metrics']['scenario_override_active'] = bool(app1_override or app2_override or vehicle_override)
+        result['global_metrics']['effective_source'] = 'pdcp_real' if proxy_latency_sample_count == 0 and real_latency_sample_count > 0 else 'proxy'
 
         result['active_cameras'] = camera_count
         result['critical_cameras'] = camera_critical_count
@@ -1812,6 +1828,9 @@ class ExtendedMetricsCollector:
                 'has_latency_samples': has_latency_samples,
                 'latency_source': 'pdcp_real' if has_latency_samples else '',
                 'latency_is_proxy': False,
+                'pdcp_provenance': 'pdcp_real' if has_latency_samples else 'unavailable',
+                'scenario_override_active': False,
+                'effective_source': 'pdcp_real' if has_latency_samples else 'unavailable',
                 'is_critical': has_latency_samples and max_latency >= SLA_THRESHOLD_US,
                 'throughput_source': 'pdcp_rx_window'
             }
@@ -1833,6 +1852,9 @@ class ExtendedMetricsCollector:
                     'has_latency_samples': True,
                     'latency_source': 'app1_camera_override',
                     'latency_is_proxy': True,
+                    'pdcp_provenance': 'proxy',
+                    'scenario_override_active': True,
+                    'effective_source': 'app1_camera_override',
                     'is_critical': override_latency_us >= SLA_THRESHOLD_US,
                 })
             elif (
@@ -1852,6 +1874,9 @@ class ExtendedMetricsCollector:
                     'has_latency_samples': True,
                     'latency_source': 'app2_sensor_override',
                     'latency_is_proxy': True,
+                    'pdcp_provenance': 'proxy',
+                    'scenario_override_active': True,
+                    'effective_source': 'app2_sensor_override',
                     'is_critical': override_latency_us >= SLA_THRESHOLD_US,
                 })
 
@@ -1909,6 +1934,9 @@ class ExtendedMetricsCollector:
                         'has_latency_samples': True,
                         'latency_source': 'vehicle_state_proxy',
                         'latency_is_proxy': True,
+                        'pdcp_provenance': 'proxy',
+                        'scenario_override_active': True,
+                        'effective_source': 'vehicle_state_proxy',
                         'is_critical': override_latency_us >= SLA_THRESHOLD_US,
                     })
                 vehicle_override_index += 1
@@ -2184,6 +2212,10 @@ class ExtendedMetricsCollector:
             'ues_with_latency_samples': len(ue_avg_latencies),
             'ues_without_latency_samples': max(0, len(result['ue_metrics']) - len(ue_avg_latencies)),
             'collector_mode': 'pdcp_real',
+            'pdcp_provenance': 'pdcp_real' if proxy_latency_sample_count == 0 else 'mixed_real_proxy',
+            'pdcp_real': proxy_latency_sample_count == 0 and real_latency_sample_count > 0,
+            'scenario_override_active': bool(app1_override or app2_override or vehicle_override),
+            'effective_source': 'pdcp_real' if proxy_latency_sample_count == 0 and real_latency_sample_count > 0 else 'proxy',
             'latency_sample_source_counts': dict(latency_source_counts),
             'real_latency_sample_count': real_latency_sample_count,
             'proxy_latency_sample_count': proxy_latency_sample_count,
@@ -2440,8 +2472,100 @@ class ExtendedMetricsCollector:
             if bool((ue_data or {}).get('latency_is_proxy')):
                 return True
         return False
+
+    def _retain_real_only_snapshot(self, extended_metrics):
+        """Remove unobserved/proxy UEs from a strict real-PDCP snapshot.
+
+        A strict run must never publish an estimated latency as if it were a
+        radio measurement.  An IMSI with real PDCP TX/RX counters but no RX
+        latency sample is still retained as a real observation: its receive
+        throughput remains zero and its latency remains unsampled.  This is
+        important for camera SLA failures, where TX without RX is the actual
+        network outcome, not a proxy estimate.
+        """
+        if not isinstance(extended_metrics, dict):
+            return extended_metrics
+        ue_metrics = extended_metrics.get('ue_metrics') or {}
+        original_proxy_count = int(
+            (extended_metrics.get('global_metrics') or {}).get('proxy_latency_sample_count', 0) or 0
+        )
+        real_ues = {}
+        for imsi, data in ue_metrics.items():
+            if not isinstance(data, dict) or bool(data.get('latency_is_proxy')):
+                continue
+            has_latency = bool(data.get('has_latency_samples'))
+            has_pdcp_observation = (
+                int(data.get('tx_pdus', 0) or 0) > 0
+                or int(data.get('rx_pdus', 0) or 0) > 0
+                or float(data.get('tx_bytes', 0) or 0.0) > 0.0
+                or float(data.get('rx_bytes', 0) or 0.0) > 0.0
+            )
+            if has_latency or has_pdcp_observation:
+                if not has_latency:
+                    data['observation_source'] = 'pdcp_real_no_rx_latency'
+                real_ues[imsi] = data
+        excluded = max(0, len(ue_metrics) - len(real_ues))
+        if excluded == 0:
+            return extended_metrics
+
+        extended_metrics['ue_metrics'] = real_ues
+        gm = extended_metrics.setdefault('global_metrics', {})
+        latencies = [float(data.get('latency_us', 0) or 0) for data in real_ues.values() if float(data.get('latency_us', 0) or 0) > 0]
+        jitters = [float(data.get('jitter_us', 0) or 0) for data in real_ues.values() if float(data.get('latency_us', 0) or 0) > 0]
+        cameras = [data for data in real_ues.values() if data.get('device_type') == 'camera']
+        sensors = [data for data in real_ues.values() if data.get('device_type') == 'sensor']
+        vehicles = [data for data in real_ues.values() if data.get('device_type') == 'vehicle']
+        critical = sum(1 for data in real_ues.values() if bool(data.get('is_critical')))
+        real_source_counts = defaultdict(int)
+        no_latency_sample_count = 0
+        for data in real_ues.values():
+            source = str(data.get('latency_source') or '')
+            if source:
+                real_source_counts[source] += 1
+            if not bool(data.get('has_latency_samples')):
+                no_latency_sample_count += 1
+        gm.update({
+            'total_active_ues': len(real_ues),
+            'total_active_cameras': len(cameras),
+            'total_active_sensors': len(sensors),
+            'total_active_vehicles': len(vehicles),
+            'total_critical_ues': critical,
+            'total_tx_bytes': sum(int(data.get('tx_bytes', 0) or 0) for data in real_ues.values()),
+            'total_rx_bytes': sum(int(data.get('rx_bytes', 0) or 0) for data in real_ues.values()),
+            'total_tx_pdus': sum(int(data.get('tx_pdus', 0) or 0) for data in real_ues.values()),
+            'total_rx_pdus': sum(int(data.get('rx_pdus', 0) or 0) for data in real_ues.values()),
+            'throughput_kbps': sum(float(data.get('throughput_kbps', 0) or 0) for data in real_ues.values()),
+            'global_avg_latency_us': sum(latencies) / len(latencies) if latencies else 0,
+            'global_min_latency_us': min(latencies) if latencies else 0,
+            'global_max_latency_us': max(latencies) if latencies else 0,
+            'global_worst_latency_us': max(latencies) if latencies else 0,
+            'global_worst_camera_latency_us': max((float(data.get('latency_us', 0) or 0) for data in cameras), default=0),
+            'global_jitter_us': sum(jitters) / len(jitters) if jitters else 0,
+            'latency_p5_us': self.percentile_5(latencies) if latencies else 0,
+            'latency_p95_us': self.percentile_95(latencies) if latencies else 0,
+            'latency_min_nonzero_us': self.min_nonzero(latencies),
+            'latency_median_us': self.median(latencies) if latencies else 0,
+            'ues_with_latency_samples': len(latencies),
+            'ues_without_latency_samples': no_latency_sample_count,
+            'collector_mode': 'pdcp_real',
+            'latency_sample_source_counts': dict(real_source_counts),
+            'real_latency_sample_count': len(latencies),
+            # If the snapshot contained only proxy/mock rows, keep the
+            # explicit signal so strict mode skips it.  When at least one
+            # genuine PDCP observation remains, excluded proxy rows are not
+            # published and the resulting snapshot is proxy-free.
+            'proxy_latency_sample_count': original_proxy_count if not real_ues else 0,
+            'proxy_expanded_sensors': False,
+            'proxy_virtual_vehicles': False,
+            'excluded_proxy_ue_count': excluded,
+            'real_pdcp_observations_without_latency': no_latency_sample_count,
+        })
+        extended_metrics['active_cameras'] = len(cameras)
+        extended_metrics['critical_cameras'] = sum(1 for data in cameras if bool(data.get('is_critical')))
+        extended_metrics['critical_ues'] = critical
+        return extended_metrics
     
-    def run(self):
+    def run(self, once=False):
         """Main loop"""
         pdcp_file = self._resolve_trace_file("pdcp")
         mac_file = self.input_dir / "DlMacStats.txt"
@@ -2498,6 +2622,8 @@ class ExtendedMetricsCollector:
                             f"[CSV_METRICS] Strict real-only mode: skipping snapshot because PDCP is {reason}."
                         )
                     self.clear_runtime_outputs()
+                    if once:
+                        break
                     time.sleep(self.poll_interval)
                     continue
                 
@@ -2531,6 +2657,15 @@ class ExtendedMetricsCollector:
                         self._attach_trace_status(extended, trace_status)
 
                     if self.require_real_pdcp and self._snapshot_has_proxy_latency(extended):
+                        extended = self._retain_real_only_snapshot(extended)
+                        if iteration == 1 or iteration % 5 == 0:
+                            excluded = extended.get('global_metrics', {}).get('excluded_proxy_ue_count', 0)
+                            print(
+                                f"[CSV_METRICS] Strict real-only mode: excluding {excluded} UEs "
+                                "without a real PDCP latency sample; no proxy is published."
+                            )
+
+                    if self.require_real_pdcp and self._snapshot_has_proxy_latency(extended):
                         if iteration == 1 or iteration % 5 == 0:
                             proxy_count = (
                                 extended.get('global_metrics', {}).get('proxy_latency_sample_count', 0)
@@ -2540,6 +2675,8 @@ class ExtendedMetricsCollector:
                                 f"proxy latency is still present (proxy_latency_sample_count={proxy_count})."
                             )
                         self.clear_runtime_outputs()
+                        if once:
+                            break
                         time.sleep(self.poll_interval)
                         continue
                     
@@ -2567,6 +2704,8 @@ class ExtendedMetricsCollector:
                 print(f"[CSV_METRICS] Loop failure on iter {iteration}: {e}")
                 traceback.print_exc()
             
+            if once:
+                break
             time.sleep(self.poll_interval)
         
         print("[CSV_METRICS] Shutdown")
@@ -2578,6 +2717,7 @@ def main():
     parser.add_argument('--output', '-o', default=DEFAULT_OUTPUT_FILE)
     parser.add_argument('--extended-output', '-e', default=DEFAULT_EXTENDED_OUTPUT_FILE)
     parser.add_argument('--poll-interval', '-p', type=float, default=DEFAULT_POLL_INTERVAL)
+    parser.add_argument('--once', action='store_true', help='Process one final snapshot and exit.')
     args = parser.parse_args()
     
     collector = ExtendedMetricsCollector(
@@ -2586,7 +2726,7 @@ def main():
         args.extended_output,
         args.poll_interval
     )
-    collector.run()
+    collector.run(once=args.once)
 
 
 if __name__ == '__main__':

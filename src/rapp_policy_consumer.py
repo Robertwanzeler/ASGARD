@@ -34,6 +34,32 @@ def load_current_policies(policy_dir: Path | None = None) -> Dict[str, Dict[str,
         "energy_policy": energy_policy,
         "slice_policy": slice_policy,
         "armd": summarize_armd_policy(energy_policy, slice_policy),
+        "per_ue_resource": summarize_per_ue_resource_policy(slice_policy),
+    }
+
+
+def summarize_per_ue_resource_policy(slice_policy: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize the individual-UE floor contract exposed through A1."""
+    block = slice_policy.get("per_ue_resource_policy", {}) if isinstance(slice_policy, dict) else {}
+    if not isinstance(block, dict) or not block:
+        return {
+            "present": False,
+            "version": "",
+            "application_status": "not_applicable",
+            "allocation_count": 0,
+            "floor_violation_count": 0,
+            "allocations": [],
+        }
+    allocations = block.get("allocations", [])
+    if not isinstance(allocations, list):
+        allocations = []
+    return {
+        "present": True,
+        "version": str(block.get("version", "") or ""),
+        "application_status": str(block.get("application_status", "pending_ack") or "pending_ack"),
+        "allocation_count": int(block.get("allocation_count", len(allocations)) or 0),
+        "floor_violation_count": int(block.get("floor_violation_count", 0) or 0),
+        "allocations": allocations,
     }
 
 

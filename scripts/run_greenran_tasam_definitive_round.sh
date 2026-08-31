@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Rodada definitiva para completar o dataset do TA-SAM no GreenRAN.
+# Preserva a topologia fixa (20 UEs, 3 câmeras, 5 veículos), usa somente
+# PDCP/E2 real para métricas, não usa proxy e alterna os nove estágios do
+# artigo adaptado ao GreenRAN. ARMD e TA-SAM permanecem ativos no rApp.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+export GREENRAN_STATE_DIR="${GREENRAN_STATE_DIR:-$PROJECT_ROOT/runs/greenran_tasam_definitive_20260810_v4}"
+export GREENRAN_FIXED_SCENARIO_CONFIG="${GREENRAN_FIXED_SCENARIO_CONFIG:-$PROJECT_ROOT/config/greenran_fixed_scenario.json}"
+
+# 10 minutos de relógio real; o perfil de eventos tem os nove grupos:
+# ALLOWED, câmera conditional/blocked, veículo conditional/blocked,
+# App2 conditional/blocked e recovery.
+export GREENRAN_WALL_TIME_LIMIT_SECONDS="${GREENRAN_WALL_TIME_LIMIT_SECONDS:-600}"
+export GREENRAN_SIM_TIME="${GREENRAN_SIM_TIME:-100000}"
+export GREENRAN_COLLECTION_EVENT_PROFILE="${GREENRAN_COLLECTION_EVENT_PROFILE:-tasam_training_balanced_v2}"
+export GREENRAN_COLLECTION_EVENT_TIME_SOURCE="wall"
+export GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES="0"
+export GREENRAN_COLLECTION_EVENT_CYCLES="0"
+
+# Topologia GreenRAN fixa e sem proxy.
+export GREENRAN_REAL_ONLY="1"
+export GREENRAN_REQUIRE_REAL_PDCP="1"
+export GREENRAN_TASAM_EXPORT_ALLOW_PROXY="0"
+export GREENRAN_NS3_UE_COUNT="${GREENRAN_NS3_UE_COUNT:-20}"
+export GREENRAN_NS3_CAMERA_UE_COUNT="${GREENRAN_NS3_CAMERA_UE_COUNT:-3}"
+export GREENRAN_NS3_VEHICLE_UE_COUNT="${GREENRAN_NS3_VEHICLE_UE_COUNT:-5}"
+export GREENRAN_NS3_MMWAVE_ENB_NODES="${GREENRAN_NS3_MMWAVE_ENB_NODES:-3}"
+export GREENRAN_RAN_PRESSURE_PROFILE="${GREENRAN_RAN_PRESSURE_PROFILE:-greenran_autonomous_priority_wall10m_v1}"
+export GREENRAN_RAN_PRESSURE_TIME_SOURCE="wall"
+export GREENRAN_START_RIC="${GREENRAN_START_RIC:-0}"
+
+# Mais ciclos de decisão por minuto, sem alterar a política do rApp.
+export GREENRAN_ORCHESTRATOR_INTERVAL="${GREENRAN_ORCHESTRATOR_INTERVAL:-2}"
+export GREENRAN_COLLECTOR_POLL_INTERVAL="${GREENRAN_COLLECTOR_POLL_INTERVAL:-0.5}"
+
+# ARMD + TA-SAM em controle conjunto, com canário e rollback.
+CONTROL_TRIAL_ROOT="$PROJECT_ROOT/runs/tasam_greenran_control_trial_20260809"
+export GREENRAN_ARMD_MODE="${GREENRAN_ARMD_MODE:-assist}"
+export GREENRAN_TASAM_ADVISOR_ENABLED="1"
+export GREENRAN_TASAM_ADVISOR_MODE="control_trial"
+export GREENRAN_TASAM_EVAL_MANIFEST="${GREENRAN_TASAM_EVAL_MANIFEST:-$CONTROL_TRIAL_ROOT/tasam_candidate_evaluation.json}"
+export GREENRAN_MARL_CONTROL_GATE_MANIFEST="${GREENRAN_MARL_CONTROL_GATE_MANIFEST:-$CONTROL_TRIAL_ROOT/marl_control_gate.json}"
+export GREENRAN_CONTROL_TRIAL_ENABLED="1"
+export GREENRAN_CONTROL_TRIAL_FRACTION="${GREENRAN_CONTROL_TRIAL_FRACTION:-0.10}"
+export GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS="${GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS:-300}"
+export GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW="${GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW:-30}"
+export GREENRAN_CONTROL_TRIAL_CRITICAL_STREAK="${GREENRAN_CONTROL_TRIAL_CRITICAL_STREAK:-3}"
+export GREENRAN_CONTROL_TRIAL_MIN_CONFIDENCE="${GREENRAN_CONTROL_TRIAL_MIN_CONFIDENCE:-0.60}"
+export GREENRAN_CONTROL_TRIAL_MIN_RAN_DELTA="${GREENRAN_CONTROL_TRIAL_MIN_RAN_DELTA:--0.01}"
+export GREENRAN_CONTROL_TRIAL_MIN_AI_DELTA="${GREENRAN_CONTROL_TRIAL_MIN_AI_DELTA:--0.01}"
+export GREENRAN_CONTROL_TRIAL_STATE="${GREENRAN_CONTROL_TRIAL_STATE:-$GREENRAN_STATE_DIR/control_trial_state.json}"
+
+# Sem treino online/ML legado durante a coleta; o treino offline vem depois.
+export GREENRAN_TASAM_TRUE_ONLINE_ENABLED="0"
+export GREENRAN_ML_RETRAIN_ENABLED="false"
+
+exec "$SCRIPT_DIR/run_greenran_tasam_3du_collection.sh"

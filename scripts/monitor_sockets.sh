@@ -7,7 +7,11 @@ while true; do
     echo "Data: $(date)"
     echo ""
     
-    SOCKETS=("/tmp/slicer.sock" "/tmp/energy_saver.sock")
+    state_dir="${GREENRAN_STATE_DIR:-/tmp}"
+    SOCKETS=(
+        "${GREENRAN_SLICER_SOCKET_PATH:-$state_dir/sockets/slicer.sock}"
+        "${GREENRAN_ENERGY_SOCKET_PATH:-$state_dir/sockets/energy_saver.sock}"
+    )
     
     for s in "${SOCKETS[@]}"; do
         if [ -S "$s" ]; then

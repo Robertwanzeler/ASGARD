@@ -58,6 +58,25 @@ class ARMDIntegrationTests(unittest.TestCase):
         self.assertEqual(advice["scenario"], "vehicle_implicito")
         self.assertEqual(advice["expected_energy_saver"], "CONDITIONAL")
 
+    def test_healthy_cycle_emits_neutral_proposal(self):
+        advisor = ARMDRuntimeAdvisor(mode="assist")
+        advice = advisor.advise(
+            decision={"energy_saver": "ALLOWED", "action": "MONITOR"},
+            camera_metrics={},
+            vehicle_metrics={},
+            app2_metrics={},
+            network_health={"cvar_us": 10000, "p95_us": 20000},
+        )
+        self.assertTrue(advice["proposal_present"])
+        self.assertTrue(advice["proposal_valid"])
+        self.assertEqual(advice["proposal_kind"], "neutral_noop")
+        self.assertEqual(advice["scenario"], "greenran_global_noop")
+
+        updated = advisor.apply({"energy_saver": "ALLOWED", "action": "MONITOR"}, advice)
+        self.assertTrue(updated["armd_proposal_present"])
+        self.assertTrue(updated["armd_proposal_valid"])
+        self.assertFalse(updated["armd_override_applied"])
+
     def test_data_lake_exposes_armd_columns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "armd_test.db"
@@ -68,6 +87,36 @@ class ARMDIntegrationTests(unittest.TestCase):
             self.assertIn("armd_scenario", columns)
             self.assertIn("armd_source", columns)
             self.assertIn("armd_override_applied", columns)
+            self.assertIn("armd_proposal_present", columns)
+            self.assertIn("tasam_proposal_present", columns)
+            self.assertIn("advisor_arbitration_present", columns)
+            self.assertIn("tasam_policy_envelope_applied", columns)
+            self.assertIn("tasam_policy_envelope_source", columns)
+            self.assertIn("tasam_policy_envelope_json", columns)
+
+    def test_data_lake_persists_armd_envelope_for_tasam(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lake = DataLake(db_path=str(Path(tmpdir) / "envelope_test.db"))
+            lake.record_decision(
+                {
+                    "energy_saver": "CONDITIONAL",
+                    "collection_event_stage_name": "vehicle_conditional",
+                    "tasam_advisor": {
+                        "armd_policy_envelope": {
+                            "applied": True,
+                            "authority": "ARMD-GreenRAN",
+                        }
+                    },
+                    "tasam_policy_envelope_applied": True,
+                    "tasam_policy_envelope_source": "armd",
+                },
+                timestamp=1700000000,
+            )
+            row = lake.conn.execute(
+                "select tasam_policy_envelope_applied, tasam_policy_envelope_source, tasam_policy_envelope_json from decisions_history"
+            ).fetchone()
+            self.assertEqual(tuple(row)[:2], (1, "armd"))
+            self.assertIn("ARMD-GreenRAN", row[2])
 
 
 if __name__ == "__main__":

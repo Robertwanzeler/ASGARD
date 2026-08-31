@@ -45,6 +45,7 @@ DRL_VENV_SITE_PACKAGES = (
 
 XAPP_INTENTS_DIR = STATE_DIR / "xapp_intents"
 XAPP_METRICS_DIR = STATE_DIR / "xapp_metrics"
+XAPP_SOCKET_DIR = STATE_DIR / "sockets"
 RAPP_POLICIES_DIR = STATE_DIR / "rapp_policies"
 CARLA_STATE_DIR = STATE_DIR / "carla_state"
 
@@ -60,6 +61,8 @@ ENERGY_INTENT_PATH = XAPP_INTENTS_DIR / "energy_saver.txt"
 VEHICLE_INTENT_PATH = XAPP_INTENTS_DIR / "vehicle_control.txt"
 RAPP_DECISION_PATH = XAPP_INTENTS_DIR / "rapp_decision.txt"
 ENERGY_COMMAND_PATH = XAPP_INTENTS_DIR / "energy_command.json"
+SLICER_SOCKET_PATH = XAPP_SOCKET_DIR / "slicer.sock"
+ENERGY_SOCKET_PATH = XAPP_SOCKET_DIR / "energy_saver.sock"
 
 METRICS_JSON_PATH = XAPP_METRICS_DIR / "metrics.json"
 EXTENDED_METRICS_JSON_PATH = XAPP_METRICS_DIR / "extended_metrics.json"
@@ -76,7 +79,7 @@ XAPP_VEHICLE_PID_PATH = STATE_DIR / "xapp_vehicle.pid"
 
 def ensure_runtime_dirs() -> None:
     """Garante os diretórios de runtime usados pelo core."""
-    for path in (STATE_DIR, RUNS_DIR, XAPP_INTENTS_DIR, XAPP_METRICS_DIR, RAPP_POLICIES_DIR, CARLA_STATE_DIR):
+    for path in (STATE_DIR, RUNS_DIR, XAPP_INTENTS_DIR, XAPP_METRICS_DIR, XAPP_SOCKET_DIR, RAPP_POLICIES_DIR, CARLA_STATE_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 

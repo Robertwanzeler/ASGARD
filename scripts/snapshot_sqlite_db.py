@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retain",
         type=int,
-        default=_env_int("GREENRAN_DB_SNAPSHOT_RETENTION", 6),
+        default=_env_int("GREENRAN_DB_SNAPSHOT_RETENTION", 2),
         help="How many snapshots to keep",
     )
     return parser

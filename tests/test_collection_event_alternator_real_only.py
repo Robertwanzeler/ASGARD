@@ -21,6 +21,16 @@ def load_module(module_name: str):
 
 
 class TestCollectionEventAlternatorRealOnly(unittest.TestCase):
+    def test_balanced_v3_extends_every_stage_for_transition_pairing(self):
+        module = load_module("collection_event_alternator_v3")
+        profile = module.PROFILES["tasam_training_balanced_v3"]
+        self.assertEqual(len(profile), 9)
+        self.assertTrue(all(stage.duration_s == 12 for stage in profile))
+        self.assertEqual(
+            [stage.name for stage in profile],
+            [stage.name for stage in module.PROFILES["tasam_training_balanced_v1"]],
+        )
+
     def test_real_only_mode_disables_application_overrides(self):
         previous = os.environ.get("GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES")
         os.environ["GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES"] = "1"

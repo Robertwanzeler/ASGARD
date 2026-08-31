@@ -1,0 +1,14 @@
+{
+  "schema": "greenran.tasam_diversity_campaign.v1",
+  "topology_id": "greenran_fixed_marl_v1",
+  "du_count": 3,
+  "profile": "tasam_training_balanced_v1",
+  "speed_min": 10,
+  "speed_max": 20,
+  "variants": [
+    {"id": "reference_20ue", "ue_count": 20, "camera_ue_count": 3, "vehicle_ue_count": 5},
+    {"id": "camera_heavy_20ue", "ue_count": 20, "camera_ue_count": 6, "vehicle_ue_count": 4},
+    {"id": "vehicle_heavy_20ue", "ue_count": 20, "camera_ue_count": 3, "vehicle_ue_count": 8},
+    {"id": "mixed_stress_20ue", "ue_count": 20, "camera_ue_count": 6, "vehicle_ue_count": 8}
+  ]
+}

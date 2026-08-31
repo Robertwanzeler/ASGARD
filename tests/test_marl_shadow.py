@@ -99,6 +99,103 @@ class TestMARLShadow(unittest.TestCase):
         self.assertGreaterEqual(comparison['shadow_ran_completion_est'], comparison['live_ran_completion_est'])
         self.assertIn('recommend_shadow', comparison)
 
+    def test_armd_envelope_bounds_tasam_inside_policy_floors(self):
+        evaluator = MARLShadowRuntimeEvaluator({'mode': 'shadow'})
+        shadow = {
+            'available': True,
+            'source': 'checkpoint',
+            'shadow_r_ran': 0.10,
+            'shadow_r_ai': 0.80,
+            'advisor': {'resource_advice': {'suggested_r_ran': 0.10, 'suggested_r_ai': 0.80}},
+        }
+        armd = {
+            'available': True,
+            'valid': True,
+            'proposal_id': 'armd:test',
+            'verdict': 'CONDITIONAL',
+            'resource_allocation': {
+                'usable_budget': 0.90,
+                'floor_total_ran': 0.20,
+                'floor_total_ai': 0.30,
+                'r_ran': 0.20,
+                'r_ai': 0.70,
+            },
+        }
+        out = evaluator.apply_armd_policy_envelope(
+            shadow,
+            armd,
+            {'usable_budget': 0.90, 'r_ran': 0.30, 'r_ai': 0.60, 'd_ran': 0.5, 'd_ai': 0.5},
+        )
+        self.assertTrue(out['armd_policy_envelope']['applied'])
+        self.assertGreaterEqual(out['shadow_r_ran'], 0.20)
+        self.assertGreaterEqual(out['shadow_r_ai'], 0.30)
+        self.assertLessEqual(out['shadow_r_ran'] + out['shadow_r_ai'], 0.90 + 1e-6)
+        self.assertTrue(out['advisor']['resource_advice']['armd_envelope_applied'])
+
+    def test_armd_critical_veto_fixes_tasam_proposal(self):
+        evaluator = MARLShadowRuntimeEvaluator({'mode': 'shadow'})
+        out = evaluator.apply_armd_policy_envelope(
+            {'available': True, 'shadow_r_ran': 0.20, 'shadow_r_ai': 0.80, 'advisor': {}},
+            {
+                'available': True,
+                'valid': True,
+                'proposal_id': 'armd:critical',
+                'verdict': 'BLOCKED',
+                'safety_veto': True,
+                'resource_allocation': {
+                    'usable_budget': 1.0,
+                    'floor_total_ran': 0.50,
+                    'floor_total_ai': 0.15,
+                    'r_ran': 0.85,
+                    'r_ai': 0.15,
+                },
+            },
+            {'usable_budget': 1.0, 'r_ran': 0.50, 'r_ai': 0.50, 'd_ran': 0.5, 'd_ai': 0.5},
+        )
+        self.assertEqual(out['shadow_r_ran'], 0.85)
+        self.assertEqual(out['shadow_r_ai'], 0.15)
+        self.assertEqual(out['advisor']['energy_advice']['decision'], 'BLOCKED')
+        self.assertEqual(out['advisor']['energy_advice']['action'], 'FULL_POWER')
+
+    def test_armd_envelope_preserves_full_shadow_result_for_runtime(self):
+        evaluator = MARLShadowRuntimeEvaluator({'mode': 'shadow'})
+        shadow = {
+            'enabled': True,
+            'available': True,
+            'valid': True,
+            'source': 'checkpoint',
+            'policy_id': 'ta_sam:test',
+            'shadow_r_ran': 0.55,
+            'shadow_r_ai': 0.35,
+            'advisor': {
+                'enabled': True,
+                'mode': 'assistant_only_control',
+                'source': 'checkpoint',
+                'valid': True,
+                'resource_advice': {'enabled': True},
+            },
+        }
+        armd = {
+            'available': True,
+            'valid': True,
+            'proposal_id': 'armd:runtime',
+            'verdict': 'CONDITIONAL',
+            'resource_allocation': {
+                'usable_budget': 0.90,
+                'floor_total_ran': 0.20,
+                'floor_total_ai': 0.20,
+            },
+        }
+        out = evaluator.apply_armd_policy_envelope(
+            shadow, armd,
+            {'usable_budget': 0.90, 'r_ran': 0.50, 'r_ai': 0.40, 'd_ran': 0.5, 'd_ai': 0.5},
+        )
+        self.assertTrue(out['enabled'])
+        self.assertEqual(out['source'], 'checkpoint')
+        self.assertTrue(out['advisor']['enabled'])
+        self.assertEqual(out['advisor']['source'], 'checkpoint')
+        self.assertTrue(out['advisor']['armd_policy_envelope']['applied'])
+
     def test_shadow_evaluator_loads_article_sac_checkpoint_format(self):
         torch = __import__('torch')
         nn = torch.nn
@@ -193,6 +290,83 @@ class TestMARLShadow(unittest.TestCase):
             self.assertTrue(out['available'])
             self.assertTrue(out['policy_id'].endswith(':article_checkpoint'))
             self.assertEqual(out['checkpoint_error'], '')
+
+    def test_explicit_checkpoint_bootstraps_without_a_valid_manifest(self):
+        torch = __import__('torch')
+        nn = torch.nn
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            run_dir = tmp_path / 'explicit_checkpoint'
+            run_dir.mkdir(parents=True, exist_ok=True)
+            class LegacyActor(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.net = nn.Sequential(
+                        nn.Linear(10, 8), nn.ReLU(), nn.Linear(8, 3), nn.Sigmoid()
+                    )
+
+            actors = nn.ModuleList([LegacyActor() for _ in range(3)])
+            torch.save(actors.state_dict(), run_dir / 'tasam_marl_actors.pt')
+            (run_dir / 'tasam_marl_checkpoint_meta.json').write_text(
+                json.dumps({
+                    'du_count': 3,
+                    'du_state_dim': 10,
+                    'actor_hidden_dims': [8],
+                    'activation': 'relu',
+                    'action_layout': ['eMBB', 'mMTC', 'URLLC'],
+                }),
+                encoding='utf-8',
+            )
+            missing_manifest = tmp_path / 'missing_eval.json'
+            gate_manifest = tmp_path / 'gate.json'
+            gate_manifest.write_text(json.dumps({'gate': {'status': 'control_trial'}}), encoding='utf-8')
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    'GREENRAN_TASAM_CHECKPOINT': str(run_dir),
+                    'GREENRAN_TASAM_CHECKPOINT_READINESS': 'control_candidate',
+                    'GREENRAN_TASAM_EVAL_MANIFEST': str(missing_manifest),
+                    'GREENRAN_MARL_CONTROL_GATE_MANIFEST': str(gate_manifest),
+                    'GREENRAN_TASAM_REQUIRE_CHECKPOINT': '1',
+                },
+                clear=False,
+            ):
+                evaluator = MARLShadowRuntimeEvaluator({'mode': 'assistant_only_control'})
+
+            self.assertTrue(evaluator.checkpoint_loaded)
+            self.assertEqual(evaluator.checkpoint_source, 'checkpoint')
+            self.assertEqual(evaluator.checkpoint_run_dir, str(run_dir))
+
+    def test_required_checkpoint_never_falls_back_to_heuristic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            missing_manifest = tmp_path / 'missing_eval.json'
+            missing_checkpoint = tmp_path / 'missing_checkpoint'
+            with mock.patch.dict(
+                os.environ,
+                {
+                    'GREENRAN_TASAM_CHECKPOINT': str(missing_checkpoint),
+                    'GREENRAN_TASAM_EVAL_MANIFEST': str(missing_manifest),
+                    'GREENRAN_MARL_CONTROL_GATE_MANIFEST': str(tmp_path / 'gate.json'),
+                    'GREENRAN_TASAM_REQUIRE_CHECKPOINT': '1',
+                },
+                clear=False,
+            ):
+                evaluator = MARLShadowRuntimeEvaluator({'mode': 'assistant_only_control'})
+                out = evaluator.evaluate({
+                    'du_states': [{
+                        'du_id': 'du1',
+                        'state_vector': [0.2] * 10,
+                    }],
+                    'slice_state': {},
+                }, resource_snapshot={'usable_budget': 1.0})
+
+            self.assertFalse(evaluator.checkpoint_loaded)
+            self.assertFalse(out['available'])
+            self.assertEqual(out['source'], 'unavailable')
+            self.assertTrue(out['required_checkpoint'])
 
 
 if __name__ == '__main__':

@@ -38,8 +38,8 @@ class VehiclePolicyRuntimeTests(unittest.TestCase):
             "high_risk_vehicles": 0,
             "medium_risk_vehicles": 1,
             "degraded_autonomy_vehicles": 0,
-            "max_latency_ms": 68.0,
-            "max_packet_loss_percent": 2.4,
+            "max_latency_ms": 12.0,
+            "max_packet_loss_percent": 0.6,
             "max_speed_mps": 6.8,
         }
         policy = evaluate_vehicle_policy(metrics)

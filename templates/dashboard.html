@@ -3,6 +3,7 @@
 {% block title %}Dashboard - GreenRAN rApp{% endblock %}
 
 {% block extra_head %}
+<script>window.__liveCollectionDashboard = true;</script>
 <style>
     /* CORREÇÃO_TEXTO_INVISIVEL - Forçar cores em todas as tabelas */
     .card-body table { background-color: transparent !important; }
@@ -171,6 +172,133 @@
         display: block;
         margin-bottom: 4px;
     }
+    .live-collection-panel {
+        border-left: 4px solid #00ff88 !important;
+        background: radial-gradient(circle at 90% 0%, rgba(0, 188, 212, 0.16), transparent 42%), #16213e;
+    }
+    .live-panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+    }
+    .live-pulse {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: #b8c7d9 !important;
+        font-size: .82rem;
+    }
+    .live-pulse-dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: #00ff88;
+        box-shadow: 0 0 12px rgba(0,255,136,.8);
+    }
+    .live-pulse-dot.stale { background: #ffaa00; box-shadow: 0 0 12px rgba(255,170,0,.7); }
+    .live-pulse-dot.dead { background: #ff4444; box-shadow: 0 0 12px rgba(255,68,68,.7); }
+    .live-kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(120px, 1fr));
+        gap: 10px;
+    }
+    .live-kpi, .live-info-box {
+        background: rgba(7, 16, 35, .55);
+        border: 1px solid rgba(143, 211, 255, .13);
+        border-radius: 10px;
+        padding: 12px 13px;
+    }
+    .live-kpi-label, .live-info-label {
+        color: #8da6c3 !important;
+        font-size: .72rem;
+        letter-spacing: .06em;
+        text-transform: uppercase;
+        margin-bottom: 5px;
+    }
+    .live-kpi-value {
+        color: #fff !important;
+        font-size: 1.35rem;
+        font-weight: 700;
+        line-height: 1.15;
+        word-break: break-word;
+    }
+    .live-kpi-sub {
+        color: #9fb0c5 !important;
+        font-size: .76rem;
+        margin-top: 4px;
+        min-height: 17px;
+    }
+    .live-progress {
+        height: 8px;
+        margin-top: 10px;
+        background: #0b1427;
+        border-radius: 5px;
+        overflow: hidden;
+    }
+    #live-training-progress {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #00bcd4, #00ff88);
+        transition: width .4s ease;
+    }
+    .live-section-title {
+        color: #d9eaff !important;
+        font-size: .82rem;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        margin: 18px 0 9px;
+    }
+    .live-info-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(150px, 1fr));
+        gap: 10px;
+    }
+    .live-info-value {
+        color: #fff !important;
+        font-size: 1.02rem;
+        font-weight: 600;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+    }
+    .live-good { color: #00ff88 !important; }
+    .live-warn { color: #ffaa00 !important; }
+    .live-bad { color: #ff6666 !important; }
+    .live-muted { color: #a8b7ca !important; }
+    .live-stage-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(170px, 1fr));
+        gap: 7px;
+    }
+    .live-stage {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 10px;
+        border-radius: 7px;
+        background: rgba(255,255,255,.035);
+        border: 1px solid rgba(255,255,255,.07);
+        font-size: .78rem;
+    }
+    .live-stage.active { border-color: #00ff88; background: rgba(0,255,136,.08); }
+    .live-stage-name { color: #dbe8f8 !important; overflow-wrap: anywhere; }
+    .live-stage-count { color: #00ff88 !important; font-weight: 700; }
+    .live-chart-wrap { height: 190px; position: relative; }
+    .live-table { margin-bottom: 0; }
+    .live-table td { border-color: rgba(255,255,255,.08) !important; padding: 6px 4px; font-size: .78rem; vertical-align: middle; }
+    .live-table .live-decision { font-weight: 700; }
+    .live-table .live-reason { color: #a8b7ca !important; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .live-footnote { color: #8da6c3 !important; font-size: .76rem; margin: 12px 0 0; }
+    @media (max-width: 1100px) {
+        .live-kpi-grid { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
+        .live-info-grid { grid-template-columns: repeat(2, minmax(150px, 1fr)); }
+    }
+    @media (max-width: 576px) {
+        .live-kpi-grid, .live-info-grid, .live-stage-grid { grid-template-columns: 1fr 1fr; }
+        .live-kpi-value { font-size: 1.1rem; }
+    }
 </style>
 {% endblock %}
 
@@ -192,6 +320,88 @@
                         <span class="armd-pill"><strong>IMSI App3</strong> {{ fixed_scenario.vehicle_base_imsi }}-{{ fixed_scenario.vehicle_imsi_end }}</span>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-3">
+    <div class="col-md-12">
+        <div class="card live-collection-panel">
+            <div class="card-header">
+                <div class="live-panel-header">
+                    <h5 class="mb-0">● Coleta online ao vivo</h5>
+                    <div class="live-pulse"><span id="live-pulse-dot" class="live-pulse-dot"></span><span id="live-pulse-text">Conectando ao runtime…</span></div>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="live-kpi-grid">
+                    <div class="live-kpi">
+                        <div class="live-kpi-label">Execução</div>
+                        <div id="live-run-status" class="live-kpi-value live-muted">—</div>
+                        <div id="live-run-age" class="live-kpi-sub">aguardando pulso</div>
+                    </div>
+                    <div class="live-kpi">
+                        <div class="live-kpi-label">Transições para treino</div>
+                        <div id="live-transitions" class="live-kpi-value">—</div>
+                        <div id="live-transitions-sub" class="live-kpi-sub">meta —</div>
+                        <div class="live-progress"><div id="live-training-progress"></div></div>
+                    </div>
+                    <div class="live-kpi">
+                        <div class="live-kpi-label">Snapshots / decisões</div>
+                        <div id="live-snapshots" class="live-kpi-value">—</div>
+                        <div id="live-rate" class="live-kpi-sub">ritmo —</div>
+                    </div>
+                    <div class="live-kpi">
+                        <div class="live-kpi-label">Estágio ativo</div>
+                        <div id="live-stage" class="live-kpi-value">—</div>
+                        <div id="live-stage-sub" class="live-kpi-sub">ciclo —</div>
+                    </div>
+                    <div class="live-kpi">
+                        <div class="live-kpi-label">PDCP / proveniência</div>
+                        <div id="live-pdcp" class="live-kpi-value">—</div>
+                        <div id="live-pdcp-sub" class="live-kpi-sub">—</div>
+                    </div>
+                    <div class="live-kpi">
+                        <div class="live-kpi-label">Treino online</div>
+                        <div id="live-training-status" class="live-kpi-value">—</div>
+                        <div id="live-training-sub" class="live-kpi-sub">—</div>
+                    </div>
+                </div>
+
+                <div class="live-section-title">Telemetria real e guardas</div>
+                <div class="live-info-grid">
+                    <div class="live-info-box"><div class="live-info-label">P95 / CVaR</div><div id="live-latency" class="live-info-value">—</div></div>
+                    <div class="live-info-box"><div class="live-info-label">Throughput entregue</div><div id="live-throughput" class="live-info-value">—</div></div>
+                    <div class="live-info-box"><div class="live-info-label">RAN / IA alocado</div><div id="live-allocation" class="live-info-value">—</div></div>
+                    <div class="live-info-box"><div class="live-info-label">Guardas</div><div id="live-guards" class="live-info-value">—</div></div>
+                </div>
+
+                <div class="live-section-title">Cobertura dos nove estágios</div>
+                <div id="live-stages" class="live-stage-grid"><div class="live-muted">Carregando estágios…</div></div>
+
+                <div class="row g-3 mt-1">
+                    <div class="col-lg-7">
+                        <div class="live-section-title">P95 e CVaR recentes</div>
+                        <div class="live-chart-wrap"><canvas id="liveQualityChart"></canvas></div>
+                    </div>
+                    <div class="col-lg-5">
+                        <div class="live-section-title">Alocação RAN / IA</div>
+                        <div class="live-chart-wrap"><canvas id="liveResourceChart"></canvas></div>
+                    </div>
+                </div>
+
+                <div class="row g-3 mt-1">
+                    <div class="col-lg-7">
+                        <div class="live-section-title">Última decisão</div>
+                        <div id="live-last-decision" class="live-info-box">—</div>
+                    </div>
+                    <div class="col-lg-5">
+                        <div class="live-section-title">xApps / transporte</div>
+                        <div id="live-xapps" class="live-info-box">—</div>
+                    </div>
+                </div>
+                <p id="live-footnote" class="live-footnote">Aguardando dados do runtime.</p>
             </div>
         </div>
     </div>
@@ -343,6 +553,12 @@
                                     modo
                                     <strong>{{ (armd.mode or 'n/a')|upper }}</strong>
                                 </span>
+                                <span class="armd-pill">
+                                    proposta
+                                    <strong style="color: {% if armd.proposal_present %}#00ff88{% else %}#ff6b6b{% endif %} !important;">
+                                        {{ 'REGISTRADA' if armd.proposal_present else 'AUSENTE' }}
+                                    </strong>
+                                </span>
                             </div>
                         </div>
                         <div class="armd-score">
@@ -377,6 +593,11 @@
                     <div class="armd-reason">
                         <strong>Motivo operacional</strong>
                         {{ armd.reason or 'Sem justificativa adicional.' }}
+                    </div>
+                    <div class="armd-meta mt-2">
+                        <span class="armd-pill"><strong>Tipo</strong> {{ (armd.proposal_kind or 'missing')|upper }}</span>
+                        <span class="armd-pill"><strong>Validade</strong> {{ 'VÁLIDA' if armd.proposal_valid else 'INCERTA' }}</span>
+                        <span class="armd-pill"><strong>Vencedor rApp</strong> {{ (armd.selected_assistant or 'aguardando')|upper }}</span>
                     </div>
                 </div>
                 {% else %}
@@ -702,6 +923,91 @@
     </div>
 </div>
 
+<div class="row mt-3">
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Recursos de RAN (separado da energia)</h5>
+            </div>
+            <div class="card-body">
+                {% set resource_window = resource_summary.window_1h or {} %}
+                <div class="row text-center">
+                    <div class="col-md-2">
+                        <div class="metric-label">Amostras (1h)</div>
+                        <div class="metric-value">{{ resource_window.samples or 0 }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">Orçamento utilizável</div>
+                        <div class="metric-value">{{ "%.3f"|format(resource_window.usable_budget or 0) }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">RAN alocado</div>
+                        <div class="metric-value">{{ "%.3f"|format(resource_window.r_ran or 0) }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">IA alocada</div>
+                        <div class="metric-value">{{ "%.3f"|format(resource_window.r_ai or 0) }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">Utilização</div>
+                        <div class="metric-value">{{ "%.1f"|format((resource_window.utilization_ratio or 0) * 100) }}%</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">Banda entregue</div>
+                        <div class="metric-value">{{ "%.1f"|format(resource_summary.delivered_bandwidth_mbps or 0) }} Mbps</div>
+                    </div>
+                </div>
+                {% set resource_latest = resource_summary.latest or {} %}
+                <div class="row text-center mt-3">
+                    <div class="col-md-2">
+                        <div class="metric-label">Estado de alocação</div>
+                        <div class="metric-value">{{ resource_latest.allocation_state or resource_summary.allocation_state or 'ALLOWED' }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">Piso RAN por UE</div>
+                        <div class="metric-value">{{ "%.3f"|format(resource_latest.floor_total_ran or 0) }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">Piso IA por UE</div>
+                        <div class="metric-value">{{ "%.3f"|format(resource_latest.floor_total_ai or 0) }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">Reforço RAN</div>
+                        <div class="metric-value">{{ "%.3f"|format(resource_latest.reinforcement_ran or 0) }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">Reforço IA</div>
+                        <div class="metric-value">{{ "%.3f"|format(resource_latest.reinforcement_ai or 0) }}</div>
+                    </div>
+                    <div class="col-md-2">
+                        <div class="metric-label">Piso viável</div>
+                        <div class="metric-value">{{ 'SIM' if resource_latest.floor_feasible else 'NÃO' }}</div>
+                    </div>
+                </div>
+                <div class="row text-center mt-3">
+                    <div class="col-md-3">
+                        <div class="metric-label">Alocação individual</div>
+                        <div class="metric-value">{{ resource_latest.per_ue_application_status or 'N/A' }}</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="metric-label">UEs com reserva</div>
+                        <div class="metric-value">{{ (resource_latest.per_ue_allocation or [])|length }}</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="metric-label">Violações por UE</div>
+                        <div class="metric-value">{{ resource_latest.per_ue_floor_violation_count or 0 }}</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="metric-label">Piso individual viável</div>
+                        <div class="metric-value">{{ 'SIM' if resource_latest.per_ue_floor_feasible else 'NÃO' }}</div>
+                    </div>
+                </div>
+                <p class="text-muted small mt-3 mb-0">{{ resource_summary.note }}</p>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="row">
     <!-- Regras de Coordenação -->
     <div class="col-md-12">
@@ -744,6 +1050,176 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+let liveQualityChart = null;
+let liveResourceChart = null;
+
+function liveEscape(value) {
+    return String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'}[ch]));
+}
+
+function liveAge(value) {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'sem pulso';
+    const seconds = Number(value);
+    if (seconds < 2) return 'agora';
+    if (seconds < 60) return `${seconds.toFixed(0)}s atrás`;
+    return `${(seconds / 60).toFixed(1)}min atrás`;
+}
+
+function liveStateClass(value) {
+    const normalized = String(value || '').toLowerCase();
+    if (['running', 'allowed', 'ok', 'protected', 'protegida', 'real', 'pdcp_real'].includes(normalized)) return 'live-good';
+    if (['conditional', 'warning', 'stale', 'waiting_dataset', 'guarda'].includes(normalized)) return 'live-warn';
+    if (['blocked', 'rollback', 'critical', 'stopped', 'proxy', 'parada'].includes(normalized)) return 'live-bad';
+    return 'live-muted';
+}
+
+function liveSet(id, value, className) {
+    const element = document.getElementById(id);
+    if (!element) return;
+    element.textContent = value;
+    element.className = element.className.replace(/\blive-(?:good|warn|bad|muted)\b/g, '').trim();
+    if (className) element.classList.add(className);
+}
+
+function liveChartOptions(yTitle) {
+    return {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+            x: { ticks: { color: '#8da6c3', maxTicksLimit: 6, maxRotation: 0 }, grid: { color: 'rgba(255,255,255,.06)' } },
+            y: { beginAtZero: true, title: { display: true, text: yTitle, color: '#8da6c3' }, ticks: { color: '#8da6c3' }, grid: { color: 'rgba(255,255,255,.06)' } }
+        },
+        plugins: { legend: { labels: { color: '#dce8f5', boxWidth: 12 } } }
+    };
+}
+
+function updateLiveCharts(data) {
+    if (typeof Chart === 'undefined') return;
+    const metrics = data.recent_metrics || [];
+    const labels = metrics.map(item => new Date(Number(item.timestamp || 0) * 1000).toLocaleTimeString());
+    const qualityDatasets = [
+        { label: 'P95 (ms)', data: metrics.map(item => item.p95_ms), borderColor: '#00ff88', backgroundColor: 'rgba(0,255,136,.10)', tension: .25, pointRadius: 0 },
+        { label: 'CVaR (ms)', data: metrics.map(item => item.cvar_ms), borderColor: '#ffaa00', backgroundColor: 'rgba(255,170,0,.08)', tension: .25, pointRadius: 0 }
+    ];
+    const qualityCanvas = document.getElementById('liveQualityChart');
+    if (qualityCanvas) {
+        if (!liveQualityChart) {
+            liveQualityChart = new Chart(qualityCanvas.getContext('2d'), { type: 'line', data: { labels, datasets: qualityDatasets }, options: liveChartOptions('ms') });
+        } else {
+            liveQualityChart.data.labels = labels;
+            liveQualityChart.data.datasets = qualityDatasets;
+            liveQualityChart.update('none');
+        }
+    }
+
+    const allocations = data.recent_allocations || [];
+    const allocationLabels = allocations.map(item => new Date(Number(item.timestamp || 0) * 1000).toLocaleTimeString());
+    const allocationDatasets = [
+        { label: 'RAN', data: allocations.map(item => Number(item.ran || 0) * 100), borderColor: '#8fd3ff', backgroundColor: 'rgba(143,211,255,.08)', tension: .25, pointRadius: 0 },
+        { label: 'IA', data: allocations.map(item => Number(item.ai || 0) * 100), borderColor: '#d98cff', backgroundColor: 'rgba(217,140,255,.08)', tension: .25, pointRadius: 0 }
+    ];
+    const resourceCanvas = document.getElementById('liveResourceChart');
+    if (resourceCanvas) {
+        if (!liveResourceChart) {
+            liveResourceChart = new Chart(resourceCanvas.getContext('2d'), { type: 'line', data: { labels: allocationLabels, datasets: allocationDatasets }, options: { ...liveChartOptions('% do orçamento'), scales: { ...liveChartOptions('% do orçamento').scales, y: { ...liveChartOptions('% do orçamento').scales.y, max: 100 } } } });
+        } else {
+            liveResourceChart.data.labels = allocationLabels;
+            liveResourceChart.data.datasets = allocationDatasets;
+            liveResourceChart.update('none');
+        }
+    }
+}
+
+function updateLiveCollection(data) {
+    const freshness = data.freshness || {};
+    const training = data.training || {};
+    const telemetry = data.telemetry || {};
+    const provenance = data.provenance || {};
+    const online = data.online || {};
+    const guard = online.guard || {};
+    const collection = data.collection || {};
+    const guards = data.guards || {};
+    const counts = (data.database || {}).counts || {};
+    const latestDecision = data.latest_decision || {};
+
+    const status = String(data.status || 'unknown').toLowerCase();
+    const pulseDot = document.getElementById('live-pulse-dot');
+    pulseDot.className = `live-pulse-dot ${status === 'running' ? '' : status === 'stale' ? 'stale' : 'dead'}`;
+    liveSet('live-run-status', data.status_label || status.toUpperCase(), liveStateClass(status));
+    document.getElementById('live-run-age').textContent = `status ${liveAge(freshness.status_age_s)} · métricas ${liveAge(freshness.metrics_age_s)}`;
+    document.getElementById('live-pulse-text').textContent = `Pulso ${liveAge(freshness.status_age_s)} · atualização a cada 2s`;
+
+    const written = Number(training.written_transitions || 0);
+    const target = Number(training.target_transitions || 0);
+    const progress = Math.max(0, Math.min(100, Number(training.progress || 0) * 100));
+    liveSet('live-transitions', `${written.toLocaleString('pt-BR')} / ${target.toLocaleString('pt-BR')}`, 'live-good');
+    document.getElementById('live-transitions-sub').textContent = `${progress.toFixed(1)}% · faltam ${Math.max(0, target - written).toLocaleString('pt-BR')}`;
+    document.getElementById('live-training-progress').style.width = `${progress}%`;
+
+    const snapshotCount = Number(online.snapshot_count || counts.marl_global_state_history || 0);
+    const decisionCount = Number(online.decision_count || counts.decisions_history || 0);
+    liveSet('live-snapshots', `${snapshotCount.toLocaleString('pt-BR')} / ${decisionCount.toLocaleString('pt-BR')}`, 'live-good');
+    document.getElementById('live-rate').textContent = `${collection.rows_last_minute || 0} linhas/min · ${collection.decisions_last_minute || 0} decisões/min`;
+    liveSet('live-stage', collection.stage || online.stage || '—', 'live-good');
+    document.getElementById('live-stage-sub').textContent = `ciclo ${collection.cycle || 0} · ${Number(collection.stage_remaining_s || 0).toFixed(1)}s restantes`;
+
+    const pdcpText = provenance.pdcp_real ? 'PDCP REAL' : (provenance.proxy_samples ? 'PROXY' : 'SEM DADO');
+    liveSet('live-pdcp', pdcpText, provenance.pdcp_real && !provenance.proxy_samples ? 'live-good' : 'live-warn');
+    document.getElementById('live-pdcp-sub').textContent = `${provenance.real_samples || 0} real · ${provenance.proxy_samples || 0} proxy · ${provenance.effective_source || '—'}`;
+    const trainingStatus = training.status || 'unknown';
+    liveSet('live-training-status', trainingStatus === 'waiting_dataset' ? 'AGUARDANDO' : trainingStatus.toUpperCase(), liveStateClass(trainingStatus));
+    document.getElementById('live-training-sub').textContent = training.reason || `${training.updates_completed || 0} updates concluídos`;
+
+    document.getElementById('live-latency').textContent = `${Number(telemetry.p95_ms || 0).toFixed(1)} / ${Number(telemetry.cvar_ms || 0).toFixed(1)} ms`;
+    document.getElementById('live-throughput').textContent = `${(Number(telemetry.throughput_kbps || 0) / 1000).toFixed(2)} Mbps · ${telemetry.throughput_source || '—'}`;
+    document.getElementById('live-allocation').textContent = `${(Number(guards.r_ran || 0) * 100).toFixed(1)}% RAN / ${(Number(guards.r_ai || 0) * 100).toFixed(1)}% IA`;
+    const guardOk = !guard.rollback && !guards.rollback && Number(guard.floor_violations || 0) === 0 && Number(guards.per_ue_floor_violations || 0) === 0 && guards.floor_feasible !== false;
+    liveSet('live-guards', guardOk ? 'OK · floor viável' : 'ATENÇÃO', guardOk ? 'live-good' : 'live-bad');
+
+    document.getElementById('live-stages').innerHTML = (collection.stages || []).map(stage => `
+        <div class="live-stage ${stage.active ? 'active' : ''}"><span class="live-stage-name">${liveEscape(stage.name)}</span><span class="live-stage-count">${Number(stage.count || 0)}</span></div>
+    `).join('') || '<div class="live-muted">Sem decisões ainda.</div>';
+
+    const decisionClass = liveStateClass(latestDecision.decision);
+    document.getElementById('live-last-decision').innerHTML = `
+        <div class="live-info-value ${decisionClass}">${liveEscape(latestDecision.decision || '—')} <span class="live-muted">· ${liveEscape(latestDecision.stage || 'sem estágio')}</span></div>
+        <div class="live-kpi-sub">${liveEscape(latestDecision.reason || 'Sem justificativa registrada.')}</div>
+        <div class="live-kpi-sub">confiança ${(Number(latestDecision.confidence || 0) * 100).toFixed(1)}% · streak ${Number(latestDecision.healthy_streak || 0)}</div>
+    `;
+
+    const xapps = data.xapps || {};
+    document.getElementById('live-xapps').innerHTML = ['SLICER', 'ENERGY', 'VEHICLE'].map(name => {
+        const xapp = xapps[name] || {};
+        const xappStatus = xapp.status || 'UNKNOWN';
+        const transport = xapp.transport_mode || '—';
+        const required = xapp.socket_required ? 'obrigatório' : 'opcional';
+        return `<div class="d-flex justify-content-between align-items-center mb-1"><span>${name}</span><span class="${liveStateClass(xappStatus)}">${liveEscape(xappStatus)}</span><span class="live-kpi-sub mb-0">${liveEscape(transport)} · socket ${required}</span></div>`;
+    }).join('');
+    document.getElementById('live-footnote').textContent = `Run: ${data.run_dir || '—'} · collector ${provenance.collector_mode || '—'} · overrides de cenário ${provenance.scenario_override_active ? 'ativos' : 'não ativos'} · SQLite ${Number(counts.extended_metrics || 0).toLocaleString('pt-BR')} métricas`;
+    updateLiveCharts(data);
+}
+
+async function refreshLiveCollection() {
+    try {
+        const response = await fetch('/api/collection/live', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        updateLiveCollection(await response.json());
+    } catch (error) {
+        const dot = document.getElementById('live-pulse-dot');
+        if (dot) dot.className = 'live-pulse-dot dead';
+        liveSet('live-run-status', 'SEM CONEXÃO', 'live-bad');
+        const pulse = document.getElementById('live-pulse-text');
+        if (pulse) pulse.textContent = 'Não foi possível ler o runtime';
+        console.error('Falha ao atualizar coleta ao vivo:', error);
+    }
+}
+
+refreshLiveCollection();
+setInterval(refreshLiveCollection, 2000);
+</script>
 <script>
 const ctx = document.getElementById('latencyChart').getContext('2d');
 const latencyChart = new Chart(ctx, {
@@ -1005,6 +1481,7 @@ function fetchEnergyStats() {
         const currentPower = current.power_percent || 100;
         const currentSavings = current.savings_percent || 0;
         const currentAction = current.action || 'UNKNOWN';
+        const modelPowerW = Number.isFinite(Number(current.model_power_w)) ? Number(current.model_power_w) : null;
         
         // Calculate color based on savings
         let savingsColor = '#ff4444'; // Red - low savings
@@ -1019,7 +1496,7 @@ function fetchEnergyStats() {
                     <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings.toFixed(1)}%</div>
                     <div style="color: #aaa; font-size: 0.9rem;">ECONOMIA ATUAL</div>
                     <div style="color: #fff; font-size: 1.1rem; margin-top: 5px;">${currentAction}</div>
-                    <div style="color: #888; font-size: 0.85rem;">Potência: ${currentPower}%</div>
+                    <div style="color: #888; font-size: 0.85rem;">Potência: ${currentPower}%${modelPowerW !== null ? ` · ${modelPowerW.toFixed(1)} W modelados` : ''}</div>
                 </div>
                 <div class="text-center text-muted">Aguardando dados...</div>
             `;
@@ -1030,6 +1507,9 @@ function fetchEnergyStats() {
         const avgPower = historyData.avg_power || 100;
         const savings = historyData.total_savings_percent || (100 - avgPower);
         const commands = historyData.by_command;
+        const modeledEnergyJ = Number(historyData.energy_j || 0);
+        const modeledAverageW = Number(historyData.average_power_w || 0);
+        const energyValid = historyData.calibrated_energy && historyData.calibrated_energy.valid;
         
         let html = `
             <div class="text-center mb-3">
@@ -1037,7 +1517,7 @@ function fetchEnergyStats() {
                 <div style="color: #aaa; font-size: 0.9rem;">ECONOMIA ATUAL</div>
                 <div style="background: #0f3460; padding: 8px; border-radius: 5px; margin-top: 8px;">
                     <div style="color: ${savingsColor}; font-size: 1.2rem; font-weight: bold;">${currentAction}</div>
-                    <div style="color: #ccc; font-size: 0.85rem;">Potência: ${currentPower}%</div>
+                    <div style="color: #ccc; font-size: 0.85rem;">Potência: ${currentPower}%${modelPowerW !== null ? ` · ${modelPowerW.toFixed(1)} W modelados` : ''}</div>
                 </div>
             </div>
             <div class="row text-center">
@@ -1049,6 +1529,11 @@ function fetchEnergyStats() {
                     <div style="color: #888; font-size: 0.8rem;">Total Cmd</div>
                     <div style="color: #fff; font-weight: bold;">${total}</div>
                 </div>
+            </div>
+            <div class="mt-2" style="color: #b8c7d9; font-size: 0.82rem;">
+                <div><strong>Modelo RU/mmWave:</strong> ${energyValid ? `${modeledEnergyJ.toFixed(1)} J` : 'indisponível'}</div>
+                <div><strong>Potência média:</strong> ${energyValid ? `${modeledAverageW.toFixed(1)} W` : 'n/a'}</div>
+                <div style="color: #8899aa;">Estimativa calibrada; não é leitura direta de wattímetro.</div>
             </div>
             <hr style="border-color: #333;">
             <div style="color: #aaa; font-size: 0.85rem;">

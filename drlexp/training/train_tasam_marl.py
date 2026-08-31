@@ -322,6 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--resume', action='store_true', help='Resume from output-dir/resume_checkpoint.pt when available')
     parser.add_argument('--resume-checkpoint', default=None, help='Optional resume checkpoint path; defaults inside output-dir')
     parser.add_argument('--resume-ignore-early-stop', action='store_true', help='Resume training even if the saved checkpoint had stopped_early=true')
+    parser.add_argument('--init-checkpoint-dir', default=None, help='Optional actor checkpoint directory used to initialize a new candidate update')
     parser.add_argument('--early-stop-patience-checkpoints', type=int, default=0, help='Stop after this many plateau checkpoints; 0 disables early stop')
     parser.add_argument('--early-stop-min-epoch', type=int, default=0, help='Do not evaluate plateau stopping before this epoch')
     parser.add_argument('--early-stop-min-improvement-pct', type=float, default=0.0, help='Minimum eval_return improvement percentage to reset plateau')
@@ -419,6 +420,21 @@ def main() -> int:
             actor_update_interval=args.actor_update_interval,
             seed=args.seed,
         )
+
+    # Online updates are intentionally written to an isolated candidate
+    # directory.  Initializing only the actors from the immutable active
+    # checkpoint keeps the active policy read-only while still making each
+    # candidate a genuine continuation of the validated TA-SAM policy.
+    if args.init_checkpoint_dir and not (args.resume and resume_checkpoint.exists()):
+        init_dir = Path(args.init_checkpoint_dir)
+        actor_path = init_dir / 'tasam_marl_actors.pt'
+        if not actor_path.is_file():
+            raise SystemExit(f'initial actor checkpoint not found: {actor_path}')
+        actor_state = torch.load(actor_path, map_location='cpu', weights_only=False)
+        try:
+            trainer.actors.load_state_dict(actor_state)
+        except (RuntimeError, TypeError) as exc:
+            raise SystemExit(f'initial actor checkpoint incompatible: {exc}') from exc
 
     history: list[dict[str, Any]] = []
     checkpoint_records: list[dict[str, Any]] = []
