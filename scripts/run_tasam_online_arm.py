@@ -55,7 +55,7 @@ ONLINE_CONTROLLER = ROOT / "scripts" / "run_tasam_online_controlled.py"
 DECISION_TARGET_WATCHER = ROOT / "scripts" / "stop_on_decision_target.py"
 DEFAULT_CHECKPOINT = ROOT / "runs/tasam_local_checkpoint_seed47_20260906"
 PROFILE = "tasam_training_balanced_v3"
-MODES = {"train_no_armd", "rapp_only", "combined", "combined_shadow", "combined_online", "combined_actuation_smoke"}
+MODES = {"train_no_armd", "rapp_only", "rapp_only_actuating", "combined", "combined_shadow", "combined_online", "combined_actuation_smoke"}
 PROTECTED_MARKERS = ("v8_full_control", "v9_directional")
 EXPECTED_NS3_BINARY = "ns3.42-Energy_saving_with_cell_utilization_scenario"
 OPTIMIZED_NS3_BINARY = ROOT / "ns-O-RAN-flexric/mmwave-LENA-oran/build-v9-optimized/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario-optimized"
@@ -1091,6 +1091,21 @@ def mode_contract(mode: str) -> dict[str, Any]:
             "historical_replay": False,
             "description": "rApp nativa sem ARMD e sem TA-SAM",
         }
+    if mode == "rapp_only_actuating":
+        # Baseline comparável do artigo: a mesma ladder de regras da rApp
+        # nativa, porém ATUANDO via E2 (mesmo caminho socket do ASGARD),
+        # sem ARMD e sem TA-SAM.  O rapp_only clássico permanece apenas
+        # observador por contrato histórico.
+        return {
+            "armd_mode": "off",
+            "tasam_enabled": False,
+            "tasam_mode": "shadow",
+            "controller_enabled": False,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": False,
+            "description": "rApp nativa atuante (baseline com E2), sem ARMD e sem TA-SAM",
+        }
     if mode == "combined":
         return {
             "armd_mode": "assist",
@@ -1519,7 +1534,7 @@ def run(args: argparse.Namespace) -> int:
     # campaign parent keeps the new run isolated and never modifies an older
     # experiment directory.
     args.run_dir.parent.mkdir(parents=True, exist_ok=True)
-    if args.mode != "rapp_only":
+    if args.mode not in {"rapp_only", "rapp_only_actuating"}:
         required = args.checkpoint / "tasam_marl_actors.pt"
         if not required.is_file():
             raise SystemExit(f"checkpoint TA-SAM ausente: {required}")
