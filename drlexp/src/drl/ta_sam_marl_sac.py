@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -20,6 +21,23 @@ CATEGORY_TO_INDEX = {name: index for index, name in enumerate(CATEGORY_ORDER)}
 POWER_LEVELS = tuple(float(value) for value in range(25, 101, 5))
 V10_POWER_LEVELS = (0.0, *POWER_LEVELS)
 TEMPORAL_FEATURE_DIM = 10
+
+
+def _select_power_levels() -> tuple[float, ...]:
+    """Power grid available to the policy intent head.
+
+    ``GREENRAN_TASAM_POWER_LEVELS=v10`` exposes the full saving range 0-100%
+    (in the actuator's native 5% resolution), where 0% power means a single
+    DU in deep sleep through the v3 per-cell contract.  The policy is free
+    to choose how much to save; overshooting is punished by the realized
+    reward: a camera/vehicle/CVaR hard violation sets
+    ``hard_safety_penalty=1.0`` and drives the transition reward to -1.0.
+    """
+    choice = str(os.environ.get('GREENRAN_TASAM_POWER_LEVELS', '')).strip().lower()
+    return V10_POWER_LEVELS if choice in {'v10', 'v10_power_levels', '0-100'} else POWER_LEVELS
+
+
+ACTIVE_POWER_LEVELS = _select_power_levels()
 
 
 def category_index(value: object) -> int:
@@ -204,7 +222,7 @@ class PowerIntentHead(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(head_input_dim, int(hidden_dim)),
             act_cls(),
-            nn.Linear(int(hidden_dim), len(POWER_LEVELS)),
+            nn.Linear(int(hidden_dim), len(ACTIVE_POWER_LEVELS)),
         )
 
     def forward(self, states: torch.Tensor, temporal_context: torch.Tensor | None = None) -> torch.Tensor:
@@ -336,7 +354,7 @@ def _power_target(payload: dict) -> int:
         value = aliases.get(str(raw or '').strip().upper(), -1.0)
     if value < 0.0:
         return -1
-    return min(range(len(POWER_LEVELS)), key=lambda index: abs(POWER_LEVELS[index] - value))
+    return min(range(len(ACTIVE_POWER_LEVELS)), key=lambda index: abs(ACTIVE_POWER_LEVELS[index] - value))
 
 
 def _economic_training_eligible(payload: dict) -> bool:
@@ -379,9 +397,10 @@ def _safe_power_target(payload: dict) -> int:
             value = float((applied or {}).get('power_percent'))
         except (TypeError, ValueError):
             return -1
-        if not math.isfinite(value) or not 25.0 <= value <= 100.0:
+        applied_floor = 0.0 if 0.0 in ACTIVE_POWER_LEVELS else 25.0
+        if not math.isfinite(value) or not applied_floor <= value <= 100.0:
             return -1
-        return min(range(len(POWER_LEVELS)), key=lambda index: abs(POWER_LEVELS[index] - value))
+        return min(range(len(ACTIVE_POWER_LEVELS)), key=lambda index: abs(ACTIVE_POWER_LEVELS[index] - value))
     feedback = payload.get('judge_feedback') or {}
     if not isinstance(feedback, dict):
         return -1
@@ -396,9 +415,9 @@ def _safe_power_target(payload: dict) -> int:
     }:
         return -1
     if observed == 'BLOCKED':
-        return min(range(len(POWER_LEVELS)), key=lambda index: abs(POWER_LEVELS[index] - 100.0))
+        return min(range(len(ACTIVE_POWER_LEVELS)), key=lambda index: abs(ACTIVE_POWER_LEVELS[index] - 100.0))
     if observed == 'CONDITIONAL' or bool(feedback.get('stage_boundary_feedback')):
-        return min(range(len(POWER_LEVELS)), key=lambda index: abs(POWER_LEVELS[index] - 60.0))
+        return min(range(len(ACTIVE_POWER_LEVELS)), key=lambda index: abs(ACTIVE_POWER_LEVELS[index] - 60.0))
     components = feedback.get('tasam_error_components') or {}
     try:
         ran = float(components.get('ran_completion', -1.0))
@@ -1007,8 +1026,8 @@ class TASAMArticleSACTrainer:
                 and len(record.behavior_global_action) == self.global_action_dim
                 else (
                     [
-                        POWER_LEVELS[record.power_target] / 100.0
-                        if 0 <= record.power_target < len(POWER_LEVELS) else 1.0,
+                        ACTIVE_POWER_LEVELS[record.power_target] / 100.0
+                        if 0 <= record.power_target < len(ACTIVE_POWER_LEVELS) else 1.0,
                         _normalized_allocation_target(record.allocation_target, self.allocation_head_output_dim)[1],
                         _normalized_allocation_target(record.allocation_target, self.allocation_head_output_dim)[2]
                         if self.allocation_head_output_dim >= 3 else 1.0,
@@ -1119,9 +1138,9 @@ class TASAMArticleSACTrainer:
         # The safe 25% state is under-represented in real traces, so retain a
         # mild class balance without inventing observations.
         targets = dataset.power_targets[mask]
-        counts = torch.bincount(targets, minlength=len(POWER_LEVELS)).to(torch.float32)
+        counts = torch.bincount(targets, minlength=len(ACTIVE_POWER_LEVELS)).to(torch.float32)
         total = float(targets.numel())
-        class_weights = torch.where(counts > 0.0, total / (len(POWER_LEVELS) * counts), torch.ones_like(counts))
+        class_weights = torch.where(counts > 0.0, total / (len(ACTIVE_POWER_LEVELS) * counts), torch.ones_like(counts))
         class_weights = torch.clamp(class_weights, min=1.0, max=3.0)
         for _ in range(self.power_head_steps):
             batch = self._batch_from_indices(dataset, self._sample_indices(len(dataset)))
@@ -1415,7 +1434,7 @@ class TASAMArticleSACTrainer:
             'temporal_feature_dim': TEMPORAL_FEATURE_DIM,
             'power_head_path': 'tasam_marl_power_head.pt',
             'power_head_hidden_dim': self.power_head_hidden_dim,
-            'power_head_classes': list(POWER_LEVELS),
+            'power_head_classes': list(ACTIVE_POWER_LEVELS),
             'power_head_optimizer': 'Adam',
             'power_head_lr': self.power_head_lr,
             'power_head_steps': self.power_head_steps,

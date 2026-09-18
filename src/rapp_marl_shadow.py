@@ -957,10 +957,22 @@ class MARLShadowRuntimeEvaluator:
                     index = int(probabilities.argmax().item())
                     levels = list(self.checkpoint_meta.get('power_head_classes') or [25.0, 60.0, 100.0])
                     percent = float(levels[max(0, min(len(levels) - 1, index))])
+                    # The scalar advice rides the control.bundle.v2 contract,
+                    # whose fail-safe floor is 25% for every cell.  Requesting
+                    # less would be clamped by the bundle and rejected by the
+                    # projected-vs-applied alignment check, wasting the
+                    # exploration.  A true 0% (single-DU deep sleep) remains
+                    # reachable only through the v3 per-cell contract.
+                    percent = max(25.0, min(100.0, percent))
+                    intent = {
+                        25.0: 'ECO_25',
+                        60.0: 'REDUCE_60',
+                        100.0: 'FULL_POWER',
+                    }.get(percent, f'POWER_{int(percent)}')
                     return {
                         'enabled': True,
                         'power_percent': percent,
-                        'intent': 'ECO_25' if percent == 25.0 else 'REDUCE_60' if percent == 60.0 else 'FULL_POWER',
+                        'intent': intent,
                         'confidence': round(float(probabilities[index].item()), 6),
                         'source': 'power_head',
                     }
