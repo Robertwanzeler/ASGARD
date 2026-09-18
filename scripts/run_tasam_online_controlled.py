@@ -2518,6 +2518,34 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
     active = Path(state["active_checkpoint"])
     du_count, du_state_dim, global_state_dim = _checkpoint_dimensions(active)
     temporal_dim = _checkpoint_temporal_dim(active)
+    # The candidate continues the active policy, so head dimensions and the
+    # power grid must come from the active checkpoint meta — not from CLI
+    # defaults.  A 3-output allocation head trained with the default 2 made
+    # every online update crash with a state_dict size mismatch.
+    try:
+        active_meta = json.loads(
+            (active / "tasam_marl_checkpoint_meta.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        active_meta = {}
+    meta_allocation_dim = len(active_meta.get("allocation_head_outputs") or [])
+    allocation_dim = (
+        meta_allocation_dim if meta_allocation_dim in (2, 3)
+        else int(getattr(args, "allocation_head_output_dim", 2))
+    )
+    meta_global_dim = int(active_meta.get("global_action_dim") or 0)
+    if meta_global_dim in (3, 5):
+        update_global_dim = meta_global_dim
+    elif state.get("economic_action_contract") == "economic_action_v3_per_du_sleep":
+        update_global_dim = 5
+    else:
+        update_global_dim = int(getattr(args, "global_action_dim", 3))
+    update_env = dict(os.environ)
+    active_power_classes = [float(v) for v in (active_meta.get("power_head_classes") or [])]
+    if active_power_classes and 0.0 in active_power_classes:
+        update_env["GREENRAN_TASAM_POWER_LEVELS"] = "v10"
+    else:
+        update_env.pop("GREENRAN_TASAM_POWER_LEVELS", None)
     # Economic v12 uses the SQLite transition table as its durable bank.  It
     # is deliberately independent of the most recent 600-row JSONL tail.
     replay_recent = Path("/dev/null") if args.experience_bank else recent_trace
@@ -2654,11 +2682,8 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
         "--target-entropy-scale", "1.0", "--batch-size", "128", "--seed", str(args.seed),
         "--category-loss-weight", str(args.category_loss_weight),
         "--category-head-hidden-dim", str(args.category_head_hidden_dim),
-        "--allocation-head-output-dim", str(getattr(args, "allocation_head_output_dim", 2)),
-        "--global-action-dim", str(
-            5 if state.get("economic_action_contract") == "economic_action_v3_per_du_sleep"
-            else getattr(args, "global_action_dim", 3)
-        ),
+        "--allocation-head-output-dim", str(allocation_dim),
+        "--global-action-dim", str(update_global_dim),
         "--temporal-dim", str(temporal_dim),
         "--power-head-hidden-dim", "64",
         "--power-head-lr", "0.001",
@@ -2670,7 +2695,7 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
         "--checkpoint-every", str(args.epochs_per_update),
     ]
     try:
-        subprocess.run(cmd, cwd=ROOT, check=True)
+        subprocess.run(cmd, cwd=ROOT, check=True, env=update_env)
     except (subprocess.CalledProcessError, OSError) as exc:
         # Do not let one candidate failure stop the real collection.  Mark
         # this snapshot watermark so the next attempt waits for a fresh
