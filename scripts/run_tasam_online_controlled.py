@@ -3081,6 +3081,13 @@ def main() -> int:
             0, count_snapshots(args.db) - args.min_new_snapshots
         )
         state.pop("last_update_error", None)
+    # A watermark de snapshots só é válida dentro do mesmo Data Lake. Estados
+    # herdados de checkpoints/campanhas anteriores podem carregar uma watermark
+    # de um DB antigo; contra um DB novo (ou recriado), o portão de update
+    # nunca dispararia (causa raiz de updates_completed=0 nas campanhas v6-v11).
+    db_snapshots_now = count_snapshots(args.db)
+    if db_snapshots_now < int(state.get("last_update_snapshot_count", 0) or 0):
+        state["last_update_snapshot_count"] = 0
     manifest_checkpoint = Path(state["active_checkpoint"])
     publish_manifests(
         args,
