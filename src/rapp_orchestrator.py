@@ -5209,7 +5209,16 @@ class RappResourceOptimizer:
                 # No TA-SAM action was selected/applied: preserve the live
                 # rApp candidate.  A categorical BLOCKED verdict alone does
                 # not authorize ARMD to overwrite it with 100% power.
-                fallback_power = requested if energy_state == 'BLOCKED' else 60.0
+                # A CONDITIONAL verdict never cuts below the requested live
+                # level (floor 60%): the legacy hardcoded 60% ignored the
+                # rule-engine monitor levels (70/90%) and turned the vehicle
+                # "margem protegida" guard into a power cut, breaking
+                # cell-edge vehicle SLA in the 2026-09-17 V2X feasibility
+                # runs (loss 2.7% -> 7% after the reduce).
+                if energy_state == 'BLOCKED' or decision.get('priority_violation'):
+                    fallback_power = max(float(requested or 100.0), 90.0)
+                else:
+                    fallback_power = max(60.0, min(float(requested or 100.0), 100.0))
                 send_level(fallback_power, f"{energy_state} rApp fallback: {reason}")
         elif energy_state == 'ALLOWED':
             send_level(requested, f"ALLOWED TA-SAM {requested:.0f}%: {reason}")
