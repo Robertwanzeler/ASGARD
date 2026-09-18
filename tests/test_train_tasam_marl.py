@@ -18,7 +18,7 @@ from train_tasam_marl import (  # noqa: E402
     main,
     parse_epoch_points,
 )
-from drl.ta_sam_marl_sac import TASAMArticleSACTrainer  # noqa: E402
+from drl.ta_sam_marl_sac import MARLTransitionRecord, TASAMArticleSACTrainer, _allocation_target, load_marl_transition_trace  # noqa: E402
 
 
 class TestTrainTasamMarlHelpers(unittest.TestCase):
@@ -88,6 +88,8 @@ class TestArticleSACStateRoundTrip(unittest.TestCase):
         )
         first_actor_param = next(trainer.actors.parameters())
         first_actor_param.data.fill_(1.23)
+        first_global_param = next(trainer.global_actor.parameters())
+        first_global_param.data.fill_(0.77)
         trainer.log_alpha.data.fill_(-2.5)
         trainer.actor_opt.rho = 0.12
         payload = trainer.training_state_dict()
@@ -104,8 +106,288 @@ class TestArticleSACStateRoundTrip(unittest.TestCase):
 
         restored_first_actor_param = next(restored.actors.parameters())
         self.assertAlmostEqual(float(restored_first_actor_param.flatten()[0].item()), 1.23, places=5)
+        self.assertAlmostEqual(
+            float(next(restored.global_actor.parameters()).flatten()[0].item()), 0.77, places=5
+        )
         self.assertAlmostEqual(float(restored.log_alpha.item()), -2.5, places=5)
         self.assertAlmostEqual(float(restored.actor_opt.rho), 0.12, places=5)
+
+    def test_category_head_trains_from_observed_feedback_and_exports(self):
+        record = MARLTransitionRecord(
+            global_state=[0.0, 0.0, 0.0, 0.0],
+            du_states=[[[0.0, 0.0, 0.0]][0]],
+            behavior_actions=[[[0.33, 0.33, 0.34]][0]],
+            reward=0.5,
+            next_global_state=[0.0, 0.0, 0.0, 0.0],
+            next_du_states=[[[0.0, 0.0, 0.0]][0]],
+            done=False,
+            category_target=0,
+            category_weight=1.0,
+        )
+        trainer = TASAMArticleSACTrainer(
+            du_count=1,
+            du_state_dim=3,
+            global_state_dim=4,
+            actor_hidden_dims=(8,),
+            critic_hidden_dims=(8,),
+            category_head_hidden_dim=8,
+            batch_size=1,
+            seed=3,
+        )
+        metrics = trainer.train_epoch([record], warmup=True)
+        self.assertEqual(metrics["category_evaluated"], 1)
+        self.assertIn("category_accuracy", metrics)
+        with tempfile.TemporaryDirectory() as tmp:
+            trainer.export_checkpoint(tmp)
+            self.assertTrue((Path(tmp) / "tasam_marl_category_head.pt").is_file())
+            self.assertTrue((Path(tmp) / "tasam_marl_global_actor.pt").is_file())
+            meta = json.loads((Path(tmp) / "tasam_marl_checkpoint_meta.json").read_text())
+            self.assertEqual(meta["category_head_classes"], ["ALLOWED", "CONDITIONAL", "BLOCKED"])
+            self.assertTrue(meta["uses_global_energy_infra_actor"])
+            self.assertEqual(meta["joint_action_dim"], 6)
+
+    def test_trace_loader_uses_observed_category_as_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = {
+                "global_state": {"state_vector": [0.0] * 4},
+                "next_global_state": {"state_vector": [0.0] * 4},
+                "du_states": [{"state_vector": [0.0] * 3, "slice_mix": {"eMBB": 1.0}}],
+                "next_du_states": [{"state_vector": [0.0] * 3}],
+                "judge_feedback": {
+                    "tasam_predicted_verdict": "CONDITIONAL",
+                    "tasam_observed_verdict": "ALLOWED",
+                },
+                "tasam_predicted_verdict": "CONDITIONAL",
+                "tasam_observed_verdict": "ALLOWED",
+                "reward_hint": -1.0,
+            }
+            path = Path(tmp) / "trace.jsonl"
+            path.write_text(json.dumps(payload) + "\n")
+            records = load_marl_transition_trace(path)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].category_target, 0)
+            self.assertEqual(records[0].category_weight, 2.0)
+
+    def test_category_head_learns_separable_13d_category_tail(self):
+        records = []
+        for category in range(3):
+            tail = [1.0 if index == category else 0.0 for index in range(3)]
+            state = [0.0] * 10 + tail
+            for _ in range(30):
+                records.append(MARLTransitionRecord(
+                    global_state=state,
+                    du_states=[[0.0] * 13],
+                    behavior_actions=[[1.0 / 3.0] * 3],
+                    reward=-1.0 if category else 0.5,
+                    next_global_state=state,
+                    next_du_states=[[0.0] * 13],
+                    done=False,
+                    category_target=category,
+                    category_weight=1.0,
+                ))
+        trainer = TASAMArticleSACTrainer(
+            du_count=1,
+            du_state_dim=13,
+            global_state_dim=13,
+            actor_hidden_dims=(8,),
+            critic_hidden_dims=(8,),
+            category_head_hidden_dim=8,
+            category_head_steps=30,
+            batch_size=32,
+            updates_per_epoch=1,
+            seed=47,
+        )
+        metrics = trainer.train_epoch(records, warmup=True)
+        self.assertGreater(metrics["conditional_recall"], 0.0)
+        self.assertGreater(metrics["conditional_f1"], 0.0)
+
+    def test_conditional_target_gets_priority_weight_and_strong_credit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = {
+                "global_state": {"state_vector": [0.0] * 4},
+                "next_global_state": {"state_vector": [0.0] * 4},
+                "du_states": [{"state_vector": [0.0] * 3, "slice_mix": {"eMBB": 1.0}}],
+                "next_du_states": [{"state_vector": [0.0] * 3}],
+                "tasam_predicted_verdict": "ALLOWED",
+                "tasam_observed_verdict": "CONDITIONAL",
+                "tasam_training_category_credit": -1.0,
+                "reward_hint": -1.0,
+            }
+            path = Path(tmp) / "trace.jsonl"
+            path.write_text(json.dumps(payload) + "\n")
+            records = load_marl_transition_trace(path)
+            self.assertEqual(records[0].category_target, 1)
+            self.assertEqual(records[0].category_weight, 2.25)
+            self.assertEqual(records[0].category_training_credit, -1.0)
+
+    def test_allocation_target_raises_both_domains_when_budget_is_feasible(self):
+        payload = {
+            "collection_quality": {"pdcp_real": True, "metric_alignment_valid": True},
+            "action": {
+                "usable_budget": 1.0,
+                "r_ran": 0.15,
+                "r_ai": 0.15,
+                "d_ran": 0.40,
+                "d_ai": 0.40,
+                "ran_completion_ratio": 0.375,
+                "ai_completion_ratio": 0.375,
+            },
+            "judge_feedback": {"feedback_status": "observed"},
+        }
+        target, weight, metadata = _allocation_target(payload)
+        self.assertEqual(weight, 1.0)
+        self.assertTrue(metadata["feasible"])
+        self.assertGreaterEqual(target[0], 0.475 - 1e-6)
+        self.assertGreaterEqual(target[1], 0.30 - 1e-6)
+        self.assertAlmostEqual(sum(target), 1.0, places=6)
+
+    def test_economic_allocation_target_contains_total_budget_fraction(self):
+        payload = {
+            "allocation_total_head_enabled": True,
+            "collection_quality": {"pdcp_real": True, "metric_alignment_valid": True},
+            "action": {
+                "usable_budget": 1.0,
+                "r_ran": 0.3,
+                "r_ai": 0.3,
+                "d_ran": 0.4,
+                "d_ai": 0.4,
+                "floor_total_ran": 0.25,
+                "floor_total_ai": 0.25,
+                "allocation_state": "ALLOWED",
+            },
+            "judge_feedback": {"feedback_status": "observed"},
+        }
+        target, weight, metadata = _allocation_target(payload)
+        self.assertEqual(weight, 1.0)
+        self.assertEqual(len(target), 3)
+        self.assertAlmostEqual(target[0] + target[1], 1.0, places=6)
+        self.assertAlmostEqual(target[2], 0.525, places=6)
+        self.assertEqual(metadata["source"], "observed_sla_floor_plus_economic_margin")
+
+    def test_infeasible_economic_floor_has_zero_weight_and_never_exceeds_one(self):
+        payload = {
+            "economic_action_contract": "applied_action_v2",
+            "allocation_total_head_enabled": True,
+            "economic_transition_eligible": True,
+            "collection_quality": {"pdcp_real": True, "metric_alignment_valid": True},
+            "action": {
+                "usable_budget": 0.80,
+                "floor_total_ran": 0.55,
+                "floor_total_ai": 0.35,
+                "r_ran": 0.55,
+                "r_ai": 0.35,
+            },
+            "judge_feedback": {"feedback_status": "observed"},
+        }
+        target, weight, metadata = _allocation_target(payload)
+        self.assertEqual(weight, 0.0)
+        self.assertFalse(metadata["economic_transition_eligible"])
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in target))
+
+    def test_economic_v2_replay_uses_the_applied_action_not_state_target(self):
+        payload = {
+            "economic_action_contract": "applied_action_v2",
+            "economic_transition_eligible": True,
+            "global_state": {"state_vector": [0.0] * 4},
+            "next_global_state": {"state_vector": [0.0] * 4},
+            "du_states": [
+                {"state_vector": [0.0] * 3, "slice_mix": {"eMBB": 1.0}}
+                for _ in range(3)
+            ],
+            "next_du_states": [{"state_vector": [0.0] * 3} for _ in range(3)],
+            "collection_quality": {"pdcp_real": True, "metric_alignment_valid": True},
+            "action": {"usable_budget": 1.0, "r_ran": 0.9, "r_ai": 0.1},
+            "economic_action": {
+                "contract": "applied_action_v2",
+                "applied": {
+                    "power_percent": 25.0,
+                    "ran_allocation": 0.30,
+                    "ai_allocation": 0.20,
+                    "usable_budget": 1.0,
+                    "du_actions": [[0.2, 0.3, 0.5]] * 3,
+                },
+            },
+            "judge_feedback": {
+                "feedback_status": "observed",
+                "economic_transition_eligible": True,
+                "tasam_online_reward": 0.42,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            trace.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            record = load_marl_transition_trace(trace)[0]
+        self.assertEqual(record.behavior_actions, [[0.2, 0.3, 0.5]] * 3)
+        self.assertEqual(record.behavior_global_action, [0.25, 0.4, 0.5])
+        self.assertEqual(record.economic_weight, 1.0)
+        self.assertAlmostEqual(record.reward, 0.42)
+
+    def test_three_output_trainer_normalizes_legacy_allocation_targets(self):
+        def record(target):
+            return MARLTransitionRecord(
+                global_state=[0.0] * 4,
+                du_states=[[0.0] * 3],
+                behavior_actions=[[1.0 / 3.0] * 3],
+                reward=0.5,
+                next_global_state=[0.0] * 4,
+                next_du_states=[[0.0] * 3],
+                done=False,
+                allocation_target=target,
+                allocation_weight=1.0,
+            )
+
+        economic = TASAMArticleSACTrainer(
+            du_count=1, du_state_dim=3, global_state_dim=4,
+            actor_hidden_dims=(8,), critic_hidden_dims=(8,),
+            allocation_head_hidden_dim=8, allocation_head_steps=1,
+            allocation_head_output_dim=3, batch_size=2, seed=47,
+        )
+        dataset = economic._prepare_dataset([
+            record([0.4, 0.6]), record([0.6, 0.4, 0.7]),
+        ])
+        self.assertEqual(tuple(dataset.allocation_targets.shape), (2, 3))
+        self.assertAlmostEqual(float(dataset.allocation_targets[0, 2]), 1.0, places=6)
+        self.assertAlmostEqual(float(dataset.allocation_targets[1, 2]), 0.7, places=6)
+        self.assertEqual(economic._train_allocation_head(dataset)["allocation_evaluated"], 2)
+
+        legacy = TASAMArticleSACTrainer(
+            du_count=1, du_state_dim=3, global_state_dim=4,
+            actor_hidden_dims=(8,), critic_hidden_dims=(8,),
+            allocation_head_hidden_dim=8, allocation_head_steps=1,
+            allocation_head_output_dim=2, batch_size=1, seed=47,
+        )
+        legacy_dataset = legacy._prepare_dataset([record([0.4, 0.6, 0.7])])
+        self.assertEqual(tuple(legacy_dataset.allocation_targets.shape), (1, 2))
+        self.assertAlmostEqual(float(legacy_dataset.allocation_targets[0, 0]), 0.4, places=6)
+        self.assertAlmostEqual(float(legacy_dataset.allocation_targets[0, 1]), 0.6, places=6)
+
+    def test_allocation_head_is_exported_and_trained_from_real_feedback(self):
+        payload = {
+            "global_state": {"state_vector": [0.0] * 4},
+            "next_global_state": {"state_vector": [0.0] * 4},
+            "du_states": [{"state_vector": [0.0] * 3, "slice_mix": {"eMBB": 1.0}}],
+            "next_du_states": [{"state_vector": [0.0] * 3}],
+            "collection_quality": {"pdcp_real": True, "metric_alignment_valid": True},
+            "action": {"usable_budget": 1.0, "r_ran": 0.2, "r_ai": 0.2, "d_ran": 0.4, "d_ai": 0.4},
+            "judge_feedback": {"feedback_status": "observed", "tasam_observed_verdict": "ALLOWED"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            trace.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            records = load_marl_transition_trace(trace)
+            trainer = TASAMArticleSACTrainer(
+                du_count=1, du_state_dim=3, global_state_dim=4,
+                actor_hidden_dims=(8,), critic_hidden_dims=(8,),
+                allocation_head_hidden_dim=8, allocation_head_steps=2,
+                batch_size=1, seed=47,
+            )
+            metrics = trainer.train_epoch(records, warmup=True)
+            self.assertEqual(metrics["allocation_evaluated"], 1)
+            self.assertIn("allocation_prediction_loss", metrics)
+            trainer.export_checkpoint(Path(tmp) / "checkpoint")
+            self.assertTrue((Path(tmp) / "checkpoint" / "tasam_marl_allocation_head.pt").is_file())
+            metadata = json.loads((Path(tmp) / "checkpoint" / "tasam_marl_checkpoint_meta.json").read_text())
+            self.assertEqual(metadata["allocation_head_outputs"], ["ran_share", "ai_share"])
 
 
 class _FakeResumeTrainer:

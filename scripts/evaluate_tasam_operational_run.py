@@ -10,7 +10,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from evaluate_tasam_network_campaign import read_network_run
+try:
+    from evaluate_tasam_network_campaign import read_network_run
+except ModuleNotFoundError:  # imported as scripts.evaluate_tasam_operational_run
+    from scripts.evaluate_tasam_network_campaign import read_network_run
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -38,6 +41,23 @@ def _stage_counts(run_dir: Path) -> dict[str, int]:
             or "unknown"
         )
         counts[name] += 1
+    if counts:
+        return dict(sorted(counts.items()))
+    db_path = run_dir / "rapp_data_lake.db"
+    if db_path.is_file():
+        conn = sqlite3.connect(str(db_path))
+        try:
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(decisions_history)").fetchall()
+            }
+            if "collection_event_stage_name" in columns:
+                for (name,) in conn.execute(
+                    "SELECT collection_event_stage_name FROM decisions_history"
+                ):
+                    counts[str(name or "unknown")] += 1
+        finally:
+            conn.close()
     return dict(sorted(counts.items()))
 
 
@@ -108,6 +128,19 @@ def _decision_integrity(run_dir: Path) -> dict[str, Any]:
             source_json = str(row["tasam_proposal_json"] or "")
         if selected and source_json and selected == source_json:
             exact_json_matches += 1
+        elif selected and source == "joint":
+            try:
+                selected_obj = json.loads(selected)
+            except json.JSONDecodeError:
+                selected_obj = {}
+            selected_id = str(row["selected_proposal_id"] or "") if "selected_proposal_id" in row.keys() else ""
+            if (
+                selected_obj.get("source") == "joint"
+                and str(selected_obj.get("proposal_id") or "") == selected_id
+                and selected_obj.get("valid") is True
+                and selected_obj.get("available") is True
+            ):
+                exact_json_matches += 1
     return {
         "database_present": True,
         "decisions": len(rows),
@@ -136,9 +169,47 @@ def _decision_integrity(run_dir: Path) -> dict[str, Any]:
     }
 
 
+def _feedback_integrity(run_dir: Path, decision_count: int) -> dict[str, Any]:
+    """Check delayed feedback coverage and exact decision-id joins."""
+    db_path = run_dir / "rapp_data_lake.db"
+    if not db_path.is_file():
+        return {"feedback_table_present": False, "complete": False}
+    conn = sqlite3.connect(str(db_path))
+    try:
+        columns = {str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(judge_outcome_history)"
+        ).fetchall()}
+        if not columns:
+            return {"feedback_table_present": False, "complete": False}
+        status_column = "feedback_status" if "feedback_status" in columns else "NULL"
+        rows = conn.execute(
+            f"SELECT decision_id, {status_column} FROM judge_outcome_history"
+        ).fetchall()
+    finally:
+        conn.close()
+    missing = [row[0] for row in rows if str(row[1] or "observed") == "missing"]
+    decision_ids = [row[0] for row in rows if row[0] is not None]
+    unique_ids = set(decision_ids)
+    complete = (
+        len(rows) == decision_count
+        and not missing
+        and len(unique_ids) == decision_count
+    )
+    return {
+        "feedback_table_present": True,
+        "feedback_rows": len(rows),
+        "feedback_observed_rows": len(rows) - len(missing),
+        "feedback_missing_rows": len(missing),
+        "feedback_missing_decision_ids": missing,
+        "feedback_unique_decision_ids": len(unique_ids),
+        "complete": complete,
+    }
+
+
 def build_report(run_dir: Path) -> dict[str, Any]:
     network = read_network_run(run_dir)
     integrity = _decision_integrity(run_dir)
+    feedback = _feedback_integrity(run_dir, int(integrity.get("decisions", 0) or 0))
     criteria = {
         "real_pdcp_only": bool(network["valid_real_only"]),
         "no_proxy_rows": int(network["proxy_metric_rows"]) == 0,
@@ -150,6 +221,8 @@ def build_report(run_dir: Path) -> dict[str, Any]:
         "single_winner_on_all_decisions": integrity.get("selected_assistant_decisions", 0) == integrity.get("decisions", 0) > 0,
         "winner_applied_exactly_on_all_decisions": integrity.get("exactly_applied_decisions", 0) == integrity.get("decisions", 0) > 0,
         "winner_json_matches_selected_on_all_decisions": integrity.get("exact_proposal_json_matches", 0) == integrity.get("decisions", 0) > 0,
+        "feedback_complete": bool(feedback.get("complete")),
+        "metric_alignment": bool(network.get("metrics_aligned_to_decisions")) and bool(network.get("evaluation_metrics_aligned")),
         "no_rollbacks": integrity.get("rollbacks", 0) == 0,
         "no_live_allocator_or_heuristic": not any(
             key in {"fallback_after_tasam_error", "heuristic_baseline"}
@@ -162,6 +235,7 @@ def build_report(run_dir: Path) -> dict[str, Any]:
         "runtime": _runtime_flags(run_dir),
         "stage_counts": _stage_counts(run_dir),
         "decision_integrity": integrity,
+        "feedback_integrity": feedback,
         "network_metrics": network,
         "acceptance": {"criteria": criteria, "valid": all(criteria.values())},
         "interpretation": {

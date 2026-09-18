@@ -1,0 +1,25 @@
+{
+  "schema": "greenran.autonomous_vehicle_profile.v1",
+  "profile": "tasam_training_economic_vehicle_safe_v1",
+  "topology": {
+    "ue_count": 20,
+    "du_count": 3,
+    "vehicle_imsis": [16, 17, 18, 19, 20]
+  },
+  "sla": {
+    "packet_loss_percent_lt": 1.0,
+    "latency_p95_ms_lt": 20.0,
+    "warmup_windows": 30,
+    "scored_windows": 120
+  },
+  "bearer": {
+    "qci": "GBR_V2X_MESSAGES",
+    "role": "autonomous_vehicle_urllc"
+  },
+  "interval_candidates_us": [4000, 6000, 8000, 12000, 16000],
+  "selection": "shortest_interval_passing_all_vehicle_windows",
+  "native_vehicle_rate_multiplier_max": 1.0,
+  "pdcp_required": true,
+  "proxy_allowed": false,
+  "energy_interpretation": "simulated_relative_reference_not_physical_consumption"
+}

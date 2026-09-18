@@ -8,12 +8,17 @@ import os
 import sys
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 try:
     from greenran_paths import ARTICLE00_SCENARIO_CONTROL_PATH
 except ModuleNotFoundError:
     from src.greenran_paths import ARTICLE00_SCENARIO_CONTROL_PATH
+
+try:
+    from energy_calibration import load_calibration, state_power_w, sleep_state_power_by_cell_w
+except ModuleNotFoundError:
+    from src.energy_calibration import load_calibration, state_power_w, sleep_state_power_by_cell_w
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -159,6 +164,86 @@ def _score_proxy(ran_completion: float, ai_completion: float, total_shortfall: f
     )
 
 
+def _energy_comparison(resource_snapshot: Dict[str, Any], marl_shadow: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the calibrated live-vs-shadow power evidence.
+
+    The live state must come from the most recent persisted energy command,
+    while the shadow state comes from the global TA-SAM power actor.  Missing
+    counts, power, or calibration metadata are deliberately invalid rather
+    than silently converted to zeros.
+    """
+    live = resource_snapshot.get('live_energy_observation') or {}
+    live_power_percent = resource_snapshot.get('live_power_percent', live.get('power_percent'))
+    live_ru_count = resource_snapshot.get('live_ru_count', live.get('ru_count'))
+    live_mmwave_count = resource_snapshot.get('live_mmwave_count', live.get('mmwave_count'))
+    shadow_power_percent = marl_shadow.get('shadow_power_percent', resource_snapshot.get('shadow_power_percent'))
+    shadow_ru_count = marl_shadow.get('shadow_ru_count', resource_snapshot.get('shadow_ru_count', live_ru_count))
+    shadow_mmwave_count = marl_shadow.get('shadow_mmwave_count', resource_snapshot.get('shadow_mmwave_count', live_mmwave_count))
+
+    try:
+        calibration = load_calibration()
+        version = str(calibration.get('calibration_version', '') or '')
+        if not version:
+            raise ValueError('calibration_version ausente')
+        if any(value is None for value in (
+            live_power_percent, live_ru_count, live_mmwave_count,
+            shadow_power_percent, shadow_ru_count, shadow_mmwave_count,
+        )):
+            raise ValueError('potência ou contagem RU/mmWave ausente')
+        live_by_cell = live.get('power_percent_by_cell') or resource_snapshot.get('live_power_percent_by_cell')
+        shadow_by_cell = marl_shadow.get('shadow_power_percent_by_cell')
+        if calibration.get('schema') == 'greenran.energy_calibration.v3' and live_by_cell and shadow_by_cell:
+            live_power_w = sleep_state_power_by_cell_w(calibration, live_by_cell)
+            shadow_power_w = sleep_state_power_by_cell_w(calibration, shadow_by_cell)
+        else:
+            live_power_w = state_power_w(
+                calibration, int(live_ru_count), int(live_mmwave_count), float(live_power_percent)
+            )
+            shadow_power_w = state_power_w(
+                calibration, int(shadow_ru_count), int(shadow_mmwave_count), float(shadow_power_percent)
+            )
+        if live_power_w <= 0.0 or shadow_power_w < 0.0:
+            raise ValueError('potência calibrada não positiva')
+        if not (0 <= int(live_ru_count) and 0 <= int(live_mmwave_count)
+                and 0 <= int(shadow_ru_count) and 0 <= int(shadow_mmwave_count)):
+            raise ValueError('contagem RU/mmWave inválida')
+        live_total = _safe_float(resource_snapshot.get('r_ran'), 0.0) + _safe_float(resource_snapshot.get('r_ai'), 0.0)
+        shadow_total = _safe_float(marl_shadow.get('shadow_r_ran'), 0.0) + _safe_float(marl_shadow.get('shadow_r_ai'), 0.0)
+        if live_total <= 0.0:
+            raise ValueError('alocação live total ausente')
+        energy_saving = _clamp((live_power_w - shadow_power_w) / live_power_w, -1.0, 1.0)
+        resource_saving = _clamp((live_total - shadow_total) / live_total, -1.0, 1.0)
+        return {
+            'energy_valid': True,
+            'resource_valid': True,
+            'energy_model_version': version,
+            'live_power_percent': round(float(live_power_percent), 6),
+            'shadow_power_percent': round(float(shadow_power_percent), 6),
+            'live_ru_count': int(live_ru_count),
+            'live_mmwave_count': int(live_mmwave_count),
+            'shadow_ru_count': int(shadow_ru_count),
+            'shadow_mmwave_count': int(shadow_mmwave_count),
+            'live_power_w': round(live_power_w, 6),
+            'shadow_power_w': round(shadow_power_w, 6),
+            'energy_saving_fraction': round(energy_saving, 6),
+            'resource_saving_fraction': round(resource_saving, 6),
+            'energy_reason': 'ok',
+        }
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {
+            'energy_valid': False,
+            'resource_valid': False,
+            'energy_model_version': '',
+            'live_power_percent': _safe_float(live_power_percent, 0.0),
+            'shadow_power_percent': _safe_float(shadow_power_percent, 0.0),
+            'live_power_w': 0.0,
+            'shadow_power_w': 0.0,
+            'energy_saving_fraction': 0.0,
+            'resource_saving_fraction': 0.0,
+            'energy_reason': str(exc),
+        }
+
+
 def build_shadow_comparison(resource_snapshot: Dict[str, Any] | None, marl_shadow: Dict[str, Any] | None) -> Dict[str, Any]:
     """Build a proxy comparison between live allocation and shadow allocation.
 
@@ -196,17 +281,36 @@ def build_shadow_comparison(resource_snapshot: Dict[str, Any] | None, marl_shado
     live_score = _score_proxy(live_ran_completion, live_ai_completion, live_shortfall, live_surplus, live_budget_gap, priority=priority)
     shadow_score = _score_proxy(shadow_ran_completion, shadow_ai_completion, shadow_shortfall, shadow_surplus, shadow_budget_gap, priority=priority)
     score_delta = shadow_score - live_score
+    energy = _energy_comparison(resource_snapshot, marl_shadow)
+    causal_score_delta = (
+        score_delta
+        + (0.20 * energy['energy_saving_fraction'])
+        + (0.10 * energy['resource_saving_fraction'])
+        if energy.get('energy_valid') and energy.get('resource_valid') else 0.0
+    )
 
     recommend_shadow = bool(
         marl_shadow.get('source') in {'checkpoint', 'mixed'}
         and marl_shadow.get('checkpoint_readiness') in {'shadow_ready', 'control_candidate'}
-        and score_delta > 0.01
+        and causal_score_delta > 0.01
     )
 
     return {
         'live_score': round(live_score, 6),
         'shadow_score': round(shadow_score, 6),
         'score_delta': round(score_delta, 6),
+        'base_sla_resource_score_delta': round(score_delta, 6),
+        'causal_score_delta': round(causal_score_delta, 6),
+        'energy_valid': bool(energy.get('energy_valid')),
+        'resource_valid': bool(energy.get('resource_valid')),
+        'energy_model_version': energy.get('energy_model_version', ''),
+        'live_power_percent': energy.get('live_power_percent', 0.0),
+        'shadow_power_percent': energy.get('shadow_power_percent', 0.0),
+        'live_power_w': energy.get('live_power_w', 0.0),
+        'shadow_power_w': energy.get('shadow_power_w', 0.0),
+        'energy_saving_fraction': energy.get('energy_saving_fraction', 0.0),
+        'resource_saving_fraction': energy.get('resource_saving_fraction', 0.0),
+        'energy_reason': energy.get('energy_reason', ''),
         'live_ran_completion_est': round(live_ran_completion, 4),
         'shadow_ran_completion_est': round(shadow_ran_completion, 4),
         'live_ai_completion_est': round(live_ai_completion, 4),
@@ -295,15 +399,21 @@ class MARLShadowRuntimeEvaluator:
         self._active_policy_id_base = self.policy_id
         self._torch = None
         self._actors = None
+        self._global_actor = None
+        self._category_head = None
+        self._power_head = None
+        self._allocation_head = None
         self._checkpoint_error = ''
         self._recommendation_history: deque[str] = deque(maxlen=self.stability_window)
+        self._last_temporal_state = None
+        self._last_temporal_resource = None
         if self.enabled:
             self._try_load_checkpoint(bootstrap=True)
 
     @property
     def checkpoint_loaded(self) -> bool:
         """Whether all active DU actors came from a loaded checkpoint."""
-        return self._actors is not None and self._torch is not None
+        return getattr(self, '_actors', None) is not None and getattr(self, '_torch', None) is not None
 
     @property
     def checkpoint_error(self) -> str:
@@ -350,6 +460,10 @@ class MARLShadowRuntimeEvaluator:
             'checkpoint_meta': getattr(self, 'checkpoint_meta', {}),
             'torch': getattr(self, '_torch', None),
             'actors': getattr(self, '_actors', None),
+            'global_actor': getattr(self, '_global_actor', None),
+            'category_head': getattr(self, '_category_head', None),
+            'power_head': getattr(self, '_power_head', None),
+            'allocation_head': getattr(self, '_allocation_head', None),
             'policy_id': getattr(self, 'policy_id', 'ta_sam_marl_shadow_v1'),
             'checkpoint_error': getattr(self, '_checkpoint_error', ''),
         }
@@ -361,6 +475,10 @@ class MARLShadowRuntimeEvaluator:
             self.checkpoint_meta = previous['checkpoint_meta']
             self._torch = previous['torch']
             self._actors = previous['actors']
+            self._global_actor = previous['global_actor']
+            self._category_head = previous['category_head']
+            self._power_head = previous['power_head']
+            self._allocation_head = previous['allocation_head']
             self.policy_id = previous['policy_id']
             self._checkpoint_error = previous['checkpoint_error']
             self._checkpoint_error = f'candidate rejected; active checkpoint kept: {self._checkpoint_error}'
@@ -495,6 +613,105 @@ class MARLShadowRuntimeEvaluator:
                 total = torch.clamp(alpha.sum(dim=-1, keepdim=True), min=1e-9)
                 return alpha / total
 
+        class _GlobalBudgetActor(nn.Module):
+            def __init__(self, input_dim: int, hidden_dims: List[int], action_dim: int = 3) -> None:
+                super().__init__()
+                layers: List[nn.Module] = []
+                previous = input_dim
+                for hidden_dim in hidden_dims:
+                    layers.append(nn.Linear(previous, hidden_dim))
+                    layers.append(_activation_factory())
+                    previous = hidden_dim
+                self.backbone = nn.Sequential(*layers)
+                self.alpha_head = nn.Linear(previous, action_dim)
+                self.beta_head = nn.Linear(previous, action_dim)
+
+            def forward(self, x):
+                features = self.backbone(x)
+                alpha = torch.nn.functional.softplus(self.alpha_head(features)) + 1.0
+                beta = torch.nn.functional.softplus(self.beta_head(features)) + 1.0
+                return alpha / (alpha + beta)
+
+        class _OrdinalCategoryHead(nn.Module):
+            def __init__(self, input_dim: int, hidden_dim: int, class_count: int = 3, temporal_dim: int = 0) -> None:
+                super().__init__()
+                self.temporal_dim = max(0, int(temporal_dim))
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    _activation_factory(),
+                    nn.Linear(hidden_dim, class_count),
+                )
+                self.temporal_encoder = (
+                    nn.Sequential(
+                        nn.Linear(self.temporal_dim, hidden_dim),
+                        _activation_factory(),
+                        nn.Linear(hidden_dim, class_count),
+                    )
+                    if self.temporal_dim > 0 else None
+                )
+
+            def forward(self, x, temporal=None):
+                logits = self.net(x)
+                if x.shape[-1] >= 3:
+                    logits = logits + x[..., -3:]
+                if self.temporal_encoder is not None:
+                    if temporal is None:
+                        temporal = torch.zeros((x.shape[0], self.temporal_dim), dtype=x.dtype, device=x.device)
+                    logits = logits + self.temporal_encoder(temporal[..., :self.temporal_dim])
+                return logits
+
+        class _PowerIntentHead(nn.Module):
+            def __init__(self, input_dim: int, hidden_dim: int, class_count: int = 3, temporal_dim: int = 0) -> None:
+                super().__init__()
+                self.temporal_dim = max(0, int(temporal_dim))
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    _activation_factory(),
+                    nn.Linear(hidden_dim, class_count),
+                )
+                self.temporal_encoder = (
+                    nn.Sequential(
+                        nn.Linear(self.temporal_dim, hidden_dim),
+                        _activation_factory(),
+                        nn.Linear(hidden_dim, class_count),
+                    )
+                    if self.temporal_dim > 0 else None
+                )
+
+            def forward(self, x, temporal=None):
+                logits = self.net(x)
+                if self.temporal_encoder is not None:
+                    if temporal is None:
+                        temporal = torch.zeros((x.shape[0], self.temporal_dim), dtype=x.dtype, device=x.device)
+                    logits = logits + self.temporal_encoder(temporal[..., :self.temporal_dim])
+                return logits
+
+        class _AllocationIntentHead(nn.Module):
+            def __init__(self, input_dim: int, hidden_dim: int, temporal_dim: int = 0, output_dim: int = 2) -> None:
+                super().__init__()
+                self.temporal_dim = max(0, int(temporal_dim))
+                self.output_dim = max(2, int(output_dim))
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim + (hidden_dim if self.temporal_dim > 0 else 0), hidden_dim),
+                    _activation_factory(),
+                    nn.Linear(hidden_dim, self.output_dim),
+                )
+                self.temporal_encoder = (
+                    nn.Sequential(nn.Linear(self.temporal_dim, hidden_dim), _activation_factory())
+                    if self.temporal_dim > 0 else None
+                )
+
+            def forward(self, x, temporal=None):
+                if self.temporal_encoder is not None:
+                    if temporal is None:
+                        temporal = torch.zeros((x.shape[0], self.temporal_dim), dtype=x.dtype, device=x.device)
+                    x = torch.cat([x, self.temporal_encoder(temporal[..., :self.temporal_dim])], dim=-1)
+                raw = self.net(x)
+                shares = torch.softmax(raw[..., :2], dim=-1)
+                if self.output_dim <= 2:
+                    return shares
+                return torch.cat([shares, torch.sigmoid(raw[..., 2:3])], dim=-1)
+
         state_keys = list(state_dict.keys()) if isinstance(state_dict, dict) else []
         article_style_state = any('.concentration_head.' in key or '.backbone.' in key for key in state_keys)
         actor_cls = _ArticleDirichletActor if article_style_state else _LegacyActorNetwork
@@ -505,8 +722,81 @@ class MARLShadowRuntimeEvaluator:
             self._checkpoint_error = f'checkpoint load failed: {exc}'
             return
         actors.eval()
+        global_actor = None
+        global_actor_path = run_dir / str(
+            self.checkpoint_meta.get('global_actor_path', 'tasam_marl_global_actor.pt')
+            or 'tasam_marl_global_actor.pt'
+        )
+        if global_actor_path.is_file():
+            try:
+                global_actor = _GlobalBudgetActor(
+                    int(self.checkpoint_meta.get('global_state_dim', 13) or 13),
+                    hidden_dims,
+                    int(self.checkpoint_meta.get('global_action_dim', 3) or 3),
+                )
+                global_actor.load_state_dict(torch.load(global_actor_path, map_location='cpu'))
+                global_actor.eval()
+            except (RuntimeError, OSError, EOFError) as exc:
+                self._checkpoint_error = f'global actor load failed: {exc}'
+                return
+        elif self.checkpoint_meta.get('uses_global_energy_infra_actor'):
+            self._checkpoint_error = 'global energy/infra actor missing'
+            return
+        category_head = None
+        category_path = run_dir / str(self.checkpoint_meta.get('category_head_path', 'tasam_marl_category_head.pt') or 'tasam_marl_category_head.pt')
+        if category_path.is_file():
+            hidden_dim = max(1, _safe_int(self.checkpoint_meta.get('category_head_hidden_dim', 64), 64))
+            class_count = len(self.checkpoint_meta.get('category_head_classes') or ['ALLOWED', 'CONDITIONAL', 'BLOCKED'])
+            category_head = _OrdinalCategoryHead(
+                int(self.checkpoint_meta.get('global_state_dim', 13) or 13),
+                hidden_dim,
+                class_count=max(3, class_count),
+                temporal_dim=int(self.checkpoint_meta.get('temporal_dim', 0) or 0),
+            )
+            try:
+                category_head.load_state_dict(torch.load(category_path, map_location='cpu'), strict=False)
+                category_head.eval()
+            except (RuntimeError, OSError, EOFError) as exc:
+                self._checkpoint_error = f'category head load failed: {exc}'
+                category_head = None
+        power_head = None
+        power_path = run_dir / str(self.checkpoint_meta.get('power_head_path', 'tasam_marl_power_head.pt') or 'tasam_marl_power_head.pt')
+        if power_path.is_file():
+            power_hidden_dim = max(1, _safe_int(self.checkpoint_meta.get('power_head_hidden_dim', 64), 64))
+            try:
+                power_head = _PowerIntentHead(
+                    int(self.checkpoint_meta.get('global_state_dim', 13) or 13),
+                    power_hidden_dim,
+                    class_count=len(self.checkpoint_meta.get('power_head_classes') or [25.0, 60.0, 100.0]),
+                    temporal_dim=int(self.checkpoint_meta.get('temporal_dim', 0) or 0),
+                )
+                power_head.load_state_dict(torch.load(power_path, map_location='cpu'), strict=False)
+                power_head.eval()
+            except (RuntimeError, OSError, EOFError) as exc:
+                self._checkpoint_error = f'power head load failed: {exc}'
+                power_head = None
+        allocation_head = None
+        allocation_path = run_dir / str(self.checkpoint_meta.get('allocation_head_path', 'tasam_marl_allocation_head.pt') or 'tasam_marl_allocation_head.pt')
+        if allocation_path.is_file():
+            allocation_hidden_dim = max(1, _safe_int(self.checkpoint_meta.get('allocation_head_hidden_dim', 64), 64))
+            try:
+                allocation_head = _AllocationIntentHead(
+                    int(self.checkpoint_meta.get('global_state_dim', 13) or 13),
+                    allocation_hidden_dim,
+                    temporal_dim=int(self.checkpoint_meta.get('temporal_dim', 0) or 0),
+                    output_dim=int(self.checkpoint_meta.get('allocation_head_output_dim', len(self.checkpoint_meta.get('allocation_head_outputs') or [0, 0])) or 2),
+                )
+                allocation_head.load_state_dict(torch.load(allocation_path, map_location='cpu'), strict=False)
+                allocation_head.eval()
+            except (RuntimeError, OSError, EOFError) as exc:
+                self._checkpoint_error = f'allocation head load failed: {exc}'
+                allocation_head = None
         self._torch = torch
         self._actors = actors
+        self._global_actor = global_actor
+        self._category_head = category_head
+        self._power_head = power_head
+        self._allocation_head = allocation_head
         self.policy_id = f"{self._active_policy_id_base}:{run_dir.name}"
         self.checkpoint_source = 'checkpoint'
         self._checkpoint_error = ''
@@ -550,6 +840,313 @@ class MARLShadowRuntimeEvaluator:
             return checkpoint_action, 'checkpoint'
         return self._heuristic_du_action(du_state), 'heuristic'
 
+    def _category_advice(self, marl_state: Dict[str, Any]) -> Dict[str, Any]:
+        """Use the observed-category head when a new checkpoint provides it."""
+        if getattr(self, '_category_head', None) is None or getattr(self, '_torch', None) is None:
+            return {'enabled': False, 'source': 'legacy_checkpoint_or_unavailable'}
+        global_state = marl_state.get('global_state') or {}
+        values = list(global_state.get('state_vector', []) if isinstance(global_state, dict) else global_state)
+        expected_dim = int(self.checkpoint_meta.get('global_state_dim', len(values)) or len(values))
+        if len(values) != expected_dim:
+            return {'enabled': False, 'source': 'invalid_global_state_dimension', 'expected_dim': expected_dim, 'actual_dim': len(values)}
+        temporal = marl_state.get('temporal_context') or marl_state.get('temporal_features') or None
+        with self._torch.no_grad():
+            logits = self._category_head(
+                self._torch.tensor(values, dtype=self._torch.float32).unsqueeze(0),
+                self._torch.tensor(temporal, dtype=self._torch.float32).unsqueeze(0) if temporal else None,
+            )[0]
+            probabilities = self._torch.softmax(logits, dim=-1)
+            predicted_index = int(probabilities.argmax().item())
+        categories = list(self.checkpoint_meta.get('category_head_classes') or ['ALLOWED', 'CONDITIONAL', 'BLOCKED'])
+        if predicted_index >= len(categories):
+            predicted_index = len(categories) - 1
+        predicted = str(categories[predicted_index]).upper()
+        action = {'ALLOWED': 'REDUCE_POWER', 'CONDITIONAL': 'MONITOR', 'BLOCKED': 'FULL_POWER'}.get(predicted, 'MONITOR')
+        return {
+            'enabled': True,
+            'source': 'category_head_observed_feedback',
+            'predicted_verdict': predicted,
+            'predicted_index': predicted_index,
+            'confidence': round(float(probabilities[predicted_index].item()), 6),
+            'probabilities': {str(categories[i]).upper(): round(float(probabilities[i].item()), 6) for i in range(min(len(categories), int(probabilities.shape[0])))},
+            'decision': predicted,
+            'action': action,
+            'reason': 'ordinal category head trained on next real network observation',
+        }
+
+    def _build_temporal_context(self, marl_state: Dict[str, Any], resource_snapshot: Dict[str, Any]) -> list[float]:
+        """Build internal temporal context; the externally persisted state stays 13-D."""
+        global_state = marl_state.get('global_state') or {}
+        current = list(global_state.get('state_vector', []) if isinstance(global_state, dict) else global_state)
+        previous_state = list(((getattr(self, '_last_temporal_state', None) or {}).get('global_state') or {}).get('state_vector', []) or [])
+        previous_resource = getattr(self, '_last_temporal_resource', None) or {}
+        category = str(
+            resource_snapshot.get('state_category')
+            or resource_snapshot.get('allocation_state')
+            or marl_state.get('state_category')
+            or 'CONDITIONAL'
+        ).upper()
+        category_value = {'ALLOWED': 0.0, 'CONDITIONAL': 0.5, 'BLOCKED': 1.0}.get(category, 0.5)
+        delta = lambda index: (float(current[index]) - float(previous_state[index])) if len(current) > index and len(previous_state) > index else 0.0
+        stage_boundary = float(
+            str(marl_state.get('scenario_stage') or '')
+            != str((getattr(self, '_last_temporal_state', None) or {}).get('scenario_stage') or '')
+        )
+        current_ran = _safe_float(resource_snapshot.get('ran_completion_ratio', 0.0))
+        current_ai = _safe_float(resource_snapshot.get('ai_completion_ratio', 0.0))
+        previous_ran = _safe_float(previous_resource.get('ran_completion_ratio', current_ran))
+        previous_ai = _safe_float(previous_resource.get('ai_completion_ratio', current_ai))
+        return [
+            category_value,
+            delta(0),
+            delta(1),
+            delta(2),
+            current_ran - previous_ran,
+            current_ai - previous_ai,
+            _share_of(_safe_float(resource_snapshot.get('r_ran')), _safe_float(resource_snapshot.get('usable_budget', 1.0)), 0.5),
+            0.0,
+            min(1.0, abs(delta(0)) + abs(delta(1)) + 0.5 * stage_boundary),
+            _safe_float(resource_snapshot.get('power_percent', 100.0), 100.0) / 100.0,
+        ]
+
+    def _power_advice(self, marl_state: Dict[str, Any], category: str, resource_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Select one of 25/60/100% while keeping BLOCKED at full power."""
+        if category == 'BLOCKED':
+            return {'enabled': True, 'power_percent': 100.0, 'intent': 'FULL_POWER', 'source': 'safety_envelope'}
+        # The online economic learner needs real, attributable variation in
+        # the actuator before its replay can distinguish a saving from a
+        # shadow-only proposal.  This is an explicit bootstrap exploration
+        # knob, restricted to non-critical states; HARD_VETO/BLOCKED still
+        # takes the branch above and remains at full power.  Frozen and
+        # historical campaigns do not set this variable.
+        bootstrap = os.environ.get('GREENRAN_TASAM_ECONOMIC_BOOTSTRAP_POWER', '').strip()
+        if bootstrap and category in {'ALLOWED', 'CONDITIONAL'}:
+            try:
+                bootstrap_power = float(bootstrap)
+            except (TypeError, ValueError):
+                bootstrap_power = 0.0
+            if bootstrap_power in {25.0, 60.0, 100.0}:
+                return {
+                    'enabled': True,
+                    'power_percent': bootstrap_power,
+                    'intent': 'ECO_25' if bootstrap_power == 25.0 else 'REDUCE_60' if bootstrap_power == 60.0 else 'FULL_POWER',
+                    'source': 'economic_bootstrap_exploration',
+                    'bootstrap': True,
+                }
+        global_advice = self._global_budget_advice(marl_state)
+        if global_advice.get('enabled'):
+            percent = float(global_advice['power_percent'])
+            return {
+                'enabled': True,
+                'power_percent': percent,
+                'intent': f'POWER_{int(percent)}',
+                'source': 'global_energy_infra_actor',
+                'global_budget': global_advice,
+            }
+        if getattr(self, '_power_head', None) is not None and getattr(self, '_torch', None) is not None:
+            values = list((marl_state.get('global_state') or {}).get('state_vector', []) or [])
+            expected = int(self.checkpoint_meta.get('global_state_dim', len(values)) or len(values))
+            if len(values) == expected:
+                temporal = marl_state.get('temporal_context') or marl_state.get('temporal_features') or None
+                with self._torch.no_grad():
+                    logits = self._power_head(
+                        self._torch.tensor(values, dtype=self._torch.float32).unsqueeze(0),
+                        self._torch.tensor(temporal, dtype=self._torch.float32).unsqueeze(0) if temporal else None,
+                    )[0]
+                    probabilities = self._torch.softmax(logits, dim=-1)
+                    index = int(probabilities.argmax().item())
+                    levels = list(self.checkpoint_meta.get('power_head_classes') or [25.0, 60.0, 100.0])
+                    percent = float(levels[max(0, min(len(levels) - 1, index))])
+                    return {
+                        'enabled': True,
+                        'power_percent': percent,
+                        'intent': 'ECO_25' if percent == 25.0 else 'REDUCE_60' if percent == 60.0 else 'FULL_POWER',
+                        'confidence': round(float(probabilities[index].item()), 6),
+                        'source': 'power_head',
+                    }
+        # Compatibility fallback for old checkpoints: category is the only
+        # learned signal, and CONDITIONAL stays in the middle power band.
+        percent = 25.0 if category == 'ALLOWED' else 60.0
+        return {'enabled': True, 'power_percent': percent, 'intent': 'ECO_25' if percent == 25.0 else 'REDUCE_60', 'source': 'category_compatibility'}
+
+    def _global_budget_advice(self, marl_state: Dict[str, Any]) -> Dict[str, Any]:
+        actor = getattr(self, '_global_actor', None)
+        if actor is None or getattr(self, '_torch', None) is None:
+            return {'enabled': False, 'source': 'legacy_checkpoint_without_global_actor'}
+        checkpoint_meta = getattr(self, 'checkpoint_meta', {}) or {}
+        values = list((marl_state.get('global_state') or {}).get('state_vector', []) or [])
+        expected = int(checkpoint_meta.get('global_state_dim', len(values)) or len(values))
+        if len(values) != expected:
+            return {'enabled': False, 'source': 'invalid_global_state_dimension'}
+        with self._torch.no_grad():
+            output = actor(self._torch.tensor(values, dtype=self._torch.float32).unsqueeze(0))[0]
+        if int(output.shape[0]) < 3:
+            return {'enabled': False, 'source': 'invalid_global_action_dimension'}
+        levels = (0.0, *tuple(float(value) for value in range(25, 101, 5)))
+        if int(output.shape[0]) >= 5 and int(checkpoint_meta.get('global_action_dim', 3) or 3) >= 5:
+            raw_powers = [100.0 * float(output[index].item()) for index in range(3)]
+            power_by_cell = {
+                str(cell_id): min(levels, key=lambda level: abs(level - raw_powers[index]))
+                for index, cell_id in enumerate((2, 3, 4))
+            }
+            sleeping = [cell for cell, value in power_by_cell.items() if value == 0.0]
+            if len(sleeping) > 1:
+                # The actor may explore invalid combinations, but the runtime
+                # must never send two sleeping DUs.  Keep one sleep request
+                # and restore the other DUs to the minimum calibrated level.
+                for cell in sleeping[1:]:
+                    power_by_cell[cell] = 25.0
+            power = float(min(power_by_cell.values()))
+            ran_share = max(0.0, min(1.0, float(output[3].item())))
+            total_fraction = max(0.0, min(1.0, float(output[4].item())))
+            return {
+                'enabled': True,
+                'source': 'global_energy_infra_actor_v10',
+                'power_percent': power,
+                'power_percent_by_cell': power_by_cell,
+                'ran_share': ran_share,
+                'ai_share': 1.0 - ran_share,
+                'total_budget_fraction': total_fraction,
+                'compute_budget': max(0.0, min(1.0, 1.0 - ran_share)),
+                'io_budget': total_fraction,
+                'raw_action': [round(float(value), 6) for value in output.tolist()],
+            }
+        raw_power = 100.0 * float(output[0].item())
+        levels = tuple(float(value) for value in range(25, 101, 5))
+        power = min(levels, key=lambda level: abs(level - raw_power))
+        return {
+            'enabled': True,
+            'source': 'global_energy_infra_actor',
+            'power_percent': power,
+            'compute_budget': max(0.25, min(1.0, float(output[1].item()))),
+            'io_budget': max(0.25, min(1.0, float(output[2].item()))),
+            'raw_action': [round(float(value), 6) for value in output.tolist()],
+        }
+
+    def _allocation_head_advice(self, marl_state: Dict[str, Any], resource_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Read the learned aggregate RAN/IA intent when the checkpoint has it."""
+        checkpoint_meta = getattr(self, 'checkpoint_meta', {}) or {}
+        if checkpoint_meta.get('economic_action_contract') == 'economic_action_v3_per_du_sleep':
+            global_advice = self._global_budget_advice(marl_state)
+            if global_advice.get('enabled') and global_advice.get('total_budget_fraction') is not None:
+                return {
+                    'enabled': True,
+                    'source': 'global_energy_infra_actor_v10',
+                    'predicted_ran_share': round(float(global_advice.get('ran_share', 0.5)), 6),
+                    'predicted_ai_share': round(float(global_advice.get('ai_share', 0.5)), 6),
+                    'predicted_total_budget_fraction': round(float(global_advice['total_budget_fraction']), 6),
+                    'power_percent_by_cell': dict(global_advice.get('power_percent_by_cell') or {}),
+                    'total_budget_head_enabled': True,
+                    'confidence': 1.0,
+                    'target_ran_completion': 1.0,
+                    'target_ai_completion': 1.0,
+                }
+        head = getattr(self, '_allocation_head', None)
+        if head is None or getattr(self, '_torch', None) is None:
+            global_advice = self._global_budget_advice(marl_state)
+            if global_advice.get('enabled'):
+                ai_share = float(global_advice['compute_budget'])
+                return {
+                    'enabled': True,
+                    'source': 'global_energy_infra_actor',
+                    'predicted_ran_share': round(1.0 - ai_share, 6),
+                    'predicted_ai_share': round(ai_share, 6),
+                    'predicted_io_budget': round(float(global_advice['io_budget']), 6),
+                    'confidence': 1.0,
+                    'target_ran_completion': 1.0,
+                    'target_ai_completion': 1.0,
+                }
+            return {'enabled': False, 'source': 'legacy_checkpoint_without_allocation_head'}
+        values = list((marl_state.get('global_state') or {}).get('state_vector', []) or [])
+        expected = int(self.checkpoint_meta.get('global_state_dim', len(values)) or len(values))
+        if len(values) != expected:
+            return {'enabled': False, 'source': 'invalid_global_state_dimension'}
+        temporal = marl_state.get('temporal_context') or marl_state.get('temporal_features') or None
+        with self._torch.no_grad():
+            probabilities = head(
+                self._torch.tensor(values, dtype=self._torch.float32).unsqueeze(0),
+                self._torch.tensor(temporal, dtype=self._torch.float32).unsqueeze(0) if temporal else None,
+            )[0]
+        ran_share = float(probabilities[0].item())
+        ai_share = float(probabilities[1].item())
+        advice = {
+            'enabled': True,
+            'source': 'allocation_head_observed_completion_feedback',
+            'predicted_ran_share': round(ran_share, 6),
+            'predicted_ai_share': round(ai_share, 6),
+            'confidence': round(float(probabilities.max().item()), 6),
+            'target_ran_completion': 0.95,
+            'target_ai_completion': 0.75,
+        }
+        if probabilities.shape[-1] >= 3:
+            # The batch dimension is removed above with ``[0]``.  The
+            # economic head therefore exposes a 1-D vector here, regardless
+            # of whether the underlying module returned a batched tensor.
+            advice['predicted_total_budget_fraction'] = round(float(probabilities[2].item()), 6)
+            advice['total_budget_head_enabled'] = True
+        else:
+            advice['total_budget_head_enabled'] = False
+        return advice
+
+    def _project_allocation_to_completion_targets(
+        self,
+        ran_share: float,
+        resource_snapshot: Dict[str, Any],
+        total_budget_fraction: float | None = None,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Project split and total utilization onto audited SLA floors."""
+        budget = _safe_float(resource_snapshot.get('usable_budget', resource_snapshot.get('resource_budget', 0.0)), 0.0)
+        d_ran = _safe_float(resource_snapshot.get('d_ran', 0.0), 0.0)
+        d_ai = _safe_float(resource_snapshot.get('d_ai', 0.0), 0.0)
+        if budget <= 1e-9:
+            return _clamp(ran_share), {'applied': False, 'reason': 'invalid_budget'}
+        floor_ran = max(0.0, _safe_float(resource_snapshot.get('floor_total_ran'), 0.0))
+        floor_ai = max(0.0, _safe_float(resource_snapshot.get('floor_total_ai'), 0.0))
+        lower_ran = floor_ran / budget if floor_ran > 0.0 else (d_ran * 0.95) / budget
+        lower_ai = floor_ai / budget if floor_ai > 0.0 else (d_ai * 0.75) / budget
+        lower_total = lower_ran + lower_ai
+        if lower_total > 1.0 + 1e-9:
+            # Never scale audited SLA floors down to fit the budget.  That
+            # would manufacture a feasible target and teach the learner to
+            # violate an impossible constraint.  Keep the requested split
+            # visible for diagnostics, but fail closed for economic control.
+            return _clamp(ran_share), {
+                'applied': False,
+                'reason': 'sla_floor_infeasible',
+                'feasible': False,
+                'ran_min_share': round(lower_ran, 6),
+                'ai_min_share': round(lower_ai, 6),
+                'budget_lower_bound_total': round(lower_total, 6),
+                'total_budget_fraction': None,
+                'margin_scale': 0.0,
+                'head_ran_share': round(_clamp(ran_share), 6),
+                'projected_ran_share': round(_clamp(ran_share), 6),
+            }
+        else:
+            feasible = True
+        state = str(resource_snapshot.get('allocation_state', 'ALLOWED') or 'ALLOWED').upper()
+        margin_scale = {'ALLOWED': 0.05, 'CONDITIONAL': 0.10, 'CRITICAL': 0.75, 'BLOCKED': 1.0}.get(state, 0.10)
+        default_total = lower_total + margin_scale * max(0.0, 1.0 - lower_total)
+        desired_total = default_total if total_budget_fraction is None else _clamp(total_budget_fraction)
+        desired_total = max(lower_total, min(1.0, desired_total))
+        original = _clamp(ran_share)
+        ran_floor_share = lower_ran / desired_total if desired_total > 1e-9 else 0.5
+        ai_floor_share = lower_ai / desired_total if desired_total > 1e-9 else 0.5
+        projected = max(original, ran_floor_share)
+        projected = min(projected, 1.0 - ai_floor_share)
+        return _clamp(projected), {
+            'applied': abs(projected - original) > 1e-9 or abs(desired_total - 1.0) > 1e-9,
+            'reason': 'sla_floor_plus_economic_margin',
+            'feasible': feasible,
+            'ran_min_share': round(ran_floor_share, 6),
+            'ai_min_share': round(ai_floor_share, 6),
+            'budget_lower_bound_total': round(lower_total, 6),
+            'total_budget_fraction': round(desired_total, 6),
+            'margin_scale': margin_scale,
+            'head_ran_share': round(original, 6),
+            'projected_ran_share': round(projected, 6),
+        }
+
     def _resource_advice(self, priority: str, resource_snapshot: Dict[str, Any], comparison: Dict[str, Any], shadow_r_ran: float, shadow_r_ai: float) -> Dict[str, Any]:
         current_r_ran = _safe_float(resource_snapshot.get('r_ran', 0.0), 0.0)
         current_r_ai = _safe_float(resource_snapshot.get('r_ai', 0.0), 0.0)
@@ -575,13 +1172,14 @@ class MARLShadowRuntimeEvaluator:
             'delta_r_ran_vs_live': round(delta_r_ran, 4),
             'delta_r_ai_vs_live': round(delta_r_ai, 4),
             'score_delta': round(_safe_float(comparison.get('score_delta', 0.0), 0.0), 6),
+            'causal_score_delta': round(_safe_float(comparison.get('causal_score_delta', comparison.get('score_delta', 0.0)), 0.0), 6),
         }
 
     def _energy_advice(self, priority: str, comparison: Dict[str, Any], shadow_r_ran: float, live_r_ran: float) -> Dict[str, Any]:
         if not self.enable_energy_advice:
             return {'enabled': False}
 
-        score_delta = _safe_float(comparison.get('score_delta', 0.0), 0.0)
+        score_delta = _safe_float(comparison.get('causal_score_delta', comparison.get('score_delta', 0.0)), 0.0)
         live_shortfall = _safe_float(comparison.get('live_total_shortfall', 0.0), 0.0)
         shadow_shortfall = _safe_float(comparison.get('shadow_total_shortfall', 0.0), 0.0)
         live_ran_completion = _safe_float(comparison.get('live_ran_completion_est', 0.0), 0.0)
@@ -729,10 +1327,15 @@ class MARLShadowRuntimeEvaluator:
         floor_ai = max(0.0, _safe_float(allocation.get('floor_total_ai', 0.0), 0.0))
         requested_ran = _safe_float(result.get('shadow_r_ran', snapshot.get('r_ran', 0.0)), 0.0)
         requested_ai = _safe_float(result.get('shadow_r_ai', snapshot.get('r_ai', 0.0)), 0.0)
-        hard_veto = bool(
-            proposal.get('safety_veto')
-            or proposal.get('critical_violation')
-            or str(proposal.get('verdict', '')).upper() == 'BLOCKED'
+        explicit_safety_level = str(proposal.get('armd_safety_level', '') or '').upper()
+        hard_veto = (
+            explicit_safety_level == 'HARD_VETO'
+            if explicit_safety_level in {'CLEAR', 'ADVISORY', 'HARD_VETO', 'UNKNOWN'}
+            else bool(
+                proposal.get('safety_veto')
+                or proposal.get('critical_violation')
+                or str(proposal.get('verdict', '')).upper() == 'BLOCKED'
+            )
         )
 
         if hard_veto:
@@ -811,6 +1414,10 @@ class MARLShadowRuntimeEvaluator:
             return {'enabled': False, 'policy_id': self.policy_id, 'mode': self.mode, 'advisory_mode': self.advisory_mode}
         marl_state = marl_state or {}
         resource_snapshot = resource_snapshot or {}
+        marl_state = dict(marl_state)
+        marl_state['temporal_context'] = self._build_temporal_context(marl_state, resource_snapshot)
+        self._last_temporal_state = marl_state
+        self._last_temporal_resource = dict(resource_snapshot)
         scenario_control = _load_scenario_control()
         du_states = marl_state.get('du_states', []) or []
         slice_state = marl_state.get('slice_state', {}) or {}
@@ -896,10 +1503,43 @@ class MARLShadowRuntimeEvaluator:
             ai_pressure=ai_pressure,
             priority=priority,
         )
+        allocation_head_advice = self._allocation_head_advice(marl_state, resource_snapshot)
+        if allocation_head_advice.get('power_percent_by_cell'):
+            # The v10 global actor owns per-DU power; carry it through the
+            # same recommendation object as the allocation head.
+            allocation_head_advice['power_percent_by_cell'] = dict(
+                allocation_head_advice['power_percent_by_cell']
+            )
+        total_budget_fraction = allocation_head_advice.get('predicted_total_budget_fraction')
+        if allocation_head_advice.get('enabled'):
+            shadow_ran_share = float(allocation_head_advice['predicted_ran_share'])
+            shadow_ran_share, allocation_projection = self._project_allocation_to_completion_targets(
+                shadow_ran_share, resource_snapshot, total_budget_fraction
+            )
+        else:
+            shadow_ran_share, allocation_projection = self._project_allocation_to_completion_targets(
+                shadow_ran_share, resource_snapshot, total_budget_fraction
+            )
+            allocation_projection['reason'] = (
+                'legacy_completion_projection' if allocation_projection.get('applied')
+                else 'allocation_head_unavailable'
+            )
         shadow_ran_share, global_guard = self._apply_global_ran_guard(shadow_ran_share, resource_snapshot, priority, embb_pressure)
         shadow_ran_share, step_guard = self._limit_ran_share_step(shadow_ran_share, resource_snapshot, priority)
-        shadow_r_ran = usable_budget * shadow_ran_share
-        shadow_r_ai = max(0.0, usable_budget - shadow_r_ran)
+        # Smoothing is useful for energy stability, but it must not undo a
+        # feasible completion target.  Re-apply the explicit projection after
+        # guards and record the second pass in the proposal audit.
+        shadow_ran_share, target_guard = self._project_allocation_to_completion_targets(
+            shadow_ran_share, resource_snapshot, allocation_projection.get('total_budget_fraction')
+        )
+        allocation_projection['post_guard'] = target_guard
+        total_budget_value = target_guard.get('total_budget_fraction')
+        if total_budget_value is None:
+            total_budget_value = allocation_projection.get('total_budget_fraction', 1.0)
+        total_budget_fraction = float(1.0 if total_budget_value is None else total_budget_value)
+        shadow_total = usable_budget * total_budget_fraction
+        shadow_r_ran = shadow_total * shadow_ran_share
+        shadow_r_ai = max(0.0, shadow_total - shadow_r_ran)
         final_source = 'checkpoint' if used_checkpoint == len(du_recommendations) and du_recommendations else 'heuristic'
         if used_checkpoint and used_checkpoint < len(du_recommendations):
             final_source = 'mixed'
@@ -921,22 +1561,80 @@ class MARLShadowRuntimeEvaluator:
             'du_recommendations': du_recommendations,
             'shadow_r_ran': round(shadow_r_ran, 4),
             'shadow_r_ai': round(shadow_r_ai, 4),
+            'shadow_total_allocation': round(shadow_total, 4),
+            'shadow_total_budget_fraction': round(total_budget_fraction, 6),
             'delta_r_ran_vs_live': round(shadow_r_ran - current_r_ran, 4),
             'delta_r_ai_vs_live': round(shadow_r_ai - current_r_ai, 4),
             'mean_action_vector': [round(mean_embb, 4), round(mean_mmtc, 4), round(mean_urllc, 4)],
             'priority': priority,
-            'guard': {'global_ran': global_guard, 'step': step_guard, 'p95_tail': tail_info},
+            'guard': {'global_ran': global_guard, 'step': step_guard, 'completion_target': target_guard, 'p95_tail': tail_info},
+            'allocation_head': allocation_head_advice,
+            'global_budget_actor': self._global_budget_advice(marl_state),
+            'allocation_projection': allocation_projection,
         }
+        result['tasam_checkpoint_valid'] = bool(
+            self.checkpoint_loaded
+            and final_source == 'checkpoint'
+            and du_recommendations
+            and all(item.get('source') == 'checkpoint' for item in du_recommendations)
+        )
+        result['tasam_fallback_used'] = final_source in {'heuristic', 'mixed'}
         result['comparison'] = build_shadow_comparison(resource_snapshot, result)
+        result['tasam_evidence_valid'] = bool(
+            result['tasam_checkpoint_valid']
+            and result['comparison'].get('energy_valid')
+            and result['comparison'].get('resource_valid')
+        )
         resource_advice = self._resource_advice(priority, resource_snapshot, result['comparison'], shadow_r_ran, shadow_r_ai)
-        energy_advice = self._energy_advice(priority, result['comparison'], shadow_r_ran, current_r_ran)
+        category_advice = self._category_advice(marl_state)
+        energy_advice = (
+            category_advice
+            if category_advice.get('enabled')
+            else self._energy_advice(priority, result['comparison'], shadow_r_ran, current_r_ran)
+        )
+        predicted_category = str(category_advice.get('predicted_verdict') or energy_advice.get('decision') or 'CONDITIONAL').upper()
+        energy_advice = dict(energy_advice)
+        if allocation_head_advice.get('power_percent_by_cell') and not energy_advice.get('power_percent_by_cell'):
+            energy_advice['power_percent_by_cell'] = dict(allocation_head_advice['power_percent_by_cell'])
+        energy_advice.update(self._power_advice(marl_state, predicted_category, resource_snapshot))
+        global_budget = energy_advice.get('global_budget') or self._global_budget_advice(marl_state)
+        if global_budget.get('power_percent_by_cell'):
+            energy_advice['power_percent_by_cell'] = dict(global_budget['power_percent_by_cell'])
+            energy_advice['sleep_requested_cells'] = [
+                int(cell) for cell, value in global_budget['power_percent_by_cell'].items()
+                if float(value) == 0.0
+            ]
+            energy_advice['total_budget_fraction'] = global_budget.get('total_budget_fraction')
+            energy_advice['ran_share'] = global_budget.get('ran_share')
+            energy_advice['ai_share'] = global_budget.get('ai_share')
+        energy_advice['decision'] = predicted_category
+        energy_advice['action'] = (
+            'POWER_DOWN_ECO' if energy_advice.get('power_percent') == 25.0
+            else 'REDUCE_POWER' if float(energy_advice.get('power_percent', 100.0) or 100.0) < 100.0
+            else 'FULL_POWER'
+        )
+        # The power actor is evaluated after the allocation proposal.  Repeat
+        # the comparison now that its shadow power level is known, otherwise
+        # the causal evidence would be permanently incomplete.
+        result['shadow_power_percent'] = energy_advice.get('power_percent')
+        result['shadow_power_percent_by_cell'] = energy_advice.get('power_percent_by_cell')
+        result['shadow_power_source'] = energy_advice.get('source', '')
+        result['comparison'] = build_shadow_comparison(resource_snapshot, result)
+        result['tasam_evidence_valid'] = bool(
+            result['tasam_checkpoint_valid']
+            and result['comparison'].get('energy_valid')
+            and result['comparison'].get('resource_valid')
+        )
+        resource_advice['score_delta'] = round(
+            _safe_float(result['comparison'].get('causal_score_delta', 0.0), 0.0), 6
+        )
         stability = self._stability_state(self._recommendation_signature(priority, resource_advice, energy_advice))
         confidence = self._advisor_confidence(final_source, result['comparison'], stability['stable'])
         evidence_flags = {
             'checkpoint_ready': self.checkpoint_readiness in {'shadow_ready', 'control_candidate'},
             'checkpoint_backed': final_source in {'checkpoint', 'mixed'},
             'positive_score_delta': (
-                _safe_float(result['comparison'].get('score_delta', 0.0), 0.0) > 0.0
+                _safe_float(result['comparison'].get('causal_score_delta', 0.0), 0.0) > 0.0
                 or self.advisory_mode in {'assistant_only_control', 'control', 'integration'}
             ),
             'stable_recommendation': stability['stable'],
@@ -964,6 +1662,7 @@ class MARLShadowRuntimeEvaluator:
             'would_influence': gate_passed and self.advisory_mode not in {'shadow', 'shadow_only'},
             'resource_advice': resource_advice,
             'energy_advice': energy_advice,
+            'category_advice': category_advice,
             'du_contributions': [
                 {
                     'du_id': item.get('du_id', 'unknown'),
@@ -978,7 +1677,7 @@ class MARLShadowRuntimeEvaluator:
             'stability': stability,
             'evidence_flags': evidence_flags,
             'arbitration_score': round(
-                (0.65 * confidence) + (0.35 * _clamp(max(_safe_float(result['comparison'].get('score_delta', 0.0), 0.0), 0.0) / 0.08, 0.0, 1.0)),
+                (0.65 * confidence) + (0.35 * _clamp(max(_safe_float(result['comparison'].get('causal_score_delta', 0.0), 0.0), 0.0) / 0.08, 0.0, 1.0)),
                 4,
             ),
             'reason': energy_advice.get('reason', ''),

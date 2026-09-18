@@ -20,7 +20,7 @@ export GREENRAN_WALL_KEEP_RIC="${GREENRAN_WALL_KEEP_RIC:-1}"
 export GREENRAN_CLEAN_SCOPE="${GREENRAN_CLEAN_SCOPE:-instance}"
 export GREENRAN_COLLECTION_EVENT_PROFILE="${GREENRAN_COLLECTION_EVENT_PROFILE:-none}"
 export GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES="${GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES:-1}"
-export GREENRAN_RAN_PRESSURE_PROFILE="greenran_autonomous_priority_wall10m_v1"
+export GREENRAN_RAN_PRESSURE_PROFILE="${GREENRAN_RAN_PRESSURE_PROFILE:-greenran_autonomous_priority_wall10m_v1}"
 export GREENRAN_RAN_PRESSURE_TIME_SOURCE="wall"
 export GREENRAN_REAL_ONLY="1"
 export GREENRAN_REQUIRE_REAL_PDCP="1"
@@ -48,8 +48,8 @@ export GREENRAN_CONTROL_TRIAL_ENABLED="${GREENRAN_CONTROL_TRIAL_ENABLED:-1}"
 export GREENRAN_CONTROL_TRIAL_FRACTION="${GREENRAN_CONTROL_TRIAL_FRACTION:-1.0}"
 export GREENRAN_TASAM_EVAL_MANIFEST="${GREENRAN_TASAM_EVAL_MANIFEST:-$PROJECT_ROOT/runs/sac_bootstrap/tasam_candidate_evaluation_latest.json}"
 export GREENRAN_TASAM_EXPORT_ALLOW_PROXY="0"
-export GREENRAN_TASAM_TRUE_ONLINE_ENABLED="0"
-export GREENRAN_ML_RETRAIN_ENABLED="false"
+export GREENRAN_TASAM_TRUE_ONLINE_ENABLED="${GREENRAN_TASAM_TRUE_ONLINE_ENABLED:-0}"
+export GREENRAN_ML_RETRAIN_ENABLED="${GREENRAN_ML_RETRAIN_ENABLED:-false}"
 export GREENRAN_PDCP_STALE_SECONDS="600"
 export GREENRAN_COLLECTION_STARTUP_WAIT_SECONDS="${GREENRAN_COLLECTION_STARTUP_WAIT_SECONDS:-10}"
 export GREENRAN_PER_UE_POLICY_CONSUMER_ENABLED="${GREENRAN_PER_UE_POLICY_CONSUMER_ENABLED:-0}"
@@ -96,12 +96,38 @@ if [[ "$GREENRAN_WALL_KEEP_RIC" == "1" ]]; then
   wall_cmd+=(--keep-ric)
 fi
 
-setsid "${wall_cmd[@]}" > "$wall_log" 2>&1 &
+# Keep the PID file bound to the actual Python supervisor.  The target
+# watcher stops this PID directly before arm finalization; wrapping it in
+# setsid can leave the file pointing at a short-lived launcher process.
+"${wall_cmd[@]}" > "$wall_log" 2>&1 &
 wall_pid=$!
 echo "$wall_pid" > "$GREENRAN_STATE_DIR/wall_clock_supervisor.pid"
 echo "[wall10m] coleta iniciada; supervisor pid=$wall_pid duração=${GREENRAN_WALL_TIME_LIMIT_SECONDS}s"
 echo "[wall10m] acompanhamento: GREENRAN_STATE_DIR='$GREENRAN_STATE_DIR' python3 scripts/status.py"
 
 wall_status=0
-wait "$wall_pid" || wall_status=$?
+if [[ "${GREENRAN_NS3_SINGLE_RUN:-0}" == "1" ]]; then
+  # Fidelity/benchmark arms represent one finite ns-3 execution.  The
+  # historical wall wrapper waits for a fixed wall-clock budget, but a
+  # cleanly finished single-run supervisor removes ns3_supervisor.pid.  Stop
+  # the wall supervisor at that boundary so the arm can finalize its terminal
+  # traces and performance evidence instead of waiting for the full budget.
+  while kill -0 "$wall_pid" 2>/dev/null; do
+    if [[ ! -f "$GREENRAN_STATE_DIR/ns3_supervisor.pid" ]]; then
+      echo "[wall10m] ns-3 single-run concluído; encerrando supervisor de wall-clock"
+      kill -TERM "$wall_pid" 2>/dev/null || true
+      break
+    fi
+    supervisor_pid="$(cat "$GREENRAN_STATE_DIR/ns3_supervisor.pid" 2>/dev/null || true)"
+    if [[ -z "$supervisor_pid" ]] || ! kill -0 "$supervisor_pid" 2>/dev/null; then
+      echo "[wall10m] supervisor ns-3 não está ativo após single-run; encerrando wall-clock"
+      kill -TERM "$wall_pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+  done
+  wait "$wall_pid" || wall_status=$?
+else
+  wait "$wall_pid" || wall_status=$?
+fi
 exit "$wall_status"

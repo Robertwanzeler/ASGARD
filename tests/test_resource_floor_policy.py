@@ -159,6 +159,14 @@ class TestResourceFloorPolicy(unittest.TestCase):
         self.assertEqual(promoted["allocation_state"], "BLOCKED")
         self.assertGreater(promoted["reinforcement_ran"] + promoted["reinforcement_ai"], 0.0)
 
+    def test_learned_allocation_preserves_surplus_above_noncritical_floor(self):
+        snapshot = compute_shared_resource_snapshot(*_metrics(), _config(), {}, "ALLOWED")
+        snapshot.update({"r_ran": 0.40, "r_ai": 0.30, "allocation_state": "ALLOWED"})
+        preserved = enforce_resource_state(snapshot, preserve_allocation=True)
+        self.assertGreaterEqual(preserved["r_ran"], 0.40)
+        self.assertGreaterEqual(preserved["r_ai"], 0.30)
+        self.assertGreater(preserved["r_ran"] + preserved["r_ai"], snapshot["floor_total_ran"] + snapshot["floor_total_ai"])
+
     def test_baseline_uses_fixed_state_band_instead_of_floor(self):
         metrics = _metrics()
         snapshot = compute_shared_resource_snapshot(*metrics, _config(), {}, "CONDITIONAL")
@@ -221,6 +229,22 @@ class TestResourceFloorPolicy(unittest.TestCase):
             self.assertEqual(len(json.loads(row[5])), 20)
             self.assertEqual(row[6], 0)
             self.assertEqual(row[7], "computed")
+
+    def test_dynamic_sensor_count_cannot_inflate_canonical_ledger(self):
+        camera, app2, vehicle, health = _metrics()
+        app2 = dict(app2)
+        app2["total_sensors"] = 25
+        app2["sensors"] = [
+            {"imsi": imsi, "device_type": "sensor"}
+            for imsi in range(4, 29)
+        ]
+        snapshot = compute_shared_resource_snapshot(
+            camera, app2, vehicle, health, _config(), {}, "ALLOWED"
+        )
+        self.assertEqual(len(snapshot["per_ue_floor"]), 20)
+        self.assertEqual(snapshot["floor_by_service"]["sensor"]["ue_count"], 12)
+        self.assertFalse(snapshot["topology_valid"])
+        self.assertGreater(snapshot["topology_observed_ue_count"], 20)
 
 
 if __name__ == "__main__":

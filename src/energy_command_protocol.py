@@ -24,7 +24,7 @@ Formato JSON:
 
 Ações:
     FULL_POWER        → RU=1, mmWave=1, 100% (potência máxima)
-    CONDITIONAL_REDUCE → RU=1, mmWave=1, 70% (economia moderada)
+    CONDITIONAL_REDUCE → RU=1, mmWave=1, 60% (economia moderada)
     POWER_DOWN        → RU=1, mmWave=1, 50% (economia média)
     POWER_DOWN_ECO    → RU=1, mmWave=1, 25% (economia alta)
     MAINTAIN          → Manter estado atual
@@ -66,14 +66,14 @@ ACTIONS = {
     'CONDITIONAL_REDUCE': {
         'ru_count': 1,
         'mmwave_count': 1,
-        'power_level': 70,  # 70% - economia moderada
+        'power_level': 60,  # 60% - economia moderada
         'ttl_seconds': 3,
-        'description': 'Economia moderada - RU=1, mmWave=1, 70% potência'
+        'description': 'Economia moderada - RU=1, mmWave=1, 60% potência'
     },
     'REDUCE_POWER': {
         'ru_count': 1,
         'mmwave_count': 1,
-        'power_level': 70,
+        'power_level': 60,
         'ttl_seconds': 3,
         'description': 'Alias legado de CONDITIONAL_REDUCE'
     },
@@ -126,7 +126,18 @@ class EnergyCommand:
         # Criar diretório se não existir
         os.makedirs(os.path.dirname(self.command_path), exist_ok=True)
     
-    def write_command(self, action, power_level=None, reason="", ttl=None):
+    def write_command(
+        self,
+        action,
+        power_level=None,
+        reason="",
+        ttl=None,
+        requested_power_percent=None,
+        power_safety_override_reason="",
+        action_correlation_id="",
+        action_origin="",
+        application_status="",
+    ):
         """
         Envia comando de energia via Socket para o xApp.
         """
@@ -147,6 +158,14 @@ class EnergyCommand:
         command = {
             'action': action,
             'power_level': power_level,
+            'requested_power_percent': (
+                power_level if requested_power_percent is None else requested_power_percent
+            ),
+            'applied_power_percent': power_level,
+            'power_safety_override_reason': power_safety_override_reason,
+            'action_correlation_id': str(action_correlation_id or ''),
+            'action_origin': str(action_origin or ''),
+            'application_status': str(application_status or ''),
             'ru_count': action_info['ru_count'],
             'mmwave_count': action_info['mmwave_count'],
             'timestamp': timestamp_ns // 1_000_000_000,
@@ -178,6 +197,11 @@ class EnergyCommand:
                     mmwave_count=action_info['mmwave_count'],
                     reason=reason,
                     timestamp_ns=timestamp_ns,
+                    requested_power_percent=requested_power_percent,
+                    power_safety_override_reason=power_safety_override_reason,
+                    action_correlation_id=action_correlation_id,
+                    action_origin=action_origin,
+                    application_status=application_status,
                 )
             
             return True
@@ -201,6 +225,11 @@ class EnergyCommand:
                         mmwave_count=action_info['mmwave_count'],
                         reason=reason,
                         timestamp_ns=timestamp_ns,
+                        requested_power_percent=requested_power_percent,
+                        power_safety_override_reason=power_safety_override_reason,
+                        action_correlation_id=action_correlation_id,
+                        action_origin=action_origin,
+                        application_status=application_status,
                     )
                 return True
             except Exception as e2:
@@ -271,11 +300,11 @@ class EnergyCommand:
         return self.write_command('FULL_POWER', reason=reason)
     
     def send_reduce_power(self, reason=""):
-        """Envia comando CONDITIONAL_REDUCE - 70% potência."""
+        """Envia comando CONDITIONAL_REDUCE - 60% potência."""
         return self.write_command('CONDITIONAL_REDUCE', reason=reason)
     
     def send_conditional_reduce(self, reason=""):
-        """Envia comando CONDITIONAL_REDUCE - 70% potência."""
+        """Envia comando CONDITIONAL_REDUCE - 60% potência."""
         return self.write_command('CONDITIONAL_REDUCE', reason=reason)
     
     def send_power_down(self, reason=""):

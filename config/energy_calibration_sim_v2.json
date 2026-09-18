@@ -1,0 +1,41 @@
+{
+  "schema": "greenran.energy_calibration.v2",
+  "calibration_version": "sim_native_v2_experimental",
+  "status": "experimental_pending_36_cell_sweep",
+  "energy_reference_source": "ns3_device_energy_model",
+  "absolute_scale_valid": false,
+  "physical_wattmeter_available": false,
+  "calibration_corpus_id": "tasam_energy_calibration_sim_v1",
+  "calibration_rank_valid": false,
+  "fit_error": null,
+  "validation": {
+    "rmse_w": null,
+    "r2": null,
+    "max_abs_percent_error": null,
+    "monotonic": false,
+    "seeds": [45, 46, 47],
+    "power_percent": [25, 50, 75, 100],
+    "active_cells": [1, 2, 3]
+  },
+  "components": {
+    "ru": {"idle_w": 80.0, "active_w": 250.0, "source": "placeholder_not_promoted"},
+    "mmwave": {"idle_w": 40.0, "active_w": 180.0, "source": "placeholder_not_promoted"}
+  },
+  "model": {
+    "form": "P = idle_power + dynamic_power * power_percent / 100",
+    "fit_method": "nonnegative_monotonic_linear_regression",
+    "fit_scope": "native_ns3_relative_simulation",
+    "promotion_required": {"r2_min": 0.9, "max_abs_percent_error": 10.0, "rank_valid": true}
+  },
+  "artifacts": {
+    "binary_sha256": "",
+    "scenario_sha256": "",
+    "config_sha256": ""
+  },
+  "limitations": [
+    "Experimental until all 36 cells finish and validation thresholds pass.",
+    "Native ns-3 energy is a relative simulation reference, not physical consumption.",
+    "CPU, memory and I/O are reported separately and are not converted to joules.",
+    "This file must not replace config/energy_calibration.json unless the sweep gate passes."
+  ]
+}

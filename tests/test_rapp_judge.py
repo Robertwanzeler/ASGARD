@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rapp_judge import RAppJudge
+from rapp_judge import RAppJudge, expected_verdict_for_stage
 from rapp_data_lake import DataLake
 
 
@@ -396,6 +396,8 @@ def test_outcome_feedback_penalizes_both_when_they_agree_on_wrong_state():
     assert feedback["tasam_category_penalty"] == 0.5
     assert feedback["tasam_category_error"] is True
     assert feedback["credit_assignment"] == "joint_error"
+    assert feedback["tasam_training_category_credit"] == -1.0
+    assert feedback["tasam_training_category_penalty"] == 1.0
 
 
 def test_correct_assistant_gets_full_credit_and_wrong_adjacent_state_is_penalized():
@@ -446,6 +448,8 @@ def test_tasam_blocked_when_conditional_is_always_penalized():
     assert feedback["tasam_category_penalty"] == 1.0
     assert feedback["tasam_credit"] == -1.0
     assert feedback["tasam_resource_credit"] == 1.0
+    assert feedback["tasam_training_category_credit"] == -2.0
+    assert feedback["tasam_training_category_penalty"] == 2.0
 
 
 def test_directional_one_level_penalty_applies_to_all_category_pairs():
@@ -494,6 +498,8 @@ def test_invalid_tasam_proposal_gets_maximum_categorical_penalty():
     assert feedback["tasam_category_credit"] == -1.0
     assert feedback["tasam_category_penalty"] == 1.0
     assert feedback["tasam_category_error"] is True
+    assert feedback["tasam_training_category_credit"] == -2.0
+    assert feedback["tasam_training_category_penalty"] == 2.0
 
 
 def test_feedback_waits_for_delayed_observation():
@@ -585,6 +591,68 @@ def test_delayed_feedback_is_persisted_in_datalake():
             "FROM judge_outcome_history WHERE decision_timestamp = 101"
         ).fetchone()
         assert row == ("ALLOWED", -0.5, 1.0, 1.0, 0.0, 0, "ALLOWED", "ALLOWED", "rede normal")
+
+
+def test_datalake_persists_exact_decision_id_and_stage_alignment():
+    with tempfile.TemporaryDirectory() as tmp:
+        lake = DataLake(f"{tmp}/rapp.db")
+        decision = {
+            "timestamp": 101,
+            "collection_event_stage_name": "camera_conditional",
+            "selected_assistant": "ta_sam",
+            "rapp_judge_result": {"selected_advocate": "ta_sam"},
+        }
+        decision_id = lake.record_decision(decision)
+        assert decision_id is not None
+        decision["decision_id"] = decision_id
+        lake.record_judge_outcome(
+            decision,
+            {
+                "correct_verdict": "BLOCKED",
+                "outcome_observed": True,
+                "tasam_category_credit": -0.5,
+                "tasam_category_penalty": 0.5,
+                "tasam_category_error": True,
+                "tasam_predicted_verdict": "CONDITIONAL",
+                "tasam_observed_verdict": "BLOCKED",
+                "decision_stage_name": "camera_conditional",
+                "observed_stage_name": "camera_blocked",
+                "stage_boundary_feedback": True,
+                "nominal_expected_verdict": "CONDITIONAL",
+            },
+            {"correct_verdict": "BLOCKED", "reason": "transição real"},
+            observed_timestamp=102,
+        )
+        row = sqlite3.connect(f"{tmp}/rapp.db").execute(
+            "SELECT decision_id, decision_stage_name, observed_stage_name, "
+            "stage_boundary_feedback, nominal_expected_verdict "
+            "FROM judge_outcome_history WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        assert row == (decision_id, "camera_conditional", "camera_blocked", 1, "CONDITIONAL")
+
+
+def test_stage_nominal_labels_are_explicit_and_observed_classification_is_real():
+    assert expected_verdict_for_stage("allowed_stable") == "ALLOWED"
+    assert expected_verdict_for_stage("vehicle_conditional") == "CONDITIONAL"
+    healthy = {
+        "camera_metrics": {"active_cameras": 3, "throughput_ready": True, "throughput_mbps": 32, "latency_ms": 18},
+        "vehicle_metrics": {
+            "available": True, "total_vehicles": 5, "ego_present": True,
+            "max_latency_ms": 8, "max_packet_loss_percent": 0.2,
+        },
+        "app2_metrics": {"delivery_success_percent": 99, "packet_loss_percent": 1.2, "avg_latency_ms": 118},
+        "network_health": {"cvar_us": 50000},
+    }
+    conditional_vehicle = {
+        **healthy,
+        "vehicle_metrics": {
+            "available": True, "total_vehicles": 5, "ego_present": True,
+            "medium_risk_vehicles": 1, "max_latency_ms": 14, "max_packet_loss_percent": 0.6,
+        },
+    }
+    assert RAppJudge.derive_observed_outcome(healthy)["correct_verdict"] == "ALLOWED"
+    assert RAppJudge.derive_observed_outcome(conditional_vehicle)["correct_verdict"] == "CONDITIONAL"
 
 
 def test_continuous_observed_reward_is_monotonic_and_records_components():

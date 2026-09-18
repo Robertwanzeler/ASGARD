@@ -99,6 +99,78 @@ class TestMARLShadow(unittest.TestCase):
         self.assertGreaterEqual(comparison['shadow_ran_completion_est'], comparison['live_ran_completion_est'])
         self.assertIn('recommend_shadow', comparison)
 
+    def test_causal_score_includes_calibrated_energy_and_resources(self):
+        comparison = build_shadow_comparison(
+            {
+                'usable_budget': 1.0,
+                'd_ran': 0.5,
+                'd_ai': 0.3,
+                'r_ran': 0.6,
+                'r_ai': 0.4,
+                'live_power_percent': 100,
+                'live_ru_count': 1,
+                'live_mmwave_count': 1,
+            },
+            {
+                'available': True,
+                'source': 'checkpoint',
+                'checkpoint_readiness': 'control_candidate',
+                'shadow_r_ran': 0.5,
+                'shadow_r_ai': 0.3,
+                'shadow_power_percent': 60,
+            },
+        )
+        self.assertTrue(comparison['energy_valid'])
+        self.assertTrue(comparison['resource_valid'])
+        self.assertGreater(comparison['energy_saving_fraction'], 0.0)
+        self.assertGreater(comparison['resource_saving_fraction'], 0.0)
+        self.assertGreater(comparison['causal_score_delta'], comparison['score_delta'])
+
+    def test_causal_score_fails_closed_without_energy_observation(self):
+        comparison = build_shadow_comparison(
+            {'usable_budget': 1.0, 'r_ran': 0.6, 'r_ai': 0.4, 'd_ran': 0.5, 'd_ai': 0.3},
+            {
+                'available': True,
+                'source': 'checkpoint',
+                'checkpoint_readiness': 'control_candidate',
+                'shadow_r_ran': 0.5,
+                'shadow_r_ai': 0.3,
+                'shadow_power_percent': 60,
+            },
+        )
+        self.assertFalse(comparison['energy_valid'])
+        self.assertEqual(comparison['causal_score_delta'], 0.0)
+
+    def test_economic_allocation_head_reads_batched_output_after_batch_strip(self):
+        torch = __import__('torch')
+
+        class EconomicHead:
+            def __call__(self, states, temporal=None):
+                return torch.tensor([[0.40, 0.60, 0.72]], dtype=torch.float32)
+
+        evaluator = MARLShadowRuntimeEvaluator({'mode': 'shadow'})
+        evaluator._torch = torch
+        evaluator._allocation_head = EconomicHead()
+        evaluator.checkpoint_meta = {'global_state_dim': 2}
+
+        advice = evaluator._allocation_head_advice(
+            {'global_state': {'state_vector': [0.1, 0.2]}},
+            {},
+        )
+
+        self.assertTrue(advice['total_budget_head_enabled'])
+        self.assertEqual(advice['predicted_total_budget_fraction'], 0.72)
+
+    def test_online_economic_bootstrap_explores_only_safe_power_states(self):
+        evaluator = MARLShadowRuntimeEvaluator({'mode': 'shadow'})
+        with mock.patch.dict(os.environ, {'GREENRAN_TASAM_ECONOMIC_BOOTSTRAP_POWER': '25'}, clear=False):
+            conditional = evaluator._power_advice({}, 'CONDITIONAL', {})
+            blocked = evaluator._power_advice({}, 'BLOCKED', {})
+        self.assertEqual(conditional['power_percent'], 25.0)
+        self.assertEqual(conditional['source'], 'economic_bootstrap_exploration')
+        self.assertEqual(blocked['power_percent'], 100.0)
+        self.assertEqual(blocked['source'], 'safety_envelope')
+
     def test_armd_envelope_bounds_tasam_inside_policy_floors(self):
         evaluator = MARLShadowRuntimeEvaluator({'mode': 'shadow'})
         shadow = {

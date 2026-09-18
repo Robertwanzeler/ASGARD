@@ -157,8 +157,10 @@ VEHICLE_HEALTHY = {
 
 VEHICLE_ALLOWED_STABLE = {
     **VEHICLE_HEALTHY,
-    "ego_latency_ms": 12.0,
-    "traffic_latency_ms": 8.0,
+    # The runtime classifies >=10 ms as a warning. Keep the nominally
+    # ALLOWED curriculum stages strictly below that boundary.
+    "ego_latency_ms": 8.0,
+    "traffic_latency_ms": 6.0,
     "ego_packet_loss_percent": 0.05,
     "traffic_packet_loss_percent": 0.02,
     "max_speed_mps": 5.0,
@@ -168,10 +170,11 @@ VEHICLE_ALLOWED_STABLE = {
 VEHICLE_WARNING = {
     **VEHICLE_ALLOWED_STABLE,
     "medium_risk_vehicles": 1,
-    "ego_latency_ms": 58.0,
-    "traffic_latency_ms": 24.0,
-    "ego_packet_loss_percent": 2.6,
-    "traffic_packet_loss_percent": 0.8,
+    # Warning must remain below the critical thresholds (20 ms / 1%).
+    "ego_latency_ms": 14.0,
+    "traffic_latency_ms": 9.0,
+    "ego_packet_loss_percent": 0.6,
+    "traffic_packet_loss_percent": 0.3,
     "max_speed_mps": 8.2,
     "mode": "warning",
 }
@@ -263,7 +266,7 @@ PROFILES: dict[str, list[Stage]] = {
             4,
             app1={**APP1_HEALTHY, "throughput_mbps": 34.5, "avg_throughput_mbps": 35.4, "latency_ms": 14.0},
             app2={**APP2_ALLOWED_STABLE, "avg_latency_ms": 92.0, "packet_loss_percent": 0.9, "delivery_success_percent": 99.4, "mode": "allowed_training"},
-            vehicle={**VEHICLE_ALLOWED_STABLE, "ego_latency_ms": 10.0, "traffic_latency_ms": 7.0, "mode": "allowed_training"},
+            vehicle={**VEHICLE_ALLOWED_STABLE, "ego_latency_ms": 8.0, "traffic_latency_ms": 6.0, "mode": "allowed_training"},
             note="Janela ALLOWED limpa para a IA ver economia sustentável.",
         ),
         _stage(
@@ -319,7 +322,7 @@ PROFILES: dict[str, list[Stage]] = {
             4,
             app1={**APP1_HEALTHY, "throughput_mbps": 33.4, "avg_throughput_mbps": 34.0, "latency_ms": 16.0},
             app2={**APP2_ALLOWED_STABLE, "avg_latency_ms": 98.0, "mode": "allowed_recovery"},
-            vehicle={**VEHICLE_ALLOWED_STABLE, "ego_latency_ms": 11.0, "traffic_latency_ms": 7.5, "mode": "allowed_recovery"},
+            vehicle={**VEHICLE_ALLOWED_STABLE, "ego_latency_ms": 8.0, "traffic_latency_ms": 6.0, "mode": "allowed_recovery"},
             note="Recuperação longa para voltar a ALLOWED e fechar o ciclo balanceado.",
         ),
     ],
@@ -506,6 +509,144 @@ PROFILES["tasam_training_balanced_v3"] = [
     replace(stage, duration_s=12) for stage in PROFILES["tasam_training_balanced_v1"]
 ]
 
+# v4_v2x is intentionally an exact clone of balanced_v3 at the offered-load
+# level.  Its only scientific difference is the native GBR V2X bearer applied
+# by the ns-3 scenario to IMSIs 16--20.  Keeping the stage objects shared makes
+# a silent Python/C++ curriculum drift impossible to miss in validation.
+PROFILES["tasam_training_balanced_v4_v2x"] = [
+    replace(stage) for stage in PROFILES["tasam_training_balanced_v3"]
+]
+
+# v4_v2x_gbr is the QoS-corrected successor of v4_v2x.  It keeps the same
+# topology, mobility and offered-load curriculum, but the native scenario
+# also supplies explicit GBR/MBR values to the V2X bearer.  The versioned name
+# prevents the old baseline evidence from being mixed with the corrected
+# radio bearer semantics.
+PROFILES["tasam_training_balanced_v4_v2x_gbr"] = [
+    replace(stage) for stage in PROFILES["tasam_training_balanced_v3"]
+]
+
+# This successor keeps the exact same offered load and GBR bearer as v4 V2X
+# GBR.  Its only change is that the native scheduler now honours the GBR
+# reservation before best-effort scheduling; keeping a distinct profile makes
+# old radio evidence non-comparable by construction.
+PROFILES["tasam_training_balanced_v4_v2x_gbr_priority"] = [
+    replace(stage) for stage in PROFILES["tasam_training_balanced_v3"]
+]
+
+# Economic adaptation must contain enough CLEAR/ADVISORY windows for the
+# applied-action replay.  The balanced curriculum above intentionally
+# includes hard camera/vehicle/App2 pulses, which is useful for categorical
+# classification but starves the economic learner when real PDCP confirms a
+# persistent vehicle loss.  This profile does not weaken any SLA or ARMD
+# threshold: it simply exercises the controller in a controlled, non-critical
+# operating envelope.  Critical events remain covered by the separate
+# categorical curriculum and are still fail-safe when they occur in ns-3.
+PROFILES["tasam_training_economic_v4"] = [
+    _stage(
+        "allowed_bootstrap",
+        24,
+        app1=APP1_HEALTHY,
+        app2=APP2_ALLOWED_STABLE,
+        vehicle=VEHICLE_ALLOWED_STABLE,
+        note="Aquecimento estável para validar PDCP antes do replay econômico.",
+    ),
+    _stage(
+        "allowed_stable",
+        72,
+        app1={**APP1_HEALTHY, "throughput_mbps": 34.5, "avg_throughput_mbps": 35.4, "latency_ms": 14.0},
+        app2={**APP2_ALLOWED_STABLE, "avg_latency_ms": 92.0, "packet_loss_percent": 0.9, "delivery_success_percent": 99.4, "mode": "allowed_training"},
+        vehicle={**VEHICLE_ALLOWED_STABLE, "ego_latency_ms": 8.0, "traffic_latency_ms": 6.0, "mode": "allowed_training"},
+        note="Janela ALLOWED longa para gerar ações econômicas aplicadas.",
+    ),
+    _stage(
+        "camera_conditional",
+        48,
+        app1=APP1_WARNING,
+        app2=APP2_ALLOWED_STABLE,
+        vehicle=VEHICLE_ALLOWED_STABLE,
+        note="CONDITIONAL sem violação dura; TA-SAM permanece dentro dos pisos.",
+    ),
+    _stage(
+        "vehicle_conditional",
+        48,
+        app1=APP1_HEALTHY,
+        app2=APP2_ALLOWED_STABLE,
+        vehicle=VEHICLE_WARNING,
+        note="CONDITIONAL veicular preventivo, sem HARD_VETO confirmado.",
+    ),
+    _stage(
+        "app2_conditional",
+        48,
+        app1=APP1_HEALTHY,
+        app2=APP2_WARNING,
+        vehicle=VEHICLE_ALLOWED_STABLE,
+        note="CONDITIONAL mMTC sem estado crítico de App2.",
+    ),
+    _stage(
+        "allowed_recovery",
+        72,
+        app1=APP1_HEALTHY,
+        app2=APP2_ALLOWED_STABLE,
+        vehicle=VEHICLE_ALLOWED_STABLE,
+        note="Recuperação estável para fechar o ciclo sem fabricar veto.",
+    ),
+]
+
+# v12 pairs with the native ns-3 profile of the same name.  The vehicle
+# payload remains real-PDCP driven; this profile only supplies controlled
+# advisory stages and never increases the native vehicle offered load.
+PROFILES["tasam_training_economic_vehicle_safe_v1"] = [
+    _stage(
+        "allowed_bootstrap",
+        24,
+        app1=APP1_HEALTHY,
+        app2=APP2_ALLOWED_STABLE,
+        vehicle=VEHICLE_ALLOWED_STABLE,
+        note="Aquecimento com bearer V2X e carga veicular selecionada pela viabilidade.",
+    ),
+    _stage(
+        "allowed_stable",
+        72,
+        app1={**APP1_HEALTHY, "throughput_mbps": 34.5, "avg_throughput_mbps": 35.4, "latency_ms": 14.0},
+        app2={**APP2_ALLOWED_STABLE, "avg_latency_ms": 92.0, "packet_loss_percent": 0.9, "delivery_success_percent": 99.4, "mode": "allowed_training"},
+        vehicle={**VEHICLE_ALLOWED_STABLE, "ego_latency_ms": 8.0, "traffic_latency_ms": 6.0, "mode": "allowed_training"},
+        note="Janela ALLOWED para ações econômicas aplicadas.",
+    ),
+    _stage(
+        "camera_conditional",
+        48,
+        app1=APP1_WARNING,
+        app2=APP2_ALLOWED_STABLE,
+        vehicle=VEHICLE_ALLOWED_STABLE,
+        note="CONDITIONAL de câmera sem veto veicular.",
+    ),
+    _stage(
+        "vehicle_conditional",
+        48,
+        app1=APP1_HEALTHY,
+        app2=APP2_ALLOWED_STABLE,
+        vehicle=VEHICLE_WARNING,
+        note="Aviso veicular advisory; o hard veto depende somente do PDCP real.",
+    ),
+    _stage(
+        "app2_conditional",
+        48,
+        app1=APP1_HEALTHY,
+        app2=APP2_WARNING,
+        vehicle=VEHICLE_ALLOWED_STABLE,
+        note="CONDITIONAL mMTC sem alterar a carga veicular segura.",
+    ),
+    _stage(
+        "allowed_recovery",
+        72,
+        app1=APP1_HEALTHY,
+        app2=APP2_ALLOWED_STABLE,
+        vehicle=VEHICLE_ALLOWED_STABLE,
+        note="Recuperação estável para fechar o ciclo.",
+    ),
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alternate collection events by updating the GreenRAN scenario-control file.")
@@ -688,6 +829,12 @@ def write_payload(path: Path, profile_name: str, position: StagePosition) -> Non
         "vehicle_override": vehicle_payload,
         "network_health_override": network_health_override,
     }
+    pairing_schedule_id = str(os.environ.get("GREENRAN_PAIRING_SCHEDULE_ID", "") or "").strip()
+    if pairing_schedule_id:
+        payload["pairing_schedule_id"] = pairing_schedule_id
+        payload["pairing_stage_key"] = (
+            f"{pairing_schedule_id}:cycle:{position.cycle_index}:stage:{position.stage_index}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 

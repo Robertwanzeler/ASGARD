@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from greenran_paths import RAPP_DB_PATH  # noqa: E402
-from rapp_judge import RAppJudge  # noqa: E402
+from rapp_judge import RAppJudge, expected_verdict_for_stage  # noqa: E402
 
 SLICE_ORDER = ("eMBB", "mMTC", "URLLC")
 EXTENDED_METRICS_PREFERRED_COLUMNS = (
@@ -91,6 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="If next sim_time drops by more than this value, mark transition as sim reset",
+    )
+    parser.add_argument(
+        "--allocation-total-head-enabled",
+        action="store_true",
+        help=(
+            "Emit the economic three-output allocation-target contract. "
+            "Only the online-economic controller sets this; historical "
+            "exports retain the legacy two-output contract."
+        ),
     )
     return parser
 
@@ -282,10 +291,22 @@ def fetch_metrics(cursor: sqlite3.Cursor, timestamp: int) -> tuple[dict[str, Any
 
 def fetch_decision(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
     row = fetch_one(cursor, "select * from decisions_history where timestamp=?", (timestamp,))
-    return dict(row) if row else {}
+    decision = dict(row) if row else {}
+    if decision:
+        decision["economic_action"] = load_json(
+            decision.get("economic_action_json"), {}
+        )
+        decision["pdcp_loss_coverage"] = load_json(
+            decision.get("pdcp_coverage_json"), {}
+        )
+    return decision
 
 
-def fetch_judge_outcome(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
+def fetch_judge_outcome(
+    cursor: sqlite3.Cursor,
+    timestamp: int,
+    decision_id: int | None = None,
+) -> dict[str, Any]:
     """Load delayed judge feedback associated with one decision.
 
     The rApp persists the decision first and scores it on the next real
@@ -294,11 +315,25 @@ def fetch_judge_outcome(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any
     """
     if not table_exists(cursor, "judge_outcome_history"):
         return {}
-    row = fetch_one(
-        cursor,
-        "select * from judge_outcome_history where decision_timestamp=?",
-        (timestamp,),
-    )
+    columns = {
+        str(row[1])
+        for row in cursor.execute("PRAGMA table_info(judge_outcome_history)").fetchall()
+    }
+    row = None
+    if decision_id is not None and "decision_id" in columns:
+        row = fetch_one(
+            cursor,
+            "select * from judge_outcome_history where decision_id=? order by id desc limit 1",
+            (int(decision_id),),
+        )
+    match_method = "decision_id" if row else "timestamp"
+    if not row:
+        order_clause = " order by id desc" if "id" in columns else ""
+        row = fetch_one(
+            cursor,
+            f"select * from judge_outcome_history where decision_timestamp=?{order_clause} limit 1",
+            (timestamp,),
+        )
     if not row:
         # Decision and Judge timestamps are produced by independent runtime
         # callbacks. A bounded nearest match recovers the delayed outcome
@@ -325,6 +360,13 @@ def fetch_judge_outcome(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any
         "source_timestamp": int(row["decision_timestamp"]),
         "skew_s": abs(int(row["decision_timestamp"]) - int(timestamp)),
         "within_tolerance": abs(int(row["decision_timestamp"]) - int(timestamp)) <= JUDGE_TIMESTAMP_TOLERANCE_S,
+        "match_method": match_method,
+        "requested_decision_id": int(decision_id) if decision_id is not None else None,
+        "source_decision_id": (
+            int(row["decision_id"])
+            if "decision_id" in row.keys() and row["decision_id"] is not None
+            else None
+        ),
     }
     payload = load_json(outcome.get("feedback_json"), {})
     outcome["feedback"] = payload.get("feedback", {}) if isinstance(payload, dict) else {}
@@ -361,6 +403,14 @@ def fetch_judge_outcome(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any
             "armd_state_credit",
             "tasam_state_credit",
             "tasam_resource_credit",
+            "tasam_category_credit",
+            "tasam_category_penalty",
+            "tasam_category_error",
+            "tasam_training_category_credit",
+            "tasam_training_category_penalty",
+            "tasam_training_reward",
+            "tasam_predicted_verdict",
+            "tasam_observed_verdict",
             "proposal_errors",
             "proposal_penalties",
             "credit_assignment",
@@ -535,13 +585,55 @@ def compute_reward(record: dict[str, Any]) -> dict[str, Any]:
     usable = max(safe_float(resource_action.get("usable_budget"), 1.0), 1e-9)
     alloc_sum = safe_float(resource_action.get("r_ran")) + safe_float(resource_action.get("r_ai"))
     demand_sum = safe_float(resource_action.get("d_ran")) + safe_float(resource_action.get("d_ai"))
+    utilization_ratio = alloc_sum / usable
+    resource_use_penalty = clamp((utilization_ratio - 0.80) / 0.20)
     over_alloc_penalty = max(0.0, (alloc_sum - usable) / usable)
     shortage_penalty = max(0.0, (demand_sum - alloc_sum) / max(demand_sum, 1e-9))
     min_qos_penalty = sum(1.0 - clamp((slices.get(sid, {}) or {}).get("min_qos_met")) for sid in SLICE_ORDER) / len(SLICE_ORDER)
     conflict_penalty = min(0.25, 0.025 * safe_float(conflict.get("recent_count"), 0.0))
     loss_penalty = min(0.20, safe_float(metrics.get("global_packet_loss_rate"), 0.0) * 20.0)
 
-    reward = qos_score - (0.25 * over_alloc_penalty) - (0.20 * shortage_penalty) - (0.30 * min_qos_penalty) - conflict_penalty - loss_penalty
+    ran_completion = clamp(embb.get("completion_ratio"))
+    ai_demand = safe_float(mmtc.get("demand")) + safe_float(urllc.get("demand"))
+    ai_completion = (
+        (safe_float(mmtc.get("completion_ratio")) * safe_float(mmtc.get("demand"))
+         + safe_float(urllc.get("completion_ratio")) * safe_float(urllc.get("demand"))) / ai_demand
+        if ai_demand > 1e-9 else 1.0
+    )
+    ran_target, ai_target = 0.95, 0.75
+    completion_shortfall_penalty = min(
+        1.0,
+        (0.60 * max(0.0, ran_target - ran_completion) / ran_target)
+        + (0.40 * max(0.0, ai_target - ai_completion) / ai_target),
+    )
+    underallocation_penalty = min(1.0, max(shortage_penalty, completion_shortfall_penalty))
+    excess_allocation_penalty = min(1.0, max(over_alloc_penalty, resource_use_penalty))
+    allocation_state = str(resource_action.get("allocation_state", "") or "").upper()
+    power_raw = resource_action.get("power_percent", record.get("tasam_power_percent", 100.0))
+    try:
+        power_percent = max(25.0, min(100.0, float(power_raw)))
+    except (TypeError, ValueError):
+        power_percent = {"POWER_DOWN_ECO": 25.0, "REDUCE_POWER": 60.0, "CONDITIONAL_REDUCE": 60.0, "FULL_POWER": 100.0}.get(str(power_raw).upper(), 100.0)
+    service_safe = (
+        allocation_state != "BLOCKED"
+        and ran_completion >= ran_target
+        and ai_completion >= ai_target
+        and urllc_latency_ms <= 120.0
+        and safe_float(metrics.get("global_packet_loss_rate")) <= 0.01
+    )
+    power_cost_penalty = ((power_percent - 25.0) / 75.0) if service_safe else 0.0
+
+    normalized_loss = clamp(loss_penalty / 0.20)
+    continuous_error = (
+        (0.25 * clamp(1.0 - qos_score))
+        + (0.10 * clamp(min(1.0, safe_float(metrics.get("cvar_per_ue_us")) / 1000.0 / 120.0 - 1.0)))
+        + (0.05 * normalized_loss)
+        + (0.35 * completion_shortfall_penalty)
+        + (0.15 * underallocation_penalty)
+        + (0.05 * excess_allocation_penalty)
+        + (0.05 * power_cost_penalty)
+    )
+    reward = max(-1.0, min(1.0, float(1.0 - (2.0 * clamp(continuous_error)))))
     return {
         "reward": round(float(reward), 6),
         "components": {
@@ -550,10 +642,21 @@ def compute_reward(record: dict[str, Any]) -> dict[str, Any]:
             "mmtc_qos": round(mmtc_qos, 6),
             "urllc_qos": round(urllc_qos, 6),
             "over_alloc_penalty": round(over_alloc_penalty, 6),
+            "resource_use_penalty": round(resource_use_penalty, 6),
+            "excess_allocation_penalty": round(excess_allocation_penalty, 6),
             "shortage_penalty": round(shortage_penalty, 6),
             "min_qos_penalty": round(min_qos_penalty, 6),
             "conflict_penalty": round(conflict_penalty, 6),
             "loss_penalty": round(loss_penalty, 6),
+            "ran_completion": round(ran_completion, 6),
+            "ai_completion": round(ai_completion, 6),
+            "ran_completion_target": ran_target,
+            "ai_completion_target": ai_target,
+            "completion_shortfall_penalty": round(completion_shortfall_penalty, 6),
+            "underallocation_penalty": round(underallocation_penalty, 6),
+            "power_percent": round(power_percent, 6),
+            "power_cost_penalty": round(power_cost_penalty, 6),
+            "power_penalty_gated_by_service": int(service_safe),
         },
     }
 
@@ -606,7 +709,11 @@ def build_snapshot(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any] | N
         return None
     metrics, metrics_alignment = fetch_metrics(cursor, timestamp)
     decision = fetch_decision(cursor, timestamp)
-    judge_outcome = fetch_judge_outcome(cursor, timestamp)
+    judge_outcome = fetch_judge_outcome(
+        cursor,
+        timestamp,
+        decision_id=decision.get("id"),
+    )
     action = fetch_resource_action(cursor, timestamp)
     shadow = fetch_shadow(cursor, timestamp)
     conflict = fetch_conflict_context(cursor, timestamp)
@@ -637,6 +744,45 @@ def build_snapshot(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any] | N
     }
 
 
+def build_temporal_context(current: dict[str, Any], nxt: dict[str, Any]) -> list[float]:
+    """Build internal temporal features while preserving the external 13-D state."""
+    current_metrics = current.get("metrics") or {}
+    next_metrics = nxt.get("metrics") or {}
+    current_slices = current.get("slice_state") or {}
+    next_slices = nxt.get("slice_state") or {}
+    def completion(group: tuple[str, ...]) -> float:
+        demand = sum(safe_float((current_slices.get(sid) or {}).get("demand")) for sid in group)
+        return (
+            sum(safe_float((current_slices.get(sid) or {}).get("completion_ratio")) * safe_float((current_slices.get(sid) or {}).get("demand")) for sid in group) / demand
+            if demand > 1e-9 else 1.0
+        )
+    def next_completion(group: tuple[str, ...]) -> float:
+        demand = sum(safe_float((next_slices.get(sid) or {}).get("demand")) for sid in group)
+        return (
+            sum(safe_float((next_slices.get(sid) or {}).get("completion_ratio")) * safe_float((next_slices.get(sid) or {}).get("demand")) for sid in group) / demand
+            if demand > 1e-9 else 1.0
+        )
+    decision = current.get("decision") or {}
+    category = {"ALLOWED": 0.0, "CONDITIONAL": 0.5, "BLOCKED": 1.0}.get(str(decision.get("energy_saver", "")).upper(), 0.5)
+    action = current.get("action") or {}
+    alloc_total = safe_float(action.get("r_ran")) + safe_float(action.get("r_ai"))
+    budget = max(safe_float(action.get("usable_budget"), 1.0), 1e-9)
+    power = safe_float(action.get("power_percent"), 100.0) / 100.0
+    stage_boundary = int(str(current.get("scenario_stage", "")) != str(nxt.get("scenario_stage", "")))
+    return [
+        category,
+        (safe_float(next_metrics.get("cvar_per_ue_us")) - safe_float(current_metrics.get("cvar_per_ue_us"))) / 100000.0,
+        (safe_float(next_metrics.get("global_packet_loss_rate")) - safe_float(current_metrics.get("global_packet_loss_rate"))),
+        (safe_float(next_metrics.get("cvar_per_ue_us")) - safe_float(current_metrics.get("cvar_per_ue_us"))) / 100000.0,
+        next_completion(("eMBB",)) - completion(("eMBB",)),
+        next_completion(("mMTC", "URLLC")) - completion(("mMTC", "URLLC")),
+        alloc_total / budget,
+        0.0,
+        min(1.0, abs(safe_float(next_metrics.get("cvar_per_ue_us")) - safe_float(current_metrics.get("cvar_per_ue_us"))) / 100000.0 + 0.5 * stage_boundary),
+        power,
+    ]
+
+
 def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     reward = compute_reward(current)
     judge_outcome = current.get("judge_outcome") or {}
@@ -647,38 +793,41 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
     )
     if judge_observed:
         # Integral online training uses the continuous error from the next
-        # real observation.  Categorical Judge credit remains audit context
-        # and is retained as a compatibility fallback for older databases.
+        # real observation and the stronger categorical signal.  Older rows
+        # have no strong field and deliberately fall back to canonical credit.
         continuous_reward = judge_feedback.get("tasam_continuous_reward")
         category_credit = judge_feedback.get("tasam_category_credit")
-        # Only records carrying the explicit category field are new-format
-        # feedback.  Keep the legacy source label for old databases that only
-        # contain tasam_state_credit.
+        strong_credit = judge_feedback.get("tasam_training_category_credit")
         explicit_category_credit = category_credit is not None
+        explicit_strong_credit = strong_credit is not None
         if category_credit is None and (
             "tasam_category_penalty" in judge_feedback
             or "tasam_category_error" in judge_feedback
         ):
             category_credit = judge_feedback.get("tasam_state_credit")
+        if strong_credit is None:
+            strong_credit = category_credit
         if (
             continuous_reward is not None
-            and category_credit is not None
+            and strong_credit is not None
             and judge_feedback.get("tasam_reward_source") == "observed_real_metrics"
         ):
-            # A category mistake is an unavoidable negative training signal;
-            # a good continuous metric cannot compensate for it.
-            reward_hint = min(
-                clamp(continuous_reward, -1.0, 1.0),
-                clamp(category_credit, -1.0, 1.0),
+            reward_hint = min(clamp(continuous_reward, -1.0, 1.0), safe_float(strong_credit))
+            reward_source = (
+                "observed_real_metrics_with_strong_categorical_penalty"
+                if explicit_strong_credit
+                else "observed_real_metrics_with_categorical_penalty"
             )
-            reward_source = "observed_real_metrics_with_categorical_penalty"
         elif continuous_reward is not None and judge_feedback.get("tasam_reward_source") == "observed_real_metrics":
             reward_hint = clamp(continuous_reward, -1.0, 1.0)
             reward_source = "observed_real_metrics"
         else:
-            reward_hint = clamp(category_credit if category_credit is not None else judge_feedback.get("tasam_credit", 0.0), -1.0, 1.0)
+            reward_hint = strong_credit if strong_credit is not None else category_credit
+            reward_hint = safe_float(reward_hint if reward_hint is not None else judge_feedback.get("tasam_credit", 0.0))
             reward_source = (
-                "rapp_judge_category_credit"
+                "rapp_judge_strong_category_credit"
+                if explicit_strong_credit
+                else "rapp_judge_category_credit"
                 if explicit_category_credit
                 else "rapp_judge_tasam_credit"
             )
@@ -695,6 +844,9 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
             "tasam_category_credit": safe_float(judge_feedback.get("tasam_category_credit", category_credit)),
             "tasam_category_penalty": safe_float(judge_feedback.get("tasam_category_penalty")),
             "tasam_category_error": bool(judge_feedback.get("tasam_category_error", False)),
+            "tasam_training_category_credit": safe_float(judge_feedback.get("tasam_training_category_credit", strong_credit)),
+            "tasam_training_category_penalty": safe_float(judge_feedback.get("tasam_training_category_penalty")),
+            "tasam_training_reward": safe_float(judge_feedback.get("tasam_training_reward", reward_hint)),
             "tasam_predicted_verdict": judge_feedback.get("tasam_predicted_verdict", ""),
             "tasam_observed_verdict": judge_feedback.get("tasam_observed_verdict", judge_feedback.get("correct_verdict", "")),
         })
@@ -704,9 +856,95 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
         reward_components = reward["components"]
     quality = collection_quality(current.get("metrics", {}), current, nxt, args)
     current_decision = current.get("decision") or {}
+    decision_economic_action = current_decision.get("economic_action") or {}
+    feedback_economic_action = judge_feedback.get("economic_action") or {}
+    economic_action = (
+        feedback_economic_action
+        if isinstance(feedback_economic_action, dict) and feedback_economic_action
+        else decision_economic_action
+    )
+    economic_contract = str(
+        judge_feedback.get("economic_action_contract")
+        or current_decision.get("economic_action_contract")
+        or economic_action.get("contract")
+        or ""
+    )
+    economic_eligible = bool(
+        judge_feedback.get(
+            "economic_transition_eligible",
+            economic_action.get("economic_transition_eligible", False),
+        )
+    )
+    if economic_contract == "applied_action_v2":
+        # The category trace remains useful after a rejected intervention,
+        # but the economic critic/actor must not learn a fictional action.
+        reward_hint = safe_float(
+            judge_feedback.get("tasam_online_reward", 0.0) if economic_eligible else 0.0
+        )
+        reward_source = (
+            "realized_applied_economic_reward_v2"
+            if economic_eligible
+            else "economic_action_ineligible_v2"
+        )
+        reward_components = dict(reward_components)
+        reward_components.update({
+            "realized_energy_saving_fraction": safe_float(
+                judge_feedback.get("realized_energy_saving_fraction")
+            ),
+            "realized_allocation_saving_fraction": safe_float(
+                judge_feedback.get("realized_allocation_saving_fraction")
+            ),
+            "economic_transition_eligible": int(economic_eligible),
+            "economic_invalid_reason": str(
+                judge_feedback.get("economic_invalid_reason")
+                or economic_action.get("outcome_invalid_reason")
+                or ""
+            ),
+        })
+    decision_stage_name = str(
+        judge_feedback.get("decision_stage_name")
+        or current.get("scenario_stage")
+        or current_decision.get("collection_event_stage_name")
+        or ""
+    )
+    observed_stage_name = str(judge_feedback.get("observed_stage_name") or "")
+    stage_boundary_feedback = bool(
+        judge_feedback.get(
+            "stage_boundary_feedback",
+            bool(
+                decision_stage_name
+                and observed_stage_name
+                and decision_stage_name != observed_stage_name
+            ),
+        )
+    )
+    nominal_expected_verdict = str(
+        judge_feedback.get("nominal_expected_verdict")
+        or expected_verdict_for_stage(decision_stage_name)
+        or "UNKNOWN"
+    )
+    predicted_verdict = str(judge_feedback.get("tasam_predicted_verdict") or "UNKNOWN")
+    observed_verdict = str(
+        judge_feedback.get("tasam_observed_verdict")
+        or judge_feedback.get("correct_verdict")
+        or "UNKNOWN"
+    )
     if current_decision.get("training_run_invalid"):
         quality["valid_for_training"] = False
         quality["invalid_reason"] = current_decision.get("invalid_reason", "invalid_tasam_proposal")
+    action = dict(current.get("action") or {})
+    decision = current.get("decision") or {}
+    power_percent = action.get("power_percent", decision.get("energy_power_level"))
+    if power_percent is None:
+        power_percent = {"POWER_DOWN_ECO": 25.0, "REDUCE_POWER": 60.0, "CONDITIONAL_REDUCE": 60.0, "FULL_POWER": 100.0}.get(
+            str(decision.get("tasam_energy_action", "") or decision.get("action", "")).upper(), 100.0
+        )
+    action["power_percent"] = power_percent
+    resource_allocation = dict(decision.get("resource_allocation") or action.get("resource_allocation") or {})
+    marl_shadow = resource_allocation.get("marl_shadow") or {}
+    allocation_head = marl_shadow.get("allocation_head") or {}
+    allocation_projection = marl_shadow.get("allocation_projection") or {}
+    temporal_context = build_temporal_context(current, nxt)
     return {
         "schema": "greenran.tasam_article_transition.v1",
         "timestamp": current["timestamp"],
@@ -715,11 +953,46 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
         "topology_id": current.get("topology_id"),
         "scenario_stage": current.get("scenario_stage"),
         "next_scenario_stage": nxt.get("scenario_stage"),
+        "decision_stage_name": decision_stage_name,
+        "observed_stage_name": observed_stage_name,
+        "stage_boundary_feedback": stage_boundary_feedback,
+        "nominal_expected_verdict": nominal_expected_verdict,
+        "nominal_category_match": bool(
+            judge_observed
+            and nominal_expected_verdict != "UNKNOWN"
+            and predicted_verdict == nominal_expected_verdict
+        ),
+        "real_category_match": bool(
+            judge_observed
+            and predicted_verdict != "UNKNOWN"
+            and predicted_verdict == observed_verdict
+        ),
         "global_state": current["global_state"],
         "slice_state": current["slice_state"],
         "du_states": current["du_states"],
-        "action": current["action"],
-        "decision": current["decision"],
+        "action": action,
+        "decision": decision,
+        "decision_id": decision.get("decision_id", decision.get("id")),
+        "snapshot_sequence_id": decision.get("snapshot_sequence_id") or current.get("metrics_alignment", {}).get("snapshot_sequence_id", current.get("timestamp")),
+        "temporal_context": temporal_context,
+        "tasam_energy_action": decision.get("tasam_energy_action", ""),
+        "tasam_power_percent": power_percent,
+        "tasam_allocation_predicted_ran": safe_float(allocation_head.get("predicted_ran_share")),
+        "tasam_allocation_predicted_ai": safe_float(allocation_head.get("predicted_ai_share")),
+        "tasam_allocation_predicted_total": safe_float(allocation_head.get("predicted_total_budget_fraction")),
+        "tasam_allocation_target_ran": safe_float(allocation_projection.get("ran_min_share")),
+        "tasam_allocation_target_ai": safe_float(allocation_projection.get("ai_min_share")),
+        "tasam_allocation_target_total": safe_float(allocation_projection.get("total_budget_fraction")),
+        "tasam_allocation_target_source": allocation_projection.get("reason", ""),
+        "tasam_allocation_target_feasible": bool(allocation_projection.get("feasible", True)),
+        # The online controller declares its three-output contract at launch.
+        # A SQLite decision can omit optional nested allocation diagnostics
+        # while the active checkpoint still contains the economic head.
+        "allocation_total_head_enabled": bool(
+            getattr(args, "allocation_total_head_enabled", False)
+            or allocation_head.get("total_budget_head_enabled")
+            or str((marl_shadow.get("checkpoint_run_dir") or "")).endswith("economic_v1")
+        ),
         "training_run_invalid": bool(current_decision.get("training_run_invalid", False)),
         "judge_feedback": judge_feedback,
         "judge_observation": judge_outcome.get("observation", {}),
@@ -738,8 +1011,38 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
         "tasam_category_credit": safe_float(judge_feedback.get("tasam_category_credit")),
         "tasam_category_penalty": safe_float(judge_feedback.get("tasam_category_penalty")),
         "tasam_category_error": bool(judge_feedback.get("tasam_category_error", False)),
-        "tasam_predicted_verdict": judge_feedback.get("tasam_predicted_verdict", ""),
-        "tasam_observed_verdict": judge_feedback.get("tasam_observed_verdict", judge_feedback.get("correct_verdict", "")),
+        "tasam_training_category_credit": safe_float(judge_feedback.get("tasam_training_category_credit")),
+        "tasam_training_category_penalty": safe_float(judge_feedback.get("tasam_training_category_penalty")),
+        "tasam_training_reward": safe_float(judge_feedback.get("tasam_training_reward", reward_hint)),
+        "tasam_online_reward": safe_float(judge_feedback.get("tasam_online_reward", reward_hint)),
+        "tasam_energy_reward": safe_float(judge_feedback.get("tasam_energy_reward")),
+        "tasam_allocation_reward": safe_float(judge_feedback.get("tasam_allocation_reward")),
+        "tasam_sla_penalty": safe_float(judge_feedback.get("tasam_sla_penalty")),
+        "applied_power_percent": safe_float(judge_feedback.get("applied_power_percent", decision.get("tasam_power_applied_percent"))),
+        "applied_ran_allocation": safe_float(judge_feedback.get("applied_ran_allocation", resource_allocation.get("r_ran"))),
+        "applied_ai_allocation": safe_float(judge_feedback.get("applied_ai_allocation", resource_allocation.get("r_ai"))),
+        "applied_total_allocation": safe_float(judge_feedback.get("applied_total_allocation", (resource_allocation.get("r_ran", 0.0) or 0.0) + (resource_allocation.get("r_ai", 0.0) or 0.0))),
+        "economic_action_contract": economic_contract,
+        "economic_action": economic_action,
+        "economic_transition_eligible": economic_eligible,
+        "economic_application_status": str(
+            judge_feedback.get("economic_application_status")
+            or current_decision.get("economic_application_status")
+            or economic_action.get("application_status")
+            or ""
+        ),
+        "economic_rejection_reason": str(
+            current_decision.get("economic_rejection_reason")
+            or economic_action.get("rejection_reason")
+            or judge_feedback.get("economic_invalid_reason")
+            or ""
+        ),
+        "live_power_percent": safe_float(judge_feedback.get("live_power_percent", (economic_action.get("live_candidate") or {}).get("power_percent"))),
+        "live_total_allocation": safe_float(judge_feedback.get("live_total_allocation", (economic_action.get("live_candidate") or {}).get("total_allocation"))),
+        "realized_energy_saving_fraction": safe_float(judge_feedback.get("realized_energy_saving_fraction")),
+        "realized_allocation_saving_fraction": safe_float(judge_feedback.get("realized_allocation_saving_fraction")),
+        "tasam_predicted_verdict": predicted_verdict if judge_observed else "",
+        "tasam_observed_verdict": observed_verdict if judge_observed else "",
         "metrics": current["metrics"],
         "metrics_alignment": {
             "current": current.get("metrics_alignment") or {},
@@ -812,8 +1115,17 @@ def main() -> int:
     decision_counts: dict[str, int] = {}
     reward_source_counts: dict[str, int] = {}
     credit_assignment_counts: dict[str, int] = {}
+    real_category_matrix: dict[str, int] = {}
+    nominal_category_matrix: dict[str, int] = {}
     judge_feedback_observed = 0
+    stage_boundary_feedback = 0
+    real_category_errors = 0
+    nominal_category_matches = 0
+    nominal_category_evaluated = 0
     tasam_credits: list[float] = []
+    economic_contract_counts: dict[str, int] = {}
+    economic_eligible_transitions = 0
+    economic_ineligible_reasons: dict[str, int] = {}
     with out_path.open("w", encoding="utf-8") as fh:
         for current, nxt in zip(snapshots, snapshots[1:]):
             record = transition_record(current, nxt, args)
@@ -831,9 +1143,31 @@ def main() -> int:
             reward_source_counts[source] = reward_source_counts.get(source, 0) + 1
             assignment = str(record.get("credit_assignment") or "unobserved")
             credit_assignment_counts[assignment] = credit_assignment_counts.get(assignment, 0) + 1
+            contract = str(record.get("economic_action_contract") or "legacy")
+            economic_contract_counts[contract] = economic_contract_counts.get(contract, 0) + 1
+            if record.get("economic_transition_eligible"):
+                economic_eligible_transitions += 1
+            elif contract == "applied_action_v2":
+                reason = str(record.get("economic_rejection_reason") or "ineligible")
+                economic_ineligible_reasons[reason] = economic_ineligible_reasons.get(reason, 0) + 1
             if record.get("judge_feedback_observed"):
                 judge_feedback_observed += 1
                 tasam_credits.append(safe_float(record.get("tasam_credit")))
+                predicted = str(record.get("tasam_predicted_verdict") or "UNKNOWN")
+                observed = str(record.get("tasam_observed_verdict") or "UNKNOWN")
+                nominal = str(record.get("nominal_expected_verdict") or "UNKNOWN")
+                real_key = f"{predicted}->{observed}"
+                real_category_matrix[real_key] = real_category_matrix.get(real_key, 0) + 1
+                if predicted != observed:
+                    real_category_errors += 1
+                if record.get("stage_boundary_feedback"):
+                    stage_boundary_feedback += 1
+                if nominal != "UNKNOWN":
+                    nominal_category_evaluated += 1
+                    if predicted == nominal:
+                        nominal_category_matches += 1
+                    nominal_key = f"{predicted}->{nominal}"
+                    nominal_category_matrix[nominal_key] = nominal_category_matrix.get(nominal_key, 0) + 1
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             written += 1
             if args.limit and written >= args.limit:
@@ -851,9 +1185,24 @@ def main() -> int:
         "decision_counts": decision_counts,
         "judge_feedback_observed": judge_feedback_observed,
         "judge_feedback_coverage": judge_feedback_observed / max(written, 1),
+        "real_category_matrix": real_category_matrix,
+        "real_category_errors": real_category_errors,
+        "real_category_accuracy": (
+            (judge_feedback_observed - real_category_errors) / max(judge_feedback_observed, 1)
+        ),
+        "nominal_category_matrix": nominal_category_matrix,
+        "nominal_category_matches": nominal_category_matches,
+        "nominal_category_evaluated": nominal_category_evaluated,
+        "nominal_category_accuracy": (
+            nominal_category_matches / max(nominal_category_evaluated, 1)
+        ),
+        "stage_boundary_feedback": stage_boundary_feedback,
         "reward_source_counts": reward_source_counts,
         "credit_assignment_counts": credit_assignment_counts,
         "tasam_credit_mean": sum(tasam_credits) / max(len(tasam_credits), 1),
+        "economic_action_contract_counts": economic_contract_counts,
+        "economic_eligible_transitions": economic_eligible_transitions,
+        "economic_ineligible_reasons": economic_ineligible_reasons,
         "armd_policy": "read_only_context_no_runtime_mutation",
         "include_invalid": bool(args.include_invalid),
     }

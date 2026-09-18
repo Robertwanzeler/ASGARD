@@ -4,6 +4,7 @@
     "scenario_binary_pattern": "scenario-greenran",
     "total_ues": 20,
     "camera_imsis": [1, 2, 3],
+    "sensor_imsi_range": [4, 15],
     "background_imsi_range": [4, 15],
     "s1u_datarate_mbps": 15,
     "s1u_delay_ms": 5,
@@ -23,7 +24,7 @@
       "latency_warning_ms": 60,
       "latency_violation_ms": 80
     },
-    "app2": {"domain": "sensor", "notes": "ARMD and runtime logic remain unchanged"},
+    "app2": {"domain": "sensor", "sensor_imsi_range": [4, 15], "delivery_target_percent": 95, "packet_loss_limit_percent": 5, "latency_limit_ms": 500},
     "app3": {
       "domain": "vehicle",
       "max_vehicles": 5,

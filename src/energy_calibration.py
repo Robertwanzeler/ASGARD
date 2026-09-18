@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "energy_calibration.json"
 NANOSECONDS = 1_000_000_000
+SUPPORTED_SCHEMAS = {
+    "greenran.energy_calibration.v1",
+    "greenran.energy_calibration.v2",
+    "greenran.energy_calibration.v3",
+}
 
 
 def _finite(value: Any, default: float = 0.0) -> float:
@@ -36,12 +42,18 @@ def _component(raw: dict[str, Any], name: str) -> dict[str, float]:
 
 def load_calibration(path: Path | str | None = None) -> dict[str, Any]:
     """Load and validate the versioned calibration file."""
-    target = Path(path) if path else DEFAULT_CONFIG_PATH
+    selected = path or os.environ.get("GREENRAN_ENERGY_CALIBRATION_PATH")
+    target = Path(selected) if selected else DEFAULT_CONFIG_PATH
+    if os.environ.get("GREENRAN_LOCAL_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        project_root = Path(__file__).resolve().parents[1]
+        resolved_target = target.expanduser().resolve()
+        if "/run/media/" in str(resolved_target) or project_root not in resolved_target.parents:
+            raise ValueError(f"GREENRAN_LOCAL_ONLY rejeitou calibração fora do projeto: {resolved_target}")
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"calibração energética inválida ou ausente: {target}: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema") != "greenran.energy_calibration.v1":
+    if not isinstance(payload, dict) or payload.get("schema") not in SUPPORTED_SCHEMAS:
         raise ValueError(f"schema de calibração não suportado: {target}")
     components = payload.get("components")
     if not isinstance(components, dict):
@@ -51,9 +63,18 @@ def load_calibration(path: Path | str | None = None) -> dict[str, Any]:
         name: _component(components, name) for name in ("ru", "mmwave")
     }
     for name, values in normalized["components"].items():
-        if values["active_w"] <= 0.0:
+        if values["active_w"] <= 0.0 and normalized["schema"] == "greenran.energy_calibration.v1":
             raise ValueError(f"potência ativa inválida para {name}: {target}")
     normalized["calibration_path"] = str(target.resolve())
+    normalized["schema"] = str(payload.get("schema"))
+    normalized["absolute_scale_valid"] = bool(payload.get("absolute_scale_valid", False))
+    normalized["physical_wattmeter_available"] = bool(
+        payload.get("physical_wattmeter_available", False)
+    )
+    normalized["energy_reference_source"] = str(
+        payload.get("energy_reference_source", "calibrated_model")
+    )
+    normalized["calibration_rank_valid"] = bool(payload.get("calibration_rank_valid", True))
     return normalized
 
 
@@ -67,6 +88,83 @@ def state_power_w(calibration: dict[str, Any], ru_count: int, mmwave_count: int,
         dynamic = values["active_w"] - values["idle_w"]
         total += units * (values["idle_w"] + dynamic * level)
     return total
+
+
+def observed_radio_power_w(calibration: dict[str, Any], power_percent: float) -> float:
+    """Model the configured combined radio unit for native observations.
+
+    The current promoted-for-relative-use corpus identifies one combined
+    radio system, not independent RU and mmWave coefficients.  Native cell
+    traces still prove the power level and active cells; they must not be
+    multiplied by an invented RU count.  Separate-component calibrations keep
+    the historical state model and require explicit counts at their caller.
+    """
+    combined = calibration.get("combined_model") or {}
+    source = str((calibration.get("components") or {}).get("mmwave", {}).get("source", ""))
+    if combined and ("combined" in source or calibration.get("status") == "experimental_combined_model"):
+        level = max(0.0, min(100.0, _finite(power_percent, 100.0))) / 100.0
+        idle = max(0.0, _finite(combined.get("idle_w")))
+        dynamic = max(0.0, _finite(combined.get("dynamic_w")))
+        return idle + dynamic * level
+    raise ValueError("calibração não possui modelo combinado para observação nativa")
+
+
+def sleep_state_power_w(
+    calibration: dict[str, Any],
+    *,
+    active_cells: int,
+    power_percent: float,
+) -> float:
+    """Return the calibrated relative power for a native DU sleep state.
+
+    Sleep power is read from the calibration corpus; it is never inferred as
+    zero.  The result remains a simulation reference, not a physical-meter
+    measurement.
+    """
+    if active_cells < 1 or active_cells > 3:
+        raise ValueError("active_cells must be between 1 and 3")
+    states = calibration.get("sleep_states") or {}
+    key = str(int(active_cells))
+    state = states.get(key)
+    if not isinstance(state, dict):
+        raise ValueError(f"missing calibrated sleep state for {active_cells} active cells")
+    idle = float(state.get("idle_w"))
+    dynamic = float(state.get("dynamic_w"))
+    level = max(0.0, min(100.0, float(power_percent))) / 100.0
+    return idle + dynamic * level
+
+
+def sleep_state_power_by_cell_w(
+    calibration: dict[str, Any],
+    power_percent_by_cell: dict[Any, Any],
+) -> float:
+    """Model a per-DU action using the calibrated active-cell state.
+
+    The v3 corpus identifies the combined radio state for two or three active
+    DUs, not independent physical wattmeters.  We therefore use the explicit
+    calibrated state for the observed active-cell count and the mean observed
+    power of those active cells.  A sleeping DU is represented by the state
+    selection, never by an invented 0 W component.
+    """
+    if not isinstance(power_percent_by_cell, dict):
+        raise ValueError("power_percent_by_cell ausente")
+    values = []
+    for cell_id in (2, 3, 4):
+        raw = power_percent_by_cell.get(str(cell_id), power_percent_by_cell.get(cell_id))
+        if raw is None:
+            raise ValueError(f"potência observada ausente para célula {cell_id}")
+        value = float(raw)
+        if not math.isfinite(value) or value < 0.0 or value > 100.0:
+            raise ValueError(f"potência observada inválida para célula {cell_id}")
+        values.append(value)
+    active = [value for value in values if value > 0.0]
+    if len(active) not in {2, 3}:
+        raise ValueError("o modelo v3 exige duas ou três DUs ativas")
+    return sleep_state_power_w(
+        calibration,
+        active_cells=len(active),
+        power_percent=sum(active) / len(active),
+    )
 
 
 def _event_timestamp_ns(event: Any) -> int:
@@ -142,4 +240,36 @@ def integrate_energy_events(
         "calibration_version": calibration.get("calibration_version", "unknown"),
         "calibration_status": calibration.get("status", "unspecified"),
         "calibration_path": calibration.get("calibration_path", ""),
+        "energy_reference_source": calibration.get("energy_reference_source", "calibrated_model"),
+        "absolute_scale_valid": bool(calibration.get("absolute_scale_valid", False)),
+        "physical_wattmeter_available": bool(calibration.get("physical_wattmeter_available", False)),
+    }
+
+
+def integrate_native_energy_samples(samples: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Integrate native ns-3 samples expressed as cumulative joules.
+
+    Native ns-3 energy is a relative simulation reference.  The function is
+    intentionally independent of the provisional RU/mmWave watt model.
+    """
+    rows = sorted(list(samples), key=lambda row: _finite(row.get("timestamp_s")))
+    if len(rows) < 2:
+        return {"valid": False, "reason": "insufficient_native_samples", "energy_j": 0.0}
+    first = _finite(rows[0].get("timestamp_s"))
+    last = _finite(rows[-1].get("timestamp_s"))
+    cumulative = [_finite(row.get("energy_j")) for row in rows]
+    if last <= first or any(value < 0 for value in cumulative):
+        return {"valid": False, "reason": "invalid_native_timestamps_or_energy", "energy_j": 0.0}
+    energy = max(0.0, cumulative[-1] - cumulative[0])
+    duration = last - first
+    return {
+        "valid": energy >= 0.0 and duration > 0.0,
+        "reason": "ok",
+        "energy_j": energy,
+        "average_power_w": energy / duration if duration else 0.0,
+        "duration_s": duration,
+        "sample_count": len(rows),
+        "energy_reference_source": "ns3_device_energy_model",
+        "absolute_scale_valid": False,
+        "physical_wattmeter_available": False,
     }

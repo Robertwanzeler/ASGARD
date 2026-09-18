@@ -37,16 +37,20 @@ from greenran_paths import (
     XAPP_SLICER_LOG_PATH,
     XAPP_ENERGY_LOG_PATH,
     XAPP_VEHICLE_LOG_PATH,
+    XAPP_TASAM_LOG_PATH,
     XAPP_SLICER_PID_PATH,
     XAPP_ENERGY_PID_PATH,
     XAPP_VEHICLE_PID_PATH,
+    XAPP_TASAM_PID_PATH,
     STATE_DIR,
     XAPP_SOCKET_DIR,
     SLICER_SOCKET_PATH,
     ENERGY_SOCKET_PATH,
+    TASAM_CONTROL_SOCKET_PATH,
     as_str,
     ensure_runtime_dirs,
 )
+from greenran_infra_budget import CgroupV2Controller, InfraBudgetError
 
 BASE_DIR = as_str(PROJECT_ROOT)
 FLEXRIC_DIR = as_str(FLEXRIC_DIR)
@@ -57,6 +61,7 @@ XAPP_PATHS = {
     "slicer": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_slicer",
     "energy_saver": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_energy_saver",
     "vehicle_control": f"{BASE_DIR}/src/xapp_vehicle_control.py",
+    "tasam_actuator": f"{FLEXRIC_BUILD}/examples/xApp/c/xapp_tasam_actuator",
 }
 
 XAPP_BUILD_DIR_CANDIDATES = [
@@ -68,12 +73,14 @@ XAPP_LOG_PATHS = {
     "slicer": as_str(XAPP_SLICER_LOG_PATH),
     "energy_saver": as_str(XAPP_ENERGY_LOG_PATH),
     "vehicle_control": as_str(XAPP_VEHICLE_LOG_PATH),
+    "tasam_actuator": as_str(XAPP_TASAM_LOG_PATH),
 }
 
 XAPP_PID_PATHS = {
     "slicer": as_str(XAPP_SLICER_PID_PATH),
     "energy_saver": as_str(XAPP_ENERGY_PID_PATH),
     "vehicle_control": as_str(XAPP_VEHICLE_PID_PATH),
+    "tasam_actuator": as_str(XAPP_TASAM_PID_PATH),
 }
 
 
@@ -116,6 +123,7 @@ class XAppManager:
         env['LD_LIBRARY_PATH'] = self.ld_library_path
         env['GREENRAN_SLICER_SOCKET_PATH'] = as_str(SLICER_SOCKET_PATH)
         env['GREENRAN_ENERGY_SOCKET_PATH'] = as_str(ENERGY_SOCKET_PATH)
+        env['GREENRAN_TASAM_CONTROL_SOCKET_PATH'] = as_str(TASAM_CONTROL_SOCKET_PATH)
         return env
 
     def _candidate_binary_paths(self, xapp_name):
@@ -128,7 +136,7 @@ class XAppManager:
             candidates.extend([
                 build_dir / 'examples' / 'xApp' / 'c' / binary_name,
                 build_dir / 'examples' / 'xApp' / 'c' / xapp_name / binary_name,
-                build_dir / 'examples' / 'xApp' / 'c' / ('slicer' if xapp_name == 'slicer' else 'energy_saver') / binary_name,
+                build_dir / 'examples' / 'xApp' / 'c' / xapp_name / binary_name,
             ])
         candidates.append(Path(XAPP_PATHS[xapp_name]))
         unique = []
@@ -189,7 +197,14 @@ class XAppManager:
             else:
                 command = [binary_path, "-c", self.config_file, "-p", f"{self.flexric_lib}/"]
 
-            with open(log_path, 'w') as log_file:
+            # Keep every restart in the campaign log.  Replacing the file on
+            # each restart hid the first E2/RC crash and made the native
+            # confirmation diagnosis impossible.
+            with open(log_path, 'a', encoding='utf-8') as log_file:
+                log_file.write(
+                    f"[XAppManager] starting {xapp_name} binary={binary_path}\n"
+                )
+                log_file.flush()
                 process = subprocess.Popen(
                     command,
                     stdout=log_file,
@@ -199,6 +214,17 @@ class XAppManager:
                 )
             
             self.processes[xapp_name] = process
+            if (
+                xapp_name == "tasam_actuator"
+                and os.environ.get("GREENRAN_CGROUP_ENFORCE", "0").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                try:
+                    CgroupV2Controller().attach("tasam", process.pid)
+                except InfraBudgetError:
+                    process.terminate()
+                    process.wait(timeout=2)
+                    raise
             
             with open(pid_path, 'w') as f:
                 f.write(str(process.pid))
@@ -288,6 +314,7 @@ class XAppManager:
                 'slicer': 'xapp_slicer',
                 'energy_saver': 'xapp_energy_saver',
                 'vehicle_control': 'xapp_vehicle_control.py',
+                'tasam_actuator': 'xapp_tasam_actuator',
             }.get(xapp_name, '')
             if expected and expected not in cmdline:
                 self._cleanup(xapp_name)
@@ -371,7 +398,7 @@ class XAppManager:
         print("[XAppManager] Limpando processos zumbis...")
 
         if os.environ.get("GREENRAN_CLEAN_SCOPE", "instance") != "instance":
-            for pattern in ['xapp_slicer', 'xapp_energy_sav', 'xapp_vehicle_control.py', 'run_slicer', 'run_energy', 'VehicleControl']:
+            for pattern in ['xapp_slicer', 'xapp_energy_sav', 'xapp_vehicle_control.py', 'xapp_tasam_actuator', 'run_slicer', 'run_energy', 'VehicleControl']:
                 try:
                     subprocess.run(['pkill', '-9', '-f', pattern],
                                   capture_output=True, timeout=2)

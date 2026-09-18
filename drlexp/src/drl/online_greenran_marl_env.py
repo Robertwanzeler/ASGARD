@@ -41,6 +41,24 @@ def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return value
 
 
+def _power_percent(resource_action: dict[str, Any]) -> float:
+    """Return the applied/proposed power level using the campaign contract."""
+    raw = resource_action.get("power_percent", resource_action.get("tasam_power_percent"))
+    if raw is None:
+        raw = resource_action.get("energy_power_level", 100.0)
+    if isinstance(raw, str):
+        aliases = {
+            "ECO": 25.0,
+            "POWER_DOWN_ECO": 25.0,
+            "REDUCE": 60.0,
+            "REDUCE_POWER": 60.0,
+            "CONDITIONAL_REDUCE": 60.0,
+            "FULL_POWER": 100.0,
+        }
+        raw = aliases.get(raw.strip().upper(), raw)
+    return max(25.0, min(100.0, _safe_float(raw, 100.0)))
+
+
 def _normalize(raw: Sequence[float]) -> list[float]:
     cleaned = [max(0.0, _safe_float(value, 0.0)) for value in raw]
     total = sum(cleaned)
@@ -123,16 +141,56 @@ def build_balanced_vehicle_energy_reward(
     # CVaR is a hard safety objective for this campaign: relative tail
     # regressions dominate small energy/resource gains.
     tail_risk_penalty = min(2.0, (0.80 * relative_tail_excess) + (0.20 * target_tail_excess))
-    reward = (
-        qos_score
-        - (0.15 * over_alloc_penalty)
-        - (0.15 * shortage_penalty)
-        - (0.25 * min_qos_penalty)
-        - (0.25 * vehicle_sla_penalty)
-        - (0.10 * resource_use_penalty)
-        - (0.40 * tail_risk_penalty)
-        - loss_penalty
+    # Completion targets are explicit campaign objectives. RAN is represented
+    # by cameras/eMBB; AI is the demand-weighted mMTC+URLLC aggregate.
+    ran_completion = _clamp(embb.get("completion_ratio"), 0.0, 1.0)
+    ai_demand = _safe_float(slice_state["mMTC"].get("demand"), 0.0) + _safe_float(slice_state["URLLC"].get("demand"), 0.0)
+    ai_completion = (
+        (
+            _safe_float(slice_state["mMTC"].get("completion_ratio"), 0.0) * _safe_float(slice_state["mMTC"].get("demand"), 0.0)
+            + _safe_float(slice_state["URLLC"].get("completion_ratio"), 0.0) * _safe_float(slice_state["URLLC"].get("demand"), 0.0)
+        ) / ai_demand
+        if ai_demand > 1e-9
+        else 1.0
     )
+    ran_target = 0.95
+    ai_target = 0.75
+    ran_shortfall = max(0.0, ran_target - ran_completion) / ran_target
+    ai_shortfall = max(0.0, ai_target - ai_completion) / ai_target
+    completion_shortfall_penalty = min(1.0, (0.60 * ran_shortfall) + (0.40 * ai_shortfall))
+    underallocation_penalty = min(1.0, max(shortage_penalty, completion_shortfall_penalty))
+    excess_allocation_penalty = min(1.0, max(over_alloc_penalty, resource_use_penalty))
+    blocked = str(
+        resource_action.get("allocation_state", resource_action.get("state_category", ""))
+        or metrics.get("allocation_state", "")
+    ).upper() == "BLOCKED"
+    sla_safe = (
+        not blocked
+        and ran_completion >= ran_target
+        and ai_completion >= ai_target
+        and vehicle_sla_penalty <= 0.20
+        and cvar_ms <= cvar_target_ms
+        and _safe_float(metrics.get("global_packet_loss_rate", 0.0), 0.0) <= 0.01
+    )
+    power_percent = _power_percent(resource_action)
+    # Energy reduction is penalized only when service targets are met. In a
+    # critical state the safety/service objective has priority over energy.
+    power_cost_penalty = ((power_percent - 25.0) / 75.0) if sla_safe else 0.0
+    # The campaign objective is a bounded error budget. Completion and
+    # underallocation dominate the energy incentive, so a lower-power action
+    # cannot look good while the services are starved.
+    normalized_loss = _clamp(loss_penalty / 0.20)
+    continuous_error = (
+        (0.25 * _clamp(1.0 - qos_score))
+        + (0.10 * _clamp(tail_risk_penalty))
+        + (0.05 * normalized_loss)
+        + (0.35 * completion_shortfall_penalty)
+        + (0.15 * underallocation_penalty)
+        + (0.05 * excess_allocation_penalty)
+        + (0.05 * power_cost_penalty)
+    )
+    reward = 1.0 - (2.0 * _clamp(continuous_error))
+    reward = max(-1.0, min(1.0, float(reward)))
     return float(reward), {
         "qos_score": float(qos_score),
         "embb_qos": float(embb_qos),
@@ -142,6 +200,7 @@ def build_balanced_vehicle_energy_reward(
         "vehicle_loss_score": float(vehicle_loss_score),
         "vehicle_sla_penalty": float(vehicle_sla_penalty),
         "over_alloc_penalty": float(over_alloc_penalty),
+        "excess_allocation_penalty": float(excess_allocation_penalty),
         "shortage_penalty": float(shortage_penalty),
         "min_qos_penalty": float(min_qos_penalty),
         "resource_use_penalty": float(resource_use_penalty),
@@ -150,6 +209,16 @@ def build_balanced_vehicle_energy_reward(
         "relative_tail_excess": float(relative_tail_excess),
         "tail_risk_penalty": float(tail_risk_penalty),
         "loss_penalty": float(loss_penalty),
+        "ran_completion": float(ran_completion),
+        "ai_completion": float(ai_completion),
+        "ran_completion_target": float(ran_target),
+        "ai_completion_target": float(ai_target),
+        "completion_shortfall_penalty": float(completion_shortfall_penalty),
+        "underallocation_penalty": float(underallocation_penalty),
+        "power_percent": float(power_percent),
+        "power_cost_penalty": float(power_cost_penalty),
+        "energy_action": str(resource_action.get("energy_action", resource_action.get("tasam_energy_action", "")) or ""),
+        "power_penalty_gated_by_service": float(1.0 if sla_safe else 0.0),
     }
 
 

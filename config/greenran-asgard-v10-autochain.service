@@ -1,0 +1,15 @@
+[Unit]
+Description=Queue ASGARD v10 after approved V2X baseline
+After=greenran-campaign-dispatcher.service
+Wants=greenran-campaign-dispatcher.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/robert/orange_nuclear
+ExecStart=/usr/bin/python3 /home/robert/orange_nuclear/scripts/queue_asgard_v10_after_v2x.py
+Restart=no
+StandardOutput=append:/home/robert/orange_nuclear/runs/agent_jobs/logs/asgard-v10-autochain.log
+StandardError=append:/home/robert/orange_nuclear/runs/agent_jobs/logs/asgard-v10-autochain.log
+
+[Install]
+WantedBy=default.target

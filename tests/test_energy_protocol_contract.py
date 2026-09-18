@@ -39,7 +39,9 @@ class EnergyProtocolContractTestCase(unittest.TestCase):
         self.assertTrue(ok)
         written = self._read_command_file()
         self.assertEqual(written["action"], "CONDITIONAL_REDUCE")
-        self.assertEqual(written["power_level"], 70)
+        self.assertEqual(written["power_level"], 60)
+        self.assertEqual(written["requested_power_percent"], 60)
+        self.assertEqual(written["applied_power_percent"], 60)
         self.assertEqual(written["ttl_seconds"], 3)
         self.assertEqual(written["ru_count"], 1)
         self.assertEqual(written["mmwave_count"], 1)
@@ -84,6 +86,30 @@ class EnergyProtocolContractTestCase(unittest.TestCase):
         source_text = c_source.read_text(encoding="utf-8")
 
         self.assertIn('strcmp(action_str, "REDUCE_POWER")', source_text)
+
+    def test_requested_and_applied_power_are_separate(self):
+        class FakeLake:
+            def __init__(self):
+                self.rows = []
+
+            def record_energy_command(self, **payload):
+                self.rows.append(payload)
+
+        lake = FakeLake()
+        cmd = self.EnergyCommand(command_path=self.command_path, data_lake=lake)
+        self.assertTrue(
+            cmd.write_command(
+                "CONDITIONAL_REDUCE",
+                power_level=60,
+                requested_power_percent=25,
+                power_safety_override_reason="test",
+            )
+        )
+        written = self._read_command_file()
+        self.assertEqual(written["requested_power_percent"], 25)
+        self.assertEqual(written["applied_power_percent"], 60)
+        self.assertEqual(lake.rows[0]["requested_power_percent"], 25)
+        self.assertEqual(lake.rows[0]["power_safety_override_reason"], "test")
 
 
 if __name__ == "__main__":

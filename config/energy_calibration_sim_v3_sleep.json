@@ -1,0 +1,28 @@
+{
+  "schema": "greenran.energy_calibration.v3",
+  "calibration_version": "sim_v3_sleep_experimental",
+  "status": "experimental_sleep_state_pending_native_corpus",
+  "energy_reference_source": "ns3_device_energy_model",
+  "absolute_scale_valid": false,
+  "physical_wattmeter_available": false,
+  "calibration_rank_valid": false,
+  "components": {
+    "ru": {"idle_w": 80.0, "active_w": 250.0, "source": "inherited_relative_reference"},
+    "mmwave": {"idle_w": 40.0, "active_w": 180.0, "source": "inherited_relative_reference"}
+  },
+  "combined_model": {"idle_w": 120.0, "dynamic_w": 310.0, "source": "native_ns3_pending_sleep_sweep"},
+  "sleep_states": {
+    "3": {"idle_w": 120.0, "dynamic_w": 310.0, "source": "native_ns3_pending_sleep_sweep"},
+    "2": {"idle_w": 80.0, "dynamic_w": 205.0, "source": "native_ns3_pending_sleep_sweep"}
+  },
+  "model": {
+    "form": "P = calibrated_state_idle + calibrated_state_dynamic * power_percent / 100",
+    "fit_scope": "native_ns3_relative_simulation",
+    "sleep_state_identification": "requires_native_observed_active_cells"
+  },
+  "limitations": [
+    "Experimental until a native sweep identifies active and sleeping DU states.",
+    "Native ns-3 energy is a relative simulation reference, not physical consumption.",
+    "This file must not replace config/energy_calibration.json automatically."
+  ]
+}

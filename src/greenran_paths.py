@@ -45,7 +45,12 @@ DRL_VENV_SITE_PACKAGES = (
 
 XAPP_INTENTS_DIR = STATE_DIR / "xapp_intents"
 XAPP_METRICS_DIR = STATE_DIR / "xapp_metrics"
-XAPP_SOCKET_DIR = STATE_DIR / "sockets"
+# Unix-domain sockets have a small kernel path limit (usually 108 bytes).
+# Campaign state paths can legitimately be much longer, so actuation launchers
+# may provide a short per-run socket directory without moving any evidence.
+XAPP_SOCKET_DIR = Path(
+    os.environ.get("GREENRAN_SOCKET_DIR", STATE_DIR / "sockets")
+).resolve()
 RAPP_POLICIES_DIR = STATE_DIR / "rapp_policies"
 CARLA_STATE_DIR = STATE_DIR / "carla_state"
 
@@ -63,6 +68,13 @@ RAPP_DECISION_PATH = XAPP_INTENTS_DIR / "rapp_decision.txt"
 ENERGY_COMMAND_PATH = XAPP_INTENTS_DIR / "energy_command.json"
 SLICER_SOCKET_PATH = XAPP_SOCKET_DIR / "slicer.sock"
 ENERGY_SOCKET_PATH = XAPP_SOCKET_DIR / "energy_saver.sock"
+TASAM_CONTROL_SOCKET_PATH = XAPP_SOCKET_DIR / "tasam_control.sock"
+TASAM_CONTROL_BUNDLE_PATH = XAPP_INTENTS_DIR / "tasam_control_bundle.json"
+TASAM_CONTROL_ACK_PATH = XAPP_INTENTS_DIR / "tasam_control_ack.json"
+TASAM_CONTROL_AUDIT_PATH = XAPP_INTENTS_DIR / "tasam_control_audit.jsonl"
+TASAM_NATIVE_CONTROL_OBSERVATIONS_PATH = Path(
+    os.environ.get("GREENRAN_NS3_ENERGY_OUTPUT_DIR", STATE_DIR / "ns3_energy")
+) / "TasamControlObservations.csv"
 
 METRICS_JSON_PATH = XAPP_METRICS_DIR / "metrics.json"
 EXTENDED_METRICS_JSON_PATH = XAPP_METRICS_DIR / "extended_metrics.json"
@@ -72,9 +84,11 @@ CARLA_VEHICLE_MAP_PATH = CARLA_STATE_DIR / "vehicle_network_map.json"
 XAPP_SLICER_LOG_PATH = STATE_DIR / "xapp_slicer.log"
 XAPP_ENERGY_LOG_PATH = STATE_DIR / "xapp_energy.log"
 XAPP_VEHICLE_LOG_PATH = STATE_DIR / "xapp_vehicle.log"
+XAPP_TASAM_LOG_PATH = STATE_DIR / "xapp_tasam_actuator.log"
 XAPP_SLICER_PID_PATH = STATE_DIR / "xapp_slicer.pid"
 XAPP_ENERGY_PID_PATH = STATE_DIR / "xapp_energy.pid"
 XAPP_VEHICLE_PID_PATH = STATE_DIR / "xapp_vehicle.pid"
+XAPP_TASAM_PID_PATH = STATE_DIR / "xapp_tasam_actuator.pid"
 
 
 def ensure_runtime_dirs() -> None:
@@ -148,6 +162,83 @@ def get_fixed_background_imsi_range(default: tuple[int, int] = (4, 12)) -> tuple
         return (int(values[0]), int(values[1]))
     except (TypeError, ValueError):
         return default
+
+
+def _scenario_range(paths: tuple[tuple[str, ...], ...], default: tuple[int, int]) -> tuple[int, int]:
+    """Read the first valid inclusive IMSI range from the fixed scenario."""
+    payload = load_fixed_scenario_config()
+    for path in paths:
+        current = payload
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        try:
+            if isinstance(current, (list, tuple)) and len(current) == 2:
+                start, end = int(current[0]), int(current[1])
+                if start > 0 and end >= start:
+                    return (start, end)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def get_fixed_sensor_imsi_range(default: tuple[int, int] = (4, 15)) -> tuple[int, int]:
+    """Return the canonical sensor IMSI range for the fixed GreenRAN scenario."""
+    return _scenario_range(
+        (("apps", "app2", "sensor_imsi_range"), ("ns3", "sensor_imsi_range")),
+        default,
+    )
+
+
+def get_fixed_vehicle_imsi_range(default: tuple[int, int] = (16, 20)) -> tuple[int, int]:
+    """Return the canonical vehicle IMSI range for the fixed scenario."""
+    payload = load_fixed_scenario_config()
+    app3 = payload.get("apps", {}).get("app3", {}) if isinstance(payload.get("apps", {}), dict) else {}
+    configured = _scenario_range((("apps", "app3", "vehicle_imsi_range"),), default)
+    if configured != default or (isinstance(app3, dict) and app3.get("vehicle_imsi_range")):
+        return configured
+    base = get_fixed_vehicle_base_imsi(default[0])
+    count = get_fixed_max_vehicles(default[1] - default[0] + 1)
+    return (base, base + max(0, count - 1))
+
+
+def get_fixed_service_imsis() -> dict[str, tuple[int, ...]]:
+    """Return immutable service-to-IMSI partitions used by runtime floors."""
+    camera = tuple(sorted(set(get_fixed_camera_imsis())))
+    sensor_start, sensor_end = get_fixed_sensor_imsi_range()
+    vehicle_start, vehicle_end = get_fixed_vehicle_imsi_range()
+    sensor = tuple(range(sensor_start, sensor_end + 1))
+    vehicle = tuple(range(vehicle_start, vehicle_end + 1))
+    all_imsis = tuple(sorted(set(camera) | set(sensor) | set(vehicle)))
+    return {
+        "camera": camera,
+        "sensor": sensor,
+        "vehicle": vehicle,
+        "all": all_imsis,
+    }
+
+
+def validate_fixed_service_topology() -> dict[str, object]:
+    """Validate that configured service partitions describe the fixed UE set."""
+    services = get_fixed_service_imsis()
+    expected = tuple(range(1, 21))
+    partitions = [set(services[name]) for name in ("camera", "sensor", "vehicle")]
+    disjoint = partitions[0] | partitions[1] | partitions[2]
+    disjoint_ok = sum(len(part) for part in partitions) == len(disjoint)
+    valid = (
+        disjoint_ok
+        and services["all"] == expected
+        and all(services[name] for name in ("camera", "sensor", "vehicle"))
+    )
+    return {
+        "valid": valid,
+        "expected_imsis": list(expected),
+        "services": {name: list(services[name]) for name in ("camera", "sensor", "vehicle")},
+        "duplicate_free": disjoint_ok,
+        "reason": "ok" if valid else "fixed_service_topology_invalid",
+    }
 
 
 def get_fixed_marl_topology() -> dict:

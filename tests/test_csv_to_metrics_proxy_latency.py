@@ -302,7 +302,10 @@ class TestCsvToMetricsProxyLatency(unittest.TestCase):
         self.assertEqual(vehicle["latency_source"], "pdcp_real")
         self.assertFalse(vehicle["latency_is_proxy"])
         self.assertEqual(vehicle["latency_us"], 120000.0)
-        self.assertAlmostEqual(vehicle["packet_loss_percent"], 0.05)
+        # Real PDCP TX/RX counters are authoritative; the scenario override
+        # may enrich vehicle risk/state metadata but cannot replace measured
+        # loss with a synthetic value.
+        self.assertAlmostEqual(vehicle["packet_loss_percent"], 0.0)
         self.assertEqual(result["global_metrics"]["latency_sample_source_counts"], {"pdcp_real": 1})
 
     def test_pdcp_path_merges_carla_vehicles_missing_from_pdcp(self):

@@ -1,0 +1,16 @@
+[Unit]
+Description=Delegate GreenRAN cgroup-v2 subtree to robert's user manager
+After=local-fs.target user@1000.service
+Wants=local-fs.target user@1000.service
+ConditionPathIsMountPoint=/sys/fs/cgroup
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/lib/greenran/setup_greenran_cgroup_delegation.sh
+RemainAfterExit=yes
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

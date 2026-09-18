@@ -383,6 +383,16 @@ def read_network_run(
         conn.close()
     all_real_metrics = _valid_pdcp_metrics(metrics)
     all_metric_tokens, alignment_scheme = _metric_alignment_tokens(all_real_metrics)
+    metric_columns = set(metrics[0].keys()) if metrics else set()
+    associated_by_decision: dict[int, sqlite3.Row] = {}
+    if "decision_id" in metric_columns:
+        for row in all_real_metrics:
+            try:
+                decision_id = int(row["decision_id"] or 0)
+            except (TypeError, ValueError):
+                decision_id = 0
+            if decision_id > 0 and decision_id not in associated_by_decision:
+                associated_by_decision[decision_id] = row
     if metric_tokens is None:
         raw_real_metrics = all_real_metrics
     else:
@@ -395,6 +405,17 @@ def read_network_run(
         raise ValueError(f"Nenhuma decisão em {db_path}")
 
     decision_columns = set(decisions[0].keys())
+    pairing_schedule_ids = [
+        str(row["pairing_schedule_id"] or "")
+        for row in decisions
+        if "pairing_schedule_id" in decision_columns
+    ]
+    snapshot_sequence_ids = [
+        str(row["snapshot_sequence_id"] or "")
+        for row in decisions
+        if "snapshot_sequence_id" in decision_columns
+    ]
+    sequence_duplicates = len(snapshot_sequence_ids) != len(set(snapshot_sequence_ids))
     assistant_modes = [
         str(row["control_trial_mode"] or "") if "control_trial_mode" in decision_columns else ""
         for row in decisions
@@ -448,14 +469,35 @@ def read_network_run(
             for row in decisions
         )
 
-    # A PDCP snapshot is a collector window, not a one-to-one rApp decision.
-    # Evaluate the common prefix of real snapshots and decisions, preserving
-    # the raw count for audit. This avoids pairing a synthetic/proxy row or a
-    # later post-stop snapshot with an earlier decision.
-    aligned_metric_count = min(len(raw_real_metrics), len(decisions))
+    # Standalone runs now persist the exact decision_id on each real snapshot.
+    # Use that association instead of a timestamp/prefix pairing.  Keep the
+    # legacy common-prefix behavior for old databases and paired token views.
+    decision_ids = []
+    if metric_tokens is None and associated_by_decision:
+        for decision in decisions:
+            try:
+                decision_id = int(
+                    (decision["decision_id"] if "decision_id" in decision.keys() else decision["id"])
+                    or 0
+                )
+            except (KeyError, TypeError, ValueError):
+                decision_id = 0
+            decision_ids.append(decision_id)
+        real_metrics = [associated_by_decision[item] for item in decision_ids if item in associated_by_decision]
+        aligned_metric_count = len(real_metrics)
+        alignment_mode = "decision_id_associated_real_snapshots"
+    else:
+        aligned_metric_count = min(len(raw_real_metrics), len(decisions))
+        real_metrics = raw_real_metrics[:aligned_metric_count]
+        alignment_mode = (
+            "common_sim_time_occurrence_windows"
+            if metric_tokens is not None and alignment_scheme == "sim_time_occurrence"
+            else "common_prefix(real_pdcp_snapshots, decisions)"
+        )
     if metric_limit is not None and int(metric_limit) > 0:
         aligned_metric_count = min(aligned_metric_count, int(metric_limit))
-    real_metrics = raw_real_metrics[:aligned_metric_count]
+        real_metrics = real_metrics[:aligned_metric_count]
+    associated_missing_ids = [item for item in decision_ids if item and item not in associated_by_decision]
     service = _service_scores(ue_rows, real_metrics)
     sla_score = sum(SERVICE_WEIGHTS[key] * service[key] for key in SERVICE_WEIGHTS)
     p95_mean_us = _mean([float(row["latency_p95_per_ue_us"] or 0.0) for row in real_metrics])
@@ -504,15 +546,18 @@ def read_network_run(
         # evaluator selects only common simulated windows below.
         "real_pdcp_metric_rows": len(all_real_metrics),
         "aligned_real_pdcp_metric_rows": len(real_metrics),
-        "evaluation_window": (
-            "common_sim_time_occurrence_windows"
-            if metric_tokens is not None and alignment_scheme == "sim_time_occurrence"
-            else "common_prefix(real_pdcp_snapshots, decisions)"
-        ),
+        "evaluation_window": alignment_mode,
         "proxy_metric_rows": len(proxy_rows),
         # This flag describes the raw collector output. The evaluated
         # statistics may intentionally use a shorter common prefix.
-        "metrics_aligned_to_decisions": len(all_real_metrics) == len(decisions),
+        "associated_real_metric_rows": len(associated_by_decision),
+        "missing_decision_metric_ids": associated_missing_ids,
+        "pairing_schedule_ids": sorted({value for value in pairing_schedule_ids if value}),
+        "snapshot_sequence_ids": snapshot_sequence_ids,
+        "snapshot_sequence_duplicates": sequence_duplicates,
+        "metrics_aligned_to_decisions": (
+            not associated_missing_ids if associated_by_decision else len(all_real_metrics) == len(decisions)
+        ),
         "evaluation_metrics_aligned": len(real_metrics) == len(decisions),
         "valid_real_only": bool(real_metrics) and not proxy_rows,
         "service_sla_score": service,
@@ -558,6 +603,7 @@ def pair_result(
     allow_metric_gap: bool = False,
     calibration_path: Path | None = None,
     target_decisions: int = 65,
+    max_metric_gap: int = 0,
 ) -> dict[str, Any]:
     baseline = read_network_run(baseline_dir, calibration_path)
     assistant = read_network_run(assistant_dir, calibration_path)
@@ -565,6 +611,27 @@ def pair_result(
     assistant_tokens = set(assistant.pop("_alignment_tokens", []))
     baseline_scheme = baseline.pop("_alignment_scheme", "row_order")
     assistant.pop("_alignment_scheme", None)
+    configured_metric_gap = max(0, int(max_metric_gap or 0))
+    # Keep the historical flag working for callers that have not migrated to
+    # the explicit limit yet. New callers should use --max-metric-gap.
+    if allow_metric_gap:
+        configured_metric_gap = max(configured_metric_gap, 1)
+    pairing_ids = {
+        *(baseline.get("pairing_schedule_ids") or []),
+        *(assistant.get("pairing_schedule_ids") or []),
+    }
+    pairing_required = bool(pairing_ids)
+    same_pairing_schedule = (
+        baseline.get("pairing_schedule_ids") == assistant.get("pairing_schedule_ids")
+        and len(pairing_ids) == 1
+    ) if pairing_required else True
+    same_snapshot_sequence = (
+        baseline.get("snapshot_sequence_ids") == assistant.get("snapshot_sequence_ids")
+        and bool(baseline.get("snapshot_sequence_ids"))
+    ) if pairing_required else True
+    no_sequence_duplicates = not (
+        baseline.get("snapshot_sequence_duplicates") or assistant.get("snapshot_sequence_duplicates")
+    )
     common_tokens = [token for token in baseline_tokens if token in assistant_tokens]
     if common_tokens:
         # Recompute both sides over exactly the same real-PDCP simulated
@@ -706,6 +773,49 @@ def pair_result(
     )
     resource_delta["valid"] = resource_valid
     deltas["resource"] = resource_delta
+    baseline_metric_gap = abs(
+        int(baseline["real_pdcp_metric_rows"]) - int(baseline["decisions"])
+    )
+    assistant_metric_gap = abs(
+        int(assistant["real_pdcp_metric_rows"]) - int(assistant["decisions"])
+    )
+    metric_row_gap = abs(
+        int(baseline["real_pdcp_metric_rows"])
+        - int(assistant["real_pdcp_metric_rows"])
+    )
+    common_aligned_real_pdcp_rows = min(
+        int(baseline["aligned_real_pdcp_metric_rows"]),
+        int(assistant["aligned_real_pdcp_metric_rows"]),
+    )
+    gap_within_limit = (
+        baseline_metric_gap <= configured_metric_gap
+        and assistant_metric_gap <= configured_metric_gap
+        and metric_row_gap <= configured_metric_gap
+    )
+    common_window_valid = (
+        baseline["aligned_real_pdcp_metric_rows"]
+        == assistant["aligned_real_pdcp_metric_rows"]
+        and common_aligned_real_pdcp_rows >= 50
+    )
+    gap_tolerated = bool(
+        configured_metric_gap > 0
+        and (baseline_metric_gap or assistant_metric_gap or metric_row_gap)
+        and gap_within_limit
+    )
+    if gap_tolerated:
+        tolerance_reason = (
+            f"diferença de {metric_row_gap} linha(s) PDCP real(is) aceita; "
+            f"limite configurado={configured_metric_gap}; estatísticas "
+            f"calculadas na janela comum de {common_aligned_real_pdcp_rows} linhas"
+        )
+    elif metric_row_gap or baseline_metric_gap or assistant_metric_gap:
+        tolerance_reason = (
+            f"diferença PDCP fora do limite: baseline_decision_gap="
+            f"{baseline_metric_gap}, assistant_decision_gap={assistant_metric_gap}, "
+            f"cross_arm_gap={metric_row_gap}, limite={configured_metric_gap}"
+        )
+    else:
+        tolerance_reason = "nenhuma diferença de contagem PDCP observada"
     return {
         "seed": int(seed),
         "repetition": int(repetition),
@@ -718,16 +828,27 @@ def pair_result(
             "same_real_pdcp_rows": baseline["real_pdcp_metric_rows"] == assistant["real_pdcp_metric_rows"],
             "alignment_scheme": baseline_scheme,
             "comparison_aligned_with_one_snapshot_gap": (
-                abs(baseline["real_pdcp_metric_rows"] - baseline["decisions"]) <= 1
-                and abs(assistant["real_pdcp_metric_rows"] - assistant["decisions"]) <= 1
-                and abs(baseline["real_pdcp_metric_rows"] - assistant["real_pdcp_metric_rows"]) <= 1
+                baseline_metric_gap <= configured_metric_gap
+                and assistant_metric_gap <= configured_metric_gap
+                and metric_row_gap <= configured_metric_gap
             ),
             "common_aligned_real_window": (
-                baseline["aligned_real_pdcp_metric_rows"]
-                == assistant["aligned_real_pdcp_metric_rows"]
-                and baseline["aligned_real_pdcp_metric_rows"] >= 50
+                common_window_valid
             ),
-            "metric_gap_allowed": bool(allow_metric_gap),
+            "metric_gap_allowed": bool(configured_metric_gap),
+            "max_metric_gap": configured_metric_gap,
+            "baseline_real_pdcp_rows": int(baseline["real_pdcp_metric_rows"]),
+            "assistant_real_pdcp_rows": int(assistant["real_pdcp_metric_rows"]),
+            "baseline_decision_metric_gap": baseline_metric_gap,
+            "assistant_decision_metric_gap": assistant_metric_gap,
+            "metric_row_gap": metric_row_gap,
+            "gap_within_limit": gap_within_limit,
+            "gap_tolerated": gap_tolerated,
+            "common_aligned_real_pdcp_rows": common_aligned_real_pdcp_rows,
+            "tolerance_justification": tolerance_reason,
+            "pairing_schedule_equal": same_pairing_schedule,
+            "snapshot_sequence_equal": same_snapshot_sequence,
+            "snapshot_sequence_unique": no_sequence_duplicates,
         },
         "deltas": deltas,
         "component_deltas": component_deltas,
@@ -741,21 +862,17 @@ def pair_result(
             and baseline["decisions"] == assistant["decisions"] == int(target_decisions)
             and (
                 (baseline["metrics_aligned_to_decisions"] and assistant["metrics_aligned_to_decisions"])
-                if not allow_metric_gap
-                else (
-                    baseline["aligned_real_pdcp_metric_rows"]
-                    == assistant["aligned_real_pdcp_metric_rows"]
-                    and baseline["aligned_real_pdcp_metric_rows"] >= 50
-                )
+                if configured_metric_gap == 0
+                else common_window_valid and gap_within_limit
             )
             and (
                 baseline["real_pdcp_metric_rows"] == assistant["real_pdcp_metric_rows"]
-                or (
-                    allow_metric_gap
-                    and baseline["aligned_real_pdcp_metric_rows"] == assistant["aligned_real_pdcp_metric_rows"]
-                    and baseline["aligned_real_pdcp_metric_rows"] >= 50
-                )
+                if configured_metric_gap == 0
+                else gap_within_limit and common_window_valid
             )
+            and same_pairing_schedule
+            and same_snapshot_sequence
+            and no_sequence_duplicates
         ),
         "resource_valid": resource_valid,
     }
@@ -857,7 +974,13 @@ def main() -> int:
     parser.add_argument(
         "--allow-metric-gap",
         action="store_true",
-        help="Use the same common prefix of real PDCP snapshots when collector cadence is not one-to-one with decisions; requires at least 50 aligned rows and no proxy rows.",
+        help="compatibility alias for --max-metric-gap 1",
+    )
+    parser.add_argument(
+        "--max-metric-gap",
+        type=int,
+        default=0,
+        help="diferença máxima de linhas PDCP reais aceita por braço e entre braços (padrão: 0)",
     )
     parser.add_argument(
         "--target-decisions",
@@ -867,6 +990,9 @@ def main() -> int:
     )
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    if args.max_metric_gap < 0:
+        raise SystemExit("max-metric-gap deve ser não negativo")
+    configured_metric_gap = max(args.max_metric_gap, 1 if args.allow_metric_gap else 0)
     pairs: list[dict[str, Any]] = []
     if args.campaign_root:
         pair_paths = set(args.campaign_root.rglob("network_pair.json"))
@@ -886,6 +1012,7 @@ def main() -> int:
                 args.allow_metric_gap,
                 args.energy_calibration,
                 args.target_decisions,
+                configured_metric_gap,
             )
         )
     if not pairs:
@@ -900,6 +1027,11 @@ def main() -> int:
             "relative_delta_cap": ENERGY_RELATIVE_DELTA_CAP,
             "hardware_power_meter_available": False,
             "calibration_path": str(args.energy_calibration.resolve()) if args.energy_calibration else None,
+        },
+        "pairing_policy": {
+            "max_metric_gap": configured_metric_gap,
+            "real_pdcp_only": True,
+            "common_window_min_rows": 50,
         },
         "pairs": pairs,
         "aggregate": aggregate(pairs),

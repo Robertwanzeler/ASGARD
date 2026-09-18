@@ -13,6 +13,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from tasam_learning_meter import build_learning_meter  # noqa: E402
+
 
 RESET = "\033[0m"
 COLORS = {
@@ -348,6 +352,27 @@ def controlled_snapshot(state_dir: Path, status: dict[str, Any], state: dict[str
     }
 
 
+def learning_meter_snapshot(state_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Use the live artifact, or rebuild it read-only for older campaigns."""
+    artifact = read_json(state_dir / "learning_meter.json")
+    if artifact:
+        return artifact
+    db = state_dir / "rapp_data_lake.db"
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(decisions_history)")}
+            if not columns:
+                return {}
+            selected = sorted(columns)
+            rows = [dict(row) for row in conn.execute(
+                f"SELECT {', '.join(selected)} FROM decisions_history ORDER BY id"
+            )]
+        return build_learning_meter(rows, state, target_transitions=int(state.get("min_economic_transitions", 180) or 180))
+    except sqlite3.Error:
+        return {}
+
+
 def xapp_snapshot(state_dir: Path) -> dict[str, dict[str, Any]]:
     """Normalize xApp health, including file-mode optional sockets."""
     payload = read_json(state_dir / "xapp_health.json")
@@ -372,6 +397,7 @@ def render(args: argparse.Namespace) -> None:
     db_info = db_snapshot(state_dir / "rapp_data_lake.db")
     training = training_snapshot(state_dir)
     controlled = controlled_snapshot(state_dir, status, state)
+    learning_meter = learning_meter_snapshot(state_dir, {**state, **status})
     xapps = xapp_snapshot(state_dir)
     scenario = read_json(state_dir / "article00_scenario_control.json")
     effective_status = status or state
@@ -428,6 +454,17 @@ def render(args: argparse.Namespace) -> None:
     )
     print(f"  SQLite: métricas={db_info['metrics']:,} snapshots={db_info['snapshots']:,} decisões={db_info['decisions']:,} judge={db_info['judge']:,} shadow={db_info['comparisons']:,} ARMD→TA-SAM={envelope_text}")
     print(f"  controlador online: updates={controlled['updates']} ({controlled['update_status']}) | rollback={controlled['rollback_count']} | desde último update={new_since_update:,}")
+    print(
+        f"  medidor TA-SAM={fmt(learning_meter.get('learning_meter'), 1)}/100 "
+        f"estado={learning_meter.get('status', 'n/d')} | "
+        f"replay econômico={learning_meter.get('economic_transitions', 0)} | "
+        f"positivas={fmt(float(learning_meter.get('positive_rate', 0) or 0) * 100, 1)}%"
+    )
+    print(
+        f"  comparação aplicada vs rApp: energia={fmt(float(learning_meter.get('mean_realized_energy_saving_fraction', 0) or 0) * 100, 2)}% | "
+        f"alocação={fmt(float(learning_meter.get('mean_realized_allocation_saving_fraction', 0) or 0) * 100, 2)}% | "
+        f"amostras={learning_meter.get('comparison_sample_count', 0)}"
+    )
     print(f"  exporter genérico: {training['status']} | transições válidas={training['written']:,}/{training['target']:,}")
     if training["reason"]:
         print(f"  motivo: {training['reason']}")

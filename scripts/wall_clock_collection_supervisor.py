@@ -24,6 +24,10 @@ PROCESS_SPECS = (
     ("xapp_slicer.pid", ("xapp_slicer",)),
     ("xapp_energy.pid", ("xapp_energy_saver",)),
     ("xapp_vehicle.pid", ("xapp_vehicle",)),
+    # Native-E2 campaigns use this actuator instead of the legacy energy
+    # socket.  It belongs to the state-directory-scoped process tree and must
+    # be drained with the simulator to avoid blocking the next dispatcher job.
+    ("xapp_tasam_actuator.pid", ("xapp_tasam_actuator",)),
     ("ns3.pid", ("ns3.42-Energy_saving_with_cell_utilization_scenario",)),
     ("ns3_supervisor.pid", ("start_ns3_supervisor.sh",)),
     ("db_snapshot.pid", ("snapshot_sqlite_db.py",)),
@@ -107,6 +111,14 @@ def stop_collection(state_dir: Path, *, keep_ric: bool) -> dict[str, str]:
 
 
 def final_export(state_dir: Path) -> int:
+    # Controlled online campaigns already persist their canonical replay in
+    # SQLite.  The article export is an optional historical artifact and can
+    # exceed the campaign budget by gigabytes.  Honor the same switch used by
+    # the live exporter at shutdown; previously this unconditional final call
+    # bypassed GREENRAN_TASAM_EXPORT_ENABLED=0.
+    raw_enabled = os.environ.get("GREENRAN_TASAM_EXPORT_ENABLED", "1").strip().lower()
+    if raw_enabled not in {"1", "true", "yes", "on"}:
+        return 0
     db_path = state_dir / "rapp_data_lake.db"
     export_dir = state_dir / "tasam_article_export"
     if not db_path.exists():
@@ -154,6 +166,12 @@ def main() -> int:
 
     deadline = started_monotonic + duration
     while True:
+        # The decision-target watcher requests a cooperative shutdown through
+        # the state directory.  This keeps ownership of worker cleanup in the
+        # wall supervisor and avoids PID/process-group ambiguity across the
+        # privileged service boundary.
+        if (state_dir / "decision_target_stop.json").exists():
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -176,6 +194,9 @@ def main() -> int:
     results = stop_collection(state_dir, keep_ric=bool(args.keep_ric))
     if args.post_stop_grace_seconds > 0:
         time.sleep(float(args.post_stop_grace_seconds))
+    export_enabled = os.environ.get("GREENRAN_TASAM_EXPORT_ENABLED", "1").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
     export_code = final_export(state_dir)
     elapsed = time.monotonic() - started_monotonic
     write_status(
@@ -192,6 +213,7 @@ def main() -> int:
             "keep_ric": bool(args.keep_ric),
             "stop_results": results,
             "final_export_code": export_code,
+            "final_export": "enabled" if export_enabled else "disabled",
         },
     )
     return 0 if export_code == 0 else export_code

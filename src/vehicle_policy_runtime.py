@@ -13,7 +13,12 @@ import os
 import time
 from typing import Any
 
-from greenran_paths import EXTENDED_METRICS_JSON_PATH, STATE_DIR, as_str
+from greenran_paths import (
+    EXTENDED_METRICS_JSON_PATH,
+    STATE_DIR,
+    as_str,
+    get_fixed_service_imsis,
+)
 
 
 EXTENDED_METRICS_PATH = as_str(EXTENDED_METRICS_JSON_PATH)
@@ -113,8 +118,11 @@ def get_vehicle_metrics(
     }
 
     try:
+        strict_real = os.environ.get("GREENRAN_REQUIRE_REAL_PDCP", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
         override = _load_vehicle_override()
-        if override:
+        if override and not strict_real:
             override_metrics = _build_vehicle_metrics_from_override(override)
             if override_metrics:
                 return override_metrics
@@ -123,8 +131,17 @@ def get_vehicle_metrics(
         ue_metrics = (extended.get("ue_metrics", {}) or {}) if isinstance(extended, dict) else {}
 
         vehicle_entries = []
+        invalid_real_vehicle = False
         for imsi, ue_data in ue_metrics.items():
             if not isinstance(ue_data, dict) or ue_data.get("device_type") != "vehicle":
+                continue
+            loss_value = ue_data.get("packet_loss_percent")
+            if strict_real and (
+                ue_data.get("pdcp_provenance") != "pdcp_real"
+                or loss_value is None
+                or bool(ue_data.get("latency_is_proxy"))
+            ):
+                invalid_real_vehicle = True
                 continue
             vehicle_entries.append(
                 {
@@ -134,18 +151,21 @@ def get_vehicle_metrics(
                     "autonomy_state": ue_data.get("autonomy_state", "unknown"),
                     "risk_state": ue_data.get("risk_state", "unknown"),
                     "latency_ms": float(ue_data.get("latency_avg_us", ue_data.get("latency_us", 0)) or 0) / 1000.0,
-                    "packet_loss_percent": float(
-                        ue_data.get(
-                            "packet_loss_percent",
-                            float(extended.get("global_metrics", {}).get("global_packet_loss_rate", 0) or 0) * 100.0,
-                        )
-                        or 0
-                    ),
+                    "packet_loss_percent": float(loss_value or 0.0),
+                    "tx_pdus": int(ue_data.get("tx_pdus", 0) or 0),
+                    "rx_pdus": int(ue_data.get("rx_pdus", 0) or 0),
+                    "sample_window_s": float(ue_data.get("sample_window_s", 0.0) or 0.0),
                     "speed_mps": float(ue_data.get("speed_mps", 0.0) or 0.0),
                     "lane_id": ue_data.get("lane_id"),
                     "waypoint_id": ue_data.get("waypoint_id"),
                 }
             )
+
+        expected_vehicle_imsis = {str(value) for value in get_fixed_service_imsis()["vehicle"]}
+        observed_vehicle_imsis = {str(item.get("imsi")) for item in vehicle_entries}
+        if strict_real and (invalid_real_vehicle or observed_vehicle_imsis != expected_vehicle_imsis):
+            metrics["reason"] = "real_pdcp_vehicle_coverage_incomplete"
+            return metrics
 
         if vehicle_entries:
             age_seconds = None
@@ -175,12 +195,23 @@ def get_vehicle_metrics(
                     "max_latency_ms": max(float(v.get("latency_ms", 0) or 0) for v in vehicle_entries),
                     "max_packet_loss_percent": max(float(v.get("packet_loss_percent", 0) or 0) for v in vehicle_entries),
                     "max_speed_mps": max(float(v.get("speed_mps", 0) or 0) for v in vehicle_entries),
+                    "min_tx_pdus": min((int(v.get("tx_pdus", 0) or 0) for v in vehicle_entries), default=0),
+                    "min_rx_pdus": min((int(v.get("rx_pdus", 0) or 0) for v in vehicle_entries), default=0),
+                    "min_sample_window_s": min((float(v.get("sample_window_s", 0.0) or 0.0) for v in vehicle_entries), default=0.0),
+                    "sample_window_s": max((float(v.get("sample_window_s", 0.0) or 0.0) for v in vehicle_entries), default=0.0),
                     "vehicles": vehicle_entries,
                 }
             )
             return metrics
 
         app3_snapshot = safe_read_json_file(monitoring_path)
+        if strict_real and (
+            app3_snapshot.get("schema") != "greenran.app3.pdcp_real_snapshot.v1"
+            or app3_snapshot.get("pdcp_provenance") != "pdcp_real"
+            or not app3_snapshot.get("valid")
+        ):
+            metrics["reason"] = "real_pdcp_app3_snapshot_missing"
+            return metrics
         vehicles_summary = app3_snapshot.get("vehicles", {}) if isinstance(app3_snapshot, dict) else {}
         network_summary = app3_snapshot.get("network", {}) if isinstance(app3_snapshot, dict) else {}
         if not isinstance(vehicles_summary, dict):
@@ -219,6 +250,10 @@ def get_vehicle_metrics(
                 "max_speed_mps": float(
                     vehicles_summary.get("max_speed_mps", network_summary.get("max_speed_mps", 0.0)) or 0.0
                 ),
+                "min_tx_pdus": int(vehicles_summary.get("min_tx_pdus", 0) or 0),
+                "min_rx_pdus": int(vehicles_summary.get("min_rx_pdus", 0) or 0),
+                "min_sample_window_s": float(vehicles_summary.get("min_sample_window_s", 0.0) or 0.0),
+                "sample_window_s": float(vehicles_summary.get("sample_window_s", 0.0) or 0.0),
                 "vehicles": [],
             }
         )
@@ -248,6 +283,43 @@ def evaluate_vehicle_policy(vehicle_metrics: dict[str, Any]) -> dict[str, Any]:
     vehicle_latency_ms = float(metrics.get("max_latency_ms", 0) or 0)
     vehicle_packet_loss = float(metrics.get("max_packet_loss_percent", 0) or 0)
     ego_present = bool(metrics.get("ego_present", False))
+
+    # A short real-PDCP window is evidence that traffic exists, but not yet
+    # enough evidence to classify a hard vehicle SLA violation.  Keep the
+    # loss calculation intact and quarantine this observation from economic
+    # replay.  Once the window is mature, the existing <1% SLA is unchanged.
+    vehicle_rows = metrics.get("vehicles") if isinstance(metrics.get("vehicles"), list) else []
+    evidence_fields_present = (
+        "min_tx_pdus" in metrics
+        or any(isinstance(row, dict) and "tx_pdus" in row for row in vehicle_rows)
+    )
+    min_tx_pdus = int(metrics.get("min_tx_pdus", 0) or 0)
+    min_sample_window_s = float(metrics.get("min_sample_window_s", 0.0) or 0.0)
+    if vehicle_rows:
+        min_tx_pdus = min(
+            (int(row.get("tx_pdus", 0) or 0) for row in vehicle_rows),
+            default=min_tx_pdus,
+        )
+        min_sample_window_s = min(
+            (float(row.get("sample_window_s", 0.0) or 0.0) for row in vehicle_rows),
+            default=min_sample_window_s,
+        )
+    if evidence_fields_present and (min_tx_pdus < 100 or min_sample_window_s < 1.0):
+        return {
+            "available": True,
+            "severity": "unknown",
+            "violation": "VEHICLE_WARMUP",
+            "action": "MONITOR",
+            "reason": (
+                "janela veicular insuficiente para decisão SLA "
+                f"(min_tx_pdus={min_tx_pdus}, min_window_s={min_sample_window_s:.3f})"
+            ),
+            "confidence": 0.0,
+            "sla_violated": False,
+            "guard_active": True,
+            "warmup": True,
+            "economic_replay_eligible": False,
+        }
 
     critical_reasons = []
     warning_reasons = []

@@ -39,6 +39,11 @@ export GREENRAN_PDCP_STALE_SECONDS="600"
 # Article track default: GREENRAN_REQUIRE_REAL_PDCP="1".
 export GREENRAN_REQUIRE_REAL_PDCP="${GREENRAN_REQUIRE_REAL_PDCP:-1}"
 export GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH="${GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH:-0}"
+export GREENRAN_NS3_ENABLE_ENERGY_CSV="${GREENRAN_NS3_ENABLE_ENERGY_CSV:-0}"
+export GREENRAN_NS3_ENERGY_OUTPUT_DIR="${GREENRAN_NS3_ENERGY_OUTPUT_DIR:-$GREENRAN_STATE_DIR/ns3_energy}"
+export GREENRAN_NS3_RNG_RUN="${GREENRAN_NS3_RNG_RUN:-1}"
+export GREENRAN_NS3_FIXED_POWER_PERCENT="${GREENRAN_NS3_FIXED_POWER_PERCENT:-100}"
+export GREENRAN_NS3_ACTIVE_CELLS="${GREENRAN_NS3_ACTIVE_CELLS:-$GREENRAN_NS3_MMWAVE_ENB_NODES}"
 export GREENRAN_NS3_E2NR_ENABLED="${GREENRAN_NS3_E2NR_ENABLED:-false}"
 export GREENRAN_NS3_USE_MC_UE_DEVICES="${GREENRAN_NS3_USE_MC_UE_DEVICES:-true}"
 export GREENRAN_NS3_E2CUUP_ENABLED="${GREENRAN_NS3_E2CUUP_ENABLED:-false}"
@@ -49,8 +54,11 @@ export GREENRAN_COLLECTION_EVENT_PID="${GREENRAN_COLLECTION_EVENT_PID:-$GREENRAN
 export GREENRAN_COLLECTION_STARTUP_WAIT_SECONDS="${GREENRAN_COLLECTION_STARTUP_WAIT_SECONDS:-120}"
 export GREENRAN_NS3_SUPERVISOR_LAUNCH_LOG="${GREENRAN_NS3_SUPERVISOR_LAUNCH_LOG:-$GREENRAN_STATE_DIR/ns3_supervisor_launch.log}"
 
-mkdir -p "$GREENRAN_STATE_DIR/xapp_metrics" "$GREENRAN_STATE_DIR/xapp_intents" "$GREENRAN_STATE_DIR/rapp_policies" "$GREENRAN_NS3_CWD"
-mkdir -p "$GREENRAN_DB_SNAPSHOT_DIR" "$GREENRAN_TASAM_EXPORT_DIR"
+mkdir -p "$GREENRAN_STATE_DIR/xapp_metrics" "$GREENRAN_STATE_DIR/xapp_intents" "$GREENRAN_STATE_DIR/rapp_policies" "$GREENRAN_NS3_CWD" "$GREENRAN_NS3_ENERGY_OUTPUT_DIR"
+mkdir -p "$GREENRAN_DB_SNAPSHOT_DIR"
+if [[ "${GREENRAN_TASAM_EXPORT_ENABLED:-1}" == "1" ]]; then
+  mkdir -p "$GREENRAN_TASAM_EXPORT_DIR"
+fi
 
 python3 "$PROJECT_ROOT/scripts/generate_article_ns3_device_roles.py" \
   --config "$GREENRAN_FIXED_SCENARIO_CONFIG" \
@@ -70,6 +78,14 @@ start_if_missing() {
     fi
   fi
   "$@"
+}
+
+CGROUP_PREFIX=()
+set_cgroup_prefix() {
+  CGROUP_PREFIX=()
+  if [[ "${GREENRAN_CGROUP_ENFORCE:-0}" == "1" ]]; then
+    CGROUP_PREFIX=(python3 "$PROJECT_ROOT/scripts/greenran_cgroup_exec.py" --group "$1" --)
+  fi
 }
 
 start_ric() {
@@ -93,7 +109,8 @@ start_ric() {
   fi
 
   export LD_LIBRARY_PATH="$PROJECT_ROOT/flexric/build_e2ap_v1/src/ric:$PROJECT_ROOT/flexric_lib:$PROJECT_ROOT/flexric/build_e2ap_v1/src/xApp:${LD_LIBRARY_PATH:-}"
-  setsid "$ric_bin" \
+  set_cgroup_prefix ric_xapps
+  setsid "${CGROUP_PREFIX[@]}" "$ric_bin" \
     -c "$PROJECT_ROOT/flexric/flexric.conf" \
     -p "$PROJECT_ROOT/flexric_lib/" \
     > "$GREENRAN_RIC_LOG" 2>&1 &
@@ -106,7 +123,8 @@ start_ric() {
 }
 
 start_ns3() {
-  setsid env \
+  set_cgroup_prefix simulator
+  setsid "${CGROUP_PREFIX[@]}" env \
     GREENRAN_PROJECT_DIR="$PROJECT_ROOT" \
     GREENRAN_STATE_DIR="$GREENRAN_STATE_DIR" \
     GREENRAN_NS3_CWD="$GREENRAN_NS3_CWD" \
@@ -119,6 +137,11 @@ start_ns3() {
     GREENRAN_NS3_UE_SPEED_MIN="$GREENRAN_NS3_UE_SPEED_MIN" \
     GREENRAN_NS3_UE_SPEED_MAX="$GREENRAN_NS3_UE_SPEED_MAX" \
     GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH="$GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH" \
+    GREENRAN_NS3_ENABLE_ENERGY_CSV="$GREENRAN_NS3_ENABLE_ENERGY_CSV" \
+    GREENRAN_NS3_ENERGY_OUTPUT_DIR="$GREENRAN_NS3_ENERGY_OUTPUT_DIR" \
+    GREENRAN_NS3_RNG_RUN="$GREENRAN_NS3_RNG_RUN" \
+    GREENRAN_NS3_FIXED_POWER_PERCENT="$GREENRAN_NS3_FIXED_POWER_PERCENT" \
+    GREENRAN_NS3_ACTIVE_CELLS="$GREENRAN_NS3_ACTIVE_CELLS" \
     GREENRAN_NS3_USE_MC_UE_DEVICES="$GREENRAN_NS3_USE_MC_UE_DEVICES" \
     GREENRAN_NS3_E2NR_ENABLED="$GREENRAN_NS3_E2NR_ENABLED" \
     GREENRAN_NS3_E2DU_ENABLED="$GREENRAN_NS3_E2DU_ENABLED" \
@@ -131,19 +154,22 @@ start_ns3() {
 }
 
 start_collector() {
-  setsid /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_STATE_DIR='$GREENRAN_STATE_DIR' GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_FIXED_SCENARIO_CONFIG='$GREENRAN_FIXED_SCENARIO_CONFIG' GREENRAN_PDCP_STALE_SECONDS='$GREENRAN_PDCP_STALE_SECONDS' GREENRAN_REQUIRE_REAL_PDCP='$GREENRAN_REQUIRE_REAL_PDCP' && while true; do python3 ./src/csv_to_metrics.py --input-dir '$GREENRAN_NS3_CWD' --output '$GREENRAN_STATE_DIR/xapp_metrics/metrics.json' --extended-output '$GREENRAN_STATE_DIR/xapp_metrics/extended_metrics.json' --poll-interval '$GREENRAN_COLLECTOR_POLL_INTERVAL'; code=\$?; echo \"[CSV_METRICS_SUPERVISOR] collector exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_CSV_LOG" 2>&1 &
+  set_cgroup_prefix collectors
+  setsid "${CGROUP_PREFIX[@]}" /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_STATE_DIR='$GREENRAN_STATE_DIR' GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_FIXED_SCENARIO_CONFIG='$GREENRAN_FIXED_SCENARIO_CONFIG' GREENRAN_PDCP_STALE_SECONDS='$GREENRAN_PDCP_STALE_SECONDS' GREENRAN_REQUIRE_REAL_PDCP='$GREENRAN_REQUIRE_REAL_PDCP' && while true; do python3 ./src/csv_to_metrics.py --input-dir '$GREENRAN_NS3_CWD' --output '$GREENRAN_STATE_DIR/xapp_metrics/metrics.json' --extended-output '$GREENRAN_STATE_DIR/xapp_metrics/extended_metrics.json' --poll-interval '$GREENRAN_COLLECTOR_POLL_INTERVAL'; code=\$?; echo \"[CSV_METRICS_SUPERVISOR] collector exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_CSV_LOG" 2>&1 &
   echo $! > "$GREENRAN_CSV_PID"
   sleep 1
 }
 
 start_rapp() {
-  setsid env GREENRAN_STATE_DIR="$GREENRAN_STATE_DIR" GREENRAN_DB_PATH="$GREENRAN_DB_PATH" GREENRAN_FIXED_SCENARIO_CONFIG="$GREENRAN_FIXED_SCENARIO_CONFIG" GREENRAN_CLEAN_SCOPE="$GREENRAN_CLEAN_SCOPE" python3 "$PROJECT_ROOT/src/rapp_orchestrator.py" --synthetic 0 --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" > "$GREENRAN_RAPP_LOG" 2>&1 &
+  set_cgroup_prefix rapp_armd
+  setsid "${CGROUP_PREFIX[@]}" env GREENRAN_STATE_DIR="$GREENRAN_STATE_DIR" GREENRAN_DB_PATH="$GREENRAN_DB_PATH" GREENRAN_FIXED_SCENARIO_CONFIG="$GREENRAN_FIXED_SCENARIO_CONFIG" GREENRAN_CLEAN_SCOPE="$GREENRAN_CLEAN_SCOPE" python3 "$PROJECT_ROOT/src/rapp_orchestrator.py" --synthetic 0 --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" > "$GREENRAN_RAPP_LOG" 2>&1 &
   echo $! > "$GREENRAN_RAPP_PID"
   sleep 1
 }
 
 start_db_snapshot_service() {
-  setsid /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_DB_SNAPSHOT_DIR='$GREENRAN_DB_SNAPSHOT_DIR' GREENRAN_DB_SNAPSHOT_RETENTION='$GREENRAN_DB_SNAPSHOT_RETENTION' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/snapshot_sqlite_db.py --db '$GREENRAN_DB_PATH' --snapshot-dir '$GREENRAN_DB_SNAPSHOT_DIR' --retain '$GREENRAN_DB_SNAPSHOT_RETENTION'; code=\$?; else echo \"[DB_SNAPSHOT] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[DB_SNAPSHOT] cycle finished with code \$code at \$(date -Is); sleeping ${GREENRAN_DB_SNAPSHOT_INTERVAL}s\"; sleep '$GREENRAN_DB_SNAPSHOT_INTERVAL'; done" > "$GREENRAN_DB_SNAPSHOT_LOG" 2>&1 &
+  set_cgroup_prefix collectors
+  setsid "${CGROUP_PREFIX[@]}" /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_DB_SNAPSHOT_DIR='$GREENRAN_DB_SNAPSHOT_DIR' GREENRAN_DB_SNAPSHOT_RETENTION='$GREENRAN_DB_SNAPSHOT_RETENTION' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/snapshot_sqlite_db.py --db '$GREENRAN_DB_PATH' --snapshot-dir '$GREENRAN_DB_SNAPSHOT_DIR' --retain '$GREENRAN_DB_SNAPSHOT_RETENTION'; code=\$?; else echo \"[DB_SNAPSHOT] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[DB_SNAPSHOT] cycle finished with code \$code at \$(date -Is); sleeping ${GREENRAN_DB_SNAPSHOT_INTERVAL}s\"; sleep '$GREENRAN_DB_SNAPSHOT_INTERVAL'; done" > "$GREENRAN_DB_SNAPSHOT_LOG" 2>&1 &
   echo $! > "$GREENRAN_DB_SNAPSHOT_PID"
   sleep 1
 }
@@ -154,12 +180,20 @@ start_tasam_export_service() {
     printf '[TASAM_EXPORT] disabled by runtime config; targeted monitor remains authoritative\n' > "$GREENRAN_TASAM_EXPORT_LOG"
     return 0
   fi
-  setsid /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_TASAM_EXPORT_DIR='$GREENRAN_TASAM_EXPORT_DIR' GREENRAN_TASAM_EXPORT_LIMIT='$GREENRAN_TASAM_EXPORT_LIMIT' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/run_tasam_article_export.py --db '$GREENRAN_DB_PATH' --output-dir '$GREENRAN_TASAM_EXPORT_DIR'; code=\$?; else echo \"[TASAM_EXPORT] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[TASAM_EXPORT] cycle finished with code \$code at \$(date -Is); sleeping ${GREENRAN_TASAM_EXPORT_INTERVAL}s\"; sleep '$GREENRAN_TASAM_EXPORT_INTERVAL'; done" > "$GREENRAN_TASAM_EXPORT_LOG" 2>&1 &
+  set_cgroup_prefix collectors
+  setsid "${CGROUP_PREFIX[@]}" /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_TASAM_EXPORT_DIR='$GREENRAN_TASAM_EXPORT_DIR' GREENRAN_TASAM_EXPORT_LIMIT='$GREENRAN_TASAM_EXPORT_LIMIT' && while true; do if [[ -f '$GREENRAN_DB_PATH' ]]; then python3 ./scripts/run_tasam_article_export.py --db '$GREENRAN_DB_PATH' --output-dir '$GREENRAN_TASAM_EXPORT_DIR'; code=\$?; else echo \"[TASAM_EXPORT] waiting for DB at $GREENRAN_DB_PATH\"; code=0; fi; echo \"[TASAM_EXPORT] cycle finished with code \$code at \$(date -Is); sleeping ${GREENRAN_TASAM_EXPORT_INTERVAL}s\"; sleep '$GREENRAN_TASAM_EXPORT_INTERVAL'; done" > "$GREENRAN_TASAM_EXPORT_LOG" 2>&1 &
   echo $! > "$GREENRAN_TASAM_EXPORT_PID"
   sleep 1
 }
 
 start_tasam_true_online_real_service() {
+  if [[ "${GREENRAN_TASAM_TRUE_ONLINE_EXTERNAL_CONTROLLER:-0}" == "1" ]]; then
+    rm -f "$GREENRAN_TASAM_TRUE_ONLINE_PID"
+    cat > "$GREENRAN_TASAM_TRUE_ONLINE_LOG" <<EOF
+[TASAM_TRUE_ONLINE_REAL] external controller owns online updates: ${GREENRAN_ONLINE_UPDATE_OWNER:-unknown}
+EOF
+    return 0
+  fi
   if [[ "${GREENRAN_TASAM_TRUE_ONLINE_ENABLED:-1}" != "1" ]]; then
     rm -f "$GREENRAN_TASAM_TRUE_ONLINE_PID"
     cat > "$GREENRAN_TASAM_TRUE_ONLINE_LOG" <<EOF
@@ -173,6 +207,13 @@ EOF
 }
 
 start_rapp_online_retrain_service() {
+  if [[ "${GREENRAN_TASAM_EXPORT_ENABLED:-1}" != "1" ]]; then
+    rm -f "$GREENRAN_RAPP_ONLINE_RETRAIN_PID"
+    cat > "$GREENRAN_RAPP_ONLINE_RETRAIN_LOG" <<EOF
+[RAPP_ONLINE_RETRAIN] disabled because article export is disabled
+EOF
+    return 0
+  fi
   if [[ "${GREENRAN_ML_RETRAIN_ENABLED:-true}" != "true" ]]; then
     rm -f "$GREENRAN_RAPP_ONLINE_RETRAIN_PID"
     cat > "$GREENRAN_RAPP_ONLINE_RETRAIN_LOG" <<EOF
@@ -191,7 +232,8 @@ start_collection_event_service() {
     return 0
   fi
 
-  setsid /bin/bash -lc "cd '$PROJECT_ROOT' && python3 ./scripts/collection_event_alternator.py --profile '$GREENRAN_COLLECTION_EVENT_PROFILE' --cycles '$GREENRAN_COLLECTION_EVENT_CYCLES' --tick-s '$GREENRAN_COLLECTION_EVENT_TICK_S' --time-source '$GREENRAN_COLLECTION_EVENT_TIME_SOURCE' --state-file '$GREENRAN_STATE_DIR/article00_scenario_control.json'" > "$GREENRAN_COLLECTION_EVENT_LOG" 2>&1 &
+  set_cgroup_prefix collectors
+  setsid "${CGROUP_PREFIX[@]}" /bin/bash -lc "cd '$PROJECT_ROOT' && python3 ./scripts/collection_event_alternator.py --profile '$GREENRAN_COLLECTION_EVENT_PROFILE' --cycles '$GREENRAN_COLLECTION_EVENT_CYCLES' --tick-s '$GREENRAN_COLLECTION_EVENT_TICK_S' --time-source '$GREENRAN_COLLECTION_EVENT_TIME_SOURCE' --state-file '$GREENRAN_STATE_DIR/article00_scenario_control.json'" > "$GREENRAN_COLLECTION_EVENT_LOG" 2>&1 &
   echo $! > "$GREENRAN_COLLECTION_EVENT_PID"
   sleep 1
 }
@@ -200,7 +242,12 @@ start_if_missing "$GREENRAN_RIC_PID" start_ric
 start_if_missing "$GREENRAN_NS3_SUPERVISOR_PID" start_ns3
 start_if_missing "$GREENRAN_CSV_PID" start_collector
 start_if_missing "$GREENRAN_RAPP_PID" start_rapp
-start_if_missing "$GREENRAN_DB_SNAPSHOT_PID" start_db_snapshot_service
+if [[ "${GREENRAN_DB_SNAPSHOT_ENABLED:-1}" == "1" ]]; then
+  start_if_missing "$GREENRAN_DB_SNAPSHOT_PID" start_db_snapshot_service
+else
+  rm -f "$GREENRAN_DB_SNAPSHOT_PID"
+  printf '[DB_SNAPSHOT] disabled by runtime config; SQLite primary remains authoritative\n' > "$GREENRAN_DB_SNAPSHOT_LOG"
+fi
 start_if_missing "$GREENRAN_TASAM_EXPORT_PID" start_tasam_export_service
 if [[ "${GREENRAN_TASAM_TRUE_ONLINE_ENABLED:-1}" == "1" ]]; then
   start_if_missing "$GREENRAN_TASAM_TRUE_ONLINE_PID" start_tasam_true_online_real_service
@@ -208,7 +255,7 @@ else
   rm -f "$GREENRAN_TASAM_TRUE_ONLINE_PID"
   start_tasam_true_online_real_service
 fi
-if [[ "${GREENRAN_ML_RETRAIN_ENABLED:-true}" == "true" ]]; then
+if [[ "${GREENRAN_TASAM_EXPORT_ENABLED:-1}" == "1" && "${GREENRAN_ML_RETRAIN_ENABLED:-true}" == "true" ]]; then
   start_if_missing "$GREENRAN_RAPP_ONLINE_RETRAIN_PID" start_rapp_online_retrain_service
 else
   rm -f "$GREENRAN_RAPP_ONLINE_RETRAIN_PID"

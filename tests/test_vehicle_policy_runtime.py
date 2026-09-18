@@ -48,6 +48,44 @@ class VehiclePolicyRuntimeTests(unittest.TestCase):
         self.assertEqual(intent["STATE"], "WARNING")
         self.assertEqual(intent["ACTION"], "FULL_POWER_GUARD")
 
+    def test_short_real_pdcp_window_is_unknown_not_hard_violation(self):
+        policy = evaluate_vehicle_policy({
+            "available": True,
+            "total_vehicles": 5,
+            "ego_present": True,
+            "max_latency_ms": 5.0,
+            "max_packet_loss_percent": 4.3,
+            "min_tx_pdus": 23,
+            "min_rx_pdus": 22,
+            "min_sample_window_s": 0.2,
+            "vehicles": [
+                {"tx_pdus": 23, "rx_pdus": 22, "sample_window_s": 0.2}
+                for _ in range(5)
+            ],
+        })
+        self.assertEqual(policy["severity"], "unknown")
+        self.assertEqual(policy["violation"], "VEHICLE_WARMUP")
+        self.assertFalse(policy["sla_violated"])
+        self.assertFalse(policy["economic_replay_eligible"])
+
+    def test_mature_real_pdcp_loss_still_enforces_vehicle_sla(self):
+        policy = evaluate_vehicle_policy({
+            "available": True,
+            "total_vehicles": 5,
+            "ego_present": True,
+            "max_latency_ms": 5.0,
+            "max_packet_loss_percent": 1.2,
+            "min_tx_pdus": 120,
+            "min_rx_pdus": 118,
+            "min_sample_window_s": 1.2,
+            "vehicles": [
+                {"tx_pdus": 120, "rx_pdus": 118, "sample_window_s": 1.2}
+                for _ in range(5)
+            ],
+        })
+        self.assertEqual(policy["severity"], "critical")
+        self.assertTrue(policy["sla_violated"])
+
 
 if __name__ == "__main__":
     unittest.main()

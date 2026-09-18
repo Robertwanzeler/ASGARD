@@ -190,6 +190,40 @@ class TestTasamNetworkEvaluation(unittest.TestCase):
             self.assertTrue(pair["valid"])
             self.assertTrue(pair["metrics_aligned"]["comparison_aligned_with_one_snapshot_gap"])
 
+    def test_pair_allows_one_real_snapshot_gap_with_explicit_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_db(root / "baseline", assistant=False, metric_count=65)
+            make_db(root / "assistant", assistant=True, metric_count=64)
+            pair = pair_result(root / "baseline", root / "assistant", 45, 1, max_metric_gap=1)
+            self.assertTrue(pair["valid"])
+            alignment = pair["metrics_aligned"]
+            self.assertEqual(alignment["max_metric_gap"], 1)
+            self.assertEqual(alignment["metric_row_gap"], 1)
+            self.assertTrue(alignment["gap_tolerated"])
+            self.assertEqual(alignment["common_aligned_real_pdcp_rows"], 64)
+
+    def test_pair_rejects_gap_above_explicit_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_db(root / "baseline", assistant=False, metric_count=65)
+            make_db(root / "assistant", assistant=True, metric_count=63)
+            pair = pair_result(root / "baseline", root / "assistant", 45, 1, max_metric_gap=1)
+            self.assertFalse(pair["valid"])
+            self.assertFalse(pair["metrics_aligned"]["gap_within_limit"])
+
+    def test_pair_report_records_no_tolerance_for_equal_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_db(root / "baseline", assistant=False, metric_count=65)
+            make_db(root / "assistant", assistant=True, metric_count=65)
+            pair = pair_result(root / "baseline", root / "assistant", 45, 1, max_metric_gap=1)
+            self.assertTrue(pair["valid"])
+            alignment = pair["metrics_aligned"]
+            self.assertEqual(alignment["baseline_real_pdcp_rows"], 65)
+            self.assertEqual(alignment["assistant_real_pdcp_rows"], 65)
+            self.assertFalse(alignment["gap_tolerated"])
+
     def test_energy_delta_is_relative_and_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -236,6 +270,42 @@ class TestTasamNetworkEvaluation(unittest.TestCase):
         self.assertEqual(healthy_components["tail_risk_penalty"], 0.0)
         self.assertGreater(regressed_components["tail_risk_penalty"], 0.0)
         self.assertLess(regressed, healthy)
+
+    def test_balanced_reward_power_cost_is_only_applied_when_service_is_safe(self):
+        slices = {
+            "eMBB": {"completion_ratio": 1.0, "qos_pressure": 0.0, "demand": 0.3, "min_qos_met": 1.0},
+            "mMTC": {"completion_ratio": 1.0, "qos_pressure": 0.0, "demand": 0.2, "min_qos_met": 1.0},
+            "URLLC": {"completion_ratio": 1.0, "qos_pressure": 0.0, "demand": 0.2, "min_qos_met": 1.0},
+        }
+        metrics = {"cvar_per_ue_us": 5_000.0, "global_packet_loss_rate": 0.0}
+        low, low_components = build_balanced_vehicle_energy_reward(
+            slices, metrics, {"usable_budget": 1.0, "power_percent": 25.0, "slice_allocation": {"eMBB": 0.3, "mMTC": 0.2, "URLLC": 0.2}}
+        )
+        high, high_components = build_balanced_vehicle_energy_reward(
+            slices, metrics, {"usable_budget": 1.0, "power_percent": 100.0, "slice_allocation": {"eMBB": 0.3, "mMTC": 0.2, "URLLC": 0.2}}
+        )
+        self.assertGreater(low, high)
+        self.assertEqual(low_components["power_cost_penalty"], 0.0)
+        self.assertGreater(high_components["power_cost_penalty"], 0.0)
+
+        blocked, blocked_components = build_balanced_vehicle_energy_reward(
+            slices, metrics, {"usable_budget": 1.0, "power_percent": 100.0, "allocation_state": "BLOCKED", "slice_allocation": {"eMBB": 0.3, "mMTC": 0.2, "URLLC": 0.2}}
+        )
+        self.assertEqual(blocked_components["power_cost_penalty"], 0.0)
+        self.assertEqual(blocked_components["power_penalty_gated_by_service"], 0.0)
+
+    def test_balanced_reward_completion_shortfall_is_monotonic(self):
+        healthy = {
+            "eMBB": {"completion_ratio": 1.0, "qos_pressure": 0.0, "demand": 0.3, "min_qos_met": 1.0},
+            "mMTC": {"completion_ratio": 1.0, "qos_pressure": 0.0, "demand": 0.2, "min_qos_met": 1.0},
+            "URLLC": {"completion_ratio": 1.0, "qos_pressure": 0.0, "demand": 0.2, "min_qos_met": 1.0},
+        }
+        short = {**healthy, "eMBB": {**healthy["eMBB"], "completion_ratio": 0.70}, "mMTC": {**healthy["mMTC"], "completion_ratio": 0.40}}
+        action = {"usable_budget": 1.0, "power_percent": 25.0, "slice_allocation": {"eMBB": 0.3, "mMTC": 0.2, "URLLC": 0.2}}
+        good, _ = build_balanced_vehicle_energy_reward(healthy, {"cvar_per_ue_us": 5_000.0}, action)
+        bad, components = build_balanced_vehicle_energy_reward(short, {"cvar_per_ue_us": 5_000.0}, action)
+        self.assertLess(bad, good)
+        self.assertGreater(components["completion_shortfall_penalty"], 0.0)
 
 
 if __name__ == "__main__":

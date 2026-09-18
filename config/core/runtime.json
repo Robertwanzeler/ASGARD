@@ -61,6 +61,8 @@
     "ran_min_active_demand": 0.15,
     "ai_min_active_demand": 0.15,
     "sla_floor_demand_fraction": 0.35,
+    "sla_floor_guard_ratio": 0.10,
+    "camera_latency_hard_ms": 80.0,
     "vehicle_floor_priority_weight": 1.5,
     "conditional_reinforcement_scale": 0.0,
     "critical_reinforcement_scale": 0.75,

@@ -1,0 +1,23 @@
+[Unit]
+Description=GreenRAN native ns-3 energy calibration sweep
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/robert/orange_nuclear
+Environment=GREENRAN_LOCAL_ONLY=1
+Environment=GREENRAN_CGROUP_ENFORCE=1
+Environment=GREENRAN_CGROUP_ALLOW_UNENFORCED=0
+Environment=GREENRAN_NS3_BIN=/home/robert/orange_nuclear/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario-default
+ExecStart=/usr/bin/python3 /home/robert/orange_nuclear/scripts/run_tasam_energy_calibration_sweep.py --output-root /home/robert/orange_nuclear/runs/tasam_energy_calibration_sim_v5 --duration-seconds 0.1 --limit 36
+StandardOutput=append:/home/robert/orange_nuclear/runs/tasam_energy_calibration_sim_v5/sweep_service.log
+StandardError=inherit
+TimeoutStartSec=infinity
+Restart=no
+NoNewPrivileges=no
+ReadWritePaths=/home/robert/orange_nuclear/runs
+
+[Install]
+WantedBy=multi-user.target

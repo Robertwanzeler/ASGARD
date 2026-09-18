@@ -29,6 +29,10 @@ import os
 import sqlite3
 import time
 import json
+import re
+import hashlib
+import io
+import math
 
 try:
     from .greenran_marl_topology import build_du_state_snapshot_from_resource_snapshot
@@ -37,13 +41,180 @@ except ImportError:
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from greenran_paths import RAPP_DB_PATH
+from greenran_paths import RAPP_DB_PATH, TASAM_NATIVE_CONTROL_OBSERVATIONS_PATH, get_fixed_service_imsis
 try:
-    from .energy_calibration import integrate_energy_events, load_calibration, state_power_w
+    from .energy_calibration import integrate_energy_events, load_calibration, state_power_w, sleep_state_power_w
 except ImportError:
-    from energy_calibration import integrate_energy_events, load_calibration, state_power_w
+    from energy_calibration import integrate_energy_events, load_calibration, state_power_w, sleep_state_power_w
 
 DEFAULT_DB_PATH = str(RAPP_DB_PATH)
+
+
+def _json_safe_copy(value, default=None):
+    """Return a compact JSON-safe copy without retaining a live reference."""
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return default
+
+
+def _selected_json_fields(payload, fields):
+    if not isinstance(payload, dict):
+        return {}
+    result = {}
+    for field in fields:
+        if field in payload and payload[field] is not None:
+            result[field] = _json_safe_copy(payload[field])
+    return result
+
+
+def _compact_judge_feedback_payload(decision_id, feedback, observation=None):
+    """Return the bounded delayed-feedback record used by the Judge table.
+
+    The full decision/next-decision pair belongs in the canonical economic
+    transition table.  Keeping it inside ``feedback_json`` duplicated large
+    MARL proposals once per decision and made a 1,300-row run exceed a GiB.
+    Historical v1 rows remain readable; new rows use this bounded v2 shape.
+    """
+    feedback = feedback if isinstance(feedback, dict) else {}
+    observation = observation if isinstance(observation, dict) else {}
+    fields = (
+        "feedback_status", "outcome_observed", "observed_metric_id",
+        "pdcp_metric_snapshot_id", "pdcp_loss_coverage", "topology_valid",
+        "tasam_action_applied", "economic_action_alignment_valid",
+        "economic_action_contract", "economic_application_status",
+        "economic_transition_eligible", "economic_training_eligible",
+        "economic_promotion_eligible", "economic_execution_mode",
+        "economic_safety_isolated", "economic_safety_isolation_reason",
+        "economic_outcome_invalid_reason", "economic_invalid_reason",
+        "armd_safety_level", "armd_role", "realized_energy_saving_fraction",
+        "realized_allocation_saving_fraction", "tasam_online_reward",
+        "tasam_energy_reward", "tasam_allocation_reward", "tasam_sla_penalty",
+        "tasam_observed_verdict", "tasam_predicted_verdict",
+        "tasam_error_components", "energy_model_version",
+        "correct_verdict", "outcome_reward", "severity_penalty",
+        "armd_credit", "tasam_credit", "tasam_state_credit",
+        "tasam_resource_credit", "tasam_observed_error",
+        "tasam_continuous_reward", "tasam_reward_source", "credit_assignment",
+        "reason", "decision_stage_name", "observed_stage_name",
+        "stage_boundary_feedback", "nominal_expected_verdict",
+    )
+    economic_action = feedback.get("economic_action") or {}
+    action_fields = (
+        "contract", "application_status", "correlation_id",
+        "native_control_sequence", "actuation_confirmed",
+        "actuation_confirmation_source", "native_observation",
+        "economic_transition_eligible", "economic_training_eligible",
+        "economic_promotion_eligible", "economic_execution_mode",
+        "economic_safety_isolated", "economic_safety_isolation_reason",
+        "outcome_invalid_reason", "rejection_reason", "safety_override",
+        "armd_safety_level", "armd_role", "armd_advisory_only",
+        "armd_hard_veto", "topology_valid", "realized_energy_saving_fraction",
+        "realized_allocation_saving_fraction", "proposed", "projected",
+        "applied", "live_candidate",
+    )
+    observation_fields = (
+        "observed_metric_id", "metric_snapshot_id", "timestamp",
+        "correct_verdict", "observed", "degraded", "critical_violation",
+        "priority_violation", "reason", "decision_stage_name",
+        "observed_stage_name", "stage_boundary_feedback",
+        "nominal_expected_verdict",
+    )
+    payload = {
+        "schema": "greenran.rapp_judge_feedback.v2",
+        "decision_id": int(decision_id) if decision_id else None,
+        "feedback": _selected_json_fields(feedback, fields),
+        "economic_action": _selected_json_fields(economic_action, action_fields),
+        "observation": _selected_json_fields(observation, observation_fields),
+        "economic_transition_ref": {
+            "decision_id": int(decision_id) if decision_id else None,
+            "observed_metric_id": feedback.get("observed_metric_id")
+            or feedback.get("pdcp_metric_snapshot_id")
+            or observation.get("observed_metric_id"),
+            "source": "tasam_economic_transition_history",
+        },
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    # This is a safety invariant, not a truncation mechanism: all fields are
+    # explicitly allow-listed above, so exceeding the bound indicates a new
+    # oversized nested field was introduced and should fail the write loudly.
+    if len(encoded.encode("utf-8")) > 32 * 1024:
+        raise ValueError("compact Judge feedback exceeds 32 KiB")
+    return payload
+
+
+def _compact_economic_transition_payload(decision_id, decision, next_decision, feedback, action):
+    """Persist the economic contract without copying whole decision snapshots.
+
+    The canonical MARL state remains in ``marl_*_state_history``.  Storing it
+    once avoids the multi-gigabyte duplicate transition bank that previously
+    exhausted the campaign artifact budget.  The controller rehydrates only
+    exact timestamps when it prepares a temporary trainer replay.
+    """
+    action_fields = (
+        "contract", "application_status", "correlation_id",
+        "native_control_sequence", "actuation_confirmed",
+        "actuation_confirmation_source", "native_observation",
+        "economic_transition_eligible", "economic_training_eligible",
+        "economic_promotion_eligible", "economic_execution_mode",
+        "economic_safety_isolated", "economic_safety_isolation_reason",
+        "economic_isolation_source", "outcome_invalid_reason",
+        "rejection_reason", "safety_override", "armd_safety_level",
+        "armd_role", "armd_advisory_only", "armd_hard_veto",
+        "tasam_operating_permission", "topology_valid",
+        "pdcp_loss_coverage", "pdcp_metric_snapshot_id",
+        "realized_energy_saving_fraction", "realized_allocation_saving_fraction",
+        "proposed", "projected", "applied", "live_candidate",
+    )
+    feedback_fields = (
+        "feedback_status", "outcome_observed", "observed_metric_id",
+        "pdcp_metric_snapshot_id", "pdcp_loss_coverage", "topology_valid",
+        "tasam_action_applied", "economic_action_alignment_valid",
+        "economic_action_contract", "economic_application_status",
+        "native_control_sequence", "actuation_confirmed",
+        "economic_transition_eligible", "economic_training_eligible",
+        "economic_promotion_eligible", "economic_execution_mode",
+        "economic_safety_isolated", "economic_safety_isolation_reason",
+        "economic_outcome_invalid_reason", "armd_safety_level", "armd_role",
+        "realized_energy_saving_fraction", "realized_allocation_saving_fraction",
+        "tasam_online_reward", "tasam_energy_reward",
+        "tasam_allocation_reward", "tasam_sla_penalty",
+        "tasam_observed_verdict", "tasam_predicted_verdict",
+        "tasam_error_components", "energy_model_version",
+    )
+    decision_fields = (
+        "decision_id", "timestamp", "metric_snapshot_id", "topology_id",
+        "tasam_checkpoint_valid", "tasam_fallback_used", "tasam_source",
+        "tasam_valid", "tasam_evidence_valid", "tasam_action_applied", "topology_valid",
+        "economic_action_contract", "economic_application_status",
+        "economic_transition_eligible", "economic_training_eligible",
+        "economic_promotion_eligible", "economic_execution_mode",
+        "economic_safety_isolated", "armd_safety_level", "armd_role",
+        "energy_model_version", "native_evidence_ingest", "decision_stage_name",
+        "allocation_state",
+    )
+    next_fields = (
+        "timestamp", "metric_snapshot_id", "topology_id", "decision_stage_name",
+        "allocation_state", "energy_model_version",
+    )
+    allocation_fields = (
+        "usable_budget", "resource_budget", "r_ran", "r_ai", "d_ran", "d_ai",
+        "floor_total_ran", "floor_total_ai", "floor_feasible", "floor_verified",
+        "allocation_state", "ran_completion_ratio", "ai_completion_ratio",
+        "ran_components", "ai_components", "live_energy_observation",
+        "live_power_percent", "live_ru_count", "live_mmwave_count",
+        "scenario_stage", "state_category",
+    )
+    allocation = decision.get("resource_allocation") or decision.get("action") or {}
+    return {
+        "schema": "greenran.tasam.economic_transition.v2",
+        "decision_id": int(decision_id),
+        "decision_provenance": _selected_json_fields(decision, decision_fields),
+        "next_decision_provenance": _selected_json_fields(next_decision, next_fields),
+        "resource_allocation": _selected_json_fields(allocation, allocation_fields),
+        "economic_action": _selected_json_fields(action, action_fields),
+        "judge_feedback": _selected_json_fields(feedback, feedback_fields),
+    }
 
 
 class DataLake:
@@ -81,6 +252,79 @@ class DataLake:
         except Exception as e:
             print(f"[DataLake] ERRO ao conectar: {e}")
             raise
+
+    def _migrate_judge_outcome_timestamp_key(self, cursor):
+        """Remove the legacy timestamp-only uniqueness from judge feedback.
+
+        Older databases used ``UNIQUE(decision_timestamp)``.  That key is not
+        sufficient when the rApp emits more than one decision in a second and
+        can replace an unrelated delayed outcome.  New databases do not add
+        that constraint; existing databases are rebuilt transactionally while
+        preserving every row.  Legacy rows retain a nullable decision_id and
+        are matched by timestamp only when no exact id is available.
+        """
+        table = "judge_outcome_history"
+        indexes = cursor.execute(f"PRAGMA index_list({table})").fetchall()
+        timestamp_unique = False
+        for index in indexes:
+            if not int(index[2] or 0):
+                continue
+            index_name = str(index[1])
+            columns = [
+                str(row[2])
+                for row in cursor.execute(f"PRAGMA index_info({index_name})").fetchall()
+            ]
+            if columns == ["decision_timestamp"]:
+                timestamp_unique = True
+                break
+        if not timestamp_unique:
+            return
+
+        schema_row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if not schema_row or not schema_row[0]:
+            return
+        new_schema = str(schema_row[0]).replace(
+            "CREATE TABLE judge_outcome_history",
+            "CREATE TABLE judge_outcome_history_new",
+            1,
+        )
+        new_schema = re.sub(
+            r",\s*UNIQUE\s*\(\s*decision_timestamp\s*\)",
+            "",
+            new_schema,
+            flags=re.IGNORECASE,
+        )
+        cursor.execute("DROP INDEX IF EXISTS idx_judge_outcome_decision_timestamp")
+        cursor.execute(
+            "ALTER TABLE judge_outcome_history RENAME TO judge_outcome_history_legacy"
+        )
+        cursor.execute(new_schema)
+        old_columns = {
+            str(row[1])
+            for row in cursor.execute("PRAGMA table_info(judge_outcome_history_legacy)").fetchall()
+        }
+        new_columns = {
+            str(row[1])
+            for row in cursor.execute("PRAGMA table_info(judge_outcome_history_new)").fetchall()
+        }
+        common = sorted(old_columns & new_columns)
+        if common:
+            names = ", ".join(common)
+            cursor.execute(
+                f"INSERT INTO judge_outcome_history_new ({names}) "
+                f"SELECT {names} FROM judge_outcome_history_legacy"
+            )
+        cursor.execute("DROP TABLE judge_outcome_history_legacy")
+        cursor.execute(
+            "ALTER TABLE judge_outcome_history_new RENAME TO judge_outcome_history"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_judge_outcome_decision_timestamp "
+            "ON judge_outcome_history(decision_timestamp)"
+        )
     
     def _create_tables(self):
         """Cria tabelas do Data Lake"""
@@ -107,6 +351,9 @@ class DataLake:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
                 datetime TEXT NOT NULL,
+                metric_snapshot_id INTEGER,
+                snapshot_sequence_id TEXT,
+                pairing_schedule_id TEXT,
                 decision TEXT NOT NULL,
                 reason TEXT,
                 confidence REAL,
@@ -135,6 +382,14 @@ class DataLake:
                 armd_source TEXT,
                 armd_confidence REAL DEFAULT 0,
                 armd_override_applied INTEGER DEFAULT 0,
+                armd_safety_level TEXT DEFAULT 'UNKNOWN',
+                armd_role TEXT DEFAULT 'advisory',
+                armd_advisory_only INTEGER DEFAULT 1,
+                armd_hard_veto INTEGER DEFAULT 0,
+                tasam_operating_permission INTEGER DEFAULT 0,
+                tasam_envelope_min_power REAL,
+                tasam_envelope_max_power REAL,
+                economic_isolation_source TEXT DEFAULT '',
                 tasam_enabled INTEGER DEFAULT 0,
                 tasam_proposal_present INTEGER DEFAULT 0,
                 tasam_proposal_valid INTEGER DEFAULT 0,
@@ -145,9 +400,63 @@ class DataLake:
                 tasam_source TEXT,
                 tasam_confidence REAL DEFAULT 0,
                 tasam_valid INTEGER DEFAULT 0,
+                tasam_checkpoint_valid INTEGER DEFAULT 0,
+                tasam_fallback_used INTEGER DEFAULT 0,
+                tasam_evidence_valid INTEGER DEFAULT 0,
+                live_allocator_algorithm TEXT DEFAULT '',
+                live_power_percent REAL,
+                shadow_power_percent REAL,
+                live_power_w REAL,
+                shadow_power_w REAL,
+                energy_saving_fraction REAL DEFAULT 0,
+                resource_saving_fraction REAL DEFAULT 0,
+                causal_score_delta REAL DEFAULT 0,
+                energy_model_version TEXT DEFAULT '',
                 tasam_would_influence INTEGER DEFAULT 0,
                 tasam_energy_decision TEXT,
                 tasam_energy_action TEXT,
+                tasam_power_percent REAL DEFAULT 100,
+                tasam_power_applied_percent REAL DEFAULT 100,
+                power_safety_override_reason TEXT DEFAULT '',
+                economic_action_contract TEXT DEFAULT '',
+                economic_execution_mode TEXT DEFAULT 'diagnostic',
+                economic_safety_isolated INTEGER DEFAULT 0,
+                economic_safety_isolation_reason TEXT DEFAULT '',
+                economic_application_status TEXT DEFAULT '',
+                economic_rejection_reason TEXT DEFAULT '',
+                actuation_confirmed INTEGER DEFAULT 0,
+                actuation_confirmation_source TEXT DEFAULT '',
+                observed_power_percent REAL,
+                observed_power_w REAL,
+                observed_ru_count INTEGER,
+                observed_mmwave_count INTEGER,
+                confirmation_decision_id INTEGER,
+                economic_outcome_invalid_reason TEXT DEFAULT '',
+                pdcp_coverage_json TEXT DEFAULT '{}',
+                topology_valid INTEGER DEFAULT 0,
+                pdcp_metric_snapshot_id INTEGER,
+                economic_transition_eligible INTEGER DEFAULT 0,
+                economic_training_eligible INTEGER DEFAULT 0,
+                economic_promotion_eligible INTEGER DEFAULT 0,
+                realized_energy_saving_fraction REAL,
+                realized_allocation_saving_fraction REAL,
+                tasam_online_reward REAL,
+                tasam_energy_reward REAL,
+                tasam_allocation_reward REAL,
+                tasam_sla_penalty REAL,
+                economic_action_json TEXT DEFAULT '{}',
+                tasam_power_cost_penalty REAL DEFAULT 0,
+                tasam_completion_shortfall_penalty REAL DEFAULT 0,
+                tasam_underallocation_penalty REAL DEFAULT 0,
+                tasam_allocation_target_ran REAL DEFAULT 0,
+                tasam_allocation_target_ai REAL DEFAULT 0,
+                tasam_allocation_predicted_ran REAL DEFAULT 0,
+                tasam_allocation_predicted_ai REAL DEFAULT 0,
+                tasam_allocation_prediction_loss REAL DEFAULT 0,
+                tasam_allocation_target_source TEXT DEFAULT '',
+                tasam_allocation_target_feasible INTEGER DEFAULT 1,
+                tasam_reward_components_json TEXT DEFAULT '{}',
+                native_evidence_ingest_json TEXT DEFAULT '{}',
                 advisor_arbitration_mode TEXT,
                 advisor_arbitration_present INTEGER DEFAULT 0,
                 advisor_proposal_pair_complete INTEGER DEFAULT 0,
@@ -210,6 +519,9 @@ class DataLake:
             row[1] for row in cursor.execute("PRAGMA table_info(decisions_history)").fetchall()
         }
         for column_name, column_def in (
+            ("metric_snapshot_id", "INTEGER"),
+            ("snapshot_sequence_id", "TEXT"),
+            ("pairing_schedule_id", "TEXT"),
             ("armd_enabled", "INTEGER DEFAULT 0"),
             ("collection_event_stage_name", "TEXT"),
             ("collection_event_target_domain", "TEXT"),
@@ -227,6 +539,14 @@ class DataLake:
             ("armd_source", "TEXT"),
             ("armd_confidence", "REAL DEFAULT 0"),
             ("armd_override_applied", "INTEGER DEFAULT 0"),
+            ("armd_safety_level", "TEXT DEFAULT 'UNKNOWN'"),
+            ("armd_role", "TEXT DEFAULT 'advisory'"),
+            ("armd_advisory_only", "INTEGER DEFAULT 1"),
+            ("armd_hard_veto", "INTEGER DEFAULT 0"),
+            ("tasam_operating_permission", "INTEGER DEFAULT 0"),
+            ("tasam_envelope_min_power", "REAL"),
+            ("tasam_envelope_max_power", "REAL"),
+            ("economic_isolation_source", "TEXT DEFAULT ''"),
             ("tasam_enabled", "INTEGER DEFAULT 0"),
             ("tasam_proposal_present", "INTEGER DEFAULT 0"),
             ("tasam_proposal_valid", "INTEGER DEFAULT 0"),
@@ -237,9 +557,63 @@ class DataLake:
             ("tasam_source", "TEXT"),
             ("tasam_confidence", "REAL DEFAULT 0"),
             ("tasam_valid", "INTEGER DEFAULT 0"),
+            ("tasam_checkpoint_valid", "INTEGER DEFAULT 0"),
+            ("tasam_fallback_used", "INTEGER DEFAULT 0"),
+            ("tasam_evidence_valid", "INTEGER DEFAULT 0"),
+            ("live_allocator_algorithm", "TEXT DEFAULT ''"),
+            ("live_power_percent", "REAL"),
+            ("shadow_power_percent", "REAL"),
+            ("live_power_w", "REAL"),
+            ("shadow_power_w", "REAL"),
+            ("energy_saving_fraction", "REAL DEFAULT 0"),
+            ("resource_saving_fraction", "REAL DEFAULT 0"),
+            ("causal_score_delta", "REAL DEFAULT 0"),
+            ("energy_model_version", "TEXT DEFAULT ''"),
             ("tasam_would_influence", "INTEGER DEFAULT 0"),
             ("tasam_energy_decision", "TEXT"),
             ("tasam_energy_action", "TEXT"),
+            ("tasam_power_percent", "REAL DEFAULT 100"),
+            ("tasam_power_applied_percent", "REAL DEFAULT 100"),
+            ("power_safety_override_reason", "TEXT DEFAULT ''"),
+            ("economic_action_contract", "TEXT DEFAULT ''"),
+            ("economic_execution_mode", "TEXT DEFAULT 'diagnostic'"),
+            ("economic_safety_isolated", "INTEGER DEFAULT 0"),
+            ("economic_safety_isolation_reason", "TEXT DEFAULT ''"),
+            ("economic_application_status", "TEXT DEFAULT ''"),
+            ("economic_rejection_reason", "TEXT DEFAULT ''"),
+            ("actuation_confirmed", "INTEGER DEFAULT 0"),
+            ("actuation_confirmation_source", "TEXT DEFAULT ''"),
+            ("observed_power_percent", "REAL"),
+            ("observed_power_w", "REAL"),
+            ("observed_ru_count", "INTEGER"),
+            ("observed_mmwave_count", "INTEGER"),
+            ("confirmation_decision_id", "INTEGER"),
+            ("economic_outcome_invalid_reason", "TEXT DEFAULT ''"),
+            ("pdcp_coverage_json", "TEXT DEFAULT '{}'"),
+            ("topology_valid", "INTEGER DEFAULT 0"),
+            ("pdcp_metric_snapshot_id", "INTEGER"),
+            ("economic_transition_eligible", "INTEGER DEFAULT 0"),
+            ("economic_training_eligible", "INTEGER DEFAULT 0"),
+            ("economic_promotion_eligible", "INTEGER DEFAULT 0"),
+            ("realized_energy_saving_fraction", "REAL"),
+            ("realized_allocation_saving_fraction", "REAL"),
+            ("tasam_online_reward", "REAL"),
+            ("tasam_energy_reward", "REAL"),
+            ("tasam_allocation_reward", "REAL"),
+            ("tasam_sla_penalty", "REAL"),
+            ("economic_action_json", "TEXT DEFAULT '{}'"),
+            ("tasam_power_cost_penalty", "REAL DEFAULT 0"),
+            ("tasam_completion_shortfall_penalty", "REAL DEFAULT 0"),
+            ("tasam_underallocation_penalty", "REAL DEFAULT 0"),
+            ("tasam_allocation_target_ran", "REAL DEFAULT 0"),
+            ("tasam_allocation_target_ai", "REAL DEFAULT 0"),
+            ("tasam_allocation_predicted_ran", "REAL DEFAULT 0"),
+            ("tasam_allocation_predicted_ai", "REAL DEFAULT 0"),
+            ("tasam_allocation_prediction_loss", "REAL DEFAULT 0"),
+            ("tasam_allocation_target_source", "TEXT DEFAULT ''"),
+            ("tasam_allocation_target_feasible", "INTEGER DEFAULT 1"),
+            ("tasam_reward_components_json", "TEXT DEFAULT '{}'"),
+            ("native_evidence_ingest_json", "TEXT DEFAULT '{}'"),
             ("advisor_arbitration_mode", "TEXT"),
             ("advisor_arbitration_present", "INTEGER DEFAULT 0"),
             ("advisor_proposal_pair_complete", "INTEGER DEFAULT 0"),
@@ -388,6 +762,7 @@ class DataLake:
                 rlc_trace_age_s REAL DEFAULT 0,
                 mac_trace_age_s REAL DEFAULT 0,
                 pdcp_latest_sim_time_s REAL DEFAULT 0,
+                decision_id INTEGER,
                 UNIQUE(timestamp)
             )
         """)
@@ -395,6 +770,7 @@ class DataLake:
             row[1] for row in cursor.execute("PRAGMA table_info(extended_metrics)").fetchall()
         }
         for column_name, column_def in (
+            ("decision_id", "INTEGER"),
             ("collector_mode", "TEXT DEFAULT ''"),
             ("throughput_source", "TEXT DEFAULT ''"),
             ("real_latency_sample_count", "INTEGER DEFAULT 0"),
@@ -439,6 +815,13 @@ class DataLake:
             row[1] for row in cursor.execute("PRAGMA table_info(ue_metrics)").fetchall()
         }
         for column_name, column_def in (
+            ("sim_time_s", "REAL DEFAULT 0"),
+            ("latency_p95_us", "REAL"),
+            ("has_latency_samples", "INTEGER DEFAULT 0"),
+            ("latency_is_proxy", "INTEGER DEFAULT 0"),
+            ("pdcp_provenance", "TEXT DEFAULT ''"),
+            ("offered_load_kbps", "REAL DEFAULT 0"),
+            ("backlog_bytes", "INTEGER DEFAULT 0"),
             ("packet_loss_percent", "REAL"),
             ("vehicle_id", "TEXT"),
             ("vehicle_role", "TEXT"),
@@ -465,6 +848,10 @@ class DataLake:
             ON extended_metrics(timestamp)
         """)
         cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_extended_decision_id
+            ON extended_metrics(decision_id)
+        """)
+        cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_ue_timestamp 
             ON ue_metrics(timestamp)
         """)
@@ -486,7 +873,36 @@ class DataLake:
                 reason TEXT,
                 timestamp_ns INTEGER,
                 power_w REAL,
-                calibration_version TEXT
+                calibration_version TEXT,
+                requested_power_percent REAL,
+                applied_power_percent REAL,
+                power_safety_override_reason TEXT DEFAULT '',
+                native_sim_energy_j REAL,
+                native_sim_power_w REAL,
+                energy_reference_source TEXT DEFAULT '',
+                absolute_scale_valid INTEGER DEFAULT 0,
+                physical_wattmeter_available INTEGER DEFAULT 0,
+                calibration_corpus_id TEXT DEFAULT '',
+                calibration_fit_error REAL,
+                calibration_rank_valid INTEGER DEFAULT 0,
+                decision_id INTEGER,
+                action_correlation_id TEXT DEFAULT '',
+                native_control_sequence INTEGER,
+                action_origin TEXT DEFAULT '',
+                application_status TEXT DEFAULT '',
+                command_sent INTEGER DEFAULT 0,
+                actuation_confirmed INTEGER DEFAULT 0,
+                actuation_confirmation_source TEXT DEFAULT '',
+                observed_power_percent REAL,
+                observed_power_w REAL,
+                observed_ru_count INTEGER,
+                observed_mmwave_count INTEGER,
+                confirmation_decision_id INTEGER,
+                observed_allocation_fraction REAL,
+                native_active_dl_symbols INTEGER,
+                native_dl_symbol_capacity INTEGER,
+                native_cell_ids_json TEXT DEFAULT '[]',
+                native_observation_version TEXT DEFAULT ''
             )
         """)
         existing_energy_columns = {
@@ -496,6 +912,35 @@ class DataLake:
             ("timestamp_ns", "INTEGER"),
             ("power_w", "REAL"),
             ("calibration_version", "TEXT"),
+            ("requested_power_percent", "REAL"),
+            ("applied_power_percent", "REAL"),
+            ("power_safety_override_reason", "TEXT DEFAULT ''"),
+            ("native_sim_energy_j", "REAL"),
+            ("native_sim_power_w", "REAL"),
+            ("energy_reference_source", "TEXT DEFAULT ''"),
+            ("absolute_scale_valid", "INTEGER DEFAULT 0"),
+            ("physical_wattmeter_available", "INTEGER DEFAULT 0"),
+            ("calibration_corpus_id", "TEXT DEFAULT ''"),
+            ("calibration_fit_error", "REAL"),
+            ("calibration_rank_valid", "INTEGER DEFAULT 0"),
+            ("decision_id", "INTEGER"),
+            ("action_correlation_id", "TEXT DEFAULT ''"),
+            ("native_control_sequence", "INTEGER"),
+            ("action_origin", "TEXT DEFAULT ''"),
+            ("application_status", "TEXT DEFAULT ''"),
+            ("command_sent", "INTEGER DEFAULT 0"),
+            ("actuation_confirmed", "INTEGER DEFAULT 0"),
+            ("actuation_confirmation_source", "TEXT DEFAULT ''"),
+            ("observed_power_percent", "REAL"),
+            ("observed_power_w", "REAL"),
+            ("observed_ru_count", "INTEGER"),
+            ("observed_mmwave_count", "INTEGER"),
+            ("confirmation_decision_id", "INTEGER"),
+            ("observed_allocation_fraction", "REAL"),
+            ("native_active_dl_symbols", "INTEGER"),
+            ("native_dl_symbol_capacity", "INTEGER"),
+            ("native_cell_ids_json", "TEXT DEFAULT '[]'"),
+            ("native_observation_version", "TEXT DEFAULT ''"),
         ):
             if column_name not in existing_energy_columns:
                 cursor.execute(f"ALTER TABLE energy_commands ADD COLUMN {column_name} {column_def}")
@@ -503,6 +948,203 @@ class DataLake:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_energy_timestamp 
             ON energy_commands(timestamp)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_energy_action_correlation
+            ON energy_commands(action_correlation_id)
+        """)
+
+        # Independent ns-3 evidence for a TA-SAM control transaction. A
+        # command ACK proves transport; this table proves what ns-3 observed
+        # at the cell/PHY boundary.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasam_control_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                sim_time_s REAL NOT NULL,
+                cell_id INTEGER NOT NULL,
+                transaction_id INTEGER NOT NULL,
+                power_transaction_id INTEGER NOT NULL DEFAULT 0,
+                scheduler_transaction_id INTEGER NOT NULL DEFAULT 0,
+                active_ues INTEGER,
+                tx_power_percent REAL,
+                tx_power_dbm REAL,
+                nominal_tx_power_dbm REAL,
+                observation_kind TEXT DEFAULT 'legacy_snapshot',
+                policy_active INTEGER DEFAULT 0,
+                policy_expiry_sim_time REAL,
+                source_generation TEXT DEFAULT '',
+                association_epoch TEXT DEFAULT '',
+                native_allocated_dl_symbols INTEGER,
+                native_dl_symbol_capacity INTEGER,
+                native_allocation_source TEXT DEFAULT '',
+                native_allocation_fraction REAL,
+                campaign_id TEXT DEFAULT '',
+                campaign_generation TEXT DEFAULT '',
+                decision_id INTEGER,
+                action_correlation_id TEXT DEFAULT '',
+                native_control_sequence INTEGER,
+                evidence_version TEXT DEFAULT 'v1',
+                imported_at INTEGER NOT NULL,
+                UNIQUE(source_path, sim_time_s, cell_id, scheduler_transaction_id,
+                       power_transaction_id, observation_kind)
+            )
+        """)
+        existing_observation_columns = {
+            row[1] for row in cursor.execute(
+                "PRAGMA table_info(tasam_control_observations)"
+            ).fetchall()
+        }
+        for column_name, column_def in (
+            ("power_transaction_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("scheduler_transaction_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("nominal_tx_power_dbm", "REAL"),
+            ("observation_kind", "TEXT DEFAULT 'legacy_snapshot'"),
+            ("policy_active", "INTEGER DEFAULT 0"),
+            ("policy_expiry_sim_time", "REAL"),
+            ("source_generation", "TEXT DEFAULT ''"),
+            ("association_epoch", "TEXT DEFAULT ''"),
+            ("native_allocated_dl_symbols", "INTEGER"),
+            ("native_dl_symbol_capacity", "INTEGER"),
+            ("native_allocation_source", "TEXT DEFAULT ''"),
+            ("native_allocation_fraction", "REAL"),
+            ("campaign_id", "TEXT DEFAULT ''"),
+            ("campaign_generation", "TEXT DEFAULT ''"),
+            ("decision_id", "INTEGER"),
+            ("action_correlation_id", "TEXT DEFAULT ''"),
+            ("native_control_sequence", "INTEGER"),
+            ("evidence_version", "TEXT DEFAULT 'v1'"),
+        ):
+            if column_name not in existing_observation_columns:
+                cursor.execute(
+                    f"ALTER TABLE tasam_control_observations ADD COLUMN "
+                    f"{column_name} {column_def}"
+                )
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasam_native_ingest_state (
+                source_path TEXT PRIMARY KEY,
+                inode INTEGER NOT NULL DEFAULT 0,
+                byte_offset INTEGER NOT NULL DEFAULT 0,
+                header TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                reset_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        existing_ingest_columns = {
+            row[1] for row in cursor.execute(
+                "PRAGMA table_info(tasam_native_ingest_state)"
+            ).fetchall()
+        }
+        for column_name, column_def in (
+            ("last_error", "TEXT NOT NULL DEFAULT ''"),
+            ("reset_count", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column_name not in existing_ingest_columns:
+                cursor.execute(
+                    f"ALTER TABLE tasam_native_ingest_state ADD COLUMN "
+                    f"{column_name} {column_def}"
+                )
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasam_native_evidence_ingest (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                campaign_id TEXT DEFAULT '',
+                source_generation TEXT DEFAULT '',
+                evidence_version TEXT DEFAULT '',
+                inode INTEGER DEFAULT 0,
+                start_offset INTEGER DEFAULT 0,
+                end_offset INTEGER DEFAULT 0,
+                imported_rows INTEGER DEFAULT 0,
+                invalid_rows INTEGER DEFAULT 0,
+                reset_detected INTEGER DEFAULT 0,
+                error TEXT DEFAULT '',
+                sim_time_s REAL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasam_native_ingest_event
+            ON tasam_native_evidence_ingest(source_path, created_at)
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasam_native_associations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                sim_time_s REAL NOT NULL,
+                cell_id INTEGER NOT NULL,
+                rnti INTEGER NOT NULL,
+                imsi INTEGER NOT NULL,
+                association_epoch TEXT DEFAULT '',
+                campaign_id TEXT DEFAULT '',
+                source_generation TEXT DEFAULT '',
+                evidence_version TEXT DEFAULT 'v1',
+                imported_at INTEGER NOT NULL,
+                UNIQUE(source_path, sim_time_s, cell_id, rnti, imsi, association_epoch)
+            )
+        """)
+        existing_association_columns = {
+            row[1] for row in cursor.execute(
+                "PRAGMA table_info(tasam_native_associations)"
+            ).fetchall()
+        }
+        for column_name, column_def in (
+            ("campaign_id", "TEXT DEFAULT ''"),
+            ("source_generation", "TEXT DEFAULT ''"),
+            # v5 association rows carry the same control identity used by
+            # the power/policy trace.  These are additive so v1-v4 traces
+            # remain readable for diagnostics, but strict v5 validators can
+            # reject rows that cannot be correlated to a decision.
+            ("transaction_id", "INTEGER DEFAULT 0"),
+            ("native_control_sequence", "INTEGER"),
+            ("decision_id", "INTEGER"),
+            ("action_correlation_id", "TEXT DEFAULT ''"),
+        ):
+            if column_name not in existing_association_columns:
+                cursor.execute(
+                    f"ALTER TABLE tasam_native_associations ADD COLUMN "
+                    f"{column_name} {column_def}"
+                )
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasam_native_association_lookup
+            ON tasam_native_associations(cell_id, imsi, sim_time_s)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasam_native_association_identity
+            ON tasam_native_associations(campaign_id, source_generation,
+                                         transaction_id, native_control_sequence,
+                                         decision_id, action_correlation_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasam_observation_transaction
+            ON tasam_control_observations(power_transaction_id, scheduler_transaction_id,
+                                          cell_id, sim_time_s)
+        """)
+
+        # A command can be confirmed several controller cycles after its ACK.
+        # Keeping this state in SQLite makes confirmation restart-safe and
+        # prevents a single in-memory slot from discarding late native rows.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasam_pending_native_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL,
+                decision_id INTEGER NOT NULL,
+                action_correlation_id TEXT NOT NULL UNIQUE,
+                native_control_sequence INTEGER NOT NULL,
+                issued_sim_time_s REAL,
+                ttl_s REAL NOT NULL DEFAULT 5.0,
+                expected_cells_json TEXT NOT NULL,
+                expected_power_percent REAL,
+                status TEXT NOT NULL DEFAULT 'pending_confirmation',
+                confirmation_json TEXT DEFAULT '{}',
+                invalid_reason TEXT DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasam_pending_status
+            ON tasam_pending_native_actions(status, native_control_sequence)
         """)
 
         cursor.execute("""
@@ -532,6 +1174,7 @@ class DataLake:
                 reinforcement_ran REAL DEFAULT 0,
                 reinforcement_ai REAL DEFAULT 0,
                 floor_feasible INTEGER DEFAULT 1,
+                topology_valid INTEGER DEFAULT 0,
                 per_ue_floor_json TEXT DEFAULT '{}',
                 per_ue_allocation_json TEXT DEFAULT '[]',
                 per_ue_floor_violation_count INTEGER DEFAULT 0,
@@ -539,6 +1182,13 @@ class DataLake:
                 per_ue_policy_id TEXT DEFAULT '',
                 per_ue_ack_timestamp REAL DEFAULT 0,
                 per_ue_ack_reason TEXT DEFAULT '',
+                tasam_allocation_target_ran REAL DEFAULT 0,
+                tasam_allocation_target_ai REAL DEFAULT 0,
+                tasam_allocation_predicted_ran REAL DEFAULT 0,
+                tasam_allocation_predicted_ai REAL DEFAULT 0,
+                tasam_allocation_prediction_loss REAL DEFAULT 0,
+                tasam_allocation_target_source TEXT DEFAULT '',
+                tasam_allocation_target_feasible INTEGER DEFAULT 1,
                 resource_floor_policy TEXT DEFAULT 'sla_per_ue_v1',
                 snapshot_json TEXT,
                 UNIQUE(timestamp)
@@ -560,6 +1210,7 @@ class DataLake:
             ("reinforcement_ran", "REAL DEFAULT 0"),
             ("reinforcement_ai", "REAL DEFAULT 0"),
             ("floor_feasible", "INTEGER DEFAULT 1"),
+            ("topology_valid", "INTEGER DEFAULT 0"),
             ("per_ue_floor_json", "TEXT DEFAULT '{}'"),
             ("per_ue_allocation_json", "TEXT DEFAULT '[]'"),
             ("per_ue_floor_violation_count", "INTEGER DEFAULT 0"),
@@ -567,6 +1218,13 @@ class DataLake:
             ("per_ue_policy_id", "TEXT DEFAULT ''"),
             ("per_ue_ack_timestamp", "REAL DEFAULT 0"),
             ("per_ue_ack_reason", "TEXT DEFAULT ''"),
+            ("tasam_allocation_target_ran", "REAL DEFAULT 0"),
+            ("tasam_allocation_target_ai", "REAL DEFAULT 0"),
+            ("tasam_allocation_predicted_ran", "REAL DEFAULT 0"),
+            ("tasam_allocation_predicted_ai", "REAL DEFAULT 0"),
+            ("tasam_allocation_prediction_loss", "REAL DEFAULT 0"),
+            ("tasam_allocation_target_source", "TEXT DEFAULT ''"),
+            ("tasam_allocation_target_feasible", "INTEGER DEFAULT 1"),
             ("resource_floor_policy", "TEXT DEFAULT 'sla_per_ue_v1'"),
         ):
             if column_name not in existing_resource_columns:
@@ -648,6 +1306,31 @@ class DataLake:
                 live_score REAL DEFAULT 0,
                 shadow_score REAL DEFAULT 0,
                 score_delta REAL DEFAULT 0,
+                base_sla_resource_score_delta REAL DEFAULT 0,
+                causal_score_delta REAL DEFAULT 0,
+                tasam_checkpoint_valid INTEGER DEFAULT 0,
+                tasam_fallback_used INTEGER DEFAULT 0,
+                tasam_evidence_valid INTEGER DEFAULT 0,
+                live_allocator_algorithm TEXT DEFAULT '',
+                live_power_percent REAL,
+                shadow_power_percent REAL,
+                live_power_w REAL,
+                shadow_power_w REAL,
+                energy_saving_fraction REAL DEFAULT 0,
+                resource_saving_fraction REAL DEFAULT 0,
+                energy_model_version TEXT DEFAULT '',
+                energy_valid INTEGER DEFAULT 0,
+                resource_valid INTEGER DEFAULT 0,
+                native_sim_energy_j REAL,
+                native_sim_power_w REAL,
+                energy_reference_source TEXT DEFAULT '',
+                absolute_scale_valid INTEGER DEFAULT 0,
+                physical_wattmeter_available INTEGER DEFAULT 0,
+                infra_resource_index REAL,
+                infra_resource_saving_fraction REAL,
+                calibration_corpus_id TEXT DEFAULT '',
+                calibration_fit_error REAL,
+                calibration_rank_valid INTEGER DEFAULT 0,
                 live_ran_completion_est REAL DEFAULT 0,
                 shadow_ran_completion_est REAL DEFAULT 0,
                 live_ai_completion_est REAL DEFAULT 0,
@@ -662,6 +1345,42 @@ class DataLake:
                 UNIQUE(timestamp)
             )
         """)
+        existing_shadow_columns = {
+            row[1] for row in cursor.execute(
+                "PRAGMA table_info(marl_shadow_comparison_history)"
+            ).fetchall()
+        }
+        for column_name, column_def in (
+            ("base_sla_resource_score_delta", "REAL DEFAULT 0"),
+            ("causal_score_delta", "REAL DEFAULT 0"),
+            ("tasam_checkpoint_valid", "INTEGER DEFAULT 0"),
+            ("tasam_fallback_used", "INTEGER DEFAULT 0"),
+            ("tasam_evidence_valid", "INTEGER DEFAULT 0"),
+            ("live_allocator_algorithm", "TEXT DEFAULT ''"),
+            ("live_power_percent", "REAL"),
+            ("shadow_power_percent", "REAL"),
+            ("live_power_w", "REAL"),
+            ("shadow_power_w", "REAL"),
+            ("energy_saving_fraction", "REAL DEFAULT 0"),
+            ("resource_saving_fraction", "REAL DEFAULT 0"),
+            ("energy_model_version", "TEXT DEFAULT ''"),
+            ("energy_valid", "INTEGER DEFAULT 0"),
+            ("resource_valid", "INTEGER DEFAULT 0"),
+            ("native_sim_energy_j", "REAL"),
+            ("native_sim_power_w", "REAL"),
+            ("energy_reference_source", "TEXT DEFAULT ''"),
+            ("absolute_scale_valid", "INTEGER DEFAULT 0"),
+            ("physical_wattmeter_available", "INTEGER DEFAULT 0"),
+            ("infra_resource_index", "REAL"),
+            ("infra_resource_saving_fraction", "REAL"),
+            ("calibration_corpus_id", "TEXT DEFAULT ''"),
+            ("calibration_fit_error", "REAL"),
+            ("calibration_rank_valid", "INTEGER DEFAULT 0"),
+        ):
+            if column_name not in existing_shadow_columns:
+                cursor.execute(
+                    f"ALTER TABLE marl_shadow_comparison_history ADD COLUMN {column_name} {column_def}"
+                )
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_marl_shadow_comparison_timestamp
             ON marl_shadow_comparison_history(timestamp)
@@ -802,6 +1521,7 @@ class DataLake:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS judge_outcome_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id INTEGER,
                 decision_timestamp INTEGER NOT NULL,
                 observed_timestamp INTEGER NOT NULL,
                 selected_assistant TEXT DEFAULT '',
@@ -822,22 +1542,28 @@ class DataLake:
                 tasam_category_credit REAL DEFAULT 0,
                 tasam_category_penalty REAL DEFAULT 0,
                 tasam_category_error INTEGER DEFAULT 0,
+                tasam_training_category_credit REAL DEFAULT 0,
+                tasam_training_category_penalty REAL DEFAULT 0,
+                tasam_training_reward REAL DEFAULT 0,
                 tasam_predicted_verdict TEXT DEFAULT '',
                 tasam_observed_verdict TEXT DEFAULT '',
                 credit_assignment TEXT DEFAULT '',
                 reason TEXT DEFAULT '',
                 feedback_json TEXT,
-                UNIQUE(decision_timestamp)
+                observed_metric_id INTEGER,
+                feedback_status TEXT DEFAULT 'observed',
+                feedback_missing_reason TEXT DEFAULT ''
             )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_judge_outcome_decision_timestamp
-            ON judge_outcome_history(decision_timestamp)
         """)
         existing_judge_columns = {
             row[1] for row in cursor.execute("PRAGMA table_info(judge_outcome_history)").fetchall()
         }
         for column_name, column_def in (
+            ("decision_id", "INTEGER"),
+            ("decision_stage_name", "TEXT DEFAULT ''"),
+            ("observed_stage_name", "TEXT DEFAULT ''"),
+            ("stage_boundary_feedback", "INTEGER DEFAULT 0"),
+            ("nominal_expected_verdict", "TEXT DEFAULT 'UNKNOWN'"),
             ("tasam_observed_error", "REAL DEFAULT 0"),
             ("tasam_continuous_reward", "REAL DEFAULT 0"),
             ("tasam_reward_source", "TEXT DEFAULT ''"),
@@ -846,11 +1572,75 @@ class DataLake:
             ("tasam_category_credit", "REAL DEFAULT 0"),
             ("tasam_category_penalty", "REAL DEFAULT 0"),
             ("tasam_category_error", "INTEGER DEFAULT 0"),
+            ("tasam_training_category_credit", "REAL DEFAULT 0"),
+            ("tasam_training_category_penalty", "REAL DEFAULT 0"),
+            ("tasam_training_reward", "REAL DEFAULT 0"),
             ("tasam_predicted_verdict", "TEXT DEFAULT ''"),
             ("tasam_observed_verdict", "TEXT DEFAULT ''"),
+            ("observed_metric_id", "INTEGER"),
+            ("feedback_status", "TEXT DEFAULT 'observed'"),
+            ("feedback_missing_reason", "TEXT DEFAULT ''"),
         ):
             if column_name not in existing_judge_columns:
                 cursor.execute(f"ALTER TABLE judge_outcome_history ADD COLUMN {column_name} {column_def}")
+
+        self._migrate_judge_outcome_timestamp_key(cursor)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_judge_outcome_decision_timestamp
+            ON judge_outcome_history(decision_timestamp)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_judge_outcome_decision_id
+            ON judge_outcome_history(decision_id)
+        """)
+
+        # Canonical persistent economic replay.  JSONL traces are useful as
+        # short-lived trainer inputs, but the SQLite row is the durable source
+        # of truth and survives controller polling windows and restarts.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasam_economic_transition_history (
+                decision_id INTEGER PRIMARY KEY,
+                decision_timestamp INTEGER NOT NULL,
+                observed_timestamp INTEGER NOT NULL,
+                source_metric_snapshot_id INTEGER,
+                observed_metric_snapshot_id INTEGER,
+                economic_action_contract TEXT DEFAULT '',
+                economic_application_status TEXT DEFAULT '',
+                economic_transition_eligible INTEGER DEFAULT 0,
+                economic_training_eligible INTEGER DEFAULT 0,
+                economic_promotion_eligible INTEGER DEFAULT 0,
+                realized_energy_saving_fraction REAL,
+                realized_allocation_saving_fraction REAL,
+                tasam_online_reward REAL,
+                tasam_energy_reward REAL,
+                tasam_allocation_reward REAL,
+                tasam_sla_penalty REAL,
+                calibration_version TEXT DEFAULT '',
+                replay_schema TEXT DEFAULT 'greenran.tasam.economic_transition.v1',
+                replay_compact_bytes INTEGER DEFAULT 0,
+                transition_json TEXT NOT NULL,
+                transition_sha256 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        existing_economic_transition_columns = {
+            row[1] for row in cursor.execute(
+                "PRAGMA table_info(tasam_economic_transition_history)"
+            ).fetchall()
+        }
+        for column_name, column_def in (
+            ("replay_schema", "TEXT DEFAULT 'greenran.tasam.economic_transition.v1'"),
+            ("replay_compact_bytes", "INTEGER DEFAULT 0"),
+        ):
+            if column_name not in existing_economic_transition_columns:
+                cursor.execute(
+                    f"ALTER TABLE tasam_economic_transition_history "
+                    f"ADD COLUMN {column_name} {column_def}"
+                )
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasam_economic_transition_eligible
+            ON tasam_economic_transition_history(economic_training_eligible, decision_id)
+        """)
 
         # Additional indexes for performance
         cursor.execute("""
@@ -938,6 +1728,15 @@ class DataLake:
 
         if decision is None:
             decision = {}
+        decision_id = None
+        try:
+            metric_snapshot_id = int(decision.get('metric_snapshot_id') or 0) or None
+        except (TypeError, ValueError):
+            metric_snapshot_id = None
+        snapshot_sequence_id = str(
+            decision.get('snapshot_sequence_id')
+            or (f"pdcp:{metric_snapshot_id}" if metric_snapshot_id is not None else "")
+        )
 
         decision_str = decision.get('energy_saver', 'UNKNOWN')
         reason = decision.get('reason', '')
@@ -979,6 +1778,15 @@ class DataLake:
         armd_source = decision.get('armd_source', '')
         armd_confidence = decision.get('armd_confidence', 0.0)
         armd_override_applied = 1 if decision.get('armd_override_applied', False) else 0
+        armd_safety_level = str(decision.get('armd_safety_level', 'UNKNOWN') or 'UNKNOWN')
+        armd_role = str(decision.get('armd_role', 'advisory') or 'advisory')
+        armd_advisory_only = 1 if decision.get('armd_advisory_only', armd_role == 'advisory') else 0
+        armd_hard_veto = 1 if decision.get('armd_hard_veto', armd_safety_level == 'HARD_VETO') else 0
+        tasam_operating_permission = 1 if decision.get('tasam_operating_permission', False) else 0
+        tasam_envelope = decision.get('tasam_policy_envelope') or {}
+        tasam_envelope_min_power = decision.get('tasam_envelope_min_power', tasam_envelope.get('min_power_percent'))
+        tasam_envelope_max_power = decision.get('tasam_envelope_max_power', tasam_envelope.get('max_power_percent'))
+        economic_isolation_source = str(decision.get('economic_isolation_source', '') or '')
         tasam_advisor = decision.get('tasam_advisor', {}) or {}
         advisor_arbitration = decision.get('advisor_arbitration', {}) or {}
         tasam_enabled = 1 if decision.get('tasam_enabled', tasam_advisor.get('enabled', False)) else 0
@@ -991,6 +1799,17 @@ class DataLake:
         tasam_source = decision.get('tasam_source', tasam_advisor.get('source', ''))
         tasam_confidence = float(decision.get('tasam_confidence', tasam_advisor.get('confidence', 0.0)) or 0.0)
         tasam_valid = 1 if decision.get('tasam_valid', tasam_advisor.get('valid', False)) else 0
+        tasam_checkpoint_valid = 1 if decision.get(
+            'tasam_checkpoint_valid', (decision.get('tasam_source', '') == 'checkpoint' and tasam_proposal_valid)
+        ) else 0
+        tasam_fallback_used = 1 if decision.get(
+            'tasam_fallback_used', decision.get('tasam_source', '') in {'heuristic', 'mixed'}
+        ) else 0
+        tasam_evidence_valid = 1 if decision.get('tasam_evidence_valid', False) else 0
+        rl_policy_runtime = decision.get('rl_policy_runtime', {}) or {}
+        live_allocator_algorithm = str(
+            decision.get('live_allocator_algorithm', rl_policy_runtime.get('algorithm', '')) or ''
+        )
         tasam_would_influence = 1 if decision.get('tasam_would_influence', tasam_advisor.get('would_influence', False)) else 0
         tasam_energy_decision = decision.get('tasam_energy_decision', ((tasam_advisor.get('energy_advice') or {}).get('decision', '')))
         tasam_energy_action = decision.get('tasam_energy_action', ((tasam_advisor.get('energy_advice') or {}).get('action', '')))
@@ -1014,8 +1833,116 @@ class DataLake:
         proposal_applied_exactly = 1 if decision.get('proposal_applied_exactly', False) else 0
         external_last_resort_used = 1 if decision.get('external_last_resort_used', False) else 0
         selected_proposal_json = json.dumps(decision.get('selected_assistant_proposal') or {}, ensure_ascii=False, sort_keys=True)
-        rl_policy_runtime = decision.get('rl_policy_runtime', {}) or {}
         resource_allocation = decision.get('resource_allocation', {}) or {}
+        energy_advice = tasam_advisor.get('energy_advice') or {}
+        reward_components = decision.get('tasam_reward_components') or decision.get('reward_components') or {}
+        tasam_power_percent = float(
+            decision.get('tasam_power_percent', energy_advice.get('power_percent', resource_allocation.get('power_percent', 100.0))) or 100.0
+        )
+        tasam_power_applied_percent = float(
+            decision.get('tasam_power_applied_percent', tasam_power_percent) or tasam_power_percent
+        )
+        causal_comparison = ((decision.get('resource_allocation') or {}).get('marl_shadow') or {}).get('comparison') or {}
+        live_power_percent = decision.get('live_power_percent', causal_comparison.get('live_power_percent'))
+        shadow_power_percent = decision.get('shadow_power_percent', causal_comparison.get('shadow_power_percent'))
+        live_power_w = decision.get('live_power_w', causal_comparison.get('live_power_w'))
+        shadow_power_w = decision.get('shadow_power_w', causal_comparison.get('shadow_power_w'))
+        energy_saving_fraction = float(decision.get('energy_saving_fraction', causal_comparison.get('energy_saving_fraction', 0.0)) or 0.0)
+        resource_saving_fraction = float(decision.get('resource_saving_fraction', causal_comparison.get('resource_saving_fraction', 0.0)) or 0.0)
+        causal_score_delta = float(decision.get('causal_score_delta', causal_comparison.get('causal_score_delta', 0.0)) or 0.0)
+        energy_model_version = str(decision.get('energy_model_version', causal_comparison.get('energy_model_version', '')) or '')
+        power_safety_override_reason = str(
+            decision.get('power_safety_override_reason', '') or ''
+        )
+        economic_action = decision.get('economic_action') or {}
+        if not isinstance(economic_action, dict):
+            economic_action = {}
+        economic_action_contract = str(
+            decision.get('economic_action_contract', economic_action.get('contract', '')) or ''
+        )
+        economic_application_status = str(
+            decision.get('economic_application_status', economic_action.get('application_status', '')) or ''
+        )
+        economic_rejection_reason = str(
+            decision.get('economic_rejection_reason', economic_action.get('rejection_reason', '')) or ''
+        )
+        actuation_confirmed = 1 if decision.get(
+            'actuation_confirmed', economic_action.get('actuation_confirmed', False)
+        ) else 0
+        actuation_confirmation_source = str(
+            decision.get(
+                'actuation_confirmation_source',
+                economic_action.get('actuation_confirmation_source', ''),
+            ) or ''
+        )
+        observed_power_percent = decision.get(
+            'observed_power_percent', economic_action.get('observed_power_percent')
+        )
+        observed_power_w = decision.get(
+            'observed_power_w', economic_action.get('observed_power_w')
+        )
+        observed_ru_count = decision.get(
+            'observed_ru_count', economic_action.get('observed_ru_count')
+        )
+        observed_mmwave_count = decision.get(
+            'observed_mmwave_count', economic_action.get('observed_mmwave_count')
+        )
+        confirmation_decision_id = decision.get(
+            'confirmation_decision_id', economic_action.get('confirmation_decision_id')
+        )
+        economic_outcome_invalid_reason = str(
+            decision.get(
+                'economic_outcome_invalid_reason',
+                economic_action.get('outcome_invalid_reason', decision.get('economic_invalid_reason', '')),
+            ) or ''
+        )
+        pdcp_coverage = decision.get('pdcp_loss_coverage', economic_action.get('pdcp_loss_coverage', {})) or {}
+        if not isinstance(pdcp_coverage, dict):
+            pdcp_coverage = {}
+        topology_valid = 1 if decision.get(
+            'topology_valid', resource_allocation.get('topology_valid', False)
+        ) else 0
+        try:
+            pdcp_metric_snapshot_id = int(
+                decision.get('pdcp_metric_snapshot_id') or decision.get('observed_metric_id') or 0
+            ) or None
+        except (TypeError, ValueError):
+            pdcp_metric_snapshot_id = None
+        economic_transition_eligible = 1 if decision.get(
+            'economic_transition_eligible', economic_action.get('economic_transition_eligible', False)
+        ) else 0
+        tasam_power_cost_penalty = float(
+            decision.get('tasam_power_cost_penalty', reward_components.get('power_cost_penalty', 0.0)) or 0.0
+        )
+        tasam_completion_shortfall_penalty = float(
+            decision.get('tasam_completion_shortfall_penalty', reward_components.get('completion_shortfall_penalty', 0.0)) or 0.0
+        )
+        tasam_underallocation_penalty = float(
+            decision.get('tasam_underallocation_penalty', reward_components.get('underallocation_penalty', 0.0)) or 0.0
+        )
+        marl_shadow = resource_allocation.get('marl_shadow') or {}
+        allocation_head = marl_shadow.get('allocation_head') or {}
+        allocation_projection = marl_shadow.get('allocation_projection') or {}
+        tasam_allocation_target_ran = float(
+            decision.get('tasam_allocation_target_ran', allocation_projection.get('ran_min_share', 0.0)) or 0.0
+        )
+        tasam_allocation_target_ai = float(
+            decision.get('tasam_allocation_target_ai', allocation_projection.get('ai_min_share', 0.0)) or 0.0
+        )
+        tasam_allocation_predicted_ran = float(
+            decision.get('tasam_allocation_predicted_ran', allocation_head.get('predicted_ran_share', 0.0)) or 0.0
+        )
+        tasam_allocation_predicted_ai = float(
+            decision.get('tasam_allocation_predicted_ai', allocation_head.get('predicted_ai_share', 0.0)) or 0.0
+        )
+        tasam_allocation_prediction_loss = float(
+            decision.get('tasam_allocation_prediction_loss', allocation_head.get('prediction_loss', 0.0)) or 0.0
+        )
+        tasam_allocation_target_source = str(
+            decision.get('tasam_allocation_target_source', 'runtime_completion_projection' if allocation_projection.get('applied') else '') or ''
+        )
+        tasam_allocation_target_feasible = 1 if allocation_projection.get('feasible', True) else 0
+        tasam_reward_components_json = json.dumps(reward_components, ensure_ascii=False, sort_keys=True)
         rl_policy_id = rl_policy_runtime.get('policy_id', '')
         rl_policy_family = rl_policy_runtime.get('family', '')
         rl_policy_algorithm = rl_policy_runtime.get('algorithm', '')
@@ -1081,7 +2008,7 @@ class DataLake:
         try:
             cursor = self.conn.cursor()
             columns = [
-                'timestamp', 'datetime', 'decision', 'reason', 'confidence', 'pattern',
+                'timestamp', 'datetime', 'metric_snapshot_id', 'snapshot_sequence_id', 'pairing_schedule_id', 'decision', 'reason', 'confidence', 'pattern',
                 'agent_override', 'energy_state', 'slicer_state',
                 'collection_event_stage_name', 'collection_event_target_domain',
                 'collection_event_cycle', 'collection_event_stage_index',
@@ -1089,9 +2016,29 @@ class DataLake:
                 'ml_decision', 'ml_confidence', 'ml_predicted_cvar_ms', 'ml_influenced',
                 'armd_enabled', 'armd_proposal_present', 'armd_proposal_valid', 'armd_proposal_kind', 'armd_actuation_applied', 'armd_proposal_json',
                 'armd_mode', 'armd_scenario', 'armd_source', 'armd_confidence', 'armd_override_applied',
+                'armd_safety_level', 'armd_role', 'armd_advisory_only', 'armd_hard_veto',
+                'tasam_operating_permission', 'tasam_envelope_min_power', 'tasam_envelope_max_power',
+                'economic_isolation_source',
                 'tasam_enabled', 'tasam_proposal_present', 'tasam_proposal_valid', 'tasam_proposal_kind', 'tasam_proposal_json',
                 'tasam_mode', 'tasam_policy_id', 'tasam_source', 'tasam_confidence',
-                'tasam_valid', 'tasam_would_influence', 'tasam_energy_decision', 'tasam_energy_action',
+                'tasam_valid', 'tasam_checkpoint_valid', 'tasam_fallback_used', 'tasam_evidence_valid',
+                'live_allocator_algorithm', 'tasam_would_influence', 'tasam_energy_decision', 'tasam_energy_action',
+                'tasam_power_percent', 'tasam_power_applied_percent', 'power_safety_override_reason',
+                'economic_action_contract', 'economic_application_status', 'economic_rejection_reason',
+                'actuation_confirmed', 'actuation_confirmation_source', 'observed_power_percent',
+                'observed_power_w', 'observed_ru_count', 'observed_mmwave_count',
+                'confirmation_decision_id',
+                'economic_outcome_invalid_reason', 'pdcp_coverage_json', 'topology_valid',
+                'pdcp_metric_snapshot_id',
+                'economic_transition_eligible', 'economic_action_json',
+                'live_power_percent', 'shadow_power_percent', 'live_power_w', 'shadow_power_w',
+                'energy_saving_fraction', 'resource_saving_fraction', 'causal_score_delta', 'energy_model_version',
+                'tasam_power_cost_penalty', 'tasam_completion_shortfall_penalty',
+                'tasam_underallocation_penalty', 'tasam_allocation_target_ran', 'tasam_allocation_target_ai',
+                'tasam_allocation_predicted_ran', 'tasam_allocation_predicted_ai',
+                'tasam_allocation_prediction_loss', 'tasam_allocation_target_source',
+                'tasam_allocation_target_feasible', 'tasam_reward_components_json',
+                'native_evidence_ingest_json',
                 'advisor_arbitration_mode', 'advisor_arbitration_present', 'advisor_proposal_pair_complete',
                 'advisor_rapp_final_decision', 'advisor_rapp_final_action',
                 'advisor_arbitration_winner', 'advisor_arbitration_score',
@@ -1113,7 +2060,8 @@ class DataLake:
                 'effective_policy_source', 'control_trial_reason',
             ]
             values = [
-                timestamp, dt_str, decision_str, reason, confidence, pattern,
+                timestamp, dt_str, metric_snapshot_id, snapshot_sequence_id,
+                str(decision.get('pairing_schedule_id', '') or ''), decision_str, reason, confidence, pattern,
                 agent_override, energy_state, slicer_state,
                 collection_event_stage_name, collection_event_target_domain,
                 collection_event_cycle, collection_event_stage_index,
@@ -1121,9 +2069,29 @@ class DataLake:
                 ml_decision, ml_confidence, ml_predicted_cvar, ml_influenced,
                 armd_enabled, armd_proposal_present, armd_proposal_valid, armd_proposal_kind, armd_actuation_applied, armd_proposal_json,
                 armd_mode, armd_scenario, armd_source, armd_confidence, armd_override_applied,
+                armd_safety_level, armd_role, armd_advisory_only, armd_hard_veto,
+                tasam_operating_permission, tasam_envelope_min_power, tasam_envelope_max_power,
+                economic_isolation_source,
                 tasam_enabled, tasam_proposal_present, tasam_proposal_valid, tasam_proposal_kind, tasam_proposal_json,
                 tasam_mode, tasam_policy_id, tasam_source, tasam_confidence,
-                tasam_valid, tasam_would_influence, tasam_energy_decision, tasam_energy_action,
+                tasam_valid, tasam_checkpoint_valid, tasam_fallback_used, tasam_evidence_valid,
+                live_allocator_algorithm, tasam_would_influence, tasam_energy_decision, tasam_energy_action,
+                tasam_power_percent, tasam_power_applied_percent, power_safety_override_reason,
+                economic_action_contract, economic_application_status, economic_rejection_reason,
+                actuation_confirmed, actuation_confirmation_source, observed_power_percent,
+                observed_power_w, observed_ru_count, observed_mmwave_count,
+                confirmation_decision_id,
+                economic_outcome_invalid_reason, json.dumps(pdcp_coverage, ensure_ascii=False, sort_keys=True),
+                topology_valid, pdcp_metric_snapshot_id,
+                economic_transition_eligible, json.dumps(economic_action, ensure_ascii=False, sort_keys=True),
+                live_power_percent, shadow_power_percent, live_power_w, shadow_power_w,
+                energy_saving_fraction, resource_saving_fraction, causal_score_delta, energy_model_version,
+                tasam_power_cost_penalty, tasam_completion_shortfall_penalty,
+                tasam_underallocation_penalty, tasam_allocation_target_ran, tasam_allocation_target_ai,
+                tasam_allocation_predicted_ran, tasam_allocation_predicted_ai,
+                tasam_allocation_prediction_loss, tasam_allocation_target_source,
+                tasam_allocation_target_feasible, tasam_reward_components_json,
+                json.dumps(decision.get('native_evidence_ingest') or {}, ensure_ascii=False, sort_keys=True),
                 advisor_arbitration_mode, advisor_arbitration_present, advisor_proposal_pair_complete,
                 advisor_rapp_final_decision, advisor_rapp_final_action,
                 advisor_arbitration_winner, advisor_arbitration_score,
@@ -1149,12 +2117,74 @@ class DataLake:
                 f"INSERT OR REPLACE INTO decisions_history ({', '.join(columns)}) VALUES ({placeholders})",
                 values,
             )
+            decision_id = int(cursor.lastrowid or 0) or None
+            if decision_id is not None:
+                # These fields are deliberately normalized from the nested
+                # action contract as well as persisted in JSON.  Delayed
+                # feedback updates the same columns below, so reports and
+                # replay do not need to parse historical blobs.
+                economic_execution_mode = str(
+                    decision.get(
+                        'economic_execution_mode',
+                        economic_action.get('economic_execution_mode', 'diagnostic'),
+                    ) or 'diagnostic'
+                )
+                economic_safety_isolated = 1 if decision.get(
+                    'economic_safety_isolated',
+                    economic_action.get('economic_safety_isolated', False),
+                ) else 0
+                economic_safety_reason = str(
+                    decision.get(
+                        'economic_safety_isolation_reason',
+                        economic_action.get('economic_safety_isolation_reason', ''),
+                    ) or ''
+                )
+                realized_energy = economic_action.get('realized_energy_saving_fraction')
+                realized_allocation = economic_action.get('realized_allocation_saving_fraction')
+                cursor.execute(
+                    """
+                    UPDATE decisions_history
+                       SET economic_execution_mode = ?,
+                           economic_safety_isolated = ?,
+                           economic_safety_isolation_reason = ?,
+                           economic_training_eligible = ?,
+                           economic_promotion_eligible = ?,
+                           realized_energy_saving_fraction = ?,
+                           realized_allocation_saving_fraction = ?,
+                           tasam_online_reward = ?,
+                           tasam_energy_reward = ?,
+                           tasam_allocation_reward = ?,
+                           tasam_sla_penalty = ?
+                     WHERE id = ?
+                    """,
+                    (
+                        economic_execution_mode,
+                        economic_safety_isolated,
+                        economic_safety_reason,
+                        1 if decision.get('economic_training_eligible', False) else 0,
+                        1 if decision.get('economic_promotion_eligible', False) else 0,
+                        realized_energy,
+                        realized_allocation,
+                        decision.get('tasam_online_reward'),
+                        decision.get('tasam_energy_reward'),
+                        decision.get('tasam_allocation_reward'),
+                        decision.get('tasam_sla_penalty'),
+                        decision_id,
+                    ),
+                )
             self.conn.commit()
+            if decision_id is not None:
+                correlation_id = str(
+                    economic_action.get('correlation_id') or decision.get('economic_action_correlation_id', '') or ''
+                )
+                if correlation_id:
+                    self.associate_energy_command_decision(correlation_id, decision_id)
             if resource_allocation:
                 self.record_resource_allocation_snapshot(resource_allocation, timestamp=timestamp)
             self.record_conflict_from_decision(decision, timestamp=timestamp)
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar decisão: {e}")
+        return decision_id
 
     def record_resource_allocation_snapshot(self, snapshot, timestamp=None):
         """Persist the resource-allocation snapshot used by the TA-SAM DRL line."""
@@ -1166,6 +2196,9 @@ class DataLake:
 
         dt = datetime.fromtimestamp(timestamp)
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        marl_shadow = snapshot.get('marl_shadow') or {}
+        allocation_head = marl_shadow.get('allocation_head') or {}
+        allocation_projection = marl_shadow.get('allocation_projection') or {}
 
         try:
             cursor = self.conn.cursor()
@@ -1175,12 +2208,19 @@ class DataLake:
                  action_semantics, resource_budget, usable_budget, d_ran, d_ai, r_ran, r_ai,
                  delta_r_ran, delta_r_ai, ran_completion_ratio, ai_completion_ratio,
                  utilization_ratio, allocation_state, healthy_streak, floor_total_ran,
-                 floor_total_ai, reinforcement_ran, reinforcement_ai, floor_feasible,
+                 floor_total_ai, reinforcement_ran, reinforcement_ai, floor_feasible, topology_valid,
                  per_ue_floor_json, per_ue_allocation_json,
                  per_ue_floor_violation_count, per_ue_application_status,
                  per_ue_policy_id, per_ue_ack_timestamp, per_ue_ack_reason,
+                 tasam_allocation_target_ran, tasam_allocation_target_ai,
+                 tasam_allocation_predicted_ran, tasam_allocation_predicted_ai,
+                 tasam_allocation_prediction_loss, tasam_allocation_target_source,
+                 tasam_allocation_target_feasible,
                  resource_floor_policy, snapshot_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp,
                 dt_str,
@@ -1206,6 +2246,7 @@ class DataLake:
                 float(snapshot.get('reinforcement_ran', 0.0) or 0.0),
                 float(snapshot.get('reinforcement_ai', 0.0) or 0.0),
                 1 if snapshot.get('floor_feasible', True) else 0,
+                1 if snapshot.get('topology_valid', False) else 0,
                 json.dumps(snapshot.get('per_ue_floor') or [], ensure_ascii=False, sort_keys=True),
                 json.dumps(snapshot.get('per_ue_allocation') or [], ensure_ascii=False, sort_keys=True),
                 int(snapshot.get('per_ue_floor_violation_count', 0) or 0),
@@ -1213,6 +2254,13 @@ class DataLake:
                 str(snapshot.get('per_ue_policy_id', '') or ''),
                 float(snapshot.get('per_ue_ack_timestamp', 0.0) or 0.0),
                 str(snapshot.get('per_ue_ack_reason', '') or ''),
+                float(snapshot.get('tasam_allocation_target_ran', allocation_projection.get('ran_min_share', 0.0)) or 0.0),
+                float(snapshot.get('tasam_allocation_target_ai', allocation_projection.get('ai_min_share', 0.0)) or 0.0),
+                float(snapshot.get('tasam_allocation_predicted_ran', allocation_head.get('predicted_ran_share', 0.0)) or 0.0),
+                float(snapshot.get('tasam_allocation_predicted_ai', allocation_head.get('predicted_ai_share', 0.0)) or 0.0),
+                float(snapshot.get('tasam_allocation_prediction_loss', allocation_head.get('prediction_loss', 0.0)) or 0.0),
+                str(snapshot.get('tasam_allocation_target_source', allocation_projection.get('reason', '')) or ''),
+                1 if snapshot.get('tasam_allocation_target_feasible', allocation_projection.get('feasible', True)) else 0,
                 str(snapshot.get('floor_policy', 'sla_per_ue_v1') or 'sla_per_ue_v1'),
                 json.dumps(snapshot, ensure_ascii=False),
             ))
@@ -1222,7 +2270,14 @@ class DataLake:
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar snapshot de recursos: {e}")
 
-    def record_judge_outcome(self, decision, feedback, observation=None, observed_timestamp=None):
+    def record_judge_outcome(
+        self,
+        decision,
+        feedback,
+        observation=None,
+        observed_timestamp=None,
+        transition=None,
+    ):
         """Persist delayed ARMD/TA-SAM credit after a real observation."""
         if not isinstance(decision, dict) or not isinstance(feedback, dict):
             return
@@ -1239,20 +2294,57 @@ class DataLake:
             or ''
         )
         try:
+            decision_id = int(decision.get('decision_id') or decision.get('id') or 0) or None
+        except (TypeError, ValueError):
+            decision_id = None
+        try:
+            observed_metric_id = int(
+                feedback.get('observed_metric_id')
+                or observation.get('observed_metric_id')
+                or observation.get('metric_snapshot_id')
+                or 0
+            ) or None
+        except (TypeError, ValueError):
+            observed_metric_id = None
+        feedback_status = str(feedback.get('feedback_status', 'observed') or 'observed')
+        feedback_missing_reason = str(feedback.get('feedback_missing_reason', '') or '')
+        if decision_id is not None:
+            self.conn.execute(
+                "DELETE FROM judge_outcome_history WHERE decision_id = ? AND feedback_status = 'missing'",
+                (decision_id,),
+            )
+        decision_stage_name = str(
+            feedback.get('decision_stage_name')
+            or decision.get('collection_event_stage_name', '')
+            or ''
+        )
+        observed_stage_name = str(feedback.get('observed_stage_name', '') or '')
+        stage_boundary_feedback = 1 if feedback.get('stage_boundary_feedback', False) else 0
+        nominal_expected_verdict = str(
+            feedback.get('nominal_expected_verdict', 'UNKNOWN') or 'UNKNOWN'
+        )
+        try:
+            compact_feedback = _compact_judge_feedback_payload(decision_id, feedback, observation)
             self.conn.execute("""
-                INSERT OR REPLACE INTO judge_outcome_history
-                (decision_timestamp, observed_timestamp, selected_assistant,
+                INSERT INTO judge_outcome_history
+                (decision_id, decision_timestamp, observed_timestamp, selected_assistant,
                 correct_verdict, observed, outcome_reward, severity_penalty,
                  armd_credit, tasam_credit, armd_state_credit,
                  tasam_state_credit, tasam_resource_credit, tasam_observed_error,
                  tasam_continuous_reward, tasam_reward_source,
                  tasam_error_components_json, tasam_action_applied,
                  tasam_category_credit, tasam_category_penalty,
-                 tasam_category_error, tasam_predicted_verdict,
-                 tasam_observed_verdict,
-                 credit_assignment, reason, feedback_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                tasam_category_error, tasam_training_category_credit,
+                tasam_training_category_penalty, tasam_training_reward,
+                tasam_predicted_verdict,
+                tasam_observed_verdict,
+                 credit_assignment, reason, feedback_json,
+                 decision_stage_name, observed_stage_name,
+                 stage_boundary_feedback, nominal_expected_verdict,
+                 observed_metric_id, feedback_status, feedback_missing_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
+                decision_id,
                 decision_timestamp,
                 int(observed_timestamp),
                 selected,
@@ -1273,18 +2365,431 @@ class DataLake:
                 float(feedback.get('tasam_category_credit', feedback.get('tasam_state_credit', 0.0)) or 0.0),
                 float(feedback.get('tasam_category_penalty', 0.0) or 0.0),
                 1 if feedback.get('tasam_category_error', False) else 0,
+                float(feedback.get('tasam_training_category_credit', feedback.get('tasam_category_credit', 0.0)) or 0.0),
+                float(feedback.get('tasam_training_category_penalty', feedback.get('tasam_category_penalty', 0.0)) or 0.0),
+                float(feedback.get('tasam_training_reward', feedback.get('tasam_training_category_credit', feedback.get('tasam_category_credit', 0.0))) or 0.0),
                 str(feedback.get('tasam_predicted_verdict', '') or ''),
                 str(feedback.get('tasam_observed_verdict', feedback.get('correct_verdict', '')) or ''),
                 str(feedback.get('credit_assignment', '') or ''),
                 str(observation.get('reason', '') or ''),
-                json.dumps({
-                    'feedback': feedback,
-                    'observation': observation,
-                }, ensure_ascii=False, sort_keys=True),
+                json.dumps(compact_feedback, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+                decision_stage_name,
+                observed_stage_name,
+                stage_boundary_feedback,
+                nominal_expected_verdict,
+                observed_metric_id,
+                feedback_status,
+                feedback_missing_reason,
             ))
             self.conn.commit()
+            if decision_id is not None:
+                self.update_decision_economic_outcome(
+                    decision_id,
+                    feedback,
+                    observed_metric_id=observed_metric_id,
+                    transition=transition,
+                )
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar feedback do juiz: {e}")
+
+    def update_decision_economic_outcome(
+        self, decision_id, feedback, observed_metric_id=None, transition=None
+    ):
+        """Attach delayed, real-PDCP economic evidence to the original decision."""
+        if not decision_id or not isinstance(feedback, dict):
+            return False
+        economic_action = feedback.get('economic_action') or {}
+        if not isinstance(economic_action, dict):
+            economic_action = {}
+        coverage = feedback.get('pdcp_loss_coverage', economic_action.get('pdcp_loss_coverage', {})) or {}
+        if not isinstance(coverage, dict):
+            coverage = {}
+        try:
+            metric_id = int(
+                observed_metric_id
+                or feedback.get('pdcp_metric_snapshot_id')
+                or feedback.get('observed_metric_id')
+                or 0
+            ) or None
+        except (TypeError, ValueError):
+            metric_id = None
+        try:
+            action_status = str(
+                feedback.get('economic_application_status')
+                or economic_action.get('application_status')
+                or ''
+            )
+            # Delayed feedback is intentionally compact and may omit static
+            # provenance that was already persisted with the decision.  Do
+            # not turn an omitted field into a false value when closing the
+            # pending native action: preserve the original decision flags,
+            # while still honoring an explicit value supplied by the
+            # validator.
+            existing_provenance = self.conn.execute(
+                """
+                SELECT tasam_checkpoint_valid, tasam_fallback_used,
+                       tasam_evidence_valid
+                  FROM decisions_history
+                 WHERE id = ?
+                """,
+                (int(decision_id),),
+            ).fetchone()
+            existing_checkpoint_valid = bool(existing_provenance[0]) if existing_provenance else False
+            existing_fallback_used = bool(existing_provenance[1]) if existing_provenance else False
+            existing_evidence_valid = bool(existing_provenance[2]) if existing_provenance else False
+            actuation_confirmed = bool(
+                feedback.get('actuation_confirmed', economic_action.get('actuation_confirmed', False))
+            )
+            # The command/ACK path is not evidence of application.  Keep the
+            # normalized decision aligned with the delayed native observation:
+            # only an observed, applied TA-SAM action may be marked applied.
+            ta_sam_actuation_applied = bool(
+                feedback.get('tasam_action_applied', feedback.get('ta_sam_actuation_applied', False))
+                and actuation_confirmed
+                and action_status == 'applied'
+            )
+            native_observation = economic_action.get('native_observation') or {}
+            if not isinstance(native_observation, dict):
+                native_observation = {}
+            tasam_evidence_valid = bool(
+                (
+                    feedback['tasam_evidence_valid']
+                    if 'tasam_evidence_valid' in feedback
+                    else economic_action['tasam_evidence_valid']
+                    if 'tasam_evidence_valid' in economic_action
+                    else existing_evidence_valid
+                )
+                and actuation_confirmed
+                and native_observation.get('valid', True)
+            )
+            checkpoint_valid = bool(
+                feedback['tasam_checkpoint_valid']
+                if 'tasam_checkpoint_valid' in feedback
+                else economic_action['tasam_checkpoint_valid']
+                if 'tasam_checkpoint_valid' in economic_action
+                else existing_checkpoint_valid
+            )
+            fallback_used = bool(
+                feedback['tasam_fallback_used']
+                if 'tasam_fallback_used' in feedback
+                else economic_action['tasam_fallback_used']
+                if 'tasam_fallback_used' in economic_action
+                else existing_fallback_used
+            )
+            economic_action.setdefault('tasam_checkpoint_valid', checkpoint_valid)
+            economic_action.setdefault('tasam_fallback_used', fallback_used)
+            economic_action.setdefault('tasam_evidence_valid', tasam_evidence_valid)
+            observed_power_percent = (
+                economic_action.get('observed_power_percent') if actuation_confirmed else None
+            )
+            energy_model_version = str(
+                feedback.get('energy_model_version')
+                or economic_action.get('energy_model_version')
+                or ''
+            )
+            realized_energy = feedback.get(
+                'realized_energy_saving_fraction', economic_action.get('realized_energy_saving_fraction')
+            )
+            realized_allocation = feedback.get(
+                'realized_allocation_saving_fraction', economic_action.get('realized_allocation_saving_fraction')
+            )
+            causal_delta = feedback.get(
+                'causal_score_delta', economic_action.get('causal_score_delta')
+            )
+            self.conn.execute(
+                """
+                UPDATE decisions_history
+                       SET economic_outcome_invalid_reason = ?,
+                       economic_transition_eligible = ?,
+                       economic_action_json = ?,
+                       economic_action_contract = ?,
+                       economic_application_status = ?,
+                       economic_rejection_reason = ?,
+                       pdcp_coverage_json = ?,
+                       topology_valid = ?,
+                       pdcp_metric_snapshot_id = ?,
+                       economic_execution_mode = ?,
+                       economic_safety_isolated = ?,
+                       economic_safety_isolation_reason = ?,
+                       economic_training_eligible = ?,
+                       economic_promotion_eligible = ?,
+                       tasam_checkpoint_valid = ?,
+                       tasam_fallback_used = ?,
+                       tasam_evidence_valid = ?,
+                       ta_sam_actuation_applied = ?,
+                       tasam_actuation_applied = ?,
+                       energy_saving_fraction = COALESCE(?, energy_saving_fraction),
+                       resource_saving_fraction = COALESCE(?, resource_saving_fraction),
+                       causal_score_delta = COALESCE(?, causal_score_delta),
+                       energy_model_version = ?,
+                       live_power_percent = ?,
+                       live_power_w = ?,
+                       tasam_power_applied_percent = ?,
+                       actuation_confirmed = ?,
+                       actuation_confirmation_source = ?,
+                       observed_power_percent = ?,
+                       observed_power_w = ?,
+                       observed_ru_count = ?,
+                       observed_mmwave_count = ?,
+                       confirmation_decision_id = ?,
+                       realized_energy_saving_fraction = ?,
+                       realized_allocation_saving_fraction = ?,
+                       tasam_online_reward = ?,
+                       tasam_energy_reward = ?,
+                       tasam_allocation_reward = ?,
+                       tasam_sla_penalty = ?
+                 WHERE id = ?
+                """,
+                (
+                    str(
+                        feedback.get('economic_outcome_invalid_reason')
+                        or feedback.get('economic_invalid_reason')
+                        or economic_action.get('outcome_invalid_reason', '')
+                        or ''
+                    ),
+                    1 if feedback.get('economic_transition_eligible', False) else 0,
+                    json.dumps(economic_action, ensure_ascii=False, sort_keys=True),
+                    str(
+                        feedback.get('economic_action_contract')
+                        or economic_action.get('contract')
+                        or ''
+                    ),
+                    action_status,
+                    str(
+                        feedback.get('economic_rejection_reason')
+                        or economic_action.get('rejection_reason')
+                        or feedback.get('economic_outcome_invalid_reason')
+                        or feedback.get('economic_invalid_reason')
+                        or ''
+                    ),
+                    json.dumps(coverage, ensure_ascii=False, sort_keys=True),
+                    1 if feedback.get('topology_valid', coverage.get('topology_valid', False)) else 0,
+                    metric_id,
+                    str(
+                        feedback.get('economic_execution_mode')
+                        or economic_action.get('economic_execution_mode')
+                        or ('safety_isolated' if feedback.get('economic_safety_isolated') else 'economic')
+                    ),
+                    1 if feedback.get(
+                        'economic_safety_isolated',
+                        economic_action.get('economic_safety_isolated', False),
+                    ) else 0,
+                    str(
+                        feedback.get('economic_safety_isolation_reason')
+                        or economic_action.get('economic_safety_isolation_reason', '')
+                        or ''
+                    ),
+                    1 if feedback.get('economic_training_eligible', False) else 0,
+                    1 if feedback.get('economic_promotion_eligible', False) else 0,
+                    1 if checkpoint_valid else 0,
+                    1 if fallback_used else 0,
+                    1 if tasam_evidence_valid else 0,
+                    1 if ta_sam_actuation_applied else 0,
+                    1 if ta_sam_actuation_applied else 0,
+                    realized_energy,
+                    realized_allocation,
+                    causal_delta,
+                    energy_model_version,
+                    feedback.get(
+                        'live_power_percent',
+                        economic_action.get('live_candidate', {}).get('power_percent'),
+                    ),
+                    feedback.get(
+                        'live_power_w',
+                        economic_action.get('live_candidate', {}).get('power_w'),
+                    ),
+                    observed_power_percent,
+                    1 if actuation_confirmed else 0,
+                    str(
+                        feedback.get(
+                            'actuation_confirmation_source',
+                            economic_action.get('actuation_confirmation_source', ''),
+                        ) or ''
+                    ),
+                    observed_power_percent,
+                    economic_action.get('observed_power_w'),
+                    economic_action.get('observed_ru_count'),
+                    economic_action.get('observed_mmwave_count'),
+                    economic_action.get('confirmation_decision_id'),
+                    feedback.get('realized_energy_saving_fraction', economic_action.get('realized_energy_saving_fraction')),
+                    feedback.get('realized_allocation_saving_fraction', economic_action.get('realized_allocation_saving_fraction')),
+                    feedback.get('tasam_online_reward'),
+                    feedback.get('tasam_energy_reward'),
+                    feedback.get('tasam_allocation_reward'),
+                    feedback.get('tasam_sla_penalty'),
+                    int(decision_id),
+                ),
+            )
+            transition = transition or feedback.get('economic_transition')
+            # The economic history is the replay corpus, not a dump of every
+            # categorical/shadow observation.  Keep those observations in
+            # judge_outcome_history and decisions_history, but only close a
+            # durable economic transition after a real applied-action result.
+            transition_status = str(
+                feedback.get('economic_application_status')
+                or (feedback.get('economic_action') or {}).get('application_status')
+                or ''
+            )
+            if (
+                isinstance(transition, dict)
+                and feedback.get('economic_transition_eligible', False)
+                and transition_status == 'applied'
+            ):
+                self.record_economic_transition(
+                    decision_id,
+                    transition,
+                    feedback,
+                    observed_metric_id=metric_id,
+                )
+            self.conn.commit()
+            return self.conn.total_changes > 0
+        except (sqlite3.Error, TypeError, ValueError):
+            return False
+
+    def record_economic_transition(self, decision_id, transition, feedback, observed_metric_id=None):
+        """Persist one fully observed economic transition idempotently."""
+        if not decision_id or not isinstance(transition, dict) or not isinstance(feedback, dict):
+            return False
+        action_preview = feedback.get('economic_action') or {}
+        if not isinstance(action_preview, dict):
+            action_preview = {}
+        if (
+            not feedback.get('economic_transition_eligible', False)
+            or str(
+                feedback.get('economic_application_status')
+                or action_preview.get('application_status')
+                or ''
+            ) != 'applied'
+        ):
+            return False
+        decision = transition.get('decision') or {}
+        next_decision = transition.get('next_decision') or {}
+        if not isinstance(decision, dict) or not isinstance(next_decision, dict):
+            return False
+        action = feedback.get('economic_action') or decision.get('economic_action') or {}
+        if not isinstance(action, dict):
+            action = {}
+        try:
+            decision_timestamp = int(decision.get('timestamp') or 0)
+            observed_timestamp = int(next_decision.get('timestamp') or time.time())
+        except (TypeError, ValueError):
+            return False
+
+        # A decision may be persisted between the periodic MARL-state writes.
+        # Store its already-computed state again under the *decision's exact
+        # timestamp* so the durable economic row has an unambiguous source
+        # and destination.  We never use a nearest-state fallback in replay.
+        def capture_exact_state(event, timestamp):
+            allocation = event.get('resource_allocation') or event.get('action') or {}
+            marl_state = allocation.get('article_marl_state') if isinstance(allocation, dict) else None
+            if not isinstance(marl_state, dict):
+                return False
+            du_states = marl_state.get('du_states') or []
+            global_state = marl_state.get('global_state') or {}
+            if not isinstance(du_states, list) or not isinstance(global_state, dict):
+                return False
+            self.record_article_marl_state(
+                {
+                    'article_marl_state': marl_state,
+                    'usable_budget': allocation.get('usable_budget', allocation.get('resource_budget', 0.0)),
+                },
+                timestamp=timestamp,
+            )
+            return True
+
+        source_state_captured = capture_exact_state(decision, decision_timestamp)
+        observed_state_captured = capture_exact_state(next_decision, observed_timestamp)
+        payload = _compact_economic_transition_payload(
+            decision_id, decision, next_decision, feedback, action
+        )
+        payload['exact_state_capture'] = {
+            'source': source_state_captured,
+            'observed': observed_state_captured,
+            'matching': 'timestamp_exact',
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        digest = hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+        try:
+            source_metric_id = int(decision.get('metric_snapshot_id') or 0) or None
+            observed_id = int(
+                observed_metric_id
+                or feedback.get('pdcp_metric_snapshot_id')
+                or next_decision.get('metric_snapshot_id')
+                or 0
+            ) or None
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO tasam_economic_transition_history
+                (decision_id, decision_timestamp, observed_timestamp,
+                 source_metric_snapshot_id, observed_metric_snapshot_id,
+                 economic_action_contract, economic_application_status,
+                 economic_transition_eligible, economic_training_eligible,
+                 economic_promotion_eligible, realized_energy_saving_fraction,
+                 realized_allocation_saving_fraction, tasam_online_reward,
+                 tasam_energy_reward, tasam_allocation_reward, tasam_sla_penalty,
+                 calibration_version, replay_schema, replay_compact_bytes,
+                 transition_json, transition_sha256, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(decision_id), decision_timestamp, observed_timestamp,
+                    source_metric_id, observed_id,
+                    str(feedback.get('economic_action_contract') or action.get('contract') or ''),
+                    str(feedback.get('economic_application_status') or action.get('application_status') or ''),
+                    1 if feedback.get('economic_transition_eligible', False) else 0,
+                    1 if feedback.get('economic_training_eligible', False) else 0,
+                    1 if feedback.get('economic_promotion_eligible', False) else 0,
+                    feedback.get('realized_energy_saving_fraction'),
+                    feedback.get('realized_allocation_saving_fraction'),
+                    feedback.get('tasam_online_reward'),
+                    feedback.get('tasam_energy_reward'),
+                    feedback.get('tasam_allocation_reward'),
+                    feedback.get('tasam_sla_penalty'),
+                    str(
+                        feedback.get('energy_model_version')
+                        or action.get('energy_model_version')
+                        or decision.get('energy_model_version')
+                        or decision.get('tasam_energy_model_version')
+                        or ''
+                    ),
+                    str(payload.get('schema') or ''),
+                    len(encoded.encode('utf-8')),
+                    encoded, digest, int(time.time()),
+                ),
+            )
+            return True
+        except (sqlite3.Error, TypeError, ValueError):
+            return False
+
+    def record_missing_judge_outcome(self, decision, reason="shutdown_before_next_real_snapshot"):
+        """Persist an explicit missing-feedback marker for a pending decision."""
+        if not isinstance(decision, dict):
+            return False
+        feedback = {
+            "outcome_observed": False,
+            "feedback_status": "missing",
+            "feedback_missing_reason": str(reason),
+            "correct_verdict": "UNKNOWN",
+            "tasam_predicted_verdict": "UNKNOWN",
+            "tasam_observed_verdict": "UNKNOWN",
+            "tasam_category_error": True,
+            "tasam_category_credit": -1.0,
+            "tasam_category_penalty": 1.0,
+            "tasam_training_category_credit": -2.0,
+            "tasam_training_category_penalty": 2.0,
+            "tasam_training_reward": -2.0,
+            "tasam_continuous_reward": -1.0,
+            "tasam_observed_error": 1.0,
+            "tasam_reward_source": "missing_real_feedback_max_penalty",
+            "tasam_action_applied": bool(decision.get("ta_sam_actuation_applied", False)),
+        }
+        self.record_judge_outcome(
+            decision,
+            feedback,
+            observation={"reason": str(reason), "correct_verdict": "UNKNOWN"},
+            observed_timestamp=int(time.time()),
+        )
+        return True
 
     def record_marl_shadow_comparison(self, snapshot, timestamp=None):
         """Persist runtime comparison between live allocator and MARL shadow allocator."""
@@ -1309,13 +2814,20 @@ class DataLake:
             cursor.execute("""
                 INSERT OR REPLACE INTO marl_shadow_comparison_history
                 (timestamp, datetime, policy_id, source, checkpoint_readiness, available, recommend_shadow,
-                 live_score, shadow_score, score_delta,
+                 live_score, shadow_score, score_delta, base_sla_resource_score_delta, causal_score_delta,
+                 tasam_checkpoint_valid, tasam_fallback_used, tasam_evidence_valid, live_allocator_algorithm,
+                 live_power_percent, shadow_power_percent, live_power_w, shadow_power_w,
+                 energy_saving_fraction, resource_saving_fraction, energy_model_version, energy_valid, resource_valid,
+                 native_sim_energy_j, native_sim_power_w, energy_reference_source,
+                 absolute_scale_valid, physical_wattmeter_available, infra_resource_index,
+                 infra_resource_saving_fraction, calibration_corpus_id, calibration_fit_error,
+                 calibration_rank_valid,
                  live_ran_completion_est, shadow_ran_completion_est,
                  live_ai_completion_est, shadow_ai_completion_est,
                  live_total_shortfall, shadow_total_shortfall,
                  live_budget_gap, shadow_budget_gap,
                  delta_r_ran, delta_r_ai, snapshot_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp,
                 dt_str,
@@ -1327,6 +2839,31 @@ class DataLake:
                 float(comparison.get('live_score', 0.0) or 0.0),
                 float(comparison.get('shadow_score', 0.0) or 0.0),
                 float(comparison.get('score_delta', 0.0) or 0.0),
+                float(comparison.get('base_sla_resource_score_delta', comparison.get('score_delta', 0.0)) or 0.0),
+                float(comparison.get('causal_score_delta', 0.0) or 0.0),
+                1 if marl_shadow.get('tasam_checkpoint_valid', False) else 0,
+                1 if marl_shadow.get('tasam_fallback_used', False) else 0,
+                1 if marl_shadow.get('tasam_evidence_valid', False) else 0,
+                str(snapshot.get('live_allocator_algorithm', '') or ''),
+                comparison.get('live_power_percent'),
+                comparison.get('shadow_power_percent'),
+                comparison.get('live_power_w'),
+                comparison.get('shadow_power_w'),
+                float(comparison.get('energy_saving_fraction', 0.0) or 0.0),
+                float(comparison.get('resource_saving_fraction', 0.0) or 0.0),
+                str(comparison.get('energy_model_version', '') or ''),
+                1 if comparison.get('energy_valid', False) else 0,
+                1 if comparison.get('resource_valid', False) else 0,
+                comparison.get('native_sim_energy_j'),
+                comparison.get('native_sim_power_w'),
+                str(comparison.get('energy_reference_source', '') or ''),
+                1 if comparison.get('absolute_scale_valid', False) else 0,
+                1 if comparison.get('physical_wattmeter_available', False) else 0,
+                comparison.get('infra_resource_index'),
+                comparison.get('infra_resource_saving_fraction'),
+                str(comparison.get('calibration_corpus_id', '') or ''),
+                comparison.get('calibration_fit_error'),
+                1 if comparison.get('calibration_rank_valid', False) else 0,
                 float(comparison.get('live_ran_completion_est', 0.0) or 0.0),
                 float(comparison.get('shadow_ran_completion_est', 0.0) or 0.0),
                 float(comparison.get('live_ai_completion_est', 0.0) or 0.0),
@@ -1664,7 +3201,7 @@ class DataLake:
                                energy_state=None, slicer_state=None,
                                latency_p5_us=0, latency_p95_us=0,
                                latency_min_nonzero_us=0, valid_samples=0,
-                               extended_metrics=None):
+                               extended_metrics=None, decision_id=None):
         """
         Registra métricas estendidas no Data Lake.
         
@@ -1742,8 +3279,12 @@ class DataLake:
                  latency_p95_per_ue_us, variance_per_ue_us2, cvar_per_ue_us, ue_count,
                  collector_mode, throughput_source, real_latency_sample_count, proxy_latency_sample_count,
                  pdcp_stale, rlc_stale, mac_stale,
-                 pdcp_trace_age_s, rlc_trace_age_s, mac_trace_age_s, pdcp_latest_sim_time_s)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 pdcp_trace_age_s, rlc_trace_age_s, mac_trace_age_s, pdcp_latest_sim_time_s,
+                 decision_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (timestamp, dt_str, sim_time_s, cell_id,
                   global_worst_latency, global_avg_latency,
                   global_min_latency, global_max_latency,
@@ -1756,12 +3297,39 @@ class DataLake:
                   latency_p95_per_ue, variance_per_ue, cvar_per_ue, ue_count,
                   collector_mode, throughput_source, real_latency_sample_count, proxy_latency_sample_count,
                   pdcp_stale, rlc_stale, mac_stale,
-                  pdcp_trace_age_s, rlc_trace_age_s, mac_trace_age_s, pdcp_latest_sim_time_s))
+                  pdcp_trace_age_s, rlc_trace_age_s, mac_trace_age_s, pdcp_latest_sim_time_s,
+                  decision_id))
             self.conn.commit()
+            row = self.conn.execute(
+                "SELECT id FROM extended_metrics WHERE timestamp = ?",
+                (timestamp,),
+            ).fetchone()
+            return int(row[0]) if row else None
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar métrica estendida: {e}")
+            return None
+
+    def associate_extended_metric_decision(self, metric_id, decision_id):
+        """Associate an already persisted real snapshot with one decision."""
+        try:
+            metric_id = int(metric_id or 0)
+            decision_id = int(decision_id or 0)
+        except (TypeError, ValueError):
+            return False
+        if metric_id <= 0 or decision_id <= 0:
+            return False
+        try:
+            self.conn.execute(
+                "UPDATE extended_metrics SET decision_id = ? WHERE id = ?",
+                (decision_id, metric_id),
+            )
+            self.conn.commit()
+            return self.conn.total_changes > 0
+        except Exception as e:
+            print(f"[DataLake] ERRO ao associar snapshot à decisão: {e}")
+            return False
     
-    def record_ue_metrics(self, timestamp=None, ue_metrics_list=None):
+    def record_ue_metrics(self, timestamp=None, ue_metrics_list=None, sim_time_s=0.0):
         """
         Registra métricas de múltiplos UEs.
         
@@ -1789,8 +3357,10 @@ class DataLake:
                      packet_loss_percent, vehicle_id, vehicle_role, autonomy_state, risk_state,
                      speed_mps, heading_deg, lane_id, waypoint_id,
                      position_x, position_y, position_z,
-                     connectivity, gateway_id, domain, mobility_profile)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     connectivity, gateway_id, domain, mobility_profile,
+                     sim_time_s, latency_p95_us, has_latency_samples,
+                     latency_is_proxy, pdcp_provenance, offered_load_kbps, backlog_bytes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (timestamp, ue.get('imsi'), ue.get('device_type'), ue.get('cell_id'),
                       ue.get('latency_us'), ue.get('latency_avg_us'), ue.get('latency_min_us'), ue.get('latency_max_us'),
                       ue.get('jitter_us'), ue.get('pdu_size_avg'),
@@ -1807,7 +3377,14 @@ class DataLake:
                       (ue.get('position') or {}).get('y'),
                       (ue.get('position') or {}).get('z'),
                       ue.get('connectivity'), ue.get('gateway_id'),
-                      ue.get('domain'), ue.get('mobility_profile')))
+                      ue.get('domain'), ue.get('mobility_profile'),
+                      float(ue.get('sim_time_s', sim_time_s) or 0.0),
+                      ue.get('latency_p95_us', ue.get('latency_us')),
+                      1 if ue.get('has_latency_samples') else 0,
+                      1 if ue.get('latency_is_proxy') else 0,
+                      ue.get('pdcp_provenance', ''),
+                      ue.get('offered_load_kbps', ue.get('tx_throughput_kbps', 0)),
+                      ue.get('backlog_bytes', 0)))
             self.conn.commit()
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar métricas de UE: {e}")
@@ -1820,6 +3397,13 @@ class DataLake:
         mmwave_count=1,
         reason="",
         timestamp_ns=None,
+        requested_power_percent=None,
+        power_safety_override_reason="",
+        decision_id=None,
+        action_correlation_id="",
+        native_control_sequence=None,
+        action_origin="",
+        application_status="",
     ):
         """
         Registra comando de energia enviado ao xApp Energy Saver.
@@ -1835,9 +3419,20 @@ class DataLake:
         timestamp = timestamp_ns // 1_000_000_000
         dt = datetime.fromtimestamp(timestamp)
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        calibration = {}
         try:
             calibration = load_calibration()
-            power_w = state_power_w(calibration, ru_count, mmwave_count, power_percent)
+            if (
+                calibration.get("schema") == "greenran.energy_calibration.v3"
+                and mmwave_count in {1, 2, 3}
+            ):
+                power_w = sleep_state_power_w(
+                    calibration,
+                    active_cells=int(mmwave_count),
+                    power_percent=power_percent,
+                )
+            else:
+                power_w = state_power_w(calibration, ru_count, mmwave_count, power_percent)
             calibration_version = str(calibration.get("calibration_version", ""))
         except ValueError as exc:
             print(f"[DataLake] WRN: calibração energética indisponível: {exc}")
@@ -1849,13 +3444,984 @@ class DataLake:
             cursor.execute("""
                 INSERT INTO energy_commands 
                 (timestamp, datetime, command, power_percent, ru_count, mmwave_count, reason,
-                 timestamp_ns, power_w, calibration_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 timestamp_ns, power_w, calibration_version,
+                 requested_power_percent, applied_power_percent, power_safety_override_reason,
+                native_sim_energy_j, native_sim_power_w, energy_reference_source,
+                absolute_scale_valid, physical_wattmeter_available, calibration_corpus_id,
+                 calibration_fit_error, calibration_rank_valid,
+                 decision_id, action_correlation_id, action_origin, application_status,
+                 native_control_sequence,
+                 command_sent, actuation_confirmed, actuation_confirmation_source,
+                 observed_power_percent, observed_power_w, observed_ru_count,
+                 observed_mmwave_count, confirmation_decision_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (timestamp, dt_str, command, power_percent, ru_count, mmwave_count, reason,
-                  timestamp_ns, power_w, calibration_version))
+                  timestamp_ns, power_w, calibration_version,
+                  power_percent if requested_power_percent is None else requested_power_percent,
+                  power_percent, power_safety_override_reason,
+                  None, None,
+                  "ns3_device_energy_model" if calibration.get("schema") == "greenran.energy_calibration.v2" else "calibrated_model",
+                  1 if calibration.get("absolute_scale_valid", False) else 0,
+                  1 if calibration.get("physical_wattmeter_available", False) else 0,
+                  str(calibration.get("calibration_corpus_id", "") or ""),
+                  calibration.get("fit_error"),
+                  1 if calibration.get("calibration_rank_valid", False) else 0,
+                  decision_id, str(action_correlation_id or ''), str(action_origin or ''),
+                  str(application_status or ''),
+                  native_control_sequence,
+                  1, 0, '', None, None, None, None, None))
+            command_id = int(cursor.lastrowid or 0) or None
             self.conn.commit()
+            return command_id
         except Exception as e:
             print(f"[DataLake] ERRO ao registrar comando de energia: {e}")
+            return None
+
+    def associate_energy_command_decision(self, correlation_id, decision_id):
+        """Bind an already-issued command to its persisted rApp decision."""
+        if not correlation_id or not decision_id:
+            return None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE energy_commands SET decision_id=? WHERE action_correlation_id=?",
+                (int(decision_id), str(correlation_id)),
+            )
+            self.conn.commit()
+            return int(cursor.rowcount or 0)
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            print(f"[DataLake] ERRO ao associar comando energético à decisão: {exc}")
+            return None
+
+    def update_energy_command_application(
+        self,
+        correlation_id,
+        status,
+        *,
+        actuation_confirmed=None,
+        confirmation_source='',
+        observed_power_percent=None,
+        observed_power_w=None,
+        observed_ru_count=None,
+        observed_mmwave_count=None,
+        confirmation_decision_id=None,
+        observed_allocation_fraction=None,
+        native_active_dl_symbols=None,
+        native_dl_symbol_capacity=None,
+        native_cell_ids=None,
+        native_observation_version=None,
+    ):
+        """Persist command status and optional confirmation from a later window."""
+        if not correlation_id:
+            return None
+        try:
+            cursor = self.conn.cursor()
+            assignments = ["application_status=?"]
+            # Keep the low-level method backward compatible with historical
+            # callers that used ``verified``.  Current orchestrator paths
+            # pass the canonical ``applied`` state explicitly only after the
+            # native confirmation validator succeeds.
+            values = [str(status or '')]
+            if actuation_confirmed is not None:
+                assignments.append("actuation_confirmed=?")
+                values.append(1 if actuation_confirmed else 0)
+            if confirmation_source:
+                assignments.append("actuation_confirmation_source=?")
+                values.append(str(confirmation_source))
+            if observed_power_percent is not None:
+                assignments.append("observed_power_percent=?")
+                values.append(observed_power_percent)
+            if observed_power_w is not None:
+                assignments.append("observed_power_w=?")
+                values.append(observed_power_w)
+            if observed_ru_count is not None:
+                assignments.append("observed_ru_count=?")
+                values.append(observed_ru_count)
+            if observed_mmwave_count is not None:
+                assignments.append("observed_mmwave_count=?")
+                values.append(observed_mmwave_count)
+            if confirmation_decision_id is not None:
+                assignments.append("confirmation_decision_id=?")
+                values.append(confirmation_decision_id)
+            if observed_allocation_fraction is not None:
+                assignments.append("observed_allocation_fraction=?")
+                values.append(observed_allocation_fraction)
+            if native_active_dl_symbols is not None:
+                assignments.append("native_active_dl_symbols=?")
+                values.append(native_active_dl_symbols)
+            if native_dl_symbol_capacity is not None:
+                assignments.append("native_dl_symbol_capacity=?")
+                values.append(native_dl_symbol_capacity)
+            if native_cell_ids is not None:
+                assignments.append("native_cell_ids_json=?")
+                values.append(json.dumps(list(native_cell_ids), sort_keys=True))
+            if native_observation_version is not None:
+                assignments.append("native_observation_version=?")
+                values.append(str(native_observation_version))
+            values.append(str(correlation_id))
+            cursor.execute(
+                f"UPDATE energy_commands SET {', '.join(assignments)} "
+                "WHERE action_correlation_id=?",
+                tuple(values),
+            )
+            self.conn.commit()
+            return int(cursor.rowcount or 0)
+        except sqlite3.Error as exc:
+            print(f"[DataLake] ERRO ao atualizar status do comando energético: {exc}")
+            return None
+
+    def energy_command_for_correlation(self, correlation_id):
+        """Return the exact post-actuation command for one decision token."""
+        if not correlation_id:
+            return {}
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM energy_commands WHERE action_correlation_id=? "
+                "ORDER BY timestamp_ns DESC, id DESC LIMIT 1",
+                (str(correlation_id),),
+            ).fetchone()
+        except sqlite3.Error:
+            return {}
+        return {str(key): row[key] for key in row.keys()} if row is not None else {}
+
+    def peek_next_decision_id(self):
+        """Return the next local decision id without inserting a decision.
+
+        The ns-3 native trace is emitted asynchronously, before the decision
+        row is committed by the orchestrator.  A single orchestrator owns an
+        arm database, so reserving the next monotonically increasing id as a
+        trace hint is deterministic; the later SQLite insert remains the
+        authoritative decision record.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM decisions_history"
+            ).fetchone()
+            return int(row[0] or 1) if row else 1
+        except (sqlite3.Error, TypeError, ValueError):
+            return 1
+
+    def ingest_native_control_observations(self, source_path=None):
+        """Import complete CSV lines incrementally without treating them as an ACK."""
+        self._last_native_import_invalid_rows = 0
+        self._last_native_import_partial = False
+        self._last_native_import_error = ""
+        if source_path:
+            path = Path(source_path)
+        else:
+            output_dir = os.environ.get("GREENRAN_NS3_ENERGY_OUTPUT_DIR")
+            if output_dir:
+                path = Path(output_dir) / "TasamControlObservations.csv"
+            else:
+                state_dir = Path(os.environ.get("GREENRAN_STATE_DIR", str(RAPP_DB_PATH.parent)))
+                path = state_dir / "ns3_energy" / "TasamControlObservations.csv"
+        if not path.is_file():
+            return 0
+        imported = 0
+        resolved_path = str(path.resolve())
+        try:
+            import csv
+            stat = path.stat()
+            inode = int(getattr(stat, "st_ino", 0) or 0)
+            state = self.conn.execute(
+                "SELECT inode, byte_offset, header, reset_count FROM tasam_native_ingest_state "
+                "WHERE source_path=?", (resolved_path,)
+            ).fetchone()
+            previous_inode = int(state[0]) if state else 0
+            previous_offset = int(state[1]) if state else 0
+            header = str(state[2]) if state else ""
+            reset_count = int(state[3] or 0) if state else 0
+            if previous_inode != inode or stat.st_size < previous_offset:
+                previous_offset = 0
+                header = ""
+                reset_count += 1
+            with path.open("rb") as handle:
+                raw_header = handle.readline()
+                if not raw_header:
+                    return 0
+                if not header:
+                    header = raw_header.decode("utf-8", errors="replace")
+                header_end = handle.tell()
+                start = max(header_end, previous_offset)
+                handle.seek(start)
+                body = handle.read()
+            if not body:
+                self.conn.execute(
+                    """INSERT INTO tasam_native_ingest_state
+                       (source_path, inode, byte_offset, header, last_error,
+                        reset_count, updated_at)
+                       VALUES (?, ?, ?, ?, '', ?, ?)
+                       ON CONFLICT(source_path) DO UPDATE SET
+                         inode=excluded.inode, byte_offset=excluded.byte_offset,
+                         header=excluded.header, last_error='',
+                         reset_count=excluded.reset_count, updated_at=excluded.updated_at""",
+                    (resolved_path, inode, start, header, reset_count, int(time.time())),
+                )
+                self.conn.commit()
+                return 0
+            last_newline = body.rfind(b"\n")
+            if last_newline < 0:
+                self._last_native_import_partial = True
+                return 0
+            complete = body[:last_newline + 1]
+            new_offset = start + len(complete)
+            text = io.StringIO(header + complete.decode("utf-8", errors="replace"))
+            for row in csv.DictReader(text):
+                    try:
+                        scheduler_transaction = int(
+                            row.get("SchedulerTransactionId", row.get("TransactionId", 0)) or 0
+                        )
+                        power_transaction = int(row.get("PowerTransactionId", 0) or 0)
+                        nominal_power = row.get("NominalTxPowerDbm")
+                        observation_kind = str(
+                            row.get("ObservationKind") or "legacy_snapshot"
+                        ).strip()
+                        policy_active = str(
+                            row.get("PolicyActive", "0") or "0"
+                        ).strip().lower() in {"1", "true", "yes"}
+                        expiry_raw = row.get("PolicyExpiryTime")
+                        expiry = (
+                            None if expiry_raw in (None, "") else float(expiry_raw)
+                        )
+                        values = (
+                            float(row["Time"]), int(row["CellId"]),
+                            scheduler_transaction, int(row["ActiveUes"]),
+                            float(row["TxPowerPercent"]), float(row["TxPowerDbm"]),
+                            power_transaction,
+                            None if nominal_power in (None, "") else float(nominal_power),
+                        observation_kind, 1 if policy_active else 0, expiry,
+                            str(row.get("SourceGeneration") or "").strip(),
+                            str(row.get("AssociationEpoch") or "").strip(),
+                            None if row.get("ActiveDlSymbols") in (None, "") else int(row.get("ActiveDlSymbols")),
+                            None if row.get("ActiveDlSymbolCapacity") in (None, "") else int(row.get("ActiveDlSymbolCapacity")),
+                            str(row.get("NativeAllocationSource") or "").strip(),
+                            str(row.get("CampaignId") or os.environ.get("GREENRAN_CAMPAIGN_ID", "")).strip(),
+                            str(row.get("EvidenceVersion") or "").strip(),
+                            str(row.get("CampaignGeneration") or row.get("SourceGeneration") or "").strip(),
+                            (None if row.get("DecisionId") in (None, "") else int(row.get("DecisionId"))),
+                            str(row.get("ActionCorrelationId") or "").strip(),
+                            (None if row.get("NativeControlSequence") in (None, "") else int(row.get("NativeControlSequence"))),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        self._last_native_import_invalid_rows += 1
+                        continue
+                    cursor = self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO tasam_control_observations
+                          (source_path, sim_time_s, cell_id, transaction_id,
+                           power_transaction_id, scheduler_transaction_id,
+                           active_ues, tx_power_percent, tx_power_dbm,
+                           nominal_tx_power_dbm, observation_kind, policy_active,
+                           policy_expiry_sim_time, source_generation,
+                           association_epoch, native_allocated_dl_symbols,
+                           native_dl_symbol_capacity, native_allocation_source,
+                           native_allocation_fraction,
+                           campaign_id, campaign_generation, decision_id,
+                           action_correlation_id, native_control_sequence,
+                           evidence_version, imported_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (resolved_path, values[0], values[1], values[2], values[6],
+                         values[2], values[3], values[4], values[5], values[7],
+                         values[8], values[9], values[10], values[11], values[12],
+                         values[13], values[14], values[15],
+                         (None if values[14] in (None, 0) else
+                          max(0.0, min(1.0, float(values[13]) / float(values[14])))),
+                         values[16], values[18], values[19], values[20], values[21],
+                         values[17] or (
+                             "v3" if values[8] in {"power_readback", "state_snapshot"} else
+                             ("v2" if values[6] > 0 else "v1")
+                         ), int(time.time())),
+                    )
+                    imported += int(cursor.rowcount or 0)
+            self.conn.execute(
+                """INSERT INTO tasam_native_ingest_state
+                   (source_path, inode, byte_offset, header, last_error,
+                    reset_count, updated_at)
+                   VALUES (?, ?, ?, ?, '', ?, ?)
+                   ON CONFLICT(source_path) DO UPDATE SET
+                     inode=excluded.inode, byte_offset=excluded.byte_offset,
+                     header=excluded.header, last_error='',
+                     reset_count=excluded.reset_count, updated_at=excluded.updated_at""",
+                (resolved_path, inode, new_offset, header, reset_count, int(time.time())),
+            )
+            self.conn.commit()
+        except (OSError, sqlite3.Error, csv.Error) as exc:
+            self._last_native_import_error = f"{type(exc).__name__}: {exc}"[:512]
+            try:
+                self.conn.execute(
+                    """INSERT INTO tasam_native_ingest_state
+                       (source_path, inode, byte_offset, header, last_error,
+                        reset_count, updated_at)
+                       VALUES (?, 0, 0, '', ?, 0, ?)
+                       ON CONFLICT(source_path) DO UPDATE SET
+                         last_error=excluded.last_error, updated_at=excluded.updated_at""",
+                    (resolved_path, f"{type(exc).__name__}: {exc}"[:512], int(time.time())),
+                )
+                self.conn.commit()
+            except sqlite3.Error:
+                pass
+            return imported
+        return imported
+
+    def ingest_native_association_observations(self, source_path=None):
+        """Import the native ``(sim_time, cell, RNTI, IMSI)`` trace.
+
+        Association evidence is deliberately separate from scheduler and
+        power observations.  It is append-only, idempotent and read only for
+        the collector: an association row can explain a cell mapping but can
+        never by itself confirm an economic action.
+        """
+        if source_path:
+            path = Path(source_path)
+        else:
+            output_dir = os.environ.get("GREENRAN_NS3_ENERGY_OUTPUT_DIR")
+            if output_dir:
+                path = Path(output_dir) / "TasamAssociationTrace.csv"
+            else:
+                state_dir = Path(os.environ.get("GREENRAN_STATE_DIR", str(RAPP_DB_PATH.parent)))
+                path = state_dir / "ns3_energy" / "TasamAssociationTrace.csv"
+        self._last_native_import_invalid_rows = 0
+        self._last_native_import_partial = False
+        self._last_native_import_error = ""
+        if not path.is_file():
+            return 0
+        imported = 0
+        resolved_path = str(path.resolve())
+        try:
+            import csv
+            stat = path.stat()
+            inode = int(getattr(stat, "st_ino", 0) or 0)
+            state = self.conn.execute(
+                "SELECT inode, byte_offset, header, reset_count FROM tasam_native_ingest_state "
+                "WHERE source_path=?", (resolved_path,)
+            ).fetchone()
+            previous_inode = int(state[0]) if state else 0
+            previous_offset = int(state[1]) if state else 0
+            header = str(state[2]) if state else ""
+            reset_count = int(state[3] or 0) if state else 0
+            if previous_inode != inode or stat.st_size < previous_offset:
+                previous_offset = 0
+                header = ""
+                reset_count += 1
+            with path.open("rb") as handle:
+                raw_header = handle.readline()
+                if not raw_header:
+                    return 0
+                if not header:
+                    header = raw_header.decode("utf-8", errors="replace")
+                header_end = handle.tell()
+                start = max(header_end, previous_offset)
+                handle.seek(start)
+                body = handle.read()
+            if not body:
+                return 0
+            last_newline = body.rfind(b"\n")
+            if last_newline < 0:
+                self._last_native_import_partial = True
+                return 0
+            complete = body[:last_newline + 1]
+            new_offset = start + len(complete)
+            text = io.StringIO(header + complete.decode("utf-8", errors="replace"))
+            for row in csv.DictReader(text):
+                try:
+                    sim_time = float(row["Time"])
+                    cell_id = int(row["CellId"])
+                    rnti = int(row["Rnti"])
+                    imsi = int(row["Imsi"])
+                    epoch = str(row.get("AssociationEpoch") or "").strip()
+                    campaign_id = str(
+                        row.get("CampaignId")
+                        or os.environ.get("GREENRAN_CAMPAIGN_ID", "")
+                    ).strip()
+                    source_generation = str(row.get("SourceGeneration") or "").strip()
+                    transaction_id = int(
+                        row.get("TransactionId")
+                        or row.get("PowerTransactionId")
+                        or row.get("SchedulerTransactionId")
+                        or 0
+                    )
+                    native_control_sequence = (
+                        None if row.get("NativeControlSequence") in (None, "")
+                        else int(row.get("NativeControlSequence"))
+                    )
+                    decision_id = (
+                        None if row.get("DecisionId") in (None, "")
+                        else int(row.get("DecisionId"))
+                    )
+                    action_correlation_id = str(
+                        row.get("ActionCorrelationId") or ""
+                    ).strip()
+                except (KeyError, TypeError, ValueError):
+                    self._last_native_import_invalid_rows += 1
+                    continue
+                if not all(math.isfinite(value) for value in (sim_time,)):
+                    continue
+                cursor = self.conn.execute(
+                    """INSERT OR IGNORE INTO tasam_native_associations
+                       (source_path, sim_time_s, cell_id, rnti, imsi,
+                       association_epoch, campaign_id, source_generation,
+                        evidence_version, transaction_id, native_control_sequence,
+                        decision_id, action_correlation_id, imported_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (resolved_path, sim_time, cell_id, rnti, imsi, epoch,
+                     campaign_id, source_generation,
+                     str(row.get("EvidenceVersion") or "v1").strip(),
+                     transaction_id, native_control_sequence, decision_id,
+                     action_correlation_id, int(time.time())),
+                )
+                imported += int(cursor.rowcount or 0)
+            self.conn.execute(
+                """INSERT INTO tasam_native_ingest_state
+                   (source_path, inode, byte_offset, header, last_error,
+                    reset_count, updated_at)
+                   VALUES (?, ?, ?, ?, '', ?, ?)
+                   ON CONFLICT(source_path) DO UPDATE SET
+                     inode=excluded.inode, byte_offset=excluded.byte_offset,
+                     header=excluded.header, last_error='',
+                     reset_count=excluded.reset_count, updated_at=excluded.updated_at""",
+                (resolved_path, inode, new_offset, header, reset_count, int(time.time())),
+            )
+            self.conn.commit()
+        except (OSError, sqlite3.Error, csv.Error) as exc:
+            self._last_native_import_error = f"{type(exc).__name__}: {exc}"[:512]
+            try:
+                self.conn.execute(
+                    """INSERT INTO tasam_native_ingest_state
+                       (source_path, inode, byte_offset, header, last_error,
+                        reset_count, updated_at)
+                       VALUES (?, 0, 0, '', ?, 0, ?)
+                       ON CONFLICT(source_path) DO UPDATE SET
+                         last_error=excluded.last_error, updated_at=excluded.updated_at""",
+                    (resolved_path, f"{type(exc).__name__}: {exc}"[:512], int(time.time())),
+                )
+                self.conn.commit()
+            except sqlite3.Error:
+                pass
+            return imported
+        return imported
+
+    def ingest_native_evidence_cycle(
+        self, control_path=None, association_path=None, *,
+        campaign_id=None, source_generation=None,
+    ):
+        """Ingest native evidence on every controller cycle.
+
+        This method is intentionally separate from confirmation: importing a
+        row proves only that ns-3 emitted an observation.  Confirmation still
+        requires a matching pending action, all expected cells, a valid
+        policy snapshot and the later PDCP window.  The small event ledger is
+        used by the learning meter to distinguish an empty shadow bundle from
+        an actual import failure.
+        """
+        def default_path(name, explicit):
+            if explicit:
+                return Path(explicit)
+            output_dir = os.environ.get("GREENRAN_NS3_ENERGY_OUTPUT_DIR")
+            if output_dir:
+                return Path(output_dir) / name
+            state_dir = Path(os.environ.get("GREENRAN_STATE_DIR", str(RAPP_DB_PATH.parent)))
+            return state_dir / "ns3_energy" / name
+
+        control = default_path("TasamControlObservations.csv", control_path)
+        association = default_path("TasamAssociationTrace.csv", association_path)
+        sources = ((control, self.ingest_native_control_observations),
+                   (association, self.ingest_native_association_observations))
+        results = []
+        for path, importer in sources:
+            resolved = str(path.resolve())
+            before = 0
+            state_before = self.conn.execute(
+                "SELECT inode, byte_offset FROM tasam_native_ingest_state WHERE source_path=?",
+                (resolved,),
+            ).fetchone()
+            if path.name.startswith("TasamControl"):
+                table = "tasam_control_observations"
+            else:
+                table = "tasam_native_associations"
+            try:
+                before = int(self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE source_path=?", (resolved,)
+                ).fetchone()[0] or 0)
+            except sqlite3.Error:
+                pass
+            error = ""
+            try:
+                imported = int(importer(path) or 0)
+            except Exception as exc:  # the cycle must report, not hide, an importer fault
+                imported = 0
+                error = f"{type(exc).__name__}: {exc}"[:512]
+            invalid_rows = int(getattr(self, "_last_native_import_invalid_rows", 0) or 0)
+            partial = bool(getattr(self, "_last_native_import_partial", False))
+            importer_error = str(getattr(self, "_last_native_import_error", "") or "")
+            if importer_error and not error:
+                error = importer_error
+            state_after = self.conn.execute(
+                "SELECT inode, byte_offset, reset_count, last_error "
+                "FROM tasam_native_ingest_state WHERE source_path=?",
+                (resolved,),
+            ).fetchone()
+            after = before
+            try:
+                after = int(self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE source_path=?", (resolved,)
+                ).fetchone()[0] or 0)
+            except sqlite3.Error:
+                pass
+            reset = bool(
+                state_before is not None and state_after is not None
+                and (int(state_before[0] or 0) != int(state_after[0] or 0)
+                     or int(state_after[1] or 0) < int(state_before[1] or 0))
+            )
+            missing = not path.is_file()
+            if missing and state_after is None:
+                error = "native_trace_missing"
+            row = {
+                "source_path": resolved,
+                "campaign_id": str(campaign_id or os.environ.get("GREENRAN_CAMPAIGN_ID", "")),
+                "source_generation": str(source_generation or os.environ.get("GREENRAN_NATIVE_SOURCE_GENERATION", "")),
+                "evidence_version": str(os.environ.get("GREENRAN_NATIVE_EVIDENCE_VERSION", "")),
+                "inode": int(state_after[0] or 0) if state_after else 0,
+                "start_offset": int(state_before[1] or 0) if state_before else 0,
+                "end_offset": int(state_after[1] or 0) if state_after else 0,
+                "imported_rows": max(0, after - before),
+                "invalid_rows": invalid_rows,
+                "partial_line_pending": partial,
+                "reset_detected": int(reset),
+                "error": error or str(state_after[3] or "") if state_after else error,
+            }
+            if invalid_rows and not row["error"]:
+                row["error"] = f"native_trace_invalid_rows:{invalid_rows}"
+            results.append(row)
+            if (
+                row["imported_rows"] or row["invalid_rows"] or row["error"]
+                or row["reset_detected"] or row["partial_line_pending"]
+            ):
+                self.conn.execute(
+                    """INSERT INTO tasam_native_evidence_ingest
+                       (source_path, campaign_id, source_generation, evidence_version,
+                        inode, start_offset, end_offset, imported_rows, invalid_rows,
+                        reset_detected, error, sim_time_s, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               (SELECT MAX(sim_time_s) FROM tasam_control_observations
+                                WHERE source_path=?), ?)""",
+                    (row["source_path"], row["campaign_id"], row["source_generation"],
+                     row["evidence_version"], row["inode"], row["start_offset"],
+                     row["end_offset"], row["imported_rows"], row["invalid_rows"],
+                     row["reset_detected"], row["error"], row["source_path"], int(time.time())),
+                )
+        self.conn.commit()
+        return {
+            "schema": "greenran.tasam.native_evidence_cycle.v1",
+            "campaign_id": str(campaign_id or os.environ.get("GREENRAN_CAMPAIGN_ID", "")),
+            "source_generation": str(source_generation or os.environ.get("GREENRAN_NATIVE_SOURCE_GENERATION", "")),
+            "evidence_version": str(os.environ.get("GREENRAN_NATIVE_EVIDENCE_VERSION", "")),
+            "sources": results,
+            "imported_control_rows": sum(r["imported_rows"] for r in results[:1]),
+            "imported_association_rows": sum(r["imported_rows"] for r in results[1:]),
+            "invalid_control_rows": sum(r["invalid_rows"] for r in results[:1]),
+            "invalid_association_rows": sum(r["invalid_rows"] for r in results[1:]),
+            "partial_lines_pending": any(
+                bool(r.get("partial_line_pending")) for r in results
+            ),
+            "valid": all(not r["error"] for r in results),
+        }
+
+    def confirm_native_control_observation(
+        self, transaction_id, expected_power_percent, expected_cell_ids,
+        *, sim_time_s=None, ttl_s=5.0, source_generation=None,
+        require_evidence_version="v3", campaign_id=None,
+        action_correlation_id=None,
+    ):
+        """Confirm one command from independent PHY and scheduler evidence.
+
+        A ``power_readback`` row proves the PHY changed.  A later
+        ``state_snapshot`` row for the same cell/transaction proves that the
+        scheduler policy was active.  Transport ACKs and legacy rows are not
+        sufficient for current campaigns.
+        """
+        try:
+            transaction_id = int(transaction_id)
+            expected_power_by_cell = None
+            if isinstance(expected_power_percent, dict):
+                expected_power_by_cell = {
+                    int(cell): float(value) for cell, value in expected_power_percent.items()
+                }
+                expected_power_percent = None
+            else:
+                expected_power_percent = float(expected_power_percent)
+            expected_cells = {int(value) for value in expected_cell_ids}
+        except (TypeError, ValueError):
+            return {"valid": False, "reason": "native_observation_contract_invalid"}
+        if not expected_cells:
+            return {"valid": False, "reason": "native_observation_cells_missing"}
+        if expected_power_by_cell is not None and set(expected_power_by_cell) != expected_cells:
+            return {"valid": False, "reason": "native_observation_power_cell_map_incomplete"}
+        if str(require_evidence_version) == "v5" and expected_cells != {2, 3, 4}:
+            return {
+                "valid": False,
+                "reason": "native_observation_expected_three_du_cells",
+            }
+        self.ingest_native_control_observations()
+        self.ingest_native_association_observations()
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT cell_id, sim_time_s, active_ues, tx_power_percent, tx_power_dbm,
+                       power_transaction_id, scheduler_transaction_id,
+                       nominal_tx_power_dbm, observation_kind, policy_active,
+                       policy_expiry_sim_time, source_generation, association_epoch,
+                       native_allocated_dl_symbols, native_dl_symbol_capacity,
+                       native_allocation_source, native_allocation_fraction,
+                       campaign_id, evidence_version, campaign_generation,
+                       decision_id, action_correlation_id, native_control_sequence
+                  FROM tasam_control_observations
+                 WHERE (power_transaction_id=? OR scheduler_transaction_id=?)
+                   AND (? IS NULL OR campaign_id=?)
+                 ORDER BY sim_time_s ASC, id ASC
+                """, (transaction_id, transaction_id, campaign_id, campaign_id),
+            ).fetchall()
+        except sqlite3.Error:
+            return {"valid": False, "reason": "native_observation_query_failed"}
+        selected_power = {}
+        selected_policy = {}
+        for row in rows:
+            cell_id = int(row[0])
+            if cell_id not in expected_cells:
+                continue
+            if source_generation and str(row[11] or "") != str(source_generation):
+                continue
+            try:
+                row_time = float(row[1])
+                row_power = float(row[3])
+                row_dbm = float(row[4])
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in (row_time, row_power, row_dbm)):
+                continue
+            in_window = sim_time_s is None or (
+                float(sim_time_s) <= row_time <= float(sim_time_s) + float(ttl_s)
+            )
+            if not in_window or str(row[18] or "") != str(require_evidence_version):
+                continue
+            if action_correlation_id and str(row[21] or "") != str(action_correlation_id):
+                continue
+            if str(require_evidence_version) == "v5":
+                # Current evidence is never allowed to silently inherit a
+                # row from another campaign/generation or from a context
+                # sidecar that was not attached to this control action.
+                if not campaign_id or str(row[17] or "") != str(campaign_id):
+                    continue
+                if not source_generation or str(row[11] or "") != str(source_generation):
+                    continue
+                if not action_correlation_id or not str(row[21] or ""):
+                    continue
+                if int(row[22] or 0) != transaction_id:
+                    continue
+            if (
+                int(row[5] or 0) == transaction_id
+                and str(row[8] or "") == "power_readback"
+                and math.isfinite(row_power)
+                and math.isfinite(row_dbm)
+                and abs(
+                    row_power - (
+                        expected_power_by_cell.get(cell_id)
+                        if expected_power_by_cell is not None
+                        else expected_power_percent
+                    )
+                ) <= 0.1
+            ) and cell_id not in selected_power:
+                selected_power[cell_id] = row
+            if (
+                int(row[6] or 0) == transaction_id
+                and str(row[8] or "") == "state_snapshot"
+                and int(row[9] or 0) == 1
+                and cell_id not in selected_policy
+            ):
+                selected_policy[cell_id] = row
+        if set(selected_power) != expected_cells or set(selected_policy) != expected_cells:
+            reason = "native_observation_missing_cell"
+            if selected_power or selected_policy:
+                reason = "native_observation_transaction_power_policy_or_window_mismatch"
+            return {
+                "valid": False,
+                "reason": reason,
+                "observed_power_cells": sorted(selected_power),
+                "observed_policy_cells": sorted(selected_policy),
+            }
+        selected_times = [
+            float(selected_power[cell][1]) for cell in expected_cells
+        ] + [
+            float(selected_policy[cell][1]) for cell in expected_cells
+        ]
+        if max(selected_times) - min(selected_times) > float(ttl_s):
+            return {
+                "valid": False,
+                "reason": "native_observation_window_not_common",
+                "observed_power_cells": sorted(selected_power),
+                "observed_policy_cells": sorted(selected_policy),
+            }
+        if any(
+            selected_policy[cell][14] in (None, 0)
+            or selected_policy[cell][16] is None
+            or not math.isfinite(float(selected_policy[cell][16]))
+            or (
+                str(require_evidence_version) == "v5"
+                and str(selected_policy[cell][15] or "") != "tasam_native_aggregate_v1"
+            )
+            for cell in expected_cells
+        ):
+            return {
+                "valid": False,
+                "reason": "native_observation_allocation_missing",
+                "observed_power_cells": sorted(selected_power),
+                "observed_policy_cells": sorted(selected_policy),
+            }
+        powers = [float(selected_power[cell][3]) for cell in sorted(expected_cells)]
+        return {
+            "valid": True,
+            "source": "ns3_tasam_control_observations",
+            "campaign_id": str(campaign_id or ""),
+            "source_generation": str(source_generation or ""),
+            "transaction_id": transaction_id,
+            "action_correlation_id": str(action_correlation_id or ""),
+            "cell_ids": sorted(expected_cells),
+            "power_percent": sum(powers) / len(powers),
+            "power_percent_by_cell": {
+                str(cell): float(selected_power[cell][3]) for cell in sorted(expected_cells)
+            },
+            "power_transaction_id": transaction_id,
+            "scheduler_transaction_id": transaction_id,
+            "evidence_version": require_evidence_version,
+            "active_ues": sum(int(selected_policy[cell][2] or 0) for cell in expected_cells),
+            "sim_time_s": max(float(selected_policy[cell][1]) for cell in expected_cells),
+            "model_component_mode": "combined_radio_relative" if True else "separate_components",
+            "observed_ru_count": None,
+            "observed_mmwave_count": len(expected_cells),
+            "active_dl_symbols": sum(
+                int(selected_policy[cell][13] or 0) for cell in expected_cells
+            ),
+            "active_dl_symbol_capacity": sum(
+                int(selected_policy[cell][14] or 0) for cell in expected_cells
+            ),
+            "native_allocation_fraction": (
+                sum(float(selected_policy[cell][16] or 0.0) for cell in expected_cells)
+                / len(expected_cells)
+            ),
+            "observations": [
+                {
+                    "cell_id": int(cell),
+                    "power_readback_sim_time_s": float(selected_power[cell][1]),
+                    "policy_active_sim_time_s": float(selected_policy[cell][1]),
+                    "active_ues": int(selected_policy[cell][2] or 0),
+                    "tx_power_percent": float(selected_power[cell][3]),
+                    "tx_power_dbm": float(selected_power[cell][4]),
+                    "power_transaction_id": int(selected_power[cell][5] or 0),
+                    "scheduler_transaction_id": int(selected_policy[cell][6] or 0),
+                    "nominal_tx_power_dbm": selected_power[cell][7],
+                    "active_dl_symbols": int(selected_policy[cell][13] or 0),
+                    "active_dl_symbol_capacity": int(selected_policy[cell][14] or 0),
+                    "native_allocation_source": selected_policy[cell][15],
+                    "native_allocation_fraction": selected_policy[cell][16],
+                    "campaign_id": selected_policy[cell][17],
+                    "campaign_generation": selected_policy[cell][19],
+                    "decision_id": selected_policy[cell][20],
+                    "action_correlation_id": selected_policy[cell][21],
+                    "native_control_sequence": selected_policy[cell][22],
+                    "observation_kind": "power_readback+state_snapshot",
+                    "evidence_version": require_evidence_version,
+                }
+                for cell in sorted(expected_cells)
+            ],
+        }
+
+    def register_pending_native_action(
+        self, campaign_id, decision_id, action_correlation_id,
+        native_control_sequence, issued_sim_time_s, ttl_s,
+        expected_cells, expected_power_percent,
+    ):
+        """Persist an E2 action before waiting for delayed native evidence."""
+        if not decision_id or not action_correlation_id or not native_control_sequence:
+            return False
+        now = int(time.time())
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO tasam_pending_native_actions
+                (campaign_id, decision_id, action_correlation_id,
+                 native_control_sequence, issued_sim_time_s, ttl_s,
+                 expected_cells_json, expected_power_percent, status,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_confirmation', ?, ?)
+                ON CONFLICT(action_correlation_id) DO UPDATE SET
+                  decision_id=excluded.decision_id,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    str(campaign_id or ""), int(decision_id), str(action_correlation_id),
+                    int(native_control_sequence), issued_sim_time_s, float(ttl_s),
+                    json.dumps(sorted({int(value) for value in expected_cells})),
+                    expected_power_percent, now, now,
+                ),
+            )
+            self.conn.commit()
+            return True
+        except (sqlite3.Error, TypeError, ValueError):
+            return False
+
+    def resolve_pending_native_action(
+        self, action_correlation_id, status, confirmation=None, reason="",
+    ):
+        """Close a pending action exactly once after confirmation/expiry."""
+        if not action_correlation_id:
+            return False
+        try:
+            cursor = self.conn.execute(
+                """
+                UPDATE tasam_pending_native_actions
+                   SET status=?, confirmation_json=?, invalid_reason=?, updated_at=?
+                 WHERE action_correlation_id=? AND status='pending_confirmation'
+                """,
+                (
+                    str(status), json.dumps(confirmation or {}, ensure_ascii=False, sort_keys=True),
+                    str(reason or ""), int(time.time()), str(action_correlation_id),
+                ),
+            )
+            self.conn.commit()
+            return int(cursor.rowcount or 0) == 1
+        except sqlite3.Error:
+            return False
+
+    def ensure_initial_energy_observation(self) -> None:
+        """Seed a measured runtime state for the first causal comparison.
+
+        The first rApp decision happens before the first actuator command of
+        a fresh run.  Persisting the known full-power startup state gives the
+        shadow comparator an observed baseline without pretending that the
+        first TA-SAM proposal was already applied.
+        """
+        try:
+            exists = self.conn.execute("SELECT 1 FROM energy_commands LIMIT 1").fetchone()
+        except sqlite3.Error:
+            exists = None
+        if exists is None:
+            self.record_energy_command(
+                command="INITIAL_OBSERVED_STATE",
+                power_percent=100,
+                ru_count=1,
+                mmwave_count=1,
+                reason="initial runtime state observed before first decision",
+            )
+
+    def latest_energy_observation(self) -> dict:
+        """Return the latest persisted energy state for causal comparison."""
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM energy_commands ORDER BY timestamp_ns DESC, id DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return {}
+        if row is None:
+            return {}
+        return {str(key): row[key] for key in row.keys()}
+
+    def real_pdcp_loss_coverage(self, metric_snapshot_id=None) -> dict:
+        """Return complete canonical loss coverage for one real-PDCP window."""
+        expected = get_fixed_service_imsis()
+        expected_by_imsi = {
+            str(imsi): service
+            for service, values in expected.items()
+            if service in {'camera', 'sensor', 'vehicle'}
+            for imsi in values
+        }
+        expected_imsis = set(expected_by_imsi)
+        try:
+            columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(ue_metrics)")}
+            required = {"pdcp_provenance", "packet_loss_percent", "device_type", "timestamp"}
+            if not required.issubset(columns):
+                return {"valid": False, "groups": {}, "expected_imsis": sorted(expected_imsis), "reason": "ue_loss_columns_missing"}
+            resolved_metric_id = None
+            if metric_snapshot_id:
+                try:
+                    resolved_metric_id = int(metric_snapshot_id)
+                except (TypeError, ValueError):
+                    resolved_metric_id = None
+            if resolved_metric_id:
+                row = self.conn.execute(
+                    "SELECT timestamp FROM extended_metrics WHERE id=?",
+                    (resolved_metric_id,),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT MAX(timestamp) AS timestamp FROM ue_metrics WHERE pdcp_provenance='pdcp_real'"
+                ).fetchone()
+            timestamp = row[0] if row else None
+            if timestamp is None:
+                return {
+                    "valid": False,
+                    "groups": {service: False for service in ('camera', 'sensor', 'vehicle')},
+                    "expected_imsis": sorted(expected_imsis),
+                    "reason": "real_pdcp_loss_rows_missing",
+                }
+            rows = self.conn.execute(
+                "SELECT imsi, device_type, packet_loss_percent, pdcp_provenance, latency_is_proxy FROM ue_metrics "
+                "WHERE timestamp=? AND pdcp_provenance='pdcp_real'",
+                (timestamp,),
+            ).fetchall()
+        except sqlite3.Error:
+            return {"valid": False, "groups": {}, "reason": "ue_loss_query_failed"}
+        observed = []
+        duplicate_imsis = []
+        invalid_rows = []
+        service_mismatch = []
+        for row in rows:
+            imsi = str(row[0])
+            observed.append(imsi)
+            expected_service = expected_by_imsi.get(imsi)
+            actual_service = str(row[1] or '').strip().lower()
+            if expected_service and actual_service != expected_service:
+                service_mismatch.append(imsi)
+            if row[3] != 'pdcp_real' or row[4] or row[2] is None or imsi not in expected_by_imsi:
+                invalid_rows.append(imsi)
+        observed_set = set(observed)
+        duplicate_imsis = sorted({imsi for imsi in observed if observed.count(imsi) > 1})
+        groups = {
+            service: all(
+                imsi in observed_set
+                and imsi not in invalid_rows
+                for imsi, row_service in expected_by_imsi.items()
+                if row_service == service
+            )
+            for service in ('camera', 'sensor', 'vehicle')
+        }
+        topology_valid = (
+            len(rows) == len(expected_imsis)
+            and observed_set == expected_imsis
+            and not duplicate_imsis
+            and not invalid_rows
+            and not service_mismatch
+        )
+        valid = topology_valid and all(groups.values())
+        reason = 'ok' if valid else (
+            'pdcp_metric_snapshot_incomplete'
+            if invalid_rows or service_mismatch else
+            'canonical_topology_mismatch'
+            if observed_set != expected_imsis or duplicate_imsis or len(rows) != len(expected_imsis)
+            else 'real_pdcp_loss_group_missing'
+        )
+        return {
+            "valid": valid,
+            "groups": groups,
+            "timestamp": int(timestamp),
+            "metric_snapshot_id": resolved_metric_id,
+            "expected_imsis": sorted(expected_imsis, key=lambda value: int(value)),
+            "observed_imsis": sorted(observed_set, key=lambda value: int(value) if value.isdigit() else value),
+            "duplicate_imsis": duplicate_imsis,
+            "invalid_imsis": sorted(set(invalid_rows), key=lambda value: int(value) if value.isdigit() else value),
+            "service_mismatch_imsis": sorted(set(service_mismatch), key=lambda value: int(value) if value.isdigit() else value),
+            "topology_valid": topology_valid,
+            "reason": reason,
+        }
 
     def record_app2_snapshot(self, snapshot=None, sensors=None, timestamp=None):
         """
@@ -2250,7 +4816,7 @@ class DataLake:
         cvar_per_ue = gm.get('cvar_per_ue_us', 0)
         ue_count = gm.get('ue_count', 0)
         
-        self.record_extended_metric(
+        metric_id = self.record_extended_metric(
             timestamp=timestamp,
             sim_time_s=sim_range.get('end', 0),
             cell_id=0,
@@ -2290,7 +4856,8 @@ class DataLake:
                 'rlc_trace_age_s': gm.get('rlc_trace_age_s', 0),
                 'mac_trace_age_s': gm.get('mac_trace_age_s', 0),
                 'pdcp_latest_sim_time_s': gm.get('pdcp_latest_sim_time_s', 0),
-            }
+            },
+            decision_id=None,
         )
         
         ue_list = []
@@ -2304,6 +4871,7 @@ class DataLake:
                     'latency_avg_us': ue_data.get('latency_avg_us', 0),
                     'latency_min_us': ue_data.get('latency_min_us', 0),
                     'latency_max_us': ue_data.get('latency_max_us', 0),
+                    'latency_p95_us': ue_data.get('latency_p95_us', ue_data.get('latency_us', 0)),
                     'jitter_us': ue_data.get('jitter_us', 0),
                     'pdu_size_avg': ue_data.get('pdu_size_avg', 0),
                     'tx_bytes': ue_data.get('tx_bytes', 0),
@@ -2314,13 +4882,21 @@ class DataLake:
                     'packet_count': ue_data.get('packet_count', 0),
                     'mcs_avg': ue_data.get('mcs_avg', 0),
                     'tb_size_avg': ue_data.get('tb_size_avg', 0),
-                    'is_critical': ue_data.get('is_critical', False)
+                    'is_critical': ue_data.get('is_critical', False),
+                    'packet_loss_percent': ue_data.get('packet_loss_percent'),
+                    'has_latency_samples': ue_data.get('has_latency_samples', False),
+                    'latency_is_proxy': ue_data.get('latency_is_proxy', False),
+                    'pdcp_provenance': ue_data.get('pdcp_provenance', ''),
+                    'offered_load_kbps': ue_data.get('tx_throughput_kbps', 0),
+                    'backlog_bytes': ue_data.get('backlog_bytes', 0),
+                    'sim_time_s': sim_range.get('end', 0),
                 })
             except (ValueError, TypeError):
                 continue
         
         if ue_list:
-            self.record_ue_metrics(timestamp, ue_list)
+            self.record_ue_metrics(timestamp, ue_list, sim_time_s=sim_range.get('end', 0))
+        return metric_id
     
     def get_hourly_stats(self, hours_back=24):
         """
@@ -2958,9 +5534,11 @@ class DataLake:
         """
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT datetime, throughput_kbps, global_packet_loss_rate, 
+            SELECT id, timestamp, datetime, throughput_kbps, global_packet_loss_rate,
                    global_jitter_us, total_tx_bytes, total_rx_bytes,
-                   cvar_per_ue_us, variance_per_ue_us2
+                   cvar_per_ue_us, variance_per_ue_us2, sim_time_s, decision_id,
+                   collector_mode, throughput_source, pdcp_stale,
+                   proxy_latency_sample_count, real_latency_sample_count
             FROM extended_metrics
             ORDER BY timestamp DESC
             LIMIT ?
@@ -2969,14 +5547,24 @@ class DataLake:
         results = []
         for row in cursor.fetchall():
             results.append({
-                'datetime': row[0],
-                'throughput_kbps': row[1],
-                'global_packet_loss_rate': row[2],
-                'global_jitter_us': row[3],
-                'total_tx_bytes': row[4],
-                'total_rx_bytes': row[5],
-                'cvar_per_ue_us': row[6],
-                'variance_per_ue_us2': row[7],
+                'metric_snapshot_id': row[0],
+                'id': row[0],
+                'timestamp': row[1],
+                'datetime': row[2],
+                'throughput_kbps': row[3],
+                'global_packet_loss_rate': row[4],
+                'global_jitter_us': row[5],
+                'total_tx_bytes': row[6],
+                'total_rx_bytes': row[7],
+                'cvar_per_ue_us': row[8],
+                'variance_per_ue_us2': row[9],
+                'sim_time_s': row[10],
+                'decision_id': row[11],
+                'collector_mode': row[12],
+                'throughput_source': row[13],
+                'pdcp_stale': row[14],
+                'proxy_latency_sample_count': row[15],
+                'real_latency_sample_count': row[16],
             })
         return results
     

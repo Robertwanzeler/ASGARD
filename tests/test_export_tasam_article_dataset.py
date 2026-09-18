@@ -43,6 +43,27 @@ class TestExportTASAMArticleDataset(unittest.TestCase):
         conn.row_factory = sqlite3.Row
         self.assertEqual(fetch_judge_outcome(conn.cursor(), 100), {})
 
+    def test_fetch_judge_outcome_prefers_exact_decision_id(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "create table judge_outcome_history "
+            "(id integer, decision_id integer, decision_timestamp integer, "
+            "observed_timestamp integer, observed integer, feedback_json text)"
+        )
+        conn.executemany(
+            "insert into judge_outcome_history values (?, ?, ?, ?, ?, ?)",
+            [
+                (1, 11, 100, 101, 1, '{"feedback":{"tag":"first"}}'),
+                (2, 12, 100, 102, 1, '{"feedback":{"tag":"second"}}'),
+            ],
+        )
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        outcome = fetch_judge_outcome(conn.cursor(), 100, decision_id=12)
+        self.assertEqual(outcome["decision_id"], 12)
+        self.assertEqual(outcome["feedback"]["tag"], "second")
+        self.assertEqual(outcome["judge_alignment"]["match_method"], "decision_id")
+
     def test_fetch_metrics_accepts_exact_and_six_second_nearest_match(self):
         conn = sqlite3.connect(":memory:")
         conn.execute("create table extended_metrics (timestamp integer, collector_mode text, real_latency_sample_count integer, proxy_latency_sample_count integer)")
@@ -134,6 +155,83 @@ class TestExportTASAMArticleDataset(unittest.TestCase):
         self.assertEqual(record["armd_context"]["mode"], "shadow")
         self.assertEqual(record["scenario_stage"], "borderline_vehicle_warning")
         self.assertTrue(record["collection_quality"]["valid_for_training"])
+
+    def test_transition_can_receive_explicit_economic_allocation_contract(self):
+        args = argparse.Namespace(
+            allow_proxy=False,
+            max_step_gap_s=20,
+            max_sim_reset_gap_s=1.0,
+            allocation_total_head_enabled=True,
+        )
+        current = {
+            "timestamp": 100,
+            "global_state": {"state_vector": [0.1, 0.2]},
+            "slice_state": {},
+            "du_states": [],
+            "action": {
+                "usable_budget": 1.0, "r_ran": 0.4, "r_ai": 0.4,
+                "d_ran": 0.3, "d_ai": 0.3,
+            },
+            "decision": {},
+            "metrics": {
+                "sim_time_s": 10.0,
+                "collector_mode": "pdcp_real",
+                "real_latency_sample_count": 1.0,
+            },
+            "armd_context": {}, "conflict_context": {}, "shadow_comparison": {},
+        }
+        nxt = dict(current)
+        nxt["timestamp"] = 105
+        nxt["metrics"] = {
+            "sim_time_s": 15.0,
+            "collector_mode": "pdcp_real",
+            "real_latency_sample_count": 1.0,
+        }
+        record = transition_record(current, nxt, args)
+        self.assertTrue(record["allocation_total_head_enabled"])
+
+    def test_v2_transition_uses_only_realized_applied_economic_reward(self):
+        args = argparse.Namespace(
+            allow_proxy=False,
+            max_step_gap_s=20,
+            max_sim_reset_gap_s=1.0,
+            allocation_total_head_enabled=True,
+        )
+        current = {
+            "timestamp": 100,
+            "global_state": {"state_vector": [0.1, 0.2]},
+            "slice_state": {},
+            "du_states": [],
+            "action": {"usable_budget": 1.0, "r_ran": 0.4, "r_ai": 0.3},
+            "decision": {
+                "economic_action_contract": "applied_action_v2",
+                "economic_action": {"contract": "applied_action_v2", "application_status": "applied"},
+            },
+            "metrics": {
+                "sim_time_s": 10.0,
+                "collector_mode": "pdcp_real",
+                "real_latency_sample_count": 1.0,
+            },
+            "judge_outcome": {
+                "observed": 1,
+                "feedback": {
+                    "outcome_observed": True,
+                    "economic_action_contract": "applied_action_v2",
+                    "economic_transition_eligible": True,
+                    "tasam_online_reward": 0.37,
+                    "realized_energy_saving_fraction": 0.20,
+                    "realized_allocation_saving_fraction": 0.10,
+                },
+            },
+            "armd_context": {}, "conflict_context": {}, "shadow_comparison": {},
+        }
+        nxt = dict(current)
+        nxt["timestamp"] = 105
+        nxt["metrics"] = {"sim_time_s": 15.0, "collector_mode": "pdcp_real", "real_latency_sample_count": 1.0}
+        record = transition_record(current, nxt, args)
+        self.assertEqual(record["reward_source"], "realized_applied_economic_reward_v2")
+        self.assertAlmostEqual(record["reward_hint"], 0.37)
+        self.assertTrue(record["economic_transition_eligible"])
 
     def test_transition_uses_delayed_tasam_judge_credit_for_training(self):
         args = argparse.Namespace(allow_proxy=False, max_step_gap_s=20, max_sim_reset_gap_s=1.0)
@@ -232,6 +330,61 @@ class TestExportTASAMArticleDataset(unittest.TestCase):
         record = transition_record(current, nxt, args)
         self.assertEqual(record["reward_hint"], -0.5)
         self.assertEqual(record["reward_source"], "observed_real_metrics_with_categorical_penalty")
+
+    def test_transition_uses_strong_category_credit_without_changing_audit_credit(self):
+        args = argparse.Namespace(allow_proxy=False, max_step_gap_s=20, max_sim_reset_gap_s=1.0)
+        current = {
+            "timestamp": 100, "datetime": "2026-06-10T12:00:00", "topology_id": "test",
+            "scenario_stage": "conditional", "global_state": {"state_vector": [0.1]},
+            "slice_state": {}, "du_states": [], "action": {},
+            "decision": {"selected_assistant": "ta_sam"},
+            "metrics": {"sim_time_s": 10.0, "collector_mode": "pdcp_real", "real_latency_sample_count": 1.0},
+            "judge_outcome": {"observed": 1, "feedback": {
+                "outcome_observed": True, "tasam_continuous_reward": 0.9,
+                "tasam_reward_source": "observed_real_metrics",
+                "tasam_category_credit": -0.5, "tasam_category_penalty": 0.5,
+                "tasam_category_error": True,
+                "tasam_training_category_credit": -2.0,
+                "tasam_training_category_penalty": 2.0,
+                "tasam_training_reward": -2.0,
+            }, "observation": {"correct_verdict": "CONDITIONAL"}},
+            "armd_context": {}, "conflict_context": {}, "shadow_comparison": {},
+        }
+        nxt = dict(current)
+        nxt["timestamp"] = 105
+        record = transition_record(current, nxt, args)
+        self.assertEqual(record["tasam_category_credit"], -0.5)
+        self.assertEqual(record["tasam_training_category_credit"], -2.0)
+        self.assertEqual(record["reward_hint"], -2.0)
+
+    def test_transition_separates_stage_boundary_from_real_penalty(self):
+        args = argparse.Namespace(allow_proxy=False, max_step_gap_s=20, max_sim_reset_gap_s=1.0)
+        current = {
+            "timestamp": 100, "datetime": "2026-06-10T12:00:00", "topology_id": "test",
+            "scenario_stage": "camera_conditional", "global_state": {"state_vector": [0.1]},
+            "slice_state": {}, "du_states": [], "action": {},
+            "decision": {"selected_assistant": "ta_sam"},
+            "metrics": {"sim_time_s": 10.0, "collector_mode": "pdcp_real", "real_latency_sample_count": 1.0},
+            "judge_outcome": {"observed": 1, "feedback": {
+                "outcome_observed": True, "tasam_continuous_reward": 0.8,
+                "tasam_reward_source": "observed_real_metrics", "tasam_category_credit": -0.5,
+                "tasam_category_penalty": 0.5, "tasam_category_error": True,
+                "tasam_predicted_verdict": "CONDITIONAL", "tasam_observed_verdict": "BLOCKED",
+                "decision_stage_name": "camera_conditional", "observed_stage_name": "camera_blocked",
+                "stage_boundary_feedback": True, "nominal_expected_verdict": "CONDITIONAL",
+            }, "observation": {"correct_verdict": "BLOCKED"}},
+            "armd_context": {}, "conflict_context": {}, "shadow_comparison": {},
+        }
+        nxt = dict(current)
+        nxt["timestamp"] = 105
+        nxt["metrics"] = {"sim_time_s": 15.0}
+        record = transition_record(current, nxt, args)
+        self.assertTrue(record["stage_boundary_feedback"])
+        self.assertEqual(record["decision_stage_name"], "camera_conditional")
+        self.assertEqual(record["observed_stage_name"], "camera_blocked")
+        self.assertEqual(record["nominal_expected_verdict"], "CONDITIONAL")
+        self.assertFalse(record["real_category_match"])
+        self.assertEqual(record["reward_hint"], -0.5)
 
     def test_collection_quality_rejects_suspected_stale_proxy_snapshot(self):
         args = argparse.Namespace(allow_proxy=False, max_step_gap_s=20, max_sim_reset_gap_s=1.0)

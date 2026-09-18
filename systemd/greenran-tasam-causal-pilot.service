@@ -1,0 +1,42 @@
+[Unit]
+Description=GreenRAN local TA-SAM causal pilot (privileged cgroup runner)
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/robert/orange_nuclear
+Environment=GREENRAN_LOCAL_ONLY=1
+Environment=GREENRAN_LOCAL_CAMPAIGN_DIR=/home/robert/orange_nuclear/runs/tasam_local_causal_pilot_seed47_20260906_v11
+Environment=GREENRAN_CGROUP_ENFORCE=1
+Environment=GREENRAN_CGROUP_ALLOW_UNENFORCED=0
+Environment=GREENRAN_REQUIRE_REAL_PDCP=1
+Environment=GREENRAN_REAL_ONLY=1
+Environment=GREENRAN_TASAM_EXPORT_ALLOW_PROXY=0
+Environment=GREENRAN_NS3_ENABLE_TRACES=1
+Environment=GREENRAN_NS3_E2DU_ENABLED=true
+Environment=GREENRAN_NS3_E2NR_ENABLED=false
+Environment=GREENRAN_NS3_BIN=/home/robert/orange_nuclear/ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario
+Environment=PYTHONPATH=/home/robert/orange_nuclear/src
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /home/robert/orange_nuclear/runs/tasam_local_causal_pilot_seed47_20260906_v11
+ExecStart=/usr/bin/bash /home/robert/orange_nuclear/scripts/run_tasam_local_causal_campaign.sh
+StandardOutput=append:/home/robert/orange_nuclear/runs/tasam_local_causal_pilot_seed47_20260906_v11/campaign_console.log
+StandardError=append:/home/robert/orange_nuclear/runs/tasam_local_causal_pilot_seed47_20260906_v11/campaign_console.log
+Restart=no
+TimeoutStartSec=infinity
+KillMode=control-group
+
+# The service intentionally has the privileges required for cgroup-v2
+# enforcement. It is fixed to the local project/checkpoint and does not
+# receive arbitrary user-supplied paths.
+NoNewPrivileges=no
+PrivateTmp=no
+ProtectHome=read-only
+ProtectSystem=full
+InaccessiblePaths=/run/media/robert/GREENRAN
+ReadWritePaths=/home/robert/orange_nuclear/runs /tmp
+
+[Install]
+WantedBy=multi-user.target

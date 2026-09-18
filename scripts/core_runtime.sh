@@ -167,6 +167,7 @@ load_greenran_runtime() {
     export GREENRAN_TASAM_TRUE_ONLINE_LOG="$STATE_DIR/tasam_true_online_real.log"
     export GREENRAN_RAPP_ONLINE_RETRAIN_LOG="$STATE_DIR/rapp_online_retrain.log"
     export GREENRAN_DB_SNAPSHOT_DIR="${GREENRAN_DB_SNAPSHOT_DIR:-$STATE_DIR/db_snapshots}"
+    export GREENRAN_DB_SNAPSHOT_ENABLED="${GREENRAN_DB_SNAPSHOT_ENABLED:-1}"
     export GREENRAN_TASAM_EXPORT_DIR="${GREENRAN_TASAM_EXPORT_DIR:-$STATE_DIR/tasam_article_export}"
     export GREENRAN_TASAM_TRUE_ONLINE_DIR="${GREENRAN_TASAM_TRUE_ONLINE_DIR:-$STATE_DIR/tasam_true_online_real}"
 
@@ -228,7 +229,13 @@ load_greenran_runtime() {
     export GREENRAN_STAGE_CONTROLLER_LOG="$STATE_DIR/runtime_stage_controller.log"
 
     mkdir -p "$GREENRAN_RUNS_DIR"
-    mkdir -p "$STATE_DIR/xapp_metrics" "$STATE_DIR/xapp_intents" "$STATE_DIR/rapp_policies" "$STATE_DIR/app3_veicular" "$GREENRAN_DB_SNAPSHOT_DIR" "$GREENRAN_TASAM_EXPORT_DIR" "$GREENRAN_TASAM_TRUE_ONLINE_DIR"
+    mkdir -p "$STATE_DIR/xapp_metrics" "$STATE_DIR/xapp_intents" "$STATE_DIR/rapp_policies" "$STATE_DIR/app3_veicular" "$GREENRAN_DB_SNAPSHOT_DIR" "$GREENRAN_TASAM_TRUE_ONLINE_DIR"
+    # Do not create the historical article-export directory for controlled
+    # campaigns that explicitly disable article export.  This keeps the
+    # artifact contract truthful: disabled means no export directory either.
+    if [[ "${GREENRAN_TASAM_EXPORT_ENABLED:-1}" == "1" ]]; then
+        mkdir -p "$GREENRAN_TASAM_EXPORT_DIR"
+    fi
 }
 
 create_greenran_run() {

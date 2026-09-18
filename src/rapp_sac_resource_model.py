@@ -23,8 +23,10 @@ from typing import Any, Dict
 
 try:
     from .greenran_marl_topology import build_du_state_snapshot
+    from .greenran_paths import get_fixed_service_imsis, validate_fixed_service_topology
 except ImportError:
     from greenran_marl_topology import build_du_state_snapshot
+    from greenran_paths import get_fixed_service_imsis, validate_fixed_service_topology
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
@@ -98,15 +100,43 @@ def infer_allocation_state(
         or _safe_float(vehicle.get("max_packet_loss_percent"), 0.0)
         >= _safe_float(config.get("vehicle_loss_warning_pct", 0.5), 0.5)
     )
+    # App2/mMTC contributes to the same three-way network category used by
+    # the rApp Judge.  Keeping these thresholds here prevents the category
+    # tail of the TA-SAM state from silently ignoring an App2-only stage.
+    app2_packet_loss = _safe_float(app2.get("packet_loss_percent"), 0.0)
+    app2_delivery = _safe_float(app2.get("delivery_success_percent"), 100.0)
+    app2_latency = _safe_float(app2.get("avg_latency_ms"), 0.0)
+    app2_connected = _safe_float(app2.get("connected_ratio"), 1.0)
+    app2_error_ratio = _safe_float(app2.get("error_ratio"), 0.0)
+    app2_error_sensors = _safe_float(app2.get("error_sensors"), 0.0)
+    app2_low_battery = _safe_float(app2.get("low_battery_sensors"), 0.0)
+    app2_battery = _safe_float(app2.get("avg_battery_percent"), 100.0)
+    app2_hard = (
+        app2_connected < 0.85
+        or app2_packet_loss >= 10.0
+        or app2_delivery < 90.0
+        or app2_latency >= _safe_float(config.get("app2_latency_target_ms", 1000.0), 1000.0)
+        or app2_battery < 15.0
+        or app2_error_ratio >= 0.20
+    )
+    app2_warning = (
+        app2_connected < 0.90
+        or app2_packet_loss >= 5.0
+        or app2_delivery < 95.0
+        or app2_latency >= 500.0
+        or app2_battery < 25.0
+        or app2_low_battery > 0.0
+        or app2_error_sensors >= 2.0
+    )
     cvar_ms = _safe_float(health.get("cvar_us"), 0.0) / 1000.0
     p95_ms = _safe_float(health.get("p95_us"), 0.0) / 1000.0
     cvar_hard = cvar_ms >= _safe_float(config.get("resource_cvar_critical_ms", 250.0), 250.0)
     p95_hard = p95_ms >= _safe_float(config.get("resource_p95_critical_ms", 120.0), 120.0)
     cvar_warning = cvar_ms >= _safe_float(config.get("cvar_target_ms", 120.0), 120.0)
     p95_warning = p95_ms >= _safe_float(config.get("p95_target_ms", 80.0), 80.0)
-    if camera_hard or vehicle_hard or cvar_hard or p95_hard:
+    if camera_hard or vehicle_hard or app2_hard or cvar_hard or p95_hard:
         return "BLOCKED"
-    if camera_warning or vehicle_warning or cvar_warning or p95_warning:
+    if camera_warning or vehicle_warning or app2_warning or cvar_warning or p95_warning:
         return "CONDITIONAL"
     return "ALLOWED"
 
@@ -120,24 +150,54 @@ def _build_per_ue_floor(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Build a non-zero SLA floor ledger for every active UE class."""
-    camera_count = max(0, _safe_int(camera_metrics.get("active_cameras"), 0))
-    sensor_count = max(0, _safe_int(app2_metrics.get("total_sensors"), 0))
-    vehicle_count = max(0, _safe_int(vehicle_metrics.get("total_vehicles"), 0))
-    if camera_count == 0:
-        camera_count = max(0, _safe_int(config.get("default_camera_ues"), 3))
-    if sensor_count == 0 and vehicle_count == 0:
-        sensor_count = max(0, _safe_int(config.get("default_sensor_ues"), 12))
-    if vehicle_count == 0:
-        vehicle_count = max(0, _safe_int(config.get("default_vehicle_ues"), 5))
+    fixed_services = get_fixed_service_imsis()
+    camera_imsis = fixed_services["camera"]
+    sensor_imsis = fixed_services["sensor"]
+    vehicle_imsis = fixed_services["vehicle"]
+    camera_count = len(camera_imsis)
+    sensor_count = len(sensor_imsis)
+    vehicle_count = len(vehicle_imsis)
 
-    fraction = _clamp(config.get("sla_floor_demand_fraction", 0.35), 0.05, 1.0)
+    per_ue_evidence = []
+    for source in (camera_metrics, app2_metrics, vehicle_metrics):
+        rows = (
+            source.get("per_ue")
+            or source.get("per_ue_metrics")
+            or source.get("sensors")
+            or source.get("vehicles")
+            or []
+        )
+        if isinstance(rows, list):
+            per_ue_evidence.extend(row for row in rows if isinstance(row, dict))
+    observed_ids = []
+    for row in per_ue_evidence:
+        try:
+            observed_ids.append(int(row.get("imsi", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    expected_ids = set(fixed_services["all"])
+    observed_set = set(observed_ids)
+    topology_manifest = validate_fixed_service_topology()
+    topology_valid = bool(observed_ids) and bool(topology_manifest.get("valid")) and (
+        len(observed_ids) == len(observed_set) and observed_set.issubset(expected_ids)
+    )
+    floor_verified = topology_valid and observed_set == expected_ids
+    # Protect complete observed demand with headroom when all UEs are visible.
+    # Keep the legacy estimate only for shadow/backward-compatible callers;
+    # full-control actuation rejects it through ``floor_verified``.
+    demand_guard = _clamp(config.get("sla_floor_guard_ratio", 0.10), 0.0, 0.50)
+    demand_factor = (
+        1.0 + demand_guard
+        if floor_verified
+        else _clamp(config.get("sla_floor_demand_fraction", 0.35), 0.05, 1.0)
+    )
     ran_floor = _clamp(
-        max(_safe_float(config.get("ran_min_active_demand", 0.15), 0.15), d_ran * fraction),
+        max(_safe_float(config.get("ran_min_active_demand", 0.15), 0.15), d_ran * demand_factor),
         0.0,
         1.0,
     ) if camera_count else 0.0
     ai_floor = _clamp(
-        max(_safe_float(config.get("ai_min_active_demand", 0.15), 0.15), d_ai * fraction),
+        max(_safe_float(config.get("ai_min_active_demand", 0.15), 0.15), d_ai * demand_factor),
         0.0,
         1.0,
     ) if sensor_count or vehicle_count else 0.0
@@ -150,19 +210,19 @@ def _build_per_ue_floor(
     ledger = []
     for index in range(camera_count):
         ledger.append({
-            "ue_id": f"camera-{index + 1}", "service": "camera", "domain": "ran",
+            "ue_id": f"camera-{index + 1}", "imsi": camera_imsis[index], "service": "camera", "domain": "ran",
             "floor_share": ran_floor / camera_count,
-            "sla": {"throughput_mbps": _safe_float(config.get("camera_throughput_target_mbps", 25.0), 25.0), "latency_ms": _safe_float(config.get("camera_latency_target_ms", 100.0), 100.0)},
+            "sla": {"throughput_mbps": _safe_float(config.get("camera_throughput_target_mbps", 25.0), 25.0), "latency_ms": _safe_float(config.get("camera_latency_hard_ms", 80.0), 80.0)},
         })
     for index in range(sensor_count):
         ledger.append({
-            "ue_id": f"sensor-{index + 1}", "service": "sensor", "domain": "ai",
+            "ue_id": f"sensor-{index + 1}", "imsi": sensor_imsis[index], "service": "sensor", "domain": "ai",
             "floor_share": sensor_total / sensor_count,
-            "sla": {"latency_ms": 500.0, "packet_loss_percent": 5.0},
+            "sla": {"latency_ms": 500.0, "packet_loss_percent": 5.0, "delivery_success_percent": 95.0},
         })
     for index in range(vehicle_count):
         ledger.append({
-            "ue_id": f"vehicle-{index + 1}", "service": "vehicle", "domain": "ai",
+            "ue_id": f"vehicle-{index + 1}", "imsi": vehicle_imsis[index], "service": "vehicle", "domain": "ai",
             "floor_share": vehicle_total / vehicle_count,
             "sla": {"latency_ms": _safe_float(config.get("vehicle_latency_target_ms", 20.0), 20.0), "packet_loss_percent": _safe_float(config.get("vehicle_loss_target_pct", 1.0), 1.0)},
         })
@@ -176,6 +236,16 @@ def _build_per_ue_floor(
         "floor_total_ran": ran_floor,
         "floor_total_ai": ai_floor,
         "active_ue_count": len(ledger),
+        "floor_estimator": "observed_demand_plus_guard_v2" if floor_verified else "legacy_aggregate_shadow_only",
+        "floor_verified": floor_verified,
+        "topology_valid": topology_valid,
+        "topology_expected_ue_count": len(expected_ids),
+        "topology_observed_ue_count": len(observed_set),
+        "topology_observed_imsis": sorted(observed_set),
+        "topology_unexpected_imsis": sorted(observed_set - expected_ids),
+        "topology_duplicate_observations": len(observed_ids) - len(observed_set),
+        "topology_validation": topology_manifest,
+        "floor_guard_ratio": demand_guard,
     }
 
 
@@ -197,9 +267,14 @@ def enforce_resource_floor(snapshot: Dict[str, Any], r_ran: float, r_ai: float) 
             ran = floor_ran + extra * extra_ran / extra_total if extra_total else floor_ran
             ai = floor_ai + extra * extra_ai / extra_total if extra_total else floor_ai
         else:
-            scale = budget / (ran + ai)
-            ran *= scale
-            ai *= scale
+            # Never scale SLA floors and report success.  The caller must
+            # restore full power and stock scheduling when they are infeasible.
+            feasible = False
+            total_floor = floor_ran + floor_ai
+            ran = budget * floor_ran / total_floor if total_floor else budget * 0.5
+            ai = max(0.0, budget - ran)
+            result["failsafe_required"] = True
+            result["failsafe_reason"] = "infeasible_ue_floors"
             feasible = False
     d_ran = _safe_float(result.get("d_ran"), 0.0)
     d_ai = _safe_float(result.get("d_ai"), 0.0)
@@ -241,6 +316,17 @@ def apply_per_ue_allocation(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "ran": max(0.0, _safe_float(result.get("floor_total_ran"), 0.0)),
         "ai": max(0.0, _safe_float(result.get("floor_total_ai"), 0.0)),
     }
+    if not bool(result.get("floor_feasible", True)) or bool(result.get("failsafe_required", False)):
+        result.update({
+            "per_ue_allocation_version": "per_ue_floor_v2",
+            "per_ue_allocation": [],
+            "per_ue_floor_applied": False,
+            "per_ue_floor_violation_count": len(ledger),
+            "per_ue_floor_feasible": False,
+            "per_ue_application_status": "failsafe_stock_scheduler",
+            "failsafe_required": True,
+        })
+        return result
     service_priority = {"camera": 1.0, "sensor": 1.0, "vehicle": 1.5}
     allocations = []
     domain_entries = {"ran": [], "ai": []}
@@ -314,7 +400,7 @@ def apply_per_ue_allocation(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def enforce_resource_state(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def enforce_resource_state(snapshot: Dict[str, Any], preserve_allocation: bool = False) -> Dict[str, Any]:
     """Apply the configured state reinforcement after an assistant proposal.
 
     A proposal may contain only a split (``r_ran``/``r_ai``).  This barrier
@@ -356,12 +442,16 @@ def enforce_resource_state(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         required_ran_extra = required_extra * ran_weight / total_weight
     required_ai_extra = required_extra - required_ran_extra
     if state in {"ALLOWED", "CONDITIONAL"}:
-        # Non-critical assistant decisions are deliberately floor-only.  Do
-        # not preserve a larger TA-SAM/RL vector here: that would turn the
-        # per-UE minimum into a lower bound while silently consuming the
-        # energy headroom that this policy is meant to save.
-        candidate_ran = floor_ran
-        candidate_ai = floor_ai
+        if preserve_allocation:
+            # A learned TA-SAM proposal is already an intentional action.
+            # Keep its surplus above the ARMD floor and only clamp malformed
+            # or over-budget values in the shared resource barrier.
+            candidate_ran = max(_safe_float(result.get("r_ran"), 0.0), floor_ran)
+            candidate_ai = max(_safe_float(result.get("r_ai"), 0.0), floor_ai)
+        else:
+            # Legacy/protected callers retain the historical floor-only band.
+            candidate_ran = floor_ran
+            candidate_ai = floor_ai
     else:
         candidate_ran = max(
             _safe_float(result.get("r_ran"), 0.0),
@@ -624,6 +714,7 @@ def compute_shared_resource_snapshot(
     shared_resource_config: Dict[str, Any],
     previous_allocation: Dict[str, float] | None = None,
     allocation_state: str | None = None,
+    state_context: str | None = None,
 ) -> Dict[str, Any]:
     cfg = shared_resource_config or {}
     ran = estimate_ran_demand(camera_metrics, network_health, cfg)
@@ -637,6 +728,14 @@ def compute_shared_resource_snapshot(
     min_utilization = _clamp(cfg.get("min_utilization_ratio", 0.55), 0.0, 1.0)
     state = _normalise_allocation_state(
         allocation_state
+        or infer_allocation_state(camera_metrics, app2_metrics, vehicle_metrics, network_health, cfg)
+    )
+    # Keep the controller's allocation state separate from the category fed
+    # to TA-SAM.  Online callers may carry a previous action in
+    # ``allocation_state``; the category context must come from the current
+    # network metrics instead.
+    network_state = _normalise_allocation_state(
+        state_context
         or infer_allocation_state(camera_metrics, app2_metrics, vehicle_metrics, network_health, cfg)
     )
     floor = _build_per_ue_floor(camera_metrics or {}, app2_metrics or {}, vehicle_metrics or {}, d_ran, d_ai, cfg)
@@ -750,6 +849,9 @@ def compute_shared_resource_snapshot(
         "ai_completion_ratio": ai_completion,
         "utilization_ratio": utilization,
         "allocation_state": state,
+        "state_category": network_state,
+        "network_operating_state": network_state,
+        "state_category_source": "current_network_metrics" if state_context is None else "explicit_current_context",
         "priority_domain": priority_domain,
         "healthy_streak": healthy_streak,
         "reinforcement_scale": reinforcement_scale,
@@ -774,5 +876,6 @@ def compute_shared_resource_snapshot(
         vehicle_metrics=vehicle_metrics,
         network_health=network_health,
         resource_snapshot=snapshot,
+        operating_state=network_state,
     )
     return snapshot

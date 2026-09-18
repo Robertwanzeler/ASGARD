@@ -35,6 +35,7 @@ class ARMDIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(advice["scenario"], "app1_throughput")
         self.assertEqual(advice["expected_energy_saver"], "BLOCKED")
+        self.assertEqual(advice["safety_level"], "HARD_VETO")
         updated = advisor.apply(decision, advice)
         self.assertEqual(updated["energy_saver"], "BLOCKED")
         self.assertTrue(updated["armd_override_applied"])
@@ -57,6 +58,7 @@ class ARMDIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(advice["scenario"], "vehicle_implicito")
         self.assertEqual(advice["expected_energy_saver"], "CONDITIONAL")
+        self.assertEqual(advice["safety_level"], "ADVISORY")
 
     def test_healthy_cycle_emits_neutral_proposal(self):
         advisor = ARMDRuntimeAdvisor(mode="assist")
@@ -71,6 +73,7 @@ class ARMDIntegrationTests(unittest.TestCase):
         self.assertTrue(advice["proposal_valid"])
         self.assertEqual(advice["proposal_kind"], "neutral_noop")
         self.assertEqual(advice["scenario"], "greenran_global_noop")
+        self.assertEqual(advice["safety_level"], "CLEAR")
 
         updated = advisor.apply({"energy_saver": "ALLOWED", "action": "MONITOR"}, advice)
         self.assertTrue(updated["armd_proposal_present"])
@@ -87,6 +90,10 @@ class ARMDIntegrationTests(unittest.TestCase):
             self.assertIn("armd_scenario", columns)
             self.assertIn("armd_source", columns)
             self.assertIn("armd_override_applied", columns)
+            self.assertIn("armd_safety_level", columns)
+            self.assertIn("armd_role", columns)
+            self.assertIn("tasam_operating_permission", columns)
+            self.assertIn("economic_isolation_source", columns)
             self.assertIn("armd_proposal_present", columns)
             self.assertIn("tasam_proposal_present", columns)
             self.assertIn("advisor_arbitration_present", columns)

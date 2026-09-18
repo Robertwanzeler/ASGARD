@@ -45,6 +45,26 @@ def _shadow_candidate_decision():
 
 
 class TestJointControlTrial(unittest.TestCase):
+    def test_online_rollout_manifest_advances_canary_fraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "online_rollout.json"
+            manifest.write_text(json.dumps({"rollout": {"fraction": 0.50}}), encoding="utf-8")
+            previous = os.environ.get("GREENRAN_TASAM_ONLINE_ROLLOUT_MANIFEST")
+            os.environ["GREENRAN_TASAM_ONLINE_ROLLOUT_MANIFEST"] = str(manifest)
+            try:
+                trial = JointControlTrial({
+                    "enabled": True,
+                    "fraction": 0.10,
+                    "state_path": str(Path(tmp) / "state.json"),
+                })
+                self.assertAlmostEqual(trial.status()["fraction"], 0.50)
+                self.assertAlmostEqual(trial._effective_fraction(), 0.50)
+            finally:
+                if previous is None:
+                    os.environ.pop("GREENRAN_TASAM_ONLINE_ROLLOUT_MANIFEST", None)
+                else:
+                    os.environ["GREENRAN_TASAM_ONLINE_ROLLOUT_MANIFEST"] = previous
+
     def test_joint_valid_decision_enters_canary_and_persists_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             trial = JointControlTrial({

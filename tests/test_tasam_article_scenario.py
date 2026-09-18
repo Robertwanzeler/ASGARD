@@ -121,7 +121,11 @@ class TestTASAMArticleScenario(unittest.TestCase):
         self.assertIn('start_if_missing "$GREENRAN_NS3_SUPERVISOR_PID" start_ns3', script)
         self.assertIn('start_if_missing "$GREENRAN_TASAM_TRUE_ONLINE_PID" start_tasam_true_online_real_service', script)
         self.assertIn('if [[ "${GREENRAN_ML_RETRAIN_ENABLED:-true}" == "true" ]]; then', script)
-        self.assertIn('setsid env \\', script)
+        self.assertTrue(
+            'setsid env \\' in script
+            or 'setsid "${CGROUP_PREFIX[@]}" env \\' in script,
+            "ns-3 must be launched through env, optionally behind the cgroup wrapper",
+        )
         self.assertIn('GREENRAN_NS3_CAMERA_UE_COUNT="$GREENRAN_NS3_CAMERA_UE_COUNT"', script)
         self.assertIn('GREENRAN_REQUIRE_REAL_PDCP="1"', script)
         self.assertIn('GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH="${GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH:-0}"', script)

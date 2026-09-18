@@ -8,6 +8,13 @@ from rapp_orchestrator import RappResourceOptimizer
 
 
 class RappOrchestratorCameraMetricsTests(unittest.TestCase):
+    def test_economic_projected_power_uses_actuator_level(self):
+        optimizer = RappResourceOptimizer.__new__(RappResourceOptimizer)
+
+        self.assertEqual(optimizer._canonical_energy_command_power(50.0), 60.0)
+        self.assertEqual(optimizer._canonical_energy_command_power(25.0), 25.0)
+        self.assertEqual(optimizer._canonical_energy_command_power(100.0), 100.0)
+
     def test_camera_sla_uses_best_real_throughput_signal_when_rx_is_zero(self):
         optimizer = RappResourceOptimizer.__new__(RappResourceOptimizer)
         optimizer.interval = 1

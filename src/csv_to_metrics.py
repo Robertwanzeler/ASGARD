@@ -37,6 +37,7 @@ from greenran_paths import (
     CARLA_VEHICLE_MAP_PATH,
     get_fixed_max_vehicles,
     get_fixed_vehicle_base_imsi,
+    get_fixed_service_imsis,
     as_str,
 )
 from greenran_runtime import load_runtime_config
@@ -61,9 +62,20 @@ TRACE_FILE_CANDIDATES = {
     ],
 }
 
-CAMERA_IMSI_RANGE = (1, 3)
-SENSOR_IMSI_RANGE = (4, 50)
-UE_IMSI_RANGE = (51, 100)
+_FIXED_SERVICE_IMSIS = get_fixed_service_imsis()
+CAMERA_IMSI_RANGE = (
+    min(_FIXED_SERVICE_IMSIS["camera"]),
+    max(_FIXED_SERVICE_IMSIS["camera"]),
+)
+SENSOR_IMSI_RANGE = (
+    min(_FIXED_SERVICE_IMSIS["sensor"]),
+    max(_FIXED_SERVICE_IMSIS["sensor"]),
+)
+VEHICLE_IMSI_RANGE = (
+    min(_FIXED_SERVICE_IMSIS["vehicle"]),
+    max(_FIXED_SERVICE_IMSIS["vehicle"]),
+)
+UE_IMSI_RANGE = VEHICLE_IMSI_RANGE
 DEFAULT_SENSOR_PROFILES = [
     {"sensor_type": "temperature", "unit": "°C", "connectivity": "5g_redcap", "gateway_id": "GW-5G-01", "domain": "environmental", "nominal_value": 27.0, "nominal_power_mw": 180.0},
     {"sensor_type": "humidity", "unit": "%", "connectivity": "5g_redcap", "gateway_id": "GW-5G-01", "domain": "environmental", "nominal_value": 82.0, "nominal_power_mw": 185.0},
@@ -93,6 +105,12 @@ class ExtendedMetricsCollector:
         self.last_total_tx_bytes = 0
         self.last_total_rx_bytes = 0
         self.last_sim_time = 0.0
+        # v9_fidelity keeps PDCP real but avoids rereading the complete trace
+        # on every wall-clock poll.  The cache is reset on inode change or
+        # truncation and only complete newline-terminated records are parsed.
+        self._pdcp_cache = []
+        self._pdcp_offset = 0
+        self._pdcp_inode = 0
         
         # Packet loss tracking (simulated based on network conditions)
         self.packet_loss_baseline = 0.001  # 0.1% baseline
@@ -105,6 +123,7 @@ class ExtendedMetricsCollector:
         self.app2_sensors_dir = self.app2_state_dir / "sensors"
         self.app2_sensors_file = self.app2_sensors_dir / "latest.json"
         self.app2_snapshot_file = self.app2_state_dir / "monitoring_snapshot.json"
+        self.app3_monitoring_file = STATE_DIR / "app3_veicular" / "monitoring_snapshot.json"
         self.scenario_control_path = ARTICLE00_SCENARIO_CONTROL_PATH
         self.carla_state_dir = CARLA_STATE_DIR
         self.carla_vehicles_path = CARLA_VEHICLES_PATH
@@ -570,6 +589,18 @@ class ExtendedMetricsCollector:
                 "label": f"camera_{imsi_num}",
             }
 
+        if VEHICLE_IMSI_RANGE[0] <= imsi_num <= VEHICLE_IMSI_RANGE[1]:
+            return {
+                "device_type": "vehicle",
+                "label": f"vehicle_{imsi_num - VEHICLE_IMSI_RANGE[0] + 1}",
+                "vehicle_id": f"veh-imsi-{imsi_num}",
+                "vehicle_role": "ego" if imsi_num == VEHICLE_IMSI_RANGE[0] else "traffic",
+                "connectivity": "5g_native",
+                "gateway_id": "GW-VEH-01",
+                "domain": "vehicular",
+                "mobility_profile": "vehicle",
+            }
+
         if SENSOR_IMSI_RANGE[0] <= imsi_num <= SENSOR_IMSI_RANGE[1]:
             sensor_index = imsi_num - SENSOR_IMSI_RANGE[0]
             profile = DEFAULT_SENSOR_PROFILES[sensor_index % len(DEFAULT_SENSOR_PROFILES)]
@@ -607,6 +638,8 @@ class ExtendedMetricsCollector:
             imsi_num = int(imsi)
             if CAMERA_IMSI_RANGE[0] <= imsi_num <= CAMERA_IMSI_RANGE[1]:
                 return "camera"
+            elif VEHICLE_IMSI_RANGE[0] <= imsi_num <= VEHICLE_IMSI_RANGE[1]:
+                return "vehicle"
             elif SENSOR_IMSI_RANGE[0] <= imsi_num <= SENSOR_IMSI_RANGE[1]:
                 return "sensor"
             elif UE_IMSI_RANGE[0] <= imsi_num <= UE_IMSI_RANGE[1]:
@@ -782,6 +815,82 @@ class ExtendedMetricsCollector:
             "roles": roles,
         }
         self.write_metrics(payload, str(self.device_role_map_path))
+
+    def export_app3_metrics(self, extended_metrics):
+        """Publish an App3 view derived only from real ns-3 PDCP rows."""
+        expected = {str(imsi) for imsi in _FIXED_SERVICE_IMSIS["vehicle"]}
+        rows = []
+        for imsi, data in (extended_metrics.get("ue_metrics", {}) or {}).items():
+            if not isinstance(data, dict) or data.get("device_type") != "vehicle":
+                continue
+            rows.append((str(imsi), data))
+
+        observed = {imsi for imsi, _ in rows}
+        real_rows = [
+            data for _, data in rows
+            if data.get("pdcp_provenance") == "pdcp_real"
+            and data.get("packet_loss_percent") is not None
+            and not bool(data.get("latency_is_proxy"))
+        ]
+        valid = observed == expected and len(real_rows) == len(expected)
+        reason = "ok" if valid else "real_pdcp_vehicle_coverage_incomplete"
+        snapshot = {
+            "schema": "greenran.app3.pdcp_real_snapshot.v1",
+            "source": "ns3_pdcp_real",
+            "pdcp_provenance": "pdcp_real" if valid else "invalid",
+            "valid": valid,
+            "validation_reason": reason,
+            "vehicle_imsis": sorted(observed, key=lambda value: int(value) if value.isdigit() else value),
+            "simulation": {
+                "mode": "ns3_real_vehicle_ues",
+                "total_ues": int((extended_metrics.get("global_metrics") or {}).get("total_active_ues", 0) or 0),
+            },
+            "vehicles": {
+                "total_vehicles": len(real_rows) if valid else 0,
+                "min_tx_pdus": min((int(data.get("tx_pdus", 0) or 0) for data in real_rows), default=0),
+                "min_rx_pdus": min((int(data.get("rx_pdus", 0) or 0) for data in real_rows), default=0),
+                "min_sample_window_s": min((float(data.get("sample_window_s", 0.0) or 0.0) for data in real_rows), default=0.0),
+                "sample_window_s": max((float(data.get("sample_window_s", 0.0) or 0.0) for data in real_rows), default=0.0),
+                "ego_present": any(
+                    str(data.get("vehicle_role", "")).lower() == "ego" for data in real_rows
+                ),
+                "high_risk_vehicles": sum(
+                    1 for data in real_rows
+                    if str(data.get("risk_state", "")).lower() in {"high", "critical"}
+                ),
+                "medium_risk_vehicles": sum(
+                    1 for data in real_rows
+                    if str(data.get("risk_state", "")).lower() in {"medium", "warning"}
+                ),
+                "degraded_autonomy_vehicles": sum(
+                    1 for data in real_rows
+                    if str(data.get("autonomy_state", "")).lower() not in {"", "normal", "unknown"}
+                ),
+                "max_latency_ms": max(
+                    (float(data.get("latency_avg_us", data.get("latency_us", 0.0)) or 0.0) / 1000.0
+                     for data in real_rows),
+                    default=0.0,
+                ),
+                "max_packet_loss_percent": max(
+                    (float(data.get("packet_loss_percent", 0.0) or 0.0) for data in real_rows),
+                    default=0.0,
+                ),
+            },
+            "network": {
+                "max_latency_ms": max(
+                    (float(data.get("latency_avg_us", data.get("latency_us", 0.0)) or 0.0) / 1000.0
+                     for data in real_rows),
+                    default=0.0,
+                ),
+                "max_packet_loss_percent": max(
+                    (float(data.get("packet_loss_percent", 0.0) or 0.0) for data in real_rows),
+                    default=0.0,
+                ),
+            },
+        }
+        self.app3_monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+        self.write_metrics(snapshot, str(self.app3_monitoring_file))
+        return valid
     
     def process_pdcp_stats(self, filepath):
         """Process DlPdcpStats.txt - Ground truth for latency
@@ -792,65 +901,96 @@ class ExtendedMetricsCollector:
         if not filepath.exists():
             return []
         
-        metrics = []
-        
+        fidelity = os.environ.get("GREENRAN_NATIVE_TRACE_PROFILE") == "v9_fidelity"
+        if not fidelity:
+            metrics = []
+            try:
+                with open(filepath, 'r') as f:
+                    lines = f
+                    for line in lines:
+                        if line.startswith('%') or line.startswith('start') or not line.strip():
+                            continue
+                        parts = line.strip().split('\t')
+                        if len(parts) < 15:
+                            continue
+                        try:
+                            time_start = float(parts[0]); time_end = float(parts[1])
+                            cell_id = int(parts[2]); imsi = parts[3]; rnti = int(parts[4])
+                            lcid = int(parts[5]); n_tx_pdus = int(parts[6]); tx_bytes = int(parts[7])
+                            n_rx_pdus = int(parts[8]); rx_bytes = int(parts[9])
+                            delay_s = float(parts[10]); delay_stddev = float(parts[11])
+                            delay_min = float(parts[12]); delay_max = float(parts[13]); pdu_size = int(parts[14])
+                            metrics.append({
+                                'time_start': time_start, 'time_end': time_end,
+                                'cell_id': cell_id, 'imsi': imsi, 'rnti': rnti, 'lcid': lcid,
+                                'n_tx_pdus': n_tx_pdus, 'tx_bytes': tx_bytes,
+                                'n_rx_pdus': n_rx_pdus, 'rx_bytes': rx_bytes,
+                                'delay_s': delay_s, 'delay_us': delay_s * 1_000_000,
+                                'delay_stddev_s': delay_stddev, 'delay_stddev_us': delay_stddev * 1_000_000,
+                                'delay_min_s': delay_min, 'delay_min_us': delay_min * 1_000_000,
+                                'delay_max_s': delay_max, 'delay_max_us': delay_max * 1_000_000,
+                                'pdu_size': pdu_size, 'device_type': self.get_device_type(imsi),
+                            })
+                        except (ValueError, IndexError):
+                            continue
+            except Exception as e:
+                print(f"[CSV_METRICS] Error reading PDCP stats: {e}")
+            return metrics
+
+        metrics = self._pdcp_cache
         try:
-            with open(filepath, 'r') as f:
-                for line in f:
-                    if line.startswith('%') or line.startswith('start') or not line.strip():
-                        continue
-                    
-                    parts = line.strip().split('\t')
-                    if len(parts) < 15:
-                        continue
-                    
-                    try:
-                        time_start = float(parts[0])
-                        time_end = float(parts[1])
-                        cell_id = int(parts[2])
-                        imsi = parts[3]
-                        rnti = int(parts[4])
-                        lcid = int(parts[5])
-                        n_tx_pdus = int(parts[6])
-                        tx_bytes = int(parts[7])
-                        n_rx_pdus = int(parts[8])
-                        rx_bytes = int(parts[9])
-                        delay_s = float(parts[10])
-                        delay_stddev = float(parts[11])
-                        delay_min = float(parts[12])
-                        delay_max = float(parts[13])
-                        pdu_size = int(parts[14])
-                        
-                        metrics.append({
-                            'time_start': time_start,
-                            'time_end': time_end,
-                            'cell_id': cell_id,
-                            'imsi': imsi,
-                            'rnti': rnti,
-                            'lcid': lcid,
-                            'n_tx_pdus': n_tx_pdus,
-                            'tx_bytes': tx_bytes,
-                            'n_rx_pdus': n_rx_pdus,
-                            'rx_bytes': rx_bytes,
-                            'delay_s': delay_s,
-                            'delay_us': delay_s * 1_000_000,
-                            'delay_stddev_s': delay_stddev,
-                            'delay_stddev_us': delay_stddev * 1_000_000,
-                            'delay_min_s': delay_min,
-                            'delay_min_us': delay_min * 1_000_000,
-                            'delay_max_s': delay_max,
-                            'delay_max_us': delay_max * 1_000_000,
-                            'pdu_size': pdu_size,
-                            'device_type': self.get_device_type(imsi)
-                        })
-                    except (ValueError, IndexError):
-                        continue
-                        
+            stat = filepath.stat()
+            inode = int(getattr(stat, "st_ino", 0) or 0)
+            if inode != self._pdcp_inode or stat.st_size < self._pdcp_offset:
+                metrics = []
+                self._pdcp_cache = metrics
+                self._pdcp_offset = 0
+                self._pdcp_inode = inode
+            with filepath.open("rb") as handle:
+                if self._pdcp_offset == 0:
+                    header = handle.readline()
+                    self._pdcp_offset = handle.tell()
+                handle.seek(self._pdcp_offset)
+                body = handle.read()
+            last_newline = body.rfind(b"\n")
+            if last_newline < 0:
+                return list(metrics)
+            complete = body[:last_newline + 1]
+            self._pdcp_offset += len(complete)
+            for raw in complete.decode("utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line.startswith('%') or line.startswith('start'):
+                    continue
+                parts = line.split('\t')
+                if len(parts) < 15:
+                    continue
+                try:
+                    time_start = float(parts[0]); time_end = float(parts[1])
+                    cell_id = int(parts[2]); imsi = parts[3]; rnti = int(parts[4])
+                    lcid = int(parts[5]); n_tx_pdus = int(parts[6]); tx_bytes = int(parts[7])
+                    n_rx_pdus = int(parts[8]); rx_bytes = int(parts[9])
+                    delay_s = float(parts[10]); delay_stddev = float(parts[11])
+                    delay_min = float(parts[12]); delay_max = float(parts[13]); pdu_size = int(parts[14])
+                    metrics.append({
+                        'time_start': time_start, 'time_end': time_end,
+                        'cell_id': cell_id, 'imsi': imsi, 'rnti': rnti, 'lcid': lcid,
+                        'n_tx_pdus': n_tx_pdus, 'tx_bytes': tx_bytes,
+                        'n_rx_pdus': n_rx_pdus, 'rx_bytes': rx_bytes,
+                        'delay_s': delay_s, 'delay_us': delay_s * 1_000_000,
+                        'delay_stddev_s': delay_stddev, 'delay_stddev_us': delay_stddev * 1_000_000,
+                        'delay_min_s': delay_min, 'delay_min_us': delay_min * 1_000_000,
+                        'delay_max_s': delay_max, 'delay_max_us': delay_max * 1_000_000,
+                        'pdu_size': pdu_size, 'device_type': self.get_device_type(imsi),
+                    })
+                except (ValueError, IndexError):
+                    continue
+            del metrics[:-20000]
+            self._pdcp_cache = metrics
+            return list(metrics)
         except Exception as e:
             print(f"[CSV_METRICS] Error reading PDCP stats: {e}")
-        
-        return metrics
-    
+            return list(metrics)
+
     def process_mac_stats(self, filepath):
         """Process DlMacStats.txt - MAC layer metrics
         
@@ -906,6 +1046,40 @@ class ExtendedMetricsCollector:
             print(f"[CSV_METRICS] Error reading MAC stats: {e}")
         
         return metrics
+
+    def process_native_aggregate(self):
+        """Read the compact v9 native control trace, not raw scheduler dumps."""
+        path = self.input_dir.parent / "ns3_energy" / "TasamControlObservations.csv"
+        if not path.is_file():
+            return {}
+        latest = {}
+        try:
+            import csv
+            with path.open(newline="", encoding="utf-8", errors="replace") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        cell = int(row.get("CellId", 0) or 0)
+                        sim_time = float(row.get("Time", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if cell <= 0:
+                        continue
+                    previous = latest.get(cell)
+                    if previous is None or sim_time >= previous["sim_time_s"]:
+                        latest[cell] = {
+                            "sim_time_s": sim_time,
+                            "cell_id": cell,
+                            "transaction_id": int(row.get("SchedulerTransactionId", 0) or 0),
+                            "power_transaction_id": int(row.get("PowerTransactionId", 0) or 0),
+                            "tx_power_percent": float(row.get("TxPowerPercent", 0.0) or 0.0),
+                            "policy_active": str(row.get("PolicyActive", "0")).lower() in {"1", "true", "yes"},
+                            "active_dl_symbols": int(row.get("ActiveDlSymbols", 0) or 0),
+                            "active_dl_symbol_capacity": int(row.get("ActiveDlSymbolCapacity", 0) or 0),
+                            "evidence_version": str(row.get("EvidenceVersion") or ""),
+                        }
+        except (OSError, ValueError, csv.Error):
+            return {}
+        return latest
 
     def process_mmwave_sched_stats(self, filepath):
         """Process EnbSchedAllocTraces.txt - mmWave scheduler allocations."""
@@ -1561,6 +1735,12 @@ class ExtendedMetricsCollector:
                     vehicle_payload.setdefault('gateway_id', vehicle_meta.get('gateway_id', 'GW-VEH-01'))
                     vehicle_payload.setdefault('domain', vehicle_meta.get('domain', 'vehicular'))
                     vehicle_payload.setdefault('mobility_profile', vehicle_meta.get('mobility_profile', 'vehicle'))
+                existing_packet_loss = result['ue_metrics'][imsi].get('packet_loss_percent')
+                existing_pdcp_provenance = result['ue_metrics'][imsi].get('pdcp_provenance')
+                preserve_real_loss = (
+                    existing_pdcp_provenance == 'pdcp_real'
+                    and existing_packet_loss is not None
+                )
                 result['ue_metrics'][imsi].update({
                     'vehicle_id': vehicle_payload.get('vehicle_id', f'veh-imsi-{imsi}'),
                     'vehicle_role': vehicle_payload.get('vehicle_role', vehicle_payload.get('role', 'traffic')),
@@ -1570,7 +1750,15 @@ class ExtendedMetricsCollector:
                     'mobility_profile': vehicle_payload.get('mobility_profile', 'vehicle'),
                     'autonomy_state': vehicle_payload.get('autonomy_state', 'normal'),
                     'risk_state': vehicle_payload.get('risk_state', 'low'),
-                    'packet_loss_percent': float(vehicle_payload.get('packet_loss_percent', 0.0) or 0.0),
+                    'packet_loss_percent': (
+                        existing_packet_loss
+                        if preserve_real_loss
+                        else (
+                            float(vehicle_payload.get('packet_loss_percent'))
+                            if vehicle_payload.get('packet_loss_percent') is not None
+                            else None
+                        )
+                    ),
                     'speed_mps': float(vehicle_payload.get('speed_mps', 0.0) or 0.0),
                     'heading_deg': float(vehicle_payload.get('heading_deg', 0.0) or 0.0),
                     'lane_id': vehicle_payload.get('lane_id'),
@@ -1806,7 +1994,14 @@ class ExtendedMetricsCollector:
             rx_throughput_kbps = (data['rx_bytes'] * 8) / (active_window_s * 1000) if active_window_s > 0 else 0
             total_pdcp_throughput_kbps = ((data['tx_bytes'] + data['rx_bytes']) * 8) / (active_window_s * 1000) if active_window_s > 0 else 0
             throughput_kbps = rx_throughput_kbps
-            
+            tx_pdus = int(data.get('tx_pdus', 0) or 0)
+            rx_pdus = int(data.get('rx_pdus', 0) or 0)
+            pdcp_real_observed = tx_pdus > 0 or rx_pdus > 0
+            packet_loss_percent = (
+                max(0.0, min(100.0, ((tx_pdus - rx_pdus) / tx_pdus) * 100.0))
+                if tx_pdus > 0 else None
+            )
+
             result['ue_metrics'][imsi] = {
                 'device_type': data['device_type'],
                 'cell_id': data.get('cell_id', 0),
@@ -1814,12 +2009,14 @@ class ExtendedMetricsCollector:
                 'latency_avg_us': avg_latency,
                 'latency_min_us': data['lat_min'] if data['lat_min'] != float('inf') else 0,
                 'latency_max_us': data['lat_max'] if has_latency_samples else 0,
+                'latency_p95_us': self.percentile_95(data['latencies']) if has_latency_samples else 0,
                 'jitter_us': avg_jitter,
                 'pdu_size_avg': avg_pdu_size,
                 'tx_bytes': data['tx_bytes'],
                 'rx_bytes': data['rx_bytes'],
-                'tx_pdus': data['tx_pdus'],
-                'rx_pdus': data['rx_pdus'],
+                'tx_pdus': tx_pdus,
+                'rx_pdus': rx_pdus,
+                'sample_window_s': active_window_s,
                 'throughput_kbps': throughput_kbps,
                 'tx_throughput_kbps': tx_throughput_kbps,
                 'rx_throughput_kbps': rx_throughput_kbps,
@@ -1828,7 +2025,9 @@ class ExtendedMetricsCollector:
                 'has_latency_samples': has_latency_samples,
                 'latency_source': 'pdcp_real' if has_latency_samples else '',
                 'latency_is_proxy': False,
-                'pdcp_provenance': 'pdcp_real' if has_latency_samples else 'unavailable',
+                'pdcp_provenance': 'pdcp_real' if pdcp_real_observed else 'unavailable',
+                'packet_loss_percent': packet_loss_percent,
+                'pdcp_loss_source': 'pdcp_real_tx_rx' if packet_loss_percent is not None else 'unavailable',
                 'scenario_override_active': False,
                 'effective_source': 'pdcp_real' if has_latency_samples else 'unavailable',
                 'is_critical': has_latency_samples and max_latency >= SLA_THRESHOLD_US,
@@ -1905,6 +2104,12 @@ class ExtendedMetricsCollector:
                         'y': float(vehicle_payload.get('y', 0.0) or 0.0),
                         'z': float(vehicle_payload.get('z', 0.0) or 0.0),
                     }
+                existing_packet_loss = result['ue_metrics'][imsi].get('packet_loss_percent')
+                existing_pdcp_provenance = result['ue_metrics'][imsi].get('pdcp_provenance')
+                preserve_real_loss = (
+                    existing_pdcp_provenance == 'pdcp_real'
+                    and existing_packet_loss is not None
+                )
                 result['ue_metrics'][imsi].update({
                     'vehicle_id': vehicle_payload.get('vehicle_id', vehicle_id or f'veh-imsi-{imsi}'),
                     'vehicle_role': vehicle_payload.get('vehicle_role', vehicle_payload.get('role', 'traffic')),
@@ -1914,7 +2119,15 @@ class ExtendedMetricsCollector:
                     'mobility_profile': vehicle_payload.get('mobility_profile', 'vehicle'),
                     'autonomy_state': vehicle_payload.get('autonomy_state', vehicle_meta.get('autonomy_state', 'normal') if vehicle_meta else 'normal'),
                     'risk_state': vehicle_payload.get('risk_state', vehicle_meta.get('risk_state', 'low') if vehicle_meta else 'low'),
-                    'packet_loss_percent': float(vehicle_payload.get('packet_loss_percent', 0.0) or 0.0),
+                    'packet_loss_percent': (
+                        existing_packet_loss
+                        if preserve_real_loss
+                        else (
+                            float(vehicle_payload.get('packet_loss_percent'))
+                            if vehicle_payload.get('packet_loss_percent') is not None
+                            else None
+                        )
+                    ),
                     'speed_mps': float(vehicle_payload.get('speed_mps', 0.0) or 0.0),
                     'heading_deg': float(vehicle_payload.get('heading_deg', 0.0) or 0.0),
                     'lane_id': vehicle_payload.get('lane_id'),
@@ -2603,9 +2816,13 @@ class ExtendedMetricsCollector:
                     )
 
                 pdcp_metrics = self.process_pdcp_stats(pdcp_file)
-                mac_metrics = self.process_mac_stats(mac_file)
-                rlc_metrics = self.process_rlc_stats(rlc_file)
-                mmwave_sched_metrics = self.process_mmwave_sched_stats(mmwave_sched_file)
+                fidelity = os.environ.get("GREENRAN_NATIVE_TRACE_PROFILE") == "v9_fidelity"
+                mac_metrics = [] if fidelity else self.process_mac_stats(mac_file)
+                rlc_metrics = [] if fidelity else self.process_rlc_stats(rlc_file)
+                mmwave_sched_metrics = (
+                    {"native_aggregate": self.process_native_aggregate()}
+                    if fidelity else self.process_mmwave_sched_stats(mmwave_sched_file)
+                )
                 cu_up_metrics = self.process_cu_up_stats(cu_up_files)
                 trace_status = {
                     'pdcp': self._trace_status(pdcp_file, pdcp_metrics),
@@ -2656,6 +2873,21 @@ class ExtendedMetricsCollector:
                         )
                         self._attach_trace_status(extended, trace_status)
 
+                    if fidelity:
+                        native_aggregate = mmwave_sched_metrics.get("native_aggregate", {})
+                        extended["native_control_observations"] = native_aggregate
+                        gm = extended.setdefault("global_metrics", {})
+                        gm["native_evidence_version"] = str(
+                            os.environ.get("GREENRAN_NATIVE_EVIDENCE_VERSION", "v4")
+                        ).strip() or "v4"
+                        gm["native_observed_cells"] = sorted(native_aggregate)
+                        gm["native_allocation_observed"] = bool(
+                            native_aggregate and all(
+                                int(item.get("active_dl_symbol_capacity", 0) or 0) > 0
+                                for item in native_aggregate.values()
+                            )
+                        )
+
                     if self.require_real_pdcp and self._snapshot_has_proxy_latency(extended):
                         extended = self._retain_real_only_snapshot(extended)
                         if iteration == 1 or iteration % 5 == 0:
@@ -2683,6 +2915,7 @@ class ExtendedMetricsCollector:
                     self.write_metrics(extended, self.extended_output_file)
                     self.export_device_roles_snapshot(extended)
                     self.export_app2_metrics(extended)
+                    self.export_app3_metrics(extended)
                     
                     standard = self.write_standard_metrics(extended)
                     self.write_metrics(standard, self.output_file)

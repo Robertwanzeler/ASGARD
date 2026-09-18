@@ -20,6 +20,27 @@ SEVERITY_RANK = {
     "BLOCKED": 3,
 }
 
+# Nominal curriculum labels are kept separate from the category observed in
+# the next real network snapshot.  The latter remains the source of reward;
+# this map is only used to audit whether the scenario itself is calibrated.
+STAGE_EXPECTED_VERDICTS = {
+    "allowed_bootstrap": "ALLOWED",
+    "allowed_stable": "ALLOWED",
+    "camera_conditional": "CONDITIONAL",
+    "camera_blocked": "BLOCKED",
+    "vehicle_conditional": "CONDITIONAL",
+    "vehicle_blocked": "BLOCKED",
+    "app2_conditional": "CONDITIONAL",
+    "app2_blocked": "BLOCKED",
+    "allowed_recovery": "ALLOWED",
+}
+
+
+def expected_verdict_for_stage(stage: Any) -> str:
+    """Return the nominal curriculum category for an authoritative stage."""
+    key = str(stage or "").strip().lower()
+    return STAGE_EXPECTED_VERDICTS.get(key, "UNKNOWN")
+
 
 def _clamp(value: Any, low: float = 0.0, high: float = 1.0, default: float = 0.0) -> float:
     try:
@@ -36,6 +57,38 @@ def _verdict(value: Any) -> str:
 
 def _distance(left: Any, right: Any) -> int:
     return abs(SEVERITY_RANK.get(_verdict(left), 0) - SEVERITY_RANK.get(_verdict(right), 0))
+
+
+def training_category_signal(predicted: Any, observed: Any, valid: bool = True) -> Dict[str, float]:
+    """Return the stronger directional signal used only by online training.
+
+    The canonical category credit remains in ``_proposal_error`` for historical
+    comparison.  This separate signal makes a wrong ordinal state expensive:
+    under-severity is ``-1`` and over-severity is ``-2`` for adjacent states;
+    two-level and invalid proposals are always ``-2``.
+    """
+    predicted_verdict = _verdict(predicted)
+    observed_verdict = _verdict(observed)
+    if not valid or predicted_verdict == "UNKNOWN" or observed_verdict == "UNKNOWN":
+        penalty = 2.0
+        credit = -2.0
+    else:
+        predicted_rank = SEVERITY_RANK[predicted_verdict]
+        observed_rank = SEVERITY_RANK[observed_verdict]
+        distance = abs(predicted_rank - observed_rank)
+        if distance == 0:
+            penalty = 0.0
+            credit = 1.0
+        elif distance >= 2 or predicted_rank > observed_rank:
+            penalty = 2.0
+            credit = -2.0
+        else:
+            penalty = 1.0
+            credit = -1.0
+    return {
+        "credit": credit,
+        "penalty": penalty,
+    }
 
 
 def _proposal_error(proposal: Dict[str, Any], correct: str, outcome: Dict[str, Any]) -> Dict[str, Any]:
@@ -70,6 +123,7 @@ def _proposal_error(proposal: Dict[str, Any], correct: str, outcome: Dict[str, A
         )
 
     category_credit = 1.0 if valid and distance == 0 else -category_penalty
+    training_signal = training_category_signal(verdict, correct, valid=valid)
 
     return {
         "verdict": verdict,
@@ -79,6 +133,8 @@ def _proposal_error(proposal: Dict[str, Any], correct: str, outcome: Dict[str, A
         "category_penalty": round(category_penalty, 6),
         "category_credit": round(category_credit, 6),
         "category_error": bool(not valid or distance > 0),
+        "training_category_credit": round(training_signal["credit"], 6),
+        "training_category_penalty": round(training_signal["penalty"], 6),
         "predicted_verdict": verdict,
         "observed_verdict": correct,
         "classification": classification,
@@ -279,6 +335,15 @@ class RAppJudge:
             # non-critical advisory.
             safety_veto = bool(proposal.get("safety_veto", True))
 
+        safety_level = str(proposal.get("armd_safety_level", "") or "").upper()
+        if source == "armd" and safety_level not in {"CLEAR", "ADVISORY", "HARD_VETO", "UNKNOWN"}:
+            safety_level = "HARD_VETO" if safety_veto else (
+                "CLEAR" if verdict == "ALLOWED" else "ADVISORY" if verdict == "CONDITIONAL" else "UNKNOWN"
+            )
+        if source == "armd" and safety_level in {"CLEAR", "ADVISORY", "UNKNOWN"}:
+            safety_veto = False
+        advisory_only = source == "armd" and safety_level in {"CLEAR", "ADVISORY"}
+
         evidence = proposal.get("evidence", [])
         if not isinstance(evidence, list):
             evidence = [str(evidence)] if evidence else []
@@ -294,6 +359,9 @@ class RAppJudge:
             "valid": valid and available and verdict != "UNKNOWN",
             "feasible": feasible,
             "safety_veto": safety_veto,
+            "armd_safety_level": safety_level,
+            "armd_role": "safety_enforcer" if safety_level == "HARD_VETO" else "advisory" if source == "armd" else "",
+            "armd_advisory_only": advisory_only,
             "priority_score": _clamp(proposal.get("priority_score", 0.0)),
             "resource_score": float(proposal.get("resource_score", resource.get("score", 0.0)) or 0.0),
             "proposal_score": _clamp(
@@ -330,7 +398,20 @@ class RAppJudge:
         fallback = self.normalize_proposal("rapp_policy", fallback_proposal)
 
         proposals = {"armd": armd, "ta_sam": tasam, "rapp_policy": fallback}
-        valid_assistants = [item for item in (armd, tasam) if item["valid"] and item["feasible"]]
+        # In the explicit v9 contract, normal ARMD proposals are advisory
+        # metadata and must never win arbitration or force a cooperative
+        # allocation.  Keep the legacy behavior when older callers omit the
+        # field so historical tests and reports remain readable.
+        explicit_armd_level = "armd_safety_level" in (armd_proposal or {})
+        valid_assistants = [
+            item for item in (armd, tasam)
+            if item["valid"] and item["feasible"]
+            and not (
+                explicit_armd_level
+                and item["source"] == "armd"
+                and item.get("armd_safety_level") in {"CLEAR", "ADVISORY"}
+            )
+        ]
         selected = None
         conflict_type = "no_valid_assistant"
         reason = "no valid assistant proposal; rApp policy fallback"
@@ -468,6 +549,8 @@ class RAppJudge:
             "assistants_cooperated": selected.get("source") == "joint",
             "armd_envelope_applied": bool(selected.get("armd_envelope_applied", False)),
             "tasam_optimization_applied": bool(selected.get("tasam_optimization_applied", False)),
+            "armd_safety_level": armd.get("armd_safety_level", "UNKNOWN"),
+            "armd_role": armd.get("armd_role", "advisory"),
             "enabled": self.enabled,
             "production_deterministic": self.production,
             "judge_verdict": selected["verdict"],
@@ -755,6 +838,36 @@ class RAppJudge:
         )
         resource_error = max(max(shortages, default=0.0), over_budget)
 
+        ran_completion = number(
+            resource.get("ran_completion_ratio"),
+            min(1.0, ran_allocation / ran_demand) if ran_demand > 0.0 else 1.0,
+        )
+        ai_completion = number(
+            resource.get("ai_completion_ratio"),
+            min(1.0, ai_allocation / ai_demand) if ai_demand > 0.0 else 1.0,
+        )
+        ran_target, ai_target = 0.95, 0.75
+        completion_shortfall = _clamp(
+            (0.60 * max(0.0, ran_target - ran_completion) / ran_target)
+            + (0.40 * max(0.0, ai_target - ai_completion) / ai_target)
+        )
+        underallocation_penalty = max(resource_error, completion_shortfall)
+        power_raw = resource.get(
+            "power_percent",
+            previous.get("tasam_power_percent", previous.get("energy_power_level", 100.0)),
+        )
+        power_aliases = {
+            "POWER_DOWN_ECO": 25.0,
+            "REDUCE_POWER": 60.0,
+            "CONDITIONAL_REDUCE": 60.0,
+            "FULL_POWER": 100.0,
+        }
+        try:
+            power_percent = max(25.0, min(100.0, float(power_raw)))
+        except (TypeError, ValueError):
+            power_percent = power_aliases.get(str(power_raw or "").strip().upper(), 100.0)
+        observed_verdict = str(observation.get("correct_verdict", "") or "").upper()
+
         service_values = {
             "camera_sla": (camera_error, camera_available),
             "vehicle_sla": (vehicle_error, vehicle_available),
@@ -768,6 +881,15 @@ class RAppJudge:
             / available_weight
             if available_weight > 0.0 else 0.0
         )
+        power_safe = (
+            observed_verdict != "BLOCKED"
+            and ran_completion >= ran_target
+            and ai_completion >= ai_target
+            and service_error <= 1e-9
+            and latency_error <= 1e-9
+            and loss_error <= 1e-9
+        )
+        power_cost_penalty = ((power_percent - 25.0) / 75.0) if power_safe else 0.0
         components = {
             "camera_sla_error": round(camera_error, 6),
             "vehicle_sla_error": round(vehicle_error, 6),
@@ -780,6 +902,15 @@ class RAppJudge:
             "resource_shortage_ran": round(shortages[0], 6),
             "resource_shortage_ai": round(shortages[1], 6),
             "resource_over_budget": round(over_budget, 6),
+            "ran_completion": round(ran_completion, 6),
+            "ai_completion": round(ai_completion, 6),
+            "ran_completion_target": ran_target,
+            "ai_completion_target": ai_target,
+            "completion_shortfall_penalty": round(completion_shortfall, 6),
+            "underallocation_penalty": round(underallocation_penalty, 6),
+            "power_percent": round(power_percent, 6),
+            "power_cost_penalty": round(power_cost_penalty, 6),
+            "power_penalty_gated_by_service": bool(power_safe),
             "camera_available": camera_available,
             "vehicle_available": vehicle_available,
             "sensors_available": sensors_available,
@@ -789,10 +920,13 @@ class RAppJudge:
             "resource_available": resource_available,
         }
         observed_error = _clamp(
-            0.65 * service_error
-            + 0.10 * latency_error
-            + 0.05 * loss_error
-            + 0.20 * resource_error,
+            0.25 * service_error
+            + 0.10 * _clamp(latency_error)
+            + 0.05 * _clamp(loss_error)
+            + 0.35 * completion_shortfall
+            + 0.15 * underallocation_penalty
+            + 0.05 * _clamp(over_budget)
+            + 0.05 * power_cost_penalty,
             0.0,
             1.0,
         )
@@ -912,6 +1046,18 @@ class RAppJudge:
             "tasam_category_credit": round(errors.get("ta_sam", {}).get("category_credit", -1.0), 6),
             "tasam_category_penalty": round(errors.get("ta_sam", {}).get("category_penalty", 1.0), 6),
             "tasam_category_error": bool(errors.get("ta_sam", {}).get("category_error", True)),
+            "tasam_training_category_credit": round(
+                errors.get("ta_sam", {}).get("training_category_credit", -2.0), 6
+            ),
+            "tasam_training_category_penalty": round(
+                errors.get("ta_sam", {}).get("training_category_penalty", 2.0), 6
+            ),
+            # The continuous component arrives with the delayed real-network
+            # observation.  The orchestrator fills this field then; keep a
+            # strong categorical fallback available for direct judge users.
+            "tasam_training_reward": round(
+                errors.get("ta_sam", {}).get("training_category_credit", -2.0), 6
+            ),
             "tasam_predicted_verdict": errors.get("ta_sam", {}).get("predicted_verdict", "UNKNOWN"),
             "tasam_observed_verdict": correct,
             "joint_credit": round(
@@ -929,4 +1075,10 @@ class RAppJudge:
         return result
 
 
-__all__ = ["RAppJudge", "SEVERITY_RANK"]
+__all__ = [
+    "RAppJudge",
+    "SEVERITY_RANK",
+    "STAGE_EXPECTED_VERDICTS",
+    "expected_verdict_for_stage",
+    "training_category_signal",
+]

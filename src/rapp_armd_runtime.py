@@ -163,6 +163,9 @@ class ARMDRuntimeAdvisor:
                     ),
                     "source": "runtime_neutral",
                     "reason": "no validated ARMD risk matched; neutral proposal",
+                    "safety_level": "CLEAR",
+                    "role": "advisory",
+                    "advisory_only": True,
                 }
             )
             return advice
@@ -201,6 +204,9 @@ class ARMDRuntimeAdvisor:
                 ),
             }
         )
+        advice["safety_level"] = self._safety_level(advice)
+        advice["role"] = "safety_enforcer" if advice["safety_level"] == "HARD_VETO" else "advisory"
+        advice["advisory_only"] = advice["safety_level"] != "HARD_VETO"
         return advice
 
     def apply(self, decision: Dict, advice: Dict, *, mutate: bool = True) -> Dict:
@@ -225,6 +231,13 @@ class ARMDRuntimeAdvisor:
         decision["armd_reason"] = advice.get("reason", "")
         decision["armd_expected_energy_saver"] = advice.get("expected_energy_saver", "")
         decision["armd_expected_action"] = advice.get("expected_action", "")
+        safety_level = str(advice.get("safety_level", "UNKNOWN") or "UNKNOWN").upper()
+        decision["armd_safety_level"] = safety_level
+        decision["armd_role"] = (
+            "safety_enforcer" if safety_level == "HARD_VETO" else "advisory"
+        )
+        decision["armd_advisory_only"] = safety_level != "HARD_VETO"
+        decision["armd_hard_veto"] = safety_level == "HARD_VETO"
         decision["armd_override_applied"] = False
         decision["armd_match_score"] = advice.get("match_score", 0.0)
         decision["armd_threshold"] = advice.get("threshold", self.threshold)
@@ -537,6 +550,30 @@ class ARMDRuntimeAdvisor:
             "evidence": evidence,
         }
 
+    @staticmethod
+    def _safety_level(advice: Dict) -> str:
+        """Separate ARMD safety authority from its ordinal energy label."""
+        scenario = str(advice.get("scenario", "") or "").lower()
+        violation = str(advice.get("priority_violation", "") or "").upper()
+        if advice.get("critical_violation"):
+            return "HARD_VETO"
+        if scenario in {
+            "app1_throughput", "app1_latencia", "app2_degradado_critico",
+            "vehicle_critical",
+        }:
+            return "HARD_VETO"
+        if violation in {
+            "THROUGHPUT", "LATENCY", "APP2_MTC_CRITICAL",
+            "VEHICLE_CRITICAL", "CVAR_CRITICAL", "P95_CRITICAL",
+        }:
+            return "HARD_VETO"
+        verdict = str(advice.get("expected_energy_saver", "") or "").upper()
+        if verdict == "ALLOWED":
+            return "CLEAR"
+        if verdict == "CONDITIONAL":
+            return "ADVISORY"
+        return "UNKNOWN"
+
     def _base_advice(self) -> Dict:
         return {
             "enabled": self.enabled,
@@ -561,6 +598,9 @@ class ARMDRuntimeAdvisor:
             "mean_f1_at_target_epoch": 0.0,
             "global_healthy": False,
             "suggests_stronger_protection": False,
+            "safety_level": "UNKNOWN",
+            "role": "advisory",
+            "advisory_only": True,
             "evidence": [],
             "summary_path": str(self.summary_path),
             "updated_at": int(time.time()),

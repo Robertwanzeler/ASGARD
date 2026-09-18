@@ -49,7 +49,10 @@ def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return value
 
 
-def _explicit_state_features(resource_snapshot: Dict[str, Any] | None) -> List[float]:
+def _explicit_state_features(
+    resource_snapshot: Dict[str, Any] | None,
+    operating_state: Any = None,
+) -> List[float]:
     """Optionally expose the authoritative 3-way operating state to MARL.
 
     The historical article-compatible vector remains 10-dimensional by
@@ -60,7 +63,16 @@ def _explicit_state_features(resource_snapshot: Dict[str, Any] | None) -> List[f
     if os.environ.get('GREENRAN_TASAM_EXPLICIT_STATE_FEATURE', '0').strip() != '1':
         return []
     snapshot = resource_snapshot or {}
-    state = str(snapshot.get('allocation_state') or '').strip().upper()
+    # This feature describes the state observed from the current network
+    # metrics.  It must not inherit the previous allocation/action state,
+    # otherwise a prior BLOCKED decision can contaminate a healthy snapshot.
+    state = str(
+        operating_state
+        if operating_state is not None
+        else snapshot.get('state_category') or snapshot.get('network_operating_state')
+        or snapshot.get('allocation_state')
+        or ''
+    ).strip().upper()
     if state == 'CRITICAL':
         state = 'BLOCKED'
     if state not in {'ALLOWED', 'CONDITIONAL', 'BLOCKED'}:
@@ -207,6 +219,7 @@ def build_du_state_snapshot(
     vehicle_metrics: Dict[str, Any] | None,
     network_health: Dict[str, Any] | None,
     resource_snapshot: Dict[str, Any] | None,
+    operating_state: Any = None,
 ) -> Dict[str, Any]:
     topology = load_logical_du_topology()
     slice_state = build_slice_state(camera_metrics, app2_metrics, vehicle_metrics, network_health, resource_snapshot)
@@ -257,7 +270,7 @@ def build_du_state_snapshot(
             _clamp(allocation_share / max(usable_budget, 1e-9)),
             _clamp(allocation_share / max(demand_share, 1e-9)) if demand_share > 1e-9 else 1.0,
         ]
-        state_vector.extend(_explicit_state_features(resource_snapshot))
+        state_vector.extend(_explicit_state_features(resource_snapshot, operating_state))
         du_states.append({
             'du_id': str(du.get('du_id', 'unknown') or 'unknown'),
             'role': str(du.get('role', 'unknown') or 'unknown'),
@@ -287,7 +300,15 @@ def build_du_state_snapshot(
             _clamp(total_demand / max(usable_budget, 1e-9)) if usable_budget > 1e-9 else 0.0,
         ],
     }
-    global_state['state_vector'].extend(_explicit_state_features(resource_snapshot))
+    global_state['state_vector'].extend(_explicit_state_features(resource_snapshot, operating_state))
+    global_state['state_category'] = str(
+        operating_state
+        if operating_state is not None
+        else (resource_snapshot or {}).get('state_category')
+        or (resource_snapshot or {}).get('network_operating_state')
+        or (resource_snapshot or {}).get('allocation_state')
+        or 'ALLOWED'
+    ).upper()
 
     return {
         'topology_id': topology.get('topology_id', 'greenran_fixed_marl_v1'),

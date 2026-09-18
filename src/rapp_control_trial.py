@@ -52,7 +52,23 @@ class JointControlTrial:
         self.enabled = _bool(os.environ.get("GREENRAN_CONTROL_TRIAL_ENABLED", config.get("enabled", False)))
         if self.full_control or self.tasam_only or self.assistant_only:
             self.enabled = True
-        self.fraction = 1.0 if (self.full_control or self.tasam_only or self.assistant_only) else min(max(_float(os.environ.get("GREENRAN_CONTROL_TRIAL_FRACTION", config.get("fraction", 0.10)), 0.10), 0.0), 1.0)
+        # Full-control mode is intentionally all-or-nothing.  Assistant-only
+        # control, however, must honor the configured canary fraction so a
+        # newly approved policy cannot silently replace the live allocator on
+        # every decision before its rollback guard has evidence.
+        self.fraction = 1.0 if self.full_control else min(max(_float(os.environ.get("GREENRAN_CONTROL_TRIAL_FRACTION", config.get("fraction", 0.10)), 0.10), 0.0), 1.0)
+        # Online economic adaptation advances its rollout in a separate
+        # controller.  The old trial object kept the bootstrap fraction
+        # (10%) forever, even after online_rollout.json reached 25%/50%.
+        # Read that state file at decision time so the safety canary and the
+        # economic rollout have one source of truth.  A malformed or missing
+        # manifest falls back to the conservative bootstrap fraction.
+        manifest_value = os.environ.get("GREENRAN_TASAM_ONLINE_ROLLOUT_MANIFEST", "").strip()
+        self.rollout_manifest = Path(manifest_value) if manifest_value else None
+        self.max_rollout_fraction = min(
+            max(_float(os.environ.get("GREENRAN_TASAM_MAX_ROLLOUT_FRACTION", "1.0"), 1.0), 0.0),
+            1.0,
+        )
         self.target_decisions = max(1, int(_float(os.environ.get("GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS", config.get("target_decisions", 300)), 300)))
         self.rollback_window = max(1, int(_float(os.environ.get("GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW", config.get("rolling_window", 30)), 30)))
         self.critical_streak_limit = max(1, int(_float(os.environ.get("GREENRAN_CONTROL_TRIAL_CRITICAL_STREAK", config.get("critical_streak", 3)), 3)))
@@ -225,7 +241,27 @@ class JointControlTrial:
             return True
         digest = hashlib.sha256(decision_id.encode("utf-8")).hexdigest()
         bucket = int(digest[:8], 16) / 0xFFFFFFFF
-        return bucket < self.fraction
+        return bucket < self._effective_fraction()
+
+    def _effective_fraction(self) -> float:
+        """Return the controller-approved rollout fraction for this decision.
+
+        The manifest is written atomically by the online controller.  Only a
+        numeric fraction in [0, max_rollout_fraction] is accepted; every
+        malformed/read-failed value keeps the conservative bootstrap value.
+        Full-control and legacy trials retain their existing behaviour.
+        """
+        if self.full_control or self.rollout_manifest is None:
+            return self.fraction
+        try:
+            payload = json.loads(self.rollout_manifest.read_text(encoding="utf-8"))
+            rollout = payload.get("rollout") if isinstance(payload, dict) else None
+            value = float(rollout.get("fraction")) if isinstance(rollout, dict) else self.fraction
+            if not math.isfinite(value):
+                return self.fraction
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return self.fraction
+        return min(max(value, 0.0), self.max_rollout_fraction)
 
     @staticmethod
     def comparison(decision: Dict[str, Any]) -> dict:
@@ -268,7 +304,7 @@ class JointControlTrial:
         if critical_streak >= self.critical_streak_limit and not self.assistant_only:
             return f"{self.critical_streak_limit} consecutive critical SLA violations"
         if len(outcomes) >= self.rollback_window:
-            avg_score = sum(_float(row.get("score_delta")) for row in outcomes[-self.rollback_window:]) / self.rollback_window
+            avg_score = sum(_float(row.get("causal_score_delta", row.get("score_delta"))) for row in outcomes[-self.rollback_window:]) / self.rollback_window
             avg_ran = sum(_float(row.get("ran_delta")) for row in outcomes[-self.rollback_window:]) / self.rollback_window
             avg_ai = sum(_float(row.get("ai_delta")) for row in outcomes[-self.rollback_window:]) / self.rollback_window
             # Assistant-only control is priority-aware. A camera/vehicle
@@ -288,7 +324,7 @@ class JointControlTrial:
                     elif priority == "ai_guarded":
                         priority_deltas.append(_float(row.get("ai_delta"), 0.0))
                     else:
-                        mixed_deltas.append(_float(row.get("score_delta"), 0.0))
+                        mixed_deltas.append(_float(row.get("causal_score_delta", row.get("score_delta")), 0.0))
                 if mixed_deltas and (sum(mixed_deltas) / len(mixed_deltas)) < -self.score_delta_epsilon:
                     avg_mixed = sum(mixed_deltas) / len(mixed_deltas)
                     return f"rolling {self.rollback_window}-decision score delta negative: {avg_mixed:.6f}"
@@ -324,6 +360,7 @@ class JointControlTrial:
         comparison = self.comparison(decision)
         candidate = {
             "score_delta": _float(comparison.get("score_delta"), 0.0),
+            "causal_score_delta": _float(comparison.get("causal_score_delta", comparison.get("score_delta")), 0.0),
             "ran_delta": _float(comparison.get("shadow_ran_completion_est"), 0.0) - _float(comparison.get("live_ran_completion_est"), 0.0),
             "ai_delta": _float(comparison.get("shadow_ai_completion_est"), 0.0) - _float(comparison.get("live_ai_completion_est"), 0.0),
             "priority": self._priority_for_decision(decision, comparison),
@@ -356,6 +393,7 @@ class JointControlTrial:
             outcome = {
                 "timestamp": int(time.time()),
                 "score_delta": _float(candidate.get("score_delta"), 0.0),
+                "causal_score_delta": _float(candidate.get("causal_score_delta", candidate.get("score_delta")), 0.0),
                 "ran_delta": _float(candidate.get("ran_delta"), 0.0),
                 "ai_delta": _float(candidate.get("ai_delta"), 0.0),
                 "priority": str(candidate.get("priority", "mixed") or "mixed"),
@@ -393,7 +431,7 @@ class JointControlTrial:
             "eligible": eligible,
             "canary": canary,
             "applied": applied,
-            "fraction": self.fraction,
+            "fraction": self._effective_fraction(),
             "reason": reason,
             "rollback": bool(self.state.get("rollback")),
             "rollback_reason": self.state.get("rollback_reason", ""),
@@ -408,7 +446,7 @@ class JointControlTrial:
         return {
             **self.state,
             "enabled": self.enabled,
-            "fraction": self.fraction,
+            "fraction": self._effective_fraction(),
             "target_decisions": self.target_decisions,
             "rollback_window": self.rollback_window,
             "critical_streak_limit": self.critical_streak_limit,

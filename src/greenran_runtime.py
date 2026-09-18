@@ -121,7 +121,11 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         "GREENRAN_INFLUXDB_PORT": ("monitoring", "influxdb_port", int),
         "GREENRAN_INFLUXDB_DB": ("monitoring", "influxdb_db", str),
         "GREENRAN_COLLECTOR_POLL_INTERVAL": ("collector", "poll_interval_seconds", float),
-        "GREENRAN_SIM_TIME": ("simulation", "default_sim_time_seconds", int),
+        # Simulation arms may include a fractional guard interval (for
+        # example, 330.5 s = 30 s warm-up + 30 ten-second windows + 0.5 s).
+        # Keeping this override as an int silently crashes the rApp before it
+        # can attach to the real-PDCP run, even though ns-3 accepts a float.
+        "GREENRAN_SIM_TIME": ("simulation", "default_sim_time_seconds", float),
         "GREENRAN_RESOURCE_R_MAX": ("shared_resources", "r_max", float),
         "GREENRAN_RESOURCE_RAN_MIN_SHARE": ("shared_resources", "ran_min_share", float),
         "GREENRAN_RESOURCE_AI_MIN_SHARE": ("shared_resources", "ai_min_share", float),

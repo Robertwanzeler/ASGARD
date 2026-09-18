@@ -161,6 +161,15 @@ def _build_summary(
         'batch_size': args.batch_size,
         'updates_per_epoch': args.updates_per_epoch,
         'actor_update_interval': args.actor_update_interval,
+        'category_loss_weight': args.category_loss_weight,
+        'category_head_hidden_dim': args.category_head_hidden_dim,
+        'temporal_dim': args.temporal_dim,
+        'power_head_hidden_dim': args.power_head_hidden_dim,
+        'power_head_lr': args.power_head_lr,
+        'power_head_steps': args.power_head_steps,
+        'allocation_head_hidden_dim': args.allocation_head_hidden_dim,
+        'allocation_head_lr': args.allocation_head_lr,
+        'allocation_head_steps': args.allocation_head_steps,
         'seed': args.seed,
         'checkpoint_every': args.checkpoint_every,
         'milestone_epochs': list(args.milestone_epochs),
@@ -315,6 +324,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch-size', type=int, default=128, help='Mini-batch size for article_sac')
     parser.add_argument('--updates-per-epoch', type=int, default=None, help='Gradient updates per epoch for article_sac')
     parser.add_argument('--actor-update-interval', type=int, default=1, help='Update actors every N critic steps in article_sac')
+    parser.add_argument('--category-loss-weight', type=float, default=0.5, help='Auxiliary observed-category loss weight')
+    parser.add_argument('--category-head-hidden-dim', type=int, default=64, help='Hidden dimension of the ordinal category head')
+    parser.add_argument('--temporal-dim', type=int, default=10, help='Optional internal temporal-context width; external state remains 13-D')
+    parser.add_argument('--power-head-hidden-dim', type=int, default=64, help='Hidden dimension of the discrete power head')
+    parser.add_argument('--power-head-lr', type=float, default=0.001, help='Learning rate for the discrete power head')
+    parser.add_argument('--power-head-steps', type=int, default=10, help='Supervised steps for the discrete power head')
+    parser.add_argument('--allocation-head-hidden-dim', type=int, default=64, help='Hidden dimension of the aggregate RAN/IA allocation head')
+    parser.add_argument('--allocation-head-lr', type=float, default=0.001, help='Learning rate for the aggregate RAN/IA allocation head')
+    parser.add_argument('--allocation-head-steps', type=int, default=10, help='Supervised steps for the aggregate RAN/IA allocation head')
+    parser.add_argument('--allocation-head-output-dim', type=int, choices=(2, 3), default=2, help='Allocation outputs: 2 legacy split values or 3 including total_budget_fraction')
+    parser.add_argument('--global-action-dim', type=int, choices=(3, 5), default=3, help='Global action width; v10 uses 5 independent DU powers plus RAN share and total budget')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--max-epochs', type=int, default=None, help='Maximum training epochs; defaults to --epochs for compatibility')
     parser.add_argument('--checkpoint-every', type=int, default=0, help='Save intermediate checkpoints every N epochs')
@@ -388,6 +408,7 @@ def main() -> int:
             actor_hidden_dims=actor_hidden_dims,
             critic_hidden_dims=critic_hidden_dims,
             activation=args.activation,
+            global_action_dim=args.global_action_dim,
         )
     else:
         records = load_marl_transition_trace(args.trace_jsonl)
@@ -418,6 +439,17 @@ def main() -> int:
             batch_size=args.batch_size,
             updates_per_epoch=args.updates_per_epoch,
             actor_update_interval=args.actor_update_interval,
+            category_loss_weight=args.category_loss_weight,
+            category_head_hidden_dim=args.category_head_hidden_dim,
+            temporal_dim=max(0, int(args.temporal_dim)),
+            power_head_hidden_dim=args.power_head_hidden_dim,
+            power_head_lr=args.power_head_lr,
+            power_head_steps=args.power_head_steps,
+            allocation_head_hidden_dim=args.allocation_head_hidden_dim,
+            allocation_head_lr=args.allocation_head_lr,
+            allocation_head_steps=args.allocation_head_steps,
+            allocation_head_output_dim=args.allocation_head_output_dim,
+            global_action_dim=args.global_action_dim,
             seed=args.seed,
         )
 
@@ -435,6 +467,27 @@ def main() -> int:
             trainer.actors.load_state_dict(actor_state)
         except (RuntimeError, TypeError) as exc:
             raise SystemExit(f'initial actor checkpoint incompatible: {exc}') from exc
+        global_actor_path = init_dir / 'tasam_marl_global_actor.pt'
+        if global_actor_path.is_file():
+            global_actor_state = torch.load(global_actor_path, map_location='cpu', weights_only=False)
+            try:
+                trainer.global_actor.load_state_dict(global_actor_state)
+            except (RuntimeError, TypeError) as exc:
+                raise SystemExit(f'initial global actor checkpoint incompatible: {exc}') from exc
+        category_path = init_dir / 'tasam_marl_category_head.pt'
+        if category_path.is_file():
+            category_state = torch.load(category_path, map_location='cpu', weights_only=False)
+            try:
+                trainer.category_head.load_state_dict(category_state, strict=False)
+            except (RuntimeError, TypeError) as exc:
+                raise SystemExit(f'initial category checkpoint incompatible: {exc}') from exc
+        allocation_path = init_dir / 'tasam_marl_allocation_head.pt'
+        if allocation_path.is_file():
+            allocation_state = torch.load(allocation_path, map_location='cpu', weights_only=False)
+            try:
+                trainer.allocation_head.load_state_dict(allocation_state, strict=False)
+            except (RuntimeError, TypeError) as exc:
+                raise SystemExit(f'initial allocation checkpoint incompatible: {exc}') from exc
 
     history: list[dict[str, Any]] = []
     checkpoint_records: list[dict[str, Any]] = []

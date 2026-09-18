@@ -1,0 +1,21 @@
+[Unit]
+Description=GreenRAN validated local campaign dispatcher
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/robert/orange_nuclear
+ExecStart=/usr/bin/python3 /home/robert/orange_nuclear/scripts/greenran_campaign_dispatcher.py --queue-root /home/robert/orange_nuclear/runs/agent_jobs
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+# A dispatcher restart must reap the currently running campaign as well; a
+# campaign is never allowed to outlive the queue worker that owns it.
+KillMode=control-group
+Environment=PYTHONPATH=/home/robert/orange_nuclear/src:/home/robert/orange_nuclear/drlexp/src
+Environment=GREENRAN_LOCAL_ONLY=1
+Environment=GREENRAN_CGROUP_ENFORCE=1
+Environment=GREENRAN_CGROUP_ALLOW_UNENFORCED=0
+
+[Install]
+WantedBy=default.target
