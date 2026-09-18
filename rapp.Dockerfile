@@ -4,7 +4,7 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY src/ /app/src/
 COPY apps/ /app/apps/
-COPY requirements.txt /app/requirements.txt
+COPY drlexp/requirements.txt /app/requirements.txt
 COPY config/ /app/config/
 
 RUN pip install --no-cache-dir -r /app/requirements.txt
