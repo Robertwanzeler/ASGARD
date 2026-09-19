@@ -61,7 +61,7 @@
     "ran_min_active_demand": 0.15,
     "ai_min_active_demand": 0.15,
     "sla_floor_demand_fraction": 0.35,
-    "sla_floor_guard_ratio": 0.10,
+    "sla_floor_guard_ratio": 0.1,
     "camera_latency_hard_ms": 80.0,
     "vehicle_floor_priority_weight": 1.5,
     "conditional_reinforcement_scale": 0.0,
@@ -71,11 +71,25 @@
     "default_sensor_ues": 12,
     "default_vehicle_ues": 5,
     "resource_cvar_critical_ms": 250.0,
-    "resource_p95_critical_ms": 120.0
-    ,"baseline_resource_bands": {
-      "ALLOWED": {"ran_ratio": 0.6029416173, "ai_ratio": 0.3970583827},
-      "CONDITIONAL": {"ran_ratio": 0.6432199344, "ai_ratio": 0.3567800656},
-      "BLOCKED": {"ran_ratio": 0.7246045526, "ai_ratio": 0.2753954474}
+    "resource_p95_critical_ms": 120.0,
+    "baseline_resource_bands": {
+      "ALLOWED": {
+        "ran_ratio": 0.6029416173,
+        "ai_ratio": 0.3970583827
+      },
+      "CONDITIONAL": {
+        "ran_ratio": 0.6432199344,
+        "ai_ratio": 0.3567800656
+      },
+      "BLOCKED": {
+        "ran_ratio": 0.7246045526,
+        "ai_ratio": 0.2753954474
+      }
+    }
+  },
+  "resource_allocation": {
+    "shared_resources": {
+      "camera_throughput_guard_mbps": 26.0
     }
   }
 }
