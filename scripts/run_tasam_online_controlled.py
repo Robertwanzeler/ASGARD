@@ -33,6 +33,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from tasam_learning_meter import build_learning_meter
+from greenran_v2x_adaptive_reward import REWARD_CONTRACT
+from greenran_v2x_window90 import validate_online_transition
 
 BASE_CHECKPOINT = ROOT / "runs/tasam_training_weak_reinforced_20260812/training_final/seed_0045/tasam_selective"
 HISTORICAL_TRACE = ROOT / "runs/greenran_tasam_e2_active_20260827_v7/final_dataset/tasam_article_trace_final.jsonl"
@@ -51,7 +53,9 @@ CANONICAL_DU_IDS = (
 
 def full_control_mode() -> bool:
     mode = os.environ.get("GREENRAN_TASAM_ADVISOR_MODE", "").strip().lower()
-    return mode in {"tasam_full_control", "tasam-full-control"}
+    return mode in {"tasam_full_control", "tasam-full-control"} or os.environ.get(
+        "GREENRAN_TASAM_PILOT_FULL_ROLLOUT", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def initial_rollout() -> tuple[str, float]:
@@ -430,6 +434,344 @@ def iter_valid_rows(path: Path):
 
 def valid_rows(path: Path) -> list[dict[str, Any]]:
     return list(iter_valid_rows(path))
+
+
+def iter_v2x_valid_rows(path: Path, *, require_judge: bool):
+    """Yield V2X rows only after the native live-evidence contract passes."""
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            quality = row.get("collection_quality") or {}
+            try:
+                aligned = (
+                    float(quality.get("current_metric_skew_s", 0) or 0) <= 6.0
+                    and float(quality.get("next_metric_skew_s", 0) or 0) <= 6.0
+                )
+            except (TypeError, ValueError):
+                aligned = False
+            if aligned and validate_online_transition(
+                row, require_adaptive_reward=True, require_judge=require_judge
+            )[0]:
+                yield row
+
+
+V2X_REPLAY_80_20_SCHEMA = "greenran.tasam.v2x.replay_80_20.v1"
+V2X_REPLAY_WINDOW90_SCHEMA = "greenran.tasam.v2x.window90.replay_80_20.v1"
+
+
+def _is_official_evaluation_row(row: dict[str, Any]) -> bool:
+    """Keep held-out evaluation transitions out of every online update.
+
+    The legacy economic replay has its own provenance rules.  This check is
+    deliberately local to the V2X/article contract so enabling the new
+    protocol cannot reinterpret old datasets.
+    """
+    phase = str(row.get("replay_phase") or row.get("phase") or "").strip().lower()
+    partition = str(row.get("replay_partition") or row.get("data_partition") or "").strip().lower()
+    return bool(
+        row.get("evaluation_frozen")
+        or row.get("official_evaluation")
+        or row.get("is_evaluation")
+        or phase.startswith("evaluation")
+        or partition in {"evaluation", "official_evaluation", "test"}
+    )
+
+
+def _v2x_replay_identity(row: dict[str, Any]) -> tuple[str, str, int, str] | None:
+    """Return the required phase/episode/seed/timestamp identity or ``None``.
+
+    A decision id alone is not enough: ids can restart for a new seed or a
+    simulator episode.  The four-part identity makes both the replay mix and
+    later audit deterministic.
+    """
+    def field(primary: str, fallback: str) -> Any:
+        value = row.get(primary)
+        return row.get(fallback) if value is None or value == "" else value
+
+    phase = str(field("replay_phase", "phase") or "").strip()
+    episode = str(field("replay_episode", "episode") or "").strip()
+    timestamp_value = field("replay_timestamp", "timestamp")
+    timestamp = "" if timestamp_value is None else str(timestamp_value).strip()
+    try:
+        seed = int(row.get("replay_seed", row.get("seed")))
+    except (TypeError, ValueError):
+        return None
+    if not phase or not episode or not timestamp:
+        return None
+    return phase, episode, seed, timestamp
+
+
+def _v2x_replay_rows(
+    path: Path, *, require_adaptive_reward: bool = False,
+    require_judge: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Load only native, identified, non-evaluation transition rows."""
+    accepted: list[dict[str, Any]] = []
+    rejected = {
+        "invalid_native_transition": 0,
+        "official_evaluation_excluded": 0,
+        "missing_phase_episode_seed_or_timestamp": 0,
+        "duplicate_transition_identity": 0,
+        "adaptive_reward_contract_missing": 0,
+        "adaptive_reward_invalid": 0,
+        "evaluation_seed_excluded": 0,
+        "scenario_control_override_excluded": 0,
+    }
+    seen: set[tuple[str, str, int, str]] = set()
+    source_rows = (
+        iter_v2x_valid_rows(path, require_judge=True)
+        if require_judge else iter_valid_rows(path)
+    )
+    for row in source_rows:
+        try:
+            seed = int(row.get("replay_seed", row.get("seed")))
+        except (TypeError, ValueError):
+            seed = -1
+        if seed not in {43, 44}:
+            rejected["evaluation_seed_excluded"] += 1
+            continue
+        if row.get("scenario_control_override") is not False:
+            rejected["scenario_control_override_excluded"] += 1
+            continue
+        if require_adaptive_reward:
+            if row.get("reward_contract") != REWARD_CONTRACT:
+                rejected["adaptive_reward_contract_missing"] += 1
+                continue
+            if row.get("collection_quality", {}).get("valid_for_training") is not True:
+                rejected["adaptive_reward_invalid"] += 1
+                continue
+            snapshot = row.get("adaptive_reward")
+            if not isinstance(snapshot, dict) or snapshot.get("reward_contract") != REWARD_CONTRACT:
+                rejected["adaptive_reward_invalid"] += 1
+                continue
+        if _is_official_evaluation_row(row):
+            rejected["official_evaluation_excluded"] += 1
+            continue
+        identity = _v2x_replay_identity(row)
+        if identity is None:
+            rejected["missing_phase_episode_seed_or_timestamp"] += 1
+            continue
+        if identity in seen:
+            rejected["duplicate_transition_identity"] += 1
+            continue
+        seen.add(identity)
+        accepted.append(row)
+    return accepted, rejected
+
+
+def build_v2x_replay_80_20(
+    historical: Path,
+    recent: Path,
+    output: Path,
+    seed: int,
+    max_rows: int = 600,
+    schema: str = V2X_REPLAY_80_20_SCHEMA,
+    replay_policy: str = "historical_80_recent_20",
+    run_seed: int | None = None,
+    strict_recent_evidence: bool = False,
+) -> dict[str, Any]:
+    """Build the article V2X replay with exact, non-replaceable 80/20 quotas.
+
+    The function is intentionally fail-closed.  It never borrows one bucket
+    to fill the other and never duplicates a transition, even while a
+    controller is short on data.  A caller must wait for the missing phase to
+    produce evidence instead of training a differently distributed policy.
+    """
+    target = int(max_rows)
+    if target <= 0:
+        raise ValueError("replay 80/20 exige max_rows positivo")
+    # This is a V2X-specific contract.  It always requires an immutable
+    # adaptive-reward snapshot, including in dry-run and unit-test paths.
+    require_adaptive_reward = True
+    historical_rows, historical_rejected = _v2x_replay_rows(
+        historical, require_adaptive_reward=require_adaptive_reward, require_judge=False
+    )
+    recent_rows, recent_rejected = _v2x_replay_rows(
+        recent, require_adaptive_reward=require_adaptive_reward,
+        require_judge=strict_recent_evidence,
+    )
+    historical_quota = int(target * 0.80)
+    recent_quota = target - historical_quota
+
+    # A source must not be able to appear in both buckets.  This can happen
+    # if a caller appends the current export to the bank before sampling it.
+    historical_ids = {_v2x_replay_identity(row) for row in historical_rows}
+    recent_unique: list[dict[str, Any]] = []
+    overlap = 0
+    for row in recent_rows:
+        if _v2x_replay_identity(row) in historical_ids:
+            overlap += 1
+            continue
+        recent_unique.append(row)
+    recent_rows = recent_unique
+    quota_ready = len(historical_rows) >= historical_quota and len(recent_rows) >= recent_quota
+    report = {
+        "schema": schema,
+        "replay_policy": replay_policy,
+        "seed": int(seed),
+        "sampling_rng_seed": int(seed),
+        "run_seed": int(run_seed) if run_seed is not None else None,
+        "target_rows": target,
+        "historical_required": historical_quota,
+        "recent_required": recent_quota,
+        "historical_valid": len(historical_rows),
+        "recent_valid": len(recent_rows),
+        "unique_available": len(historical_rows) + len(recent_rows),
+        "historical_used": 0,
+        "recent_used": 0,
+        "total": 0,
+        "no_duplicates": True,
+        "evaluation_excluded": True,
+        "source_overlap_excluded": overlap,
+        "historical_rejected": historical_rejected,
+        "recent_rejected": recent_rejected,
+        "quota_ready": quota_ready,
+        "quota_unmet_groups": [
+            *([] if len(historical_rows) >= historical_quota else ["historical"]),
+            *([] if len(recent_rows) >= recent_quota else ["recent"]),
+        ],
+        "selected_transition_ids": {"historical": [], "recent": []},
+    }
+    if not quota_ready:
+        report["status"] = "waiting_replay_quota"
+        return report
+
+    rng = random.Random(seed)
+    historical_choice = (
+        rng.sample(historical_rows, historical_quota)
+        if historical_quota < len(historical_rows) else list(historical_rows)
+    )
+    # Recency is meaningful inside the current bucket.  Retain the newest
+    # required transitions rather than randomly replacing them with old rows.
+    recent_choice = recent_rows[-recent_quota:] if recent_quota else []
+    mixed = [
+        {**row, "replay_bucket": "historical", "replay_contract": schema}
+        for row in historical_choice
+    ] + [
+        {**row, "replay_bucket": "recent", "replay_contract": schema}
+        for row in recent_choice
+    ]
+    rng.shuffle(mixed)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as handle:
+        for row in mixed:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    report.update({
+        "status": "ready",
+        "historical_used": historical_quota,
+        "recent_used": recent_quota,
+        "total": len(mixed),
+        "phase_coverage": sorted({str(row.get("replay_phase")) for row in mixed}),
+        "output": str(output),
+        "selected_transition_ids": {
+            "historical": ["|".join(map(str, _v2x_replay_identity(row))) for row in historical_choice],
+            "recent": ["|".join(map(str, _v2x_replay_identity(row))) for row in recent_choice],
+        },
+    })
+    return report
+
+
+def build_v2x_replay_window90(
+    historical: Path,
+    recent: Path,
+    output: Path,
+    seed: int,
+    run_seed: int | None = None,
+    strict_recent_evidence: bool = False,
+) -> dict[str, Any]:
+    """Build the pilot's immutable 72 historical / 18 recent replay."""
+    return build_v2x_replay_80_20(
+        historical,
+        recent,
+        output,
+        seed,
+        max_rows=90,
+        schema=V2X_REPLAY_WINDOW90_SCHEMA,
+        replay_policy="window90_historical_80_recent_20",
+        run_seed=run_seed,
+        strict_recent_evidence=strict_recent_evidence,
+    )
+
+
+def _annotate_v2x_recent_trace(trace: Path, args: argparse.Namespace, update_id: int) -> None:
+    """Add campaign-local training identity to a derived export only."""
+    if not trace.is_file():
+        return
+    phase = f"{args.state_dir.name}:update_{update_id:04d}"
+    rows: list[dict[str, Any]] = []
+    with trace.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            row["replay_phase"] = str(row.get("replay_phase") or phase)
+            row["replay_episode"] = str(row.get("replay_episode") or update_id)
+            row["replay_seed"] = int(row.get("replay_seed", row.get("seed", args.seed)) or args.seed)
+            timestamp = row.get("replay_timestamp")
+            if timestamp is None or timestamp == "":
+                timestamp = row.get("timestamp")
+            row["replay_timestamp"] = "" if timestamp is None else str(timestamp)
+            row["replay_partition"] = "training"
+            # Keep the exporter value authoritative.  In particular, never
+            # turn missing evidence into a valid false value while a Judge or
+            # native readback is still pending.
+            if "scenario_control_override" not in row:
+                row["scenario_control_override"] = None
+            # Persisted banks use ``experience_id`` for de-duplication.  Give
+            # V2X rows the same phase-scoped identity used by the 80/20
+            # sampler so simulator decision counters may safely restart.
+            row["tasam_experience_id"] = (
+                f"v2x|{row['replay_phase']}|{row['replay_episode']}|"
+                f"{row['replay_seed']}|{row['replay_timestamp']}"
+            )
+            rows.append(row)
+    with trace.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _annotate_v2x_candidate(candidate: Path, active: Path, args: argparse.Namespace, replay: dict[str, Any]) -> None:
+    """Attach immutable article provenance to a successfully trained candidate."""
+    for name in ("tasam_marl_checkpoint_meta.json", "tasam_marl_summary.json"):
+        path = candidate / name
+        payload = load_json(path)
+        if not payload:
+            continue
+        payload.update({
+            "article_method": "sac_l2" if args.sam_mode == "l2" else "ta_sam_selective",
+            "sam_mode": args.sam_mode,
+            "l2_weight": float(args.l2_weight),
+            "replay_contract": (
+                V2X_REPLAY_WINDOW90_SCHEMA
+                if getattr(args, "replay_policy", "") == "v2x_window90"
+                else V2X_REPLAY_80_20_SCHEMA
+            ),
+            "reward_contract": REWARD_CONTRACT,
+            "historical_replay_source": str(args.experience_bank),
+            "historical_replay_sha256": sha256_file(args.experience_bank),
+            "recent_replay_source": str(args.recent_experience_bank),
+            "replay_rows": replay.get("total"),
+            "replay_quotas": {
+                "historical": replay.get("historical_used"),
+                "recent": replay.get("recent_used"),
+            },
+            "parent_checkpoint": str(active),
+            "evaluation_eligible": False,
+            "promotion_eligible": False,
+        })
+        save_json(path, payload)
 
 
 def _economic_row_is_eligible(row: dict[str, Any], *, current_native_only: bool = False) -> bool:
@@ -1443,21 +1785,34 @@ def _checkpoint_temporal_dim(checkpoint: Path) -> int:
 
 
 def export_recent(args: argparse.Namespace, trace: Path, summary: Path) -> None:
+    v2x_replay = getattr(args, "replay_policy", "legacy") in {"v2x_80_20", "v2x_window90"}
     cmd = [
         sys.executable,
         str(ROOT / "scripts/export_tasam_article_dataset.py"),
         "--db", str(args.db),
         "--output-jsonl", str(trace),
         "--summary-json", str(summary),
-        "--max-step-gap-s", "6",
+        "--e2-audit-jsonl", str(args.state_dir / "xapp_intents" / "tasam_control_audit.jsonl"),
+        "--max-step-gap-s", "60" if v2x_replay else "6",
         "--max-sim-reset-gap-s", "1",
         "--limit", str(args.export_limit),
+        # Keep pending rows visible to the live finalizer.  The replay
+        # validator below remains fail-closed and admits only rows whose
+        # subsequent native metric and Judge feedback have arrived.
+        "--include-invalid",
     ]
     # Forward the active checkpoint contract explicitly.  Otherwise, missing
     # optional diagnostics in a persisted decision can silently downgrade an
     # economic three-output target to the legacy two-output form.
     if int(getattr(args, "allocation_head_output_dim", 2)) >= 3:
         cmd.append("--allocation-total-head-enabled")
+    reward_contract = str(getattr(args, "reward_contract", "legacy") or "legacy")
+    if reward_contract != "legacy":
+        cmd.extend(["--reward-contract", reward_contract])
+    if str(os.environ.get("GREENRAN_TASAM_REWARD_ENERGY_ENABLED", "0")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        cmd.append("--energy-enabled")
     subprocess.run(cmd, cwd=ROOT, check=True)
 
 
@@ -1798,6 +2153,16 @@ def checkpoint_quality(checkpoint: Path) -> tuple[tuple[float, float, float, flo
     return values, True
 
 
+def checkpoint_eval_return(checkpoint: Path) -> tuple[float, bool]:
+    """Read the V2X learner return used only after category quality ties."""
+    try:
+        metrics = load_json(checkpoint / "tasam_marl_summary.json").get("final_metrics") or {}
+        value = float(metrics["eval_return"])
+    except (KeyError, OSError, TypeError, ValueError):
+        return 0.0, False
+    return (value, math.isfinite(value))
+
+
 def _promotion_operational_gate(candidate: Path, active: Path) -> tuple[bool, dict[str, Any]]:
     """Apply optional service/energy gates without breaking old checkpoints."""
     candidate_summary = load_json(candidate / "tasam_marl_summary.json")
@@ -1938,14 +2303,26 @@ def promote_candidate_if_better(state: dict[str, Any], candidate: Path, *, reaso
         return False
     candidate_quality, candidate_available = checkpoint_quality(candidate)
     active_quality, active_available = checkpoint_quality(active)
+    candidate_return, candidate_return_available = checkpoint_eval_return(candidate)
+    active_return, active_return_available = checkpoint_eval_return(active)
     operational_ok, operational_gate = _promotion_operational_gate(candidate, active)
     candidate_shadow_ok, candidate_shadow_gate = _candidate_shadow_gate(state, candidate, active)
     economic_ok, economic_gate = _economic_candidate_gate(state, candidate)
     # Empty/legacy summaries retain the historical behavior for compatibility.
-    better = (
-        True if not candidate_available or not active_available
-        else candidate_quality > active_quality
-    )
+    if not candidate_available or not active_available:
+        better = True
+    elif candidate_quality > active_quality:
+        better = True
+    elif candidate_quality == active_quality:
+        # Category/SLA quality remains primary.  A tied candidate may replace
+        # the active policy only when its frozen evaluation return is higher.
+        better = (
+            candidate_return_available
+            and active_return_available
+            and candidate_return > active_return + 1e-9
+        )
+    else:
+        better = False
     better = bool(better and operational_ok and candidate_shadow_ok and economic_ok)
     state["promotion_comparison"] = {
         "reason": reason,
@@ -1955,6 +2332,9 @@ def promote_candidate_if_better(state: dict[str, Any], candidate: Path, *, reaso
         "active_quality": list(active_quality),
         "candidate_quality_available": candidate_available,
         "active_quality_available": active_available,
+        "candidate_eval_return": candidate_return if candidate_return_available else None,
+        "active_eval_return": active_return if active_return_available else None,
+        "eval_return_tiebreak_used": candidate_quality == active_quality,
         "promoted": better,
         "operational_gate": operational_gate,
         "candidate_shadow_gate": candidate_shadow_gate,
@@ -1967,7 +2347,7 @@ def promote_candidate_if_better(state: dict[str, Any], candidate: Path, *, reaso
             if not candidate_shadow_ok
             else (
                 "economic_action_contract_or_evidence_invalid"
-                if not economic_ok else "inferior_category_first_quality"
+                if not economic_ok else "inferior_category_or_eval_return_quality"
             )
         )
         state["candidate_promoted"] = False
@@ -2505,13 +2885,29 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
     sqlite_economic_replay = bool(
         economic_contract and getattr(args, "sqlite_economic_replay", False)
     )
+    v2x_replay_80_20 = getattr(args, "replay_policy", "legacy") == "v2x_80_20"
+    v2x_replay_window90 = getattr(args, "replay_policy", "legacy") == "v2x_window90"
+    v2x_replay = v2x_replay_80_20 or v2x_replay_window90
+    replay_schema = V2X_REPLAY_WINDOW90_SCHEMA if v2x_replay_window90 else V2X_REPLAY_80_20_SCHEMA
+    # The energy V3 pilot deliberately combines the economic action head with
+    # the window90 72/18 replay.  It must use the JSONL V2X evidence contract;
+    # the SQLite economic history is a different, legacy replay source and is
+    # rejected only when explicitly requested alongside the V2X policy.
+    if v2x_replay and sqlite_economic_replay:
+        raise ValueError("replay V2X window90 não pode usar SQLite econômico")
+    if v2x_replay and not args.experience_bank:
+        raise ValueError("replay V2X 80/20 exige --experience-bank histórico")
+    if v2x_replay and not args.recent_experience_bank:
+        raise ValueError("replay V2X 80/20 exige --recent-experience-bank privado")
     # The durable economic bank already contains every training transition.
     # Exporting a second article trace here used to duplicate multi-gigabyte
     # decision snapshots before the learner even started.
     if not sqlite_economic_replay:
         export_recent(args, recent_trace, export_summary)
+    if v2x_replay:
+        _annotate_v2x_recent_trace(recent_trace, args, update_id)
     bank_manifest = None
-    if args.experience_bank and not sqlite_economic_replay:
+    if args.experience_bank and not sqlite_economic_replay and not v2x_replay:
         bank_manifest = persist_experience_bank(
             args.experience_bank, recent_trace, args.state_dir.name
         )
@@ -2550,7 +2946,26 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
     # is deliberately independent of the most recent 600-row JSONL tail.
     replay_recent = Path("/dev/null") if args.experience_bank else recent_trace
     replay_path = args.state_dir / "replay_buffer" / f"replay_update_{update_id:04d}.jsonl"
-    if economic_contract and getattr(args, "sqlite_economic_replay", False):
+    if v2x_replay:
+        # Sample the bank before appending the current export.  Otherwise the
+        # current phase can be silently counted as both historical and recent.
+        bank_manifest = persist_experience_bank(
+            args.recent_experience_bank, recent_trace, args.state_dir.name
+        )
+        replay = (
+            build_v2x_replay_window90(
+                args.experience_bank, args.recent_experience_bank,
+                replay_path, args.seed + update_id, run_seed=args.seed,
+                strict_recent_evidence=True,
+            )
+            if v2x_replay_window90 else
+            build_v2x_replay_80_20(
+                args.experience_bank, args.recent_experience_bank,
+                replay_path, args.seed + update_id, args.replay_rows,
+                run_seed=args.seed, strict_recent_evidence=True,
+            )
+        )
+    elif economic_contract and getattr(args, "sqlite_economic_replay", False):
         replay = build_sqlite_economic_replay(
             args.state_dir / "rapp_data_lake.db",
             replay_path,
@@ -2586,6 +3001,22 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
                 if args.prioritize_category_errors else 0
             ),
         )
+    if v2x_replay and not replay.get("quota_ready", False):
+        state["last_update_snapshot_count"] = snapshot_count
+        state["last_replay"] = replay
+        save_json(update_dir / "replay_manifest.json", {
+            "schema": replay_schema,
+            "update_id": update_id,
+            "replay": replay,
+            "training_started": False,
+        })
+        return {
+            "status": "waiting_replay_80_20_quota",
+            "update_id": update_id,
+            "snapshot_count": snapshot_count,
+            "replay": replay,
+            "experience_bank": bank_manifest,
+        }
     unmet_groups = set(replay.get("quota_unmet_groups", []))
     if args.prioritize_category_errors and "conditional_transition" in unmet_groups:
         # Do not train without the central state-transition signal. Optional
@@ -2602,9 +3033,18 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
             "replay": replay,
             "experience_bank": bank_manifest,
         }
+    if v2x_replay:
+        save_json(update_dir / "replay_manifest.json", {
+            "schema": replay_schema,
+            "update_id": update_id,
+            "replay": replay,
+            "training_started": True,
+            "evaluation_excluded": True,
+        })
     training_trace = replay_path
     economic_filter = None
-    if economic_contract:
+    economic_v2x_replay = bool(economic_contract and v2x_replay)
+    if economic_contract and not economic_v2x_replay:
         economic_trace = replay_path if sqlite_economic_replay else (
             args.state_dir / "replay_buffer" / f"economic_replay_update_{update_id:04d}.jsonl"
         )
@@ -2650,11 +3090,11 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
     # transitions before starting a learner update.
     minimum_trainable = (
         args.economic_update_min_transitions
-        if economic_contract else args.min_trainable_transitions
+        if economic_contract and not economic_v2x_replay else args.min_trainable_transitions
     )
     available_trainable = (
         economic_filter["eligible_rows"]
-        if economic_contract and economic_filter is not None
+        if economic_contract and not economic_v2x_replay and economic_filter is not None
         else replay.get("unique_available", 0)
     )
     if available_trainable < minimum_trainable:
@@ -2668,13 +3108,16 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
             "replay": replay,
             "experience_bank": bank_manifest,
         }
-    candidate = update_dir / "tasam_selective"
+    candidate = update_dir / str(args.sam_mode)
     train_python = str(args.train_python if args.train_python.exists() else sys.executable)
     cmd = [
         train_python, str(ROOT / "drlexp/training/train_tasam_marl.py"),
-        "--trace-jsonl", str(economic_trace if economic_contract else replay_path),
+        "--trace-jsonl", str(
+            economic_trace if economic_contract and not economic_v2x_replay else replay_path
+        ),
         "--output-dir", str(candidate), "--epochs", str(args.epochs_per_update),
-        "--trainer-backend", "article_sac", "--sam-mode", "tasam_selective",
+        "--trainer-backend", "article_sac", "--sam-mode", str(args.sam_mode),
+        "--lr", str(args.learning_rate), "--l2-weight", str(args.l2_weight),
         "--actor-sam-rho", "0.5", "--actor-sam-rho-final", "0.01",
         "--critic-sam-rho", "0.5", "--critic-sam-rho-final", "0.01",
         "--td-var-threshold", "0.01", "--warmup-epochs", "1", "--bc-weight", "0.0",
@@ -2707,7 +3150,10 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
             "training_status": "failed",
             "training_error": str(exc),
         }
-        for temporary in (recent_trace, replay_path if sqlite_economic_replay else economic_trace if economic_contract else None):
+        for temporary in (
+            recent_trace,
+            replay_path if sqlite_economic_replay else economic_trace if economic_contract and not economic_v2x_replay else None,
+        ):
             if temporary:
                 Path(temporary).unlink(missing_ok=True)
         return {
@@ -2718,7 +3164,11 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
             "experience_bank": bank_manifest,
             "error": str(exc),
         }
-    economic_replay = economic_replay_evidence(economic_trace if economic_contract else replay_path)
+    if v2x_replay:
+        _annotate_v2x_candidate(candidate, active, args, replay)
+    economic_replay = economic_replay_evidence(
+        economic_trace if economic_contract and not economic_v2x_replay else replay_path
+    )
     if economic_contract and economic_filter is not None:
         economic_replay["filter"] = economic_filter
         economic_replay["replay_schema"] = replay.get("replay_schema", "")
@@ -2748,6 +3198,19 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
         "snapshot_count": snapshot_count,
     })
     if full_control_mode():
+        # O gate de não-inferioridade (promote_candidate_if_better ->
+        # _candidate_shadow_gate) consome o artefato apontado por
+        # state["candidate_shadow_evaluation"].  Este ramo pulava
+        # evaluate_candidate_shadow, o artefato nunca existia e toda
+        # promoção falhava com candidate_shadow_evaluation_missing
+        # (piloto r19: promotion_count=0 em 239 decisões).  Avalie o
+        # candidato antes de promover; o rigor do gate permanece intacto.
+        shadow_evaluation, shadow_evaluation_path = evaluate_candidate_shadow(
+            args, state, active, candidate,
+            replay_path if sqlite_economic_replay else recent_trace,
+        )
+        state["candidate_shadow_evaluation"] = str(shadow_evaluation_path.resolve())
+        publish_candidate_shadow_manifest(args, state, candidate, shadow_evaluation)
         if not promote_candidate_if_better(state, candidate, reason="full_control_update_result"):
             save_rollout_manifest(args, state, stage="full", fraction=1.0, reason="candidate_not_promoted")
             return {
@@ -2801,6 +3264,7 @@ def normalize(args: argparse.Namespace) -> argparse.Namespace:
     args.db = Path(args.db) if args.db else args.state_dir / "rapp_data_lake.db"
     args.historical_trace = Path(args.historical_trace)
     args.experience_bank = Path(args.experience_bank) if args.experience_bank else None
+    args.recent_experience_bank = Path(args.recent_experience_bank) if args.recent_experience_bank else None
     args.train_python = Path(args.train_python)
     args.rollout_manifest = args.state_dir / "online_rollout.json"
     args.eval_manifest = args.state_dir / "online_eval_manifest.json"
@@ -2843,6 +3307,11 @@ def main() -> int:
         help="banco persistente de experiências anteriores para bootstrap explícito",
     )
     parser.add_argument(
+        "--recent-experience-bank",
+        default=None,
+        help="banco mutável exclusivo do arm para as 20%% transições recentes",
+    )
+    parser.add_argument(
         "--online-only",
         action="store_true",
         help="usa somente transições reais exportadas desta execução; não carrega replay histórico",
@@ -2852,6 +3321,24 @@ def main() -> int:
     parser.add_argument("--min-new-snapshots", type=int, default=500)
     parser.add_argument("--min-trainable-transitions", type=int, default=180)
     parser.add_argument("--replay-rows", type=int, default=600)
+    parser.add_argument(
+        "--replay-policy",
+        choices=("legacy", "v2x_80_20", "v2x_window90"),
+        default="legacy",
+        help="contrato de amostragem; v2x_80_20 usa somente 80%% histórico e 20%% recente",
+    )
+    parser.add_argument(
+        "--reward-contract", default="legacy",
+        help="contrato de recompensa exportado antes da amostragem do replay",
+    )
+    parser.add_argument(
+        "--sam-mode",
+        choices=("tasam_selective", "l2"),
+        default="tasam_selective",
+        help="TA-SAM seletivo ou baseline SAC com regularização L2",
+    )
+    parser.add_argument("--l2-weight", type=float, default=0.0)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument(
         "--prioritize-category-errors",
         action="store_true",
@@ -2893,6 +3380,10 @@ def main() -> int:
         "--sqlite-economic-replay", action="store_true",
         help="use the durable tasam_economic_transition_history table as replay source",
     )
+    parser.add_argument(
+        "--update-milestones", default="",
+        help="comma-separated snapshot milestones at which exactly one online update may run",
+    )
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--export-limit", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=45)
@@ -2908,6 +3399,31 @@ def main() -> int:
         help="reabre uma tentativa de update que falhou, sem reiniciar o runtime de coleta",
     )
     args = normalize(parser.parse_args())
+    try:
+        args.update_milestones = tuple(
+            sorted({int(item.strip()) for item in str(args.update_milestones).split(",") if item.strip()})
+        )
+    except ValueError as exc:
+        raise SystemExit("--update-milestones aceita apenas inteiros separados por vírgula") from exc
+    if any(value <= 0 for value in args.update_milestones):
+        raise SystemExit("--update-milestones deve conter valores positivos")
+    if args.replay_policy in {"v2x_80_20", "v2x_window90"}:
+        if args.online_only:
+            raise SystemExit("replay V2X 80/20 não aceita --online-only")
+        if args.experience_bank is None:
+            raise SystemExit("replay V2X 80/20 exige --experience-bank")
+        if args.recent_experience_bank is None:
+            raise SystemExit("replay V2X 80/20 exige --recent-experience-bank")
+        if args.prioritize_category_errors:
+            raise SystemExit("replay V2X 80/20 não aceita repetição/priorização de categorias")
+        expected_rows = 90 if args.replay_policy == "v2x_window90" else 600
+        if args.replay_rows != expected_rows:
+            raise SystemExit(
+                "contrato V2X 80/20 exige exatamente "
+                f"{expected_rows} transições ({int(expected_rows * 0.8)}/{int(expected_rows * 0.2)})"
+            )
+    if args.sam_mode == "l2" and args.l2_weight <= 0.0:
+        raise SystemExit("baseline SAC-L2 exige --l2-weight positivo")
     args.max_rollout_fraction = min(max(float(args.max_rollout_fraction), 0.0), 1.0)
     if args.max_rollout_fraction not in {0.0, 0.10, 0.25, 0.50, 1.0}:
         raise SystemExit("--max-rollout-fraction deve ser 0, 0.10, 0.25, 0.50 ou 1.0")
@@ -2928,6 +3444,18 @@ def main() -> int:
             "historical_replay_enabled": not args.online_only,
             "experience_bank_enabled": bool(args.experience_bank),
             "experience_bank": str(args.experience_bank) if args.experience_bank else "",
+            "recent_experience_bank": str(args.recent_experience_bank) if args.recent_experience_bank else "",
+            "replay_contract": (
+                V2X_REPLAY_WINDOW90_SCHEMA
+                if args.replay_policy == "v2x_window90"
+                else V2X_REPLAY_80_20_SCHEMA
+                if args.replay_policy == "v2x_80_20"
+                else "legacy"
+            ),
+            "replay_policy": args.replay_policy,
+            "sam_mode": args.sam_mode,
+            "l2_weight": float(args.l2_weight),
+            "learning_rate": float(args.learning_rate),
             "min_trainable_transitions": args.min_trainable_transitions,
             "status": "running" if initial_fraction > 0.0 else "shadow",
             "stage": initial_stage,
@@ -2943,12 +3471,24 @@ def main() -> int:
             "last_candidate_rejection": {},
             "last_rejected_checkpoint": "",
             "updates_completed": 0,
+            "update_milestones": list(args.update_milestones),
             "last_update_snapshot_count": 0,
             "stage_started_decisions": 0,
             "rollback_count": 0,
             "reward_enabled": True,
             "reward_source": "observed_real_metrics",
             "reward_mode": "continuous_observed_error",
+            "reward_contract": str(args.reward_contract or "legacy"),
+            "reward_weight_snapshot": {
+                "max_energy_weight": 0.30,
+                "ewma_previous": 0.75,
+                "ewma_current": 0.25,
+                "healthy_exit_decisions": 3,
+                "v2x_base": 0.45,
+                "v2x_risk_slope": 0.35,
+                "equity_base": 0.25,
+                "equity_risk_slope": 0.20,
+            } if str(args.reward_contract or "") == REWARD_CONTRACT else {},
             "replay_strategy": (
                 "energy_focused_40_30_20_10_v1"
                 if args.prioritize_category_errors else "uniform_valid_rows"
@@ -2970,6 +3510,20 @@ def main() -> int:
             "ml_enabled": os.environ.get("GREENRAN_ML_ENABLED", "0") in {"1", "true", "True"},
             "retrain_enabled": os.environ.get("GREENRAN_ML_RETRAIN_ENABLED", "false") in {"1", "true", "True"},
             "history": [],
+        }
+    # Persist the active reward contract even when resuming an older state
+    # file.  The snapshot is audit metadata; it never rewrites past rows.
+    state["reward_contract"] = str(args.reward_contract or state.get("reward_contract") or "legacy")
+    if state["reward_contract"] == REWARD_CONTRACT:
+        state["reward_weight_snapshot"] = {
+            "max_energy_weight": 0.30,
+            "ewma_previous": 0.75,
+            "ewma_current": 0.25,
+            "healthy_exit_decisions": 3,
+            "v2x_base": 0.45,
+            "v2x_risk_slope": 0.35,
+            "equity_base": 0.25,
+            "equity_risk_slope": 0.20,
         }
     elif migrate_legacy_candidate_shadow_state(args, state, count_decisions(args.db)):
         # Keep the active checkpoint and counters; the candidate remains in
@@ -3055,6 +3609,7 @@ def main() -> int:
     state["promotion_window"] = args.promotion_window
     state["min_economic_transitions"] = args.min_economic_transitions
     state["economic_update_min_transitions"] = args.economic_update_min_transitions
+    state["update_milestones"] = list(args.update_milestones)
     state["ml_enabled"] = os.environ.get("GREENRAN_ML_ENABLED", "0") in {"1", "true", "True"}
     state["retrain_enabled"] = os.environ.get("GREENRAN_ML_RETRAIN_ENABLED", "false") in {"1", "true", "True"}
     state["category_curriculum"] = checkpoint_entry(
@@ -3120,7 +3675,10 @@ def main() -> int:
         manifest_checkpoint,
         "control_candidate" if float(state.get("rollout_fraction", 0.0) or 0.0) > 0.0 else "shadow_ready",
     )
-    if state.get("candidate_checkpoint") and not full_control_mode():
+    # Sem o filtro full-control: no modo full-control o artefato de shadow
+    # também precisa existir para o gate de não-inferioridade; em retomadas,
+    # materialize-o aqui quando ausente (mesma recuperação do modo protegido).
+    if state.get("candidate_checkpoint"):
         candidate_path = Path(state["candidate_checkpoint"])
         if not state.get("candidate_shadow_evaluation"):
             candidate_trace = candidate_path.parent / "recent_trace.jsonl"
@@ -3184,9 +3742,17 @@ def main() -> int:
                 or state.get("candidate_shadow_evaluation")
             )
         )
+        milestone_due = True
+        if args.update_milestones:
+            completed = int(state.get("updates_completed", 0) or 0)
+            milestone_due = any(
+                snapshots >= milestone and completed < index
+                for index, milestone in enumerate(args.update_milestones, start=1)
+            )
         if (
             state.get("stage") != "rollback"
             and not pending_candidate
+            and milestone_due
             and snapshots - int(state.get("last_update_snapshot_count", 0) or 0) >= args.min_new_snapshots
             and (
                 args.online_only

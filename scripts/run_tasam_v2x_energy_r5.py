@@ -130,20 +130,24 @@ def _native_gate_ready(run_dir: Path, *, require_economic: bool) -> bool:
     simulation.  A complete sequence is required before stopping the arm so
     that a partial DU readback can never be mistaken for a valid gate.
     """
-    performance = run_dir / "xapp_metrics" / "extended_metrics.json"
-    try:
-        metrics = json.loads(performance.read_text(encoding="utf-8"))
-        sim_end = float((metrics.get("sim_time_range") or {}).get("end", 0.0) or 0.0)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return False
-    # The arm launcher measures RTF only after five simulated seconds.  Do
-    # not stop before that contract is observable; otherwise the gate could
-    # prove E2 while silently skipping the fixed performance floor.
-    if sim_end < 5.0:
-        return False
     trace = run_dir / "ns3_energy" / "TasamControlObservations.csv"
     if not trace.is_file():
         return False
+    # O snapshot extended_metrics.json é escrito periodicamente e atrasa em
+    # relação às observações por evento; na janela curta do gate esse atraso
+    # (ex.: 4.8 s simulados no snapshot com a cadeia v6 já além de 5 s no
+    # trace) derrubava braços íntegros no limite de 5 s.  O trace v6 é a
+    # fonte autoritativa do tempo simulado; o snapshot vira fallback apenas
+    # para o caso de ainda não haver linha v6.
+    snapshot_sim_end = 0.0
+    performance = run_dir / "xapp_metrics" / "extended_metrics.json"
+    try:
+        metrics = json.loads(performance.read_text(encoding="utf-8"))
+        snapshot_sim_end = float(
+            (metrics.get("sim_time_range") or {}).get("end", 0.0) or 0.0
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        snapshot_sim_end = 0.0
     # A native observation is not sufficient by itself: the sequence may be
     # a safety/fallback bundle or a partially acknowledged transaction.  The
     # actuator audit is the authoritative per-sequence proof that the
@@ -192,11 +196,18 @@ def _native_gate_ready(run_dir: Path, *, require_economic: bool) -> bool:
     if not allowed_sequences:
         return False
     by_sequence: dict[str, dict[str, set[str]]] = {}
+    trace_sim_end = 0.0
+    trace_v6_rows = 0
     try:
         with trace.open(newline="", encoding="utf-8", errors="replace") as handle:
             for row in csv.DictReader(handle):
                 if str(row.get("EvidenceVersion") or "") != "v6":
                     continue
+                trace_v6_rows += 1
+                try:
+                    trace_sim_end = max(trace_sim_end, float(row.get("Time") or 0.0))
+                except (TypeError, ValueError):
+                    pass
                 sequence = str(row.get("NativeControlSequence") or "").strip()
                 cell = str(row.get("CellId") or "").strip()
                 kind = str(row.get("ObservationKind") or "").strip()
@@ -209,6 +220,12 @@ def _native_gate_ready(run_dir: Path, *, require_economic: bool) -> bool:
                 if kind:
                     state["kinds"].add(kind)
     except (OSError, csv.Error):
+        return False
+    # O lançador mede o RTF só após cinco segundos simulados.  Não pare antes
+    # desse contrato ser observável; caso contrário o gate poderia provar o
+    # E2 pulando silenciosamente o piso de performance.
+    sim_end = trace_sim_end if trace_v6_rows else snapshot_sim_end
+    if sim_end < 5.0:
         return False
     return any(
         state["cells"] >= {"2", "3", "4"}
