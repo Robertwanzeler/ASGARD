@@ -86,7 +86,7 @@ from rapp_online_retrain_runtime import (
 )
 from rapp_armd_runtime import ARMDRuntimeAdvisor
 from rapp_rl_policy import build_runtime_rl_policy
-from rapp_sac_resource_model import apply_baseline_resource_band, apply_per_ue_allocation, compute_shared_resource_snapshot, enforce_resource_state, infer_allocation_state
+from rapp_sac_resource_model import apply_baseline_resource_band, apply_per_ue_allocation, compute_shared_resource_snapshot, enforce_resource_state, enforce_tasam_headroom_envelope, infer_allocation_state
 from rapp_marl_shadow import MARLShadowRuntimeEvaluator, build_shadow_comparison
 from rapp_network_improvement import build_network_improvement
 from rapp_judge import RAppJudge, expected_verdict_for_stage
@@ -112,11 +112,13 @@ from greenran_control_bundle import (
 )
 from tasam_economic_v3 import (
     CONTRACT as ECONOMIC_ACTION_V3_CONTRACT,
+    ENERGY_STAIRCASE_CONTRACT,
     DU_CELL_IDS,
     EconomicActionV3Error,
     normalize_power_by_cell,
     project_total_budget_fraction,
     realized_economic_reward,
+    staircase_candidate,
 )
 from greenran_infra_budget import CgroupV2Controller, InfraBudgetError, build_physical_budget
 from tasam_safety_shield import (
@@ -388,6 +390,17 @@ class RappResourceOptimizer:
             'healthy_streak': 0,
             'floor_total_ran': 0.0,
             'floor_total_ai': 0.0,
+        }
+        self._energy_staircase_state = {
+            'contract': ENERGY_STAIRCASE_CONTRACT,
+            'healthy_streak': 0,
+            'healthy_required': int(os.environ.get(
+                'GREENRAN_TASAM_ENERGY_STAIRCASE_HEALTHY_REQUIRED', '3'
+            ) or 3),
+            'rung_by_cell': {},
+            'last_confirmed_by_cell': {},
+            'last_observation_healthy': False,
+            'last_observation_critical': False,
         }
         self.marl_shadow_evaluator = MARLShadowRuntimeEvaluator(RUNTIME_CONFIG.get('tasam_advisor', {}))
         if self.marl_shadow_evaluator.require_checkpoint and not self.marl_shadow_evaluator.checkpoint_loaded:
@@ -1429,6 +1442,108 @@ class RappResourceOptimizer:
         ).strip().lower() in {'applied_action_v2', ECONOMIC_ACTION_V3_CONTRACT}
 
     @staticmethod
+    def _energy_staircase_enabled() -> bool:
+        return os.environ.get(
+            'GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT', ''
+        ).strip() == ENERGY_STAIRCASE_CONTRACT
+
+    @staticmethod
+    def _safe_power_floor_by_cell(decision: dict, allocation: dict, contract: dict) -> dict | None:
+        """Read only an explicit native/checkpoint safe power-floor ledger.
+
+        The staircase must never infer RF safety from the actor request or
+        from scheduler shares.  Campaigns that do not expose this ledger are
+        therefore rejected into the existing full-power safety path.
+        """
+        proposal = decision.get('tasam_proposal') or {}
+        advisor = decision.get('tasam_advisor') or {}
+        ledger_candidate = None
+        ledger_path = os.environ.get('GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER', '').strip()
+        if ledger_path:
+            try:
+                with open(ledger_path, encoding='utf-8') as handle:
+                    ledger = json.load(handle)
+                if (
+                    isinstance(ledger, dict)
+                    and ledger.get('status') == 'validated'
+                    and ledger.get('schema') == 'greenran.tasam.v2x.safe_power_floor.v1'
+                ):
+                    ledger_candidate = ledger.get('safe_floor_percent_by_cell')
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                ledger_candidate = None
+        candidates = (
+            ledger_candidate,
+            decision.get('safe_power_floor_percent_by_cell'),
+            decision.get('native_safe_power_floor_percent_by_cell'),
+            allocation.get('safe_power_floor_percent_by_cell'),
+            allocation.get('native_safe_power_floor_percent_by_cell'),
+            proposal.get('safe_power_floor_percent_by_cell'),
+            advisor.get('safe_power_floor_percent_by_cell'),
+            (contract.get('live_candidate') or {}).get('safe_power_floor_percent_by_cell'),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, dict) and all(
+                str(cell) in candidate or cell in candidate for cell in DU_CELL_IDS
+            ):
+                return candidate
+        return None
+
+    def _apply_energy_staircase(
+        self,
+        decision: dict,
+        allocation: dict,
+        contract: dict,
+        requested_power_by_cell: dict[int, int],
+    ) -> tuple[dict[int, int], bool]:
+        """Project only TA-SAM's economic action onto the safe ladder."""
+        if not self._energy_staircase_enabled():
+            return requested_power_by_cell, False
+        selected_assistant = str(decision.get('selected_assistant') or '').lower()
+        if selected_assistant not in {'ta_sam', 'joint'}:
+            decision['energy_staircase_applied'] = False
+            decision['energy_staircase_reason'] = 'rapp_reference_is_unrestricted'
+            return requested_power_by_cell, False
+        floor = self._safe_power_floor_by_cell(decision, allocation, contract)
+        if floor is None:
+            decision['energy_staircase_applied'] = False
+            decision['energy_staircase_reason'] = 'safe_power_floor_telemetry_missing'
+            decision['tasam_v3_action_error'] = 'energy_staircase_requires_native_safe_power_floor'
+            return {cell: 100 for cell in DU_CELL_IDS}, True
+        state = dict(self._energy_staircase_state)
+        try:
+            selected, next_state = staircase_candidate(
+                floor,
+                requested_power_by_cell,
+                allow_sleep=os.environ.get('GREENRAN_TASAM_ALLOW_DU_SLEEP', '0') == '1',
+                state=state,
+                healthy=bool(state.get('last_observation_healthy')),
+                healthy_required=int(state.get('healthy_required', 3) or 3),
+                critical=bool(state.get('last_observation_critical')),
+            )
+        except EconomicActionV3Error as exc:
+            decision['energy_staircase_applied'] = False
+            decision['energy_staircase_reason'] = str(exc)
+            decision['tasam_v3_action_error'] = str(exc)
+            return {cell: 100 for cell in DU_CELL_IDS}, True
+        self._energy_staircase_state = next_state
+        self._energy_staircase_state['last_observation_healthy'] = False
+        self._energy_staircase_state['last_observation_critical'] = False
+        decision['energy_staircase_applied'] = True
+        decision['energy_staircase_contract'] = ENERGY_STAIRCASE_CONTRACT
+        decision['energy_staircase_state'] = dict(next_state)
+        decision['energy_staircase_safe_floor_percent_by_cell'] = {
+            str(cell): float(floor.get(cell, floor.get(str(cell))))
+            for cell in DU_CELL_IDS
+        }
+        decision['energy_staircase_requested_power_percent_by_cell'] = {
+            str(cell): int(requested_power_by_cell[cell]) for cell in DU_CELL_IDS
+        }
+        decision['energy_staircase_selected_power_percent_by_cell'] = {
+            str(cell): int(selected[cell]) for cell in DU_CELL_IDS
+        }
+        return selected, False
+
+    @staticmethod
     def _is_economic_contract(contract: dict | None) -> bool:
         return str((contract or {}).get('contract') or '') in {
             'applied_action_v2', ECONOMIC_ACTION_V3_CONTRACT,
@@ -1634,7 +1749,7 @@ class RappResourceOptimizer:
     ) -> None:
         """Keep flat decision columns and nested v2 contract in sync."""
         contract = decision.get('economic_action')
-        if not isinstance(contract, dict) or contract.get('contract') != 'applied_action_v2':
+        if not isinstance(contract, dict) or not self._is_economic_contract(contract):
             return
         self._sync_economic_contract_provenance(decision, contract)
         if projected_power is not None:
@@ -1667,7 +1782,7 @@ class RappResourceOptimizer:
         ADVISORY.
         """
         contract = contract if isinstance(contract, dict) else decision.get('economic_action')
-        if not isinstance(contract, dict) or contract.get('contract') != 'applied_action_v2':
+        if not isinstance(contract, dict) or not RappResourceOptimizer._is_economic_contract(contract):
             return contract or {}
         for field in (
             'armd_safety_level', 'armd_role', 'armd_advisory_only', 'armd_hard_veto',
@@ -2216,6 +2331,9 @@ class RappResourceOptimizer:
             )
         if not self._tasam_full_control_enabled():
             allocation = enforce_resource_state(allocation, preserve_allocation=True)
+        allocation = enforce_tasam_headroom_envelope(
+            allocation, headroom_ratio=0.15
+        )
         structural_valid = bool(
             tasam_advisor.get('enabled')
             and tasam_advisor.get('source') in {'checkpoint', 'mixed'}
@@ -3972,6 +4090,10 @@ class RappResourceOptimizer:
                 resource_allocation,
                 preserve_allocation=decision.get('selected_assistant') in {'ta_sam', 'joint'},
             )
+            if decision.get('selected_assistant') in {'ta_sam', 'joint'}:
+                resource_allocation = enforce_tasam_headroom_envelope(
+                    resource_allocation, headroom_ratio=0.15
+                )
             resource_allocation = apply_per_ue_allocation(resource_allocation)
         else:
             resource_allocation = apply_baseline_resource_band(
@@ -4464,6 +4586,107 @@ class RappResourceOptimizer:
             )
         return mapping, evidence
 
+    def _native_association_cells(self, sim_time_s):
+        """Return the native RRC IMSI set currently visible on each DU.
+
+        In MC runs an IMSI can legitimately be present in more than one
+        mmWave RRC map while the association converges.  The old helper
+        collapsed those rows independently per IMSI, which could create a
+        bundle with an empty DU or with a policy sent to a DU that did not
+        contain that RNTI when ns-3 processed the request.  Use the latest
+        complete per-cell snapshot instead and preserve native multi-cell
+        membership for scheduler preparation.
+        """
+        try:
+            self.data_lake.ingest_native_association_observations()
+            conn = getattr(self.data_lake, 'conn', None)
+            if conn is None:
+                return {}, 'association_database_unavailable'
+            cutoff = float(sim_time_s or 0.0)
+            campaign_id = str(os.environ.get('GREENRAN_CAMPAIGN_ID', '') or '').strip()
+            source_generation = str(os.environ.get('GREENRAN_NATIVE_SOURCE_GENERATION', '') or '').strip()
+            evidence_version = str(os.environ.get('GREENRAN_NATIVE_EVIDENCE_VERSION', '') or '').strip()
+            filters = ""
+            params = [cutoff]
+            if campaign_id:
+                filters += " AND campaign_id=?"
+                params.append(campaign_id)
+            if source_generation:
+                filters += " AND source_generation=?"
+                params.append(source_generation)
+            if evidence_version:
+                filters += " AND evidence_version=?"
+                params.append(evidence_version)
+            rows = conn.execute(
+                f"""
+                SELECT id, cell_id, imsi, rnti, sim_time_s, association_epoch
+                  FROM tasam_native_associations
+                 WHERE imsi BETWEEN 1 AND 20
+                   AND cell_id IN (2, 3, 4)
+                   AND sim_time_s <= ?
+                   {filters}
+                 ORDER BY cell_id ASC, sim_time_s ASC, id ASC
+                """,
+                tuple(params),
+            ).fetchall()
+        except Exception:
+            return {}, 'association_query_failed'
+
+        # The trace is change-based per cell.  Select one complete event for
+        # each DU, rather than mixing the latest row of every IMSI from
+        # different epochs.  This preserves removals and native MC overlap.
+        events: dict[int, dict[tuple[float, str], list[tuple[int, int, int, int]]]] = {}
+        for row in rows:
+            try:
+                row_id = int(row[0])
+                cell_id = int(row[1])
+                imsi = int(row[2])
+                rnti = int(row[3])
+                row_time = float(row[4])
+                epoch = str(row[5] or '')
+            except (TypeError, ValueError):
+                continue
+            if cell_id not in {2, 3, 4} or imsi not in range(1, 21):
+                continue
+            events.setdefault(cell_id, {}).setdefault((row_time, epoch), []).append(
+                (row_id, imsi, rnti, cell_id)
+            )
+
+        selected: dict[int, tuple[float, str, list[tuple[int, int, int, int]]]] = {}
+        for cell_id, cell_events in events.items():
+            if not cell_events:
+                continue
+            key = max(
+                cell_events,
+                key=lambda item: (item[0], max(row[0] for row in cell_events[item])),
+            )
+            selected[cell_id] = (key[0], key[1], cell_events[key])
+
+        missing_cells = sorted({2, 3, 4} - set(selected))
+        if missing_cells:
+            return {}, f'association_incomplete_missing_cells:{missing_cells}'
+
+        association_cells: dict[int, set[int]] = {2: set(), 3: set(), 4: set()}
+        coverage: dict[int, set[int]] = {imsi: set() for imsi in range(1, 21)}
+        evidence: dict[int, dict[str, object]] = {}
+        for cell_id, (row_time, epoch, cell_rows) in selected.items():
+            for _row_id, imsi, rnti, _cell_id in cell_rows:
+                association_cells[cell_id].add(imsi)
+                coverage[imsi].add(cell_id)
+            evidence[cell_id] = {
+                'cell_id': cell_id,
+                'sim_time_s': row_time,
+                'association_epoch': epoch,
+                'imsis': sorted(association_cells[cell_id]),
+            }
+
+        missing_imsis = sorted(imsi for imsi, cells in coverage.items() if not cells)
+        if missing_imsis:
+            return {}, f'association_incomplete_missing_imsis:{missing_imsis}'
+        if any(not association_cells[cell_id] for cell_id in (2, 3, 4)):
+            return {}, 'association_incomplete_empty_du'
+        return association_cells, evidence
+
     def _ingest_native_evidence_cycle(self, sim_time_s):
         """Import native traces even when the current decision is shadow.
 
@@ -4551,14 +4774,24 @@ class RappResourceOptimizer:
         )
         if action_origin == 'armd_rapp_safety':
             requested = 100
+        # The energetic rApp reference is also a native V3 producer.  It is
+        # operational evidence, not TA-SAM economic replay, but it must use
+        # the same per-DU bundle/readback contract so the two arms are
+        # comparable.  Safety bundles remain v2 failsafe traffic.
+        rapp_v3_candidate = (
+            self._economic_contract_name() == ECONOMIC_ACTION_V3_CONTRACT
+            and action_origin == 'rapp_live'
+        )
         power_by_cell: dict[int, int] | None = None
-        if v3_contract and economic_candidate and action_origin != 'armd_rapp_safety':
+        if (v3_contract and economic_candidate or rapp_v3_candidate) and action_origin != 'armd_rapp_safety':
             raw_power_by_cell = (
                 decision.get('tasam_power_percent_by_cell')
                 or (decision.get('tasam_proposal') or {}).get('power_percent_by_cell')
                 or (allocation.get('power_percent_by_cell') if isinstance(allocation, dict) else None)
                 or contract.get('proposed', {}).get('power_percent_by_cell')
                 or contract.get('projected', {}).get('power_percent_by_cell')
+                or contract.get('live_candidate', {}).get('power_percent_by_cell')
+                or {cell_id: requested for cell_id in DU_CELL_IDS}
             )
             try:
                 power_by_cell = normalize_power_by_cell(raw_power_by_cell)
@@ -4572,6 +4805,17 @@ class RappResourceOptimizer:
                 requested = 100
         if action_origin == 'armd_rapp_safety':
             power_by_cell = {cell_id: 100 for cell_id in DU_CELL_IDS}
+        staircase_failsafe = False
+        if power_by_cell and (v3_contract or rapp_v3_candidate):
+            power_by_cell, staircase_failsafe = self._apply_energy_staircase(
+                decision,
+                allocation,
+                contract,
+                power_by_cell,
+            )
+            if staircase_failsafe:
+                action_origin = 'armd_rapp_safety'
+                economic_candidate = False
         if power_by_cell and any(power == 0 for power in power_by_cell.values()):
             sleep_evidence = decision.get('du_sleep') or contract.get('projected', {}).get('du_sleep') or {}
             sleep_ready = (
@@ -4596,15 +4840,38 @@ class RappResourceOptimizer:
             )
         except (TypeError, ValueError):
             sim_time_s = 0.0
-        association_map, association_evidence = self._native_association_map(sim_time_s)
-        association_valid = set(association_map) == set(range(1, 21)) and all(
-            int(cell) in {2, 3, 4} for cell in association_map.values()
+        association_cells, association_evidence = self._native_association_cells(sim_time_s)
+        association_valid = (
+            set(association_cells) == {2, 3, 4}
+            and all(association_cells.get(cell) for cell in (2, 3, 4))
+            and set().union(*(association_cells.get(cell, set()) for cell in (2, 3, 4)))
+            == set(range(1, 21))
         )
+        # Keep a primary cell only for the SLA/floor projector.  The E2
+        # bundle below uses every native cell membership, including a real
+        # MC overlap, so scheduler preparation is sent to the same DUs that
+        # exposed the RNTI in the native trace.
+        association_map = {}
+        if association_valid:
+            for imsi in range(1, 21):
+                candidates = [
+                    cell for cell in (2, 3, 4)
+                    if imsi in association_cells.get(cell, set())
+                ]
+                association_map[imsi] = min(candidates)
         decision['tasam_association_evidence'] = {
             'valid': association_valid,
             'reason': '' if association_valid else str(association_evidence),
             'sim_time_s': sim_time_s,
             'mapping': association_map if association_valid else {},
+            'cells': {
+                str(cell): sorted(association_cells.get(cell, set()))
+                for cell in (2, 3, 4)
+            } if association_valid else {},
+            'multi_cell_imsis': sorted(
+                imsi for imsi in range(1, 21)
+                if sum(imsi in association_cells.get(cell, set()) for cell in (2, 3, 4)) > 1
+            ) if association_valid else [],
         }
         if association_valid:
             # Replace only the serving-cell field used by the E2 shield and
@@ -4687,9 +4954,24 @@ class RappResourceOptimizer:
         if not failsafe:
             requested = int(projected['tx_power_percent'])
             for policy in projected.get('ue_policies') or []:
-                cells[int(policy['cell_id'])].append({
-                    key: value for key, value in policy.items() if key != 'cell_id'
-                })
+                imsi = int(policy['imsi'])
+                native_cells = [
+                    cell for cell in (2, 3, 4)
+                    if imsi in association_cells.get(cell, set())
+                ]
+                if not native_cells:
+                    failsafe = True
+                    break
+                for cell_id in native_cells:
+                    cells[cell_id].append({
+                        key: value for key, value in policy.items() if key != 'cell_id'
+                    })
+            if not all(cells[cell_id] for cell_id in (2, 3, 4)):
+                failsafe = True
+            if failsafe:
+                decision['tasam_association_evidence']['reason'] = 'native_association_policy_coverage_incomplete'
+                decision['tasam_association_evidence']['valid'] = False
+                decision['tasam_association_evidence']['mapping'] = {}
             allocation['per_ue_floor_feasible'] = True
             allocation['floor_verified'] = True
             allocation['floor_by_cell_bp'] = projected.get('floor_by_cell_bp', {})
@@ -4733,12 +5015,20 @@ class RappResourceOptimizer:
                     io_fraction=decision.get('tasam_infra_io_budget'),
                 ),
             }
-            if v3_contract and power_by_cell:
+            if (v3_contract or rapp_v3_candidate) and power_by_cell:
                 bundle['schema'] = CONTROL_BUNDLE_V3_SCHEMA
                 bundle['economic_action_contract'] = ECONOMIC_ACTION_V3_CONTRACT
                 bundle['power_percent_by_cell'] = {
                     str(cell_id): int(power) for cell_id, power in power_by_cell.items()
                 }
+                if any(
+                    sum(
+                        1 for cell_policies in cells.values()
+                        if any(int(item.get('imsi', 0)) == imsi for item in cell_policies)
+                    ) > 1
+                    for imsi in range(1, 21)
+                ):
+                    bundle['association_mode'] = 'native_rrc_mc_overlap'
                 bundle['mode'] = ECONOMIC_ACTION_V3_CONTRACT
                 if any(power == 0 for power in power_by_cell.values()):
                     bundle['du_sleep'] = dict(decision.get('du_sleep') or {})
@@ -4807,7 +5097,7 @@ class RappResourceOptimizer:
                 decision['native_operational_action_origin'] = action_origin
             native_required = os.environ.get(
                 'GREENRAN_NATIVE_EVIDENCE_VERSION', 'v3'
-            ).strip() == 'v5'
+            ).strip() in {'v5', 'v6'}
             context_ok = self._write_native_control_context(decision, trace_contract)
             if native_required and not context_ok and not failsafe:
                 # An optimization without the native identity bridge is not
@@ -4854,6 +5144,21 @@ class RappResourceOptimizer:
             decision['tasam_control_ack'] = ack
             policy_applied = bool(ack.get('applied')) and not bool(ack.get('fallback'))
             decision['tasam_transport_ack'] = policy_applied
+            cell_results = ack.get('cell_results') if isinstance(ack, dict) else None
+            if isinstance(cell_results, list):
+                confirmed_cells = {
+                    int(item.get('cell_id')) for item in cell_results
+                    if isinstance(item, dict)
+                    and item.get('scheduler_ack') is True
+                    and item.get('power_ack') is True
+                    and item.get('cell_id') is not None
+                }
+                decision['e2_cell_ack_complete'] = confirmed_cells >= {2, 3, 4}
+                decision['e2_cell_ack_cells'] = sorted(confirmed_cells)
+            else:
+                decision['e2_cell_ack_complete'] = False if os.environ.get(
+                    'GREENRAN_NATIVE_EVIDENCE_VERSION', 'v3'
+                ).strip() in {'v5', 'v6'} else None
             # Transport ACK is not native application evidence. The flag used
             # by replay and promotion becomes true only in the delayed
             # feedback path after the ns-3 observation is correlated.
@@ -5269,16 +5574,20 @@ class RappResourceOptimizer:
             previous.get('native_operational_action_origin')
             or previous.get('tasam_e2_route') == 'native_operational_bundle'
         )
+        pending_bundle = previous.get('tasam_control_bundle') or {}
+        pending_cells_payload = pending_bundle.get('cells') or []
+        pending_native_correlation = str(
+            pending_contract.get('correlation_id')
+            or previous.get('native_operational_correlation_id')
+            or ''
+        )
         if (
-            not operational_only
-            and self._is_economic_contract(pending_contract) and (
-            previous.get('tasam_control_bundle') or {}
-            ).get('cells')
+            (operational_only or self._is_economic_contract(pending_contract))
+            and pending_cells_payload
         ):
-            pending_bundle = previous.get('tasam_control_bundle') or {}
-            pending_cells = [cell.get('cell_id') for cell in pending_bundle.get('cells') or []]
+            pending_cells = [cell.get('cell_id') for cell in pending_cells_payload]
             pending_command = self.data_lake.energy_command_for_correlation(
-                str(pending_contract.get('correlation_id') or '')
+                pending_native_correlation
             )
             pending_power = (
                 (pending_contract.get('applied') or {}).get('power_percent_by_cell')
@@ -5286,6 +5595,14 @@ class RappResourceOptimizer:
                 or pending_command.get('applied_power_percent')
                 or pending_command.get('requested_power_percent')
             )
+            if operational_only:
+                pending_power_by_cell = {
+                    str(cell.get('cell_id')): float(cell.get('tx_power_percent'))
+                    for cell in pending_cells_payload
+                    if cell.get('cell_id') is not None and cell.get('tx_power_percent') is not None
+                }
+                if pending_power_by_cell:
+                    pending_power = pending_power_by_cell
             pending_sequence = (
                 pending_contract.get('native_control_sequence')
                 or previous.get('tasam_control_sequence')
@@ -5299,7 +5616,7 @@ class RappResourceOptimizer:
                 require_evidence_version=os.environ.get('GREENRAN_NATIVE_EVIDENCE_VERSION', 'v3'),
                 source_generation=os.environ.get('GREENRAN_NATIVE_SOURCE_GENERATION') or None,
                 campaign_id=os.environ.get('GREENRAN_CAMPAIGN_ID') or None,
-                action_correlation_id=str(pending_contract.get('correlation_id') or '') or None,
+                action_correlation_id=pending_native_correlation or None,
             )
             def _sim_time(payload):
                 for value in (
@@ -5358,7 +5675,11 @@ class RappResourceOptimizer:
                 and previous.get('tasam_e2_route') != 'native_bundle'
             )
         )
-        correlation_id = str(contract.get('correlation_id') or '')
+        correlation_id = str(
+            contract.get('correlation_id')
+            or previous.get('native_operational_correlation_id')
+            or ''
+        )
         command = self.data_lake.energy_command_for_correlation(correlation_id)
         live = contract.get('live_candidate') or {}
         applied = contract.get('applied') or {}
@@ -5371,12 +5692,24 @@ class RappResourceOptimizer:
         # this exact transaction, power and simulation-time window.
         observed_energy = {}
         native_confirmation = {}
-        if contract_v2 and bundle_present and not operational_only:
+        if bundle_present and (contract_v2 or operational_only):
             bundle = previous.get('tasam_control_bundle') or {}
             expected_cells = [cell.get('cell_id') for cell in bundle.get('cells') or []]
+            expected_power_by_cell = (
+                applied.get('power_percent_by_cell')
+                or (command or {}).get('applied_power_percent')
+            )
+            if operational_only:
+                operational_power_by_cell = {
+                    str(cell.get('cell_id')): float(cell.get('tx_power_percent'))
+                    for cell in bundle.get('cells') or []
+                    if cell.get('cell_id') is not None and cell.get('tx_power_percent') is not None
+                }
+                if operational_power_by_cell:
+                    expected_power_by_cell = operational_power_by_cell
             native_confirmation = self.data_lake.confirm_native_control_observation(
                 contract.get('native_control_sequence') or previous.get('tasam_control_sequence'),
-                applied.get('power_percent_by_cell')
+                expected_power_by_cell
                 or applied.get('power_percent', (command or {}).get('applied_power_percent')),
                 expected_cells,
                 sim_time_s=bundle.get('sim_time_s'),
@@ -5456,6 +5789,60 @@ class RappResourceOptimizer:
                 })
                 contract['applied'] = applied
         actuation_confirmed = bool(contract_v2 and native_confirmation.get('valid'))
+        # V2X adaptive reward is scored only after the correlated native
+        # observation is available.  The first call to compute_observed_error
+        # above intentionally has no energy evidence because the async E2/ns-3
+        # readback has not arrived yet.  Recompose here so the trainer and the
+        # persisted transition consume the same immutable reward snapshot.
+        if (
+            os.environ.get('GREENRAN_TASAM_REWARD_CONTRACT', '').strip()
+            == 'greenran.tasam.v2x.reward_adaptive.v1'
+            and os.environ.get('GREENRAN_TASAM_REWARD_ENERGY_ENABLED', '0').strip().lower()
+            in {'1', 'true', 'yes', 'on'}
+        ):
+            observed_power_w = observed_energy.get('power_w')
+            reference_power_w = None
+            try:
+                calibration = load_calibration()
+                by_cell = native_confirmation.get('power_percent_by_cell') or {}
+                active_cells = sum(
+                    1 for cell in (2, 3, 4)
+                    if float(by_cell.get(str(cell), by_cell.get(cell, 0.0)) or 0.0) > 0.0
+                )
+                if active_cells in {2, 3} and calibration.get('sleep_states'):
+                    reference_power_w = sleep_state_power_w(
+                        calibration, active_cells=active_cells, power_percent=100.0
+                    )
+                elif calibration.get('combined_model'):
+                    combined = calibration['combined_model']
+                    reference_power_w = float(combined.get('idle_w', 0.0)) + float(
+                        combined.get('dynamic_w', 0.0)
+                    )
+                if reference_power_w is None or reference_power_w <= 0.0:
+                    reference_power_w = observed_radio_power_w(calibration, 100.0)
+            except (TypeError, ValueError, KeyError):
+                reference_power_w = None
+            energy_evidence = {
+                'native': bool(native_confirmation.get('valid')),
+                'e2_ack': bool(actuation_confirmed),
+                'evidence_version': native_confirmation.get('evidence_version', ''),
+                'action_correlation_id': correlation_id,
+                'power_w': observed_power_w,
+                'reference_power_w': reference_power_w,
+                'cost': (
+                    max(0.0, min(1.0, float(observed_power_w) / float(reference_power_w)))
+                    if observed_power_w is not None and reference_power_w and reference_power_w > 0.0
+                    else None
+                ),
+                'energy_model_version': str(
+                    contract.get('energy_model_version') or previous.get('energy_model_version') or ''
+                ),
+            }
+            previous['energy_evidence'] = energy_evidence
+            current_decision['energy_evidence'] = energy_evidence
+            refreshed = RAppJudge.compute_observed_error(previous, current_decision, RUNTIME_CONFIG)
+            feedback.update(refreshed)
+            feedback['energy_evidence'] = energy_evidence
         previous['ta_sam_actuation_applied'] = bool(
             actuation_confirmed
             and previous.get('selected_assistant') in {'ta_sam', 'joint'}
@@ -5567,6 +5954,22 @@ class RappResourceOptimizer:
         elif not aligned:
             invalid_reason = 'projected_applied_power_divergence_over_5pp'
         economic_valid = not invalid_reason
+        if self._energy_staircase_enabled() and previous.get('energy_staircase_applied'):
+            staircase_healthy = bool(
+                economic_valid
+                and not outcome.get('critical_violation')
+                and sla_penalty <= 0.0
+                and actuation_confirmed
+            )
+            self._energy_staircase_state['last_observation_healthy'] = staircase_healthy
+            self._energy_staircase_state['last_observation_critical'] = bool(
+                outcome.get('critical_violation') or not economic_valid
+            )
+            previous['energy_staircase_observation'] = {
+                'healthy': staircase_healthy,
+                'critical': bool(outcome.get('critical_violation') or not economic_valid),
+                'economic_transition_eligible': economic_valid,
+            }
         if outcome.get('critical_violation') or not previous_resource.get('floor_feasible', True):
             sla_penalty = 1.0
         energy_delta = float(energy_reward)
@@ -5938,6 +6341,18 @@ class RappResourceOptimizer:
                 'tasam_energy_decision': decision.get('tasam_energy_decision', ''),
                 'tasam_energy_action': decision.get('tasam_energy_action', ''),
                 'ta_sam_actuation_applied': decision.get('ta_sam_actuation_applied', False),
+                # Evidência da cadeia de permissão/rollout (ausentes do log até
+                # 2026-09-25: o diagnóstico do r19 leu None para um valor que
+                # nunca foi gravado).  Sem estes campos é impossível auditar
+                # por que uma decisão não atuou economicamente.
+                'armd_safety_level': decision.get('armd_safety_level'),
+                'tasam_operating_permission': decision.get('tasam_operating_permission'),
+                'assistant_rollout_fraction': decision.get('assistant_rollout_fraction'),
+                'assistant_rollout_allowed': decision.get('assistant_rollout_allowed'),
+                'assistant_rollout_applied': decision.get('assistant_rollout_applied'),
+                'proposal_applied_exactly': decision.get('proposal_applied_exactly', False),
+                'economic_execution_mode': decision.get('economic_execution_mode', ''),
+                'economic_safety_isolated': decision.get('economic_safety_isolated', False),
                 'control_trial_mode': decision.get('control_trial_mode', ''),
                 'effective_policy_algorithm': decision.get('effective_policy_algorithm', ''),
                 'effective_policy_source': decision.get('effective_policy_source', ''),
