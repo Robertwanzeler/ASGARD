@@ -20,6 +20,7 @@ whose name identifies ARMD.
 from __future__ import annotations
 
 import argparse
+import atexit
 from contextlib import closing
 import hashlib
 import json
@@ -41,21 +42,51 @@ sys.path.insert(0, str(ROOT / "src"))
 from greenran_infra_budget import (  # noqa: E402
     CgroupV2Controller,
     InfraBudgetError,
+    SYSTEMD_USER_SCOPE_BACKEND,
     assert_cgroup_delegation,
     build_physical_budget,
+    probe_systemd_user_scope,
 )
 from greenran_infra_monitor import InfrastructureMonitor  # noqa: E402
 from energy_calibration import load_calibration  # noqa: E402
 try:
+    from greenran_v2x_binary_freshness import assert_v2x_binary_fresh, build_provenance  # noqa: E402
+except ModuleNotFoundError:
+    from scripts.greenran_v2x_binary_freshness import assert_v2x_binary_fresh, build_provenance  # noqa: E402
+try:
     from run_tasam_online_controlled import prune_candidate_artifacts  # noqa: E402
 except ModuleNotFoundError:
     from scripts.run_tasam_online_controlled import prune_candidate_artifacts  # noqa: E402
+try:
+    from v2x_parallel_slots import SlotLease, assert_disk_capacity, resolve_slots  # noqa: E402
+except ModuleNotFoundError:
+    from scripts.v2x_parallel_slots import SlotLease, assert_disk_capacity, resolve_slots  # noqa: E402
 WALL_RUNNER = ROOT / "scripts" / "run_greenran_tasam_3du_wall10m.sh"
 ONLINE_CONTROLLER = ROOT / "scripts" / "run_tasam_online_controlled.py"
 DECISION_TARGET_WATCHER = ROOT / "scripts" / "stop_on_decision_target.py"
 DEFAULT_CHECKPOINT = ROOT / "runs/tasam_local_checkpoint_seed47_20260906"
 PROFILE = "tasam_training_balanced_v3"
-MODES = {"train_no_armd", "rapp_only", "rapp_only_actuating", "combined", "combined_shadow", "combined_online", "combined_actuation_smoke"}
+BASELINE_MAX_PROFILE = "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max"
+PARALLEL_PAIR_RESOURCE_PROFILE = "parallel_pair_v1"
+MODES = {
+    "train_no_armd", "rapp_only", "rapp_only_actuating", "combined",
+    "combined_shadow", "combined_online", "combined_actuation_smoke",
+    # Article-faithful V2X arms.  They are separate from the legacy economic
+    # modes so their replay, SAM choice and promotion criteria cannot leak
+    # into historical campaigns.
+    "sac_l2_online", "sac_l2_frozen", "tasam_v2x_online", "tasam_v2x_frozen",
+    "asgard_v2x_window90_online",
+    "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
+}
+V2X_ENERGY_MODES = {
+    "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
+}
+
+
+def _is_v6_v2x_profile(profile: str) -> bool:
+    """Return true for the versioned V6 V2X profiles, including V6.1."""
+    normalized = str(profile or "").strip().lower()
+    return normalized.startswith("tasam_training_balanced_v6") and "_v2x_" in normalized
 PROTECTED_MARKERS = ("v8_full_control", "v9_directional")
 EXPECTED_NS3_BINARY = "ns3.42-Energy_saving_with_cell_utilization_scenario"
 OPTIMIZED_NS3_BINARY = ROOT / "ns-O-RAN-flexric/mmwave-LENA-oran/build-v9-optimized/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario-optimized"
@@ -95,6 +126,38 @@ def _read_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _reconcile_wall_status(
+    run_dir: Path,
+    wall_status: int,
+    reason: str,
+    *,
+    completion_verified: bool,
+) -> None:
+    """Close a wall supervisor status left running by a finite ns-3 exit."""
+    path = run_dir / "wall_clock_status.json"
+    status = _read_json(path)
+    if not status or status.get("phase") != "running":
+        return
+    now = time.time()
+    started = status.get("started_at")
+    status.update({
+        # A SIGTERM is not proof that ns-3 finished its requested simulation.
+        # It is "finished" only when a separate, contract-specific completion
+        # proof has been established (finite sim-time or an allowed watcher).
+        "phase": "finished" if wall_status == 0 or completion_verified else "cancelled",
+        "finished_at": datetime.fromtimestamp(now, tz=timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "elapsed_s": status.get("elapsed_s", 0.0),
+        "remaining_s": 0.0,
+        "reconciled_by_arm": True,
+        "reconciliation_reason": reason or (
+            "wall_time_complete" if wall_status == 0
+            else ("verified_cooperative_completion" if completion_verified else "external_termination")
+        ),
+        "wall_runner_exit_code": wall_status,
+    })
+    _write_json(path, status)
 
 
 def _free_gib(path: Path) -> float:
@@ -667,17 +730,68 @@ def _validate_vehicle_profile_manifest(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"manifesto veicular inválido: {path}: {exc}") from exc
+    erratum_path = path.parent / "assessment_erratum_v1.json"
+    if erratum_path.is_file():
+        try:
+            erratum = json.loads(erratum_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"errata veicular inválida: {erratum_path}") from exc
+        if erratum.get("correction", {}).get("promotion_eligible") is False:
+            raise SystemExit("campanha veicular possui errata não promocionável")
     allowed = {4000, 6000, 8000, 12000, 16000}
     try:
         interval = int(payload.get("selected_interval_us") or 0)
     except (TypeError, ValueError):
         interval = 0
     if (
-        payload.get("schema") != "greenran.autonomous_vehicle_feasibility.v1"
+        payload.get("schema") not in {
+            "greenran.autonomous_vehicle_feasibility.v1",
+            "greenran.autonomous_vehicle_feasibility.v2",
+            "greenran.autonomous_vehicle_feasibility.v3",
+            "greenran.autonomous_vehicle_feasibility.v4",
+        }
         or payload.get("status") != "passed"
         or interval not in allowed
     ):
         raise SystemExit("manifesto veicular precisa ser uma seleção aprovada da v12")
+    if payload.get("schema") == "greenran.autonomous_vehicle_feasibility.v2":
+        provenance = payload.get("provenance") or {}
+        contract = provenance.get("metric_contract") or {}
+        if (
+            contract.get("pdcp_source") != "native_pdcp_trace_unique_sim_epochs"
+            or contract.get("collector_mode") != "pdcp_real"
+            or contract.get("proxy_allowed") is not False
+        ):
+            raise SystemExit("manifesto veicular v2 não comprova PDCP real sem proxy")
+    if payload.get("schema") == "greenran.autonomous_vehicle_feasibility.v3":
+        contract = payload.get("metric_contract")
+        if (
+            contract != "per_pdu_cohort_v1"
+            or payload.get("connectivity_mode") not in {"mmwave_only", "lte_anchored_mc"}
+            or payload.get("scheduler_policy") != "gbr_debt_rr_v1"
+            or int(payload.get("loss_grace_ms", 0)) != 1000
+        ):
+            raise SystemExit("manifesto veicular v3 não comprova o contrato PDCP por PDU")
+    if payload.get("schema") == "greenran.autonomous_vehicle_feasibility.v4":
+        provenance = payload.get("provenance") or {}
+        native_contract = provenance.get("metric_contract") or {}
+        matrix = payload.get("multi_seed_validation") or {}
+        if (
+            payload.get("scientific_decision") != "approved"
+            or payload.get("promotion_eligible") is not True
+            or payload.get("metric_contract") != "per_pdu_cohort_v1"
+            or payload.get("scheduler_policy") != "gbr_debt_rr_v1"
+            or int(payload.get("loss_grace_ms", 0)) != 1000
+            or native_contract.get("pdcp_source") != "native_pdcp_pdu_tx_rx"
+            or native_contract.get("collector_mode") != "pdcp_real"
+            or native_contract.get("proxy_allowed") is not False
+            or matrix.get("valid") is not True
+            or tuple(matrix.get("required_seeds") or []) != (45, 46, 47)
+            or tuple(matrix.get("complete_seeds") or []) != (45, 46, 47)
+            or matrix.get("seed47_reused_from_phase1") is not True
+            or matrix.get("provenance_compatible") is not True
+        ):
+            raise SystemExit("manifesto veicular v4 não comprova baseline multi-seed PDCP real")
     if expected_profile is not None and payload.get("profile") != expected_profile:
         raise SystemExit(
             "manifesto veicular pertence a outro perfil: "
@@ -774,18 +888,27 @@ def _validate_runtime_contract(env: dict[str, str], mode: str, checkpoint: Path)
     if mismatches:
         raise SystemExit("contrato do piloto inválido: " + "; ".join(mismatches))
     if env.get("GREENRAN_NS3_NATIVE_AGGREGATED_EVIDENCE") == "1":
-        if env.get("GREENRAN_NATIVE_EVIDENCE_VERSION") != "v5":
+        required_version = "v6" if (
+            mode in V2X_ENERGY_MODES
+            or env.get("GREENRAN_NATIVE_EVIDENCE_VERSION") == "v6"
+        ) else "v5"
+        if env.get("GREENRAN_NATIVE_EVIDENCE_VERSION") != required_version:
             raise SystemExit(
-                "evidência nativa incompatível: campanhas novas exigem GREENRAN_NATIVE_EVIDENCE_VERSION=v5"
+                "evidência nativa incompatível: "
+                f"o modo {mode} exige GREENRAN_NATIVE_EVIDENCE_VERSION={required_version}"
             )
         if env.get("GREENRAN_NATIVE_TRACE_PROFILE") != "v9_fidelity":
             raise SystemExit(
                 "perfil de trace nativo incompatível: esperado v9_fidelity"
             )
-    if mode in {"combined", "combined_online", "combined_actuation_smoke"}:
+    if mode in {
+        "combined", "combined_online", "combined_actuation_smoke",
+        "sac_l2_online", "sac_l2_frozen", "tasam_v2x_online", "tasam_v2x_frozen",
+        "asgard_v2x_window90_online", *V2X_ENERGY_MODES,
+    }:
         if mode == "combined_actuation_smoke" and env.get("GREENRAN_NS3_E2_CONTROL_ENABLED") != "1":
             raise SystemExit("smoke de atuação exige GREENRAN_NS3_E2_CONTROL_ENABLED=1")
-        if mode == "combined_online" and (
+        if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} and (
             env.get("GREENRAN_ML_ENABLED") != "1"
             or env.get("GREENRAN_ML_RETRAIN_ENABLED", "").lower() != "true"
         ):
@@ -886,6 +1009,9 @@ def _common_env(
     artifact_min_free_gib: float = 10.0,
     actuation_enabled: bool = False,
     native_fidelity: bool = False,
+    disable_app_overrides: bool = False,
+    infra_resource_profile: str | None = None,
+    execution_slot_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     sim_time_value = float(sim_time)
     sim_time_text = (
@@ -894,6 +1020,8 @@ def _common_env(
         else str(sim_time_value)
     )
     env = dict(os.environ)
+    if execution_slot_env:
+        env.update(execution_slot_env)
     env.update(
         {
             "GREENRAN_STATE_DIR": str(run_dir),
@@ -901,6 +1029,11 @@ def _common_env(
             # audit evidence remain in ``run_dir``; only the transient IPC
             # endpoints use this short path.
             "GREENRAN_SOCKET_DIR": str(_short_socket_dir(run_dir)),
+            "GREENRAN_V2X_EXECUTION_SLOT": env.get("GREENRAN_V2X_EXECUTION_SLOT", "serial"),
+            "GREENRAN_E2_TERM_PORT": env.get("GREENRAN_E2_TERM_PORT", "36421"),
+            "GREENRAN_E2_XAPP_PORT": env.get("GREENRAN_E2_XAPP_PORT", "36422"),
+            "GREENRAN_E2_LOCAL_PORT": env.get("GREENRAN_E2_LOCAL_PORT", "38470"),
+            "GREENRAN_PORT_OFFSET": env.get("GREENRAN_PORT_OFFSET", "0"),
             "GREENRAN_FIXED_SCENARIO_CONFIG": str(ROOT / "config/greenran_fixed_scenario.json"),
             "GREENRAN_SIM_TIME": sim_time_text,
             "GREENRAN_WALL_TIME_LIMIT_SECONDS": str(int(wall_time)),
@@ -922,9 +1055,11 @@ def _common_env(
                 if native_fidelity or os.environ.get("GREENRAN_NATIVE_EVIDENCE_VERSION", "v3") == "v3"
                 else os.environ.get("GREENRAN_COLLECTION_EVENT_TIME_SOURCE", "wall")
             ),
-            "GREENRAN_COLLECTION_EVENT_TICK_S": "0.25",
+            "GREENRAN_COLLECTION_EVENT_TICK_S": os.environ.get(
+                "GREENRAN_COLLECTION_EVENT_TICK_S", "0.25"
+            ),
             "GREENRAN_COLLECTION_EVENT_CYCLES": "0",
-            "GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES": "0",
+            "GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES": "1" if disable_app_overrides else "0",
             "GREENRAN_REAL_ONLY": "1",
             "GREENRAN_REQUIRE_REAL_PDCP": "1",
             "GREENRAN_TASAM_EXPORT_ALLOW_PROXY": "0",
@@ -1046,6 +1181,33 @@ def _common_env(
             "NS_GLOBAL_VALUE": f"RngRun={seed}",
         }
     )
+    if profile == BASELINE_MAX_PROFILE:
+        # The protected baseline is the only arm allowed to request the
+        # enlarged simulator envelope. MC/LTE are explicit so stale shell
+        # variables cannot silently disable recovery.
+        selected_resource_profile = infra_resource_profile or "baseline_max_v1"
+        scope_budget = build_physical_budget(
+            1.0, unrestricted=True, resource_profile=selected_resource_profile
+        )
+        scope_prefix = f"greenran-{run_dir.name}".replace("_", "-")[:80]
+        env.update({
+            "GREENRAN_INFRA_RESOURCE_PROFILE": selected_resource_profile,
+            "GREENRAN_CGROUP_BACKEND": SYSTEMD_USER_SCOPE_BACKEND,
+            "GREENRAN_CGROUP_SCOPE_PREFIX": scope_prefix,
+            "GREENRAN_NS3_USE_MC_UE_DEVICES": "true",
+            "GREENRAN_NS3_E2LTE_ENABLED": "true",
+            # E2-LTE carries fallback observability.  Keep the unstable
+            # E2-NR path disabled for the native rApp contract.
+            "GREENRAN_NS3_E2NR_ENABLED": "false",
+            "GREENRAN_NS3_E2DU_ENABLED": "true",
+            "GREENRAN_V2X_FALLBACK_POLICY": "mmwave_primary_lte_risk_fallback_v2",
+            "GREENRAN_V2X_LINK_METRIC_CONTRACT": "vehicle_link_state_v2",
+        })
+        for group, limits in scope_budget["groups"].items():
+            key = group.upper()
+            env[f"GREENRAN_CGROUP_SCOPE_{key}_CPU_QUOTA_US"] = str(limits["cpu_quota_us"])
+            env[f"GREENRAN_CGROUP_SCOPE_{key}_MEMORY_HIGH_BYTES"] = str(limits["memory_high_bytes"])
+            env[f"GREENRAN_CGROUP_SCOPE_{key}_IO_WEIGHT"] = str(limits["io_weight"])
     env["GREENRAN_TASAM_ONLINE_ROLLOUT_MANIFEST"] = str(run_dir / "online_rollout.json")
     env["GREENRAN_TASAM_EVAL_MANIFEST"] = str(run_dir / "online_eval_manifest.json")
     env["GREENRAN_MARL_CONTROL_GATE_MANIFEST"] = str(control_gate or (run_dir / "online_control_gate.json"))
@@ -1069,6 +1231,130 @@ def _common_env(
 
 
 def mode_contract(mode: str) -> dict[str, Any]:
+    if mode == "sac_l2_online":
+        return {
+            "armd_mode": "off",
+            "tasam_enabled": True,
+            "tasam_mode": "tasam_full_control",
+            "controller_enabled": True,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": True,
+            "article_method": "sac_l2",
+            "sam_mode": "l2",
+            "l2_weight": 0.0001,
+            "replay_contract": "greenran.tasam.v2x.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "description": "baseline SAC-L2 com adaptação online V2X, sem SAM e sem ARMD",
+        }
+    if mode == "sac_l2_frozen":
+        return {
+            "armd_mode": "off",
+            "tasam_enabled": True,
+            "tasam_mode": "tasam_full_control",
+            "controller_enabled": False,
+            "actuation_enabled": True,
+            "frozen_checkpoint": True,
+            "historical_replay": False,
+            "article_method": "sac_l2",
+            "sam_mode": "l2",
+            "l2_weight": 0.0001,
+            "replay_contract": "greenran.tasam.v2x.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "description": "avaliação V2X congelada do baseline SAC-L2",
+        }
+    if mode == "tasam_v2x_online":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "assistant_only_control",
+            "assistant_decision_mode": "cooperative_hierarchy",
+            "controller_enabled": True,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": True,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "description": "TA-SAM seletivo online V2X com ARMD, Judge e safety shield",
+        }
+    if mode == "asgard_v2x_window90_online":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "assistant_only_control",
+            "assistant_decision_mode": "cooperative_hierarchy",
+            "controller_enabled": True,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": True,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.window90.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "pilot_rollout_100": True,
+            "description": "piloto TA-SAM online V2X 90 observações com rollout integral e safety shield",
+        }
+    if mode == "asgard_v2x_window90_energy_online":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "assistant_only_control",
+            "assistant_decision_mode": "cooperative_hierarchy",
+            "controller_enabled": True,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": True,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.window90.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "pilot_rollout_100": True,
+            "energy_mode": True,
+            "description": "TA-SAM online V2X com atuação econômica V3 e energia nativa",
+        }
+    if mode == "asgard_v2x_window90_energy_frozen":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "assistant_only_control",
+            "assistant_decision_mode": "cooperative_hierarchy",
+            "controller_enabled": False,
+            "actuation_enabled": True,
+            "frozen_checkpoint": True,
+            "historical_replay": False,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.window90.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "pilot_rollout_100": True,
+            "energy_mode": True,
+            "description": "avaliação congelada TA-SAM V2X com energia nativa",
+        }
+    if mode == "tasam_v2x_frozen":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "assistant_only_control",
+            "assistant_decision_mode": "cooperative_hierarchy",
+            "controller_enabled": False,
+            "actuation_enabled": True,
+            "frozen_checkpoint": True,
+            "historical_replay": False,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "description": "avaliação V2X congelada TA-SAM com ARMD, Judge e safety shield",
+        }
     if mode == "train_no_armd":
         return {
             "armd_mode": "off",
@@ -1175,6 +1461,12 @@ def build_environment(
     artifact_budget_gib: float = 4.0,
     artifact_min_free_gib: float = 10.0,
     native_fidelity: bool = False,
+    energy_enabled: bool = False,
+    energy_staircase: bool = False,
+    safe_power_floor_ledger: Path | None = None,
+    disable_app_overrides: bool = False,
+    infra_resource_profile: str | None = None,
+    execution_slot_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     contract = mode_contract(mode)
     env = _common_env(
@@ -1193,6 +1485,9 @@ def build_environment(
         artifact_min_free_gib=artifact_min_free_gib,
         actuation_enabled=bool(contract["actuation_enabled"]),
         native_fidelity=native_fidelity,
+        disable_app_overrides=disable_app_overrides,
+        infra_resource_profile=infra_resource_profile,
+        execution_slot_env=execution_slot_env,
     )
     env["GREENRAN_ARMD_MODE"] = str(contract["armd_mode"])
     # The dispatcher/user service may inherit the historical file/shadow
@@ -1212,15 +1507,61 @@ def build_environment(
         # dedicated EPS activation for McUeNetDevice.  The v12 vehicle
         # contract uses the supported mmWave UE bearer path explicitly.
         env["GREENRAN_NS3_USE_MC_UE_DEVICES"] = "false"
+    if profile == BASELINE_MAX_PROFILE:
+        # A baseline-max run must use the real LTE anchor even if the caller
+        # inherited a legacy vehicle manifest that requested non-MC devices.
+        env["GREENRAN_NS3_USE_MC_UE_DEVICES"] = "true"
+        env["GREENRAN_NS3_E2LTE_ENABLED"] = "true"
+        env["GREENRAN_NS3_E2NR_ENABLED"] = "false"
+        env["GREENRAN_NS3_E2DU_ENABLED"] = "true"
     env["GREENRAN_TASAM_ADVISOR_ENABLED"] = "1" if contract["tasam_enabled"] else "0"
     env["GREENRAN_TASAM_ADVISOR_MODE"] = str(contract["tasam_mode"])
     env["GREENRAN_CONTROL_TRIAL_ENABLED"] = "1" if contract["actuation_enabled"] else "0"
     env["GREENRAN_TASAM_REQUIRE_CHECKPOINT"] = "1" if contract["tasam_enabled"] else "0"
+    if contract.get("reward_contract"):
+        env["GREENRAN_TASAM_REWARD_CONTRACT"] = str(contract["reward_contract"])
+        env["GREENRAN_TASAM_REWARD_ENERGY_ENABLED"] = "1" if energy_enabled else "0"
+    else:
+        env.pop("GREENRAN_TASAM_REWARD_CONTRACT", None)
+        env.pop("GREENRAN_TASAM_REWARD_ENERGY_ENABLED", None)
+    # The rApp reference is also an energy-observation arm when requested.
+    # It must use the same V3/native readback path, while remaining free of
+    # TA-SAM's floor/headroom envelope.
+    if mode == "rapp_only_actuating" and energy_enabled:
+        env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = "economic_action_v3_per_du_sleep"
+    elif contract.get("economic_action_contract"):
+        env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = str(
+            contract["economic_action_contract"]
+        )
+    if mode in V2X_ENERGY_MODES or (energy_enabled and _is_v6_v2x_profile(profile)):
+        # v6 is intentionally distinct from the historical v5 trace: a
+        # current energy arm requires a complete three-DU confirmation.
+        env["GREENRAN_NATIVE_EVIDENCE_VERSION"] = "v6"
+        env["GREENRAN_NATIVE_SOURCE_GENERATION"] = f"{run_dir.name}:native-v6"
+        env["GREENRAN_NS3_NATIVE_AGGREGATED_EVIDENCE"] = "1"
+        env["GREENRAN_TASAM_ECONOMIC_HEAD_ENABLED"] = "1" if mode in V2X_ENERGY_MODES else "0"
+        env["GREENRAN_TASAM_RESOURCE_FLOOR_POLICY"] = "floor_to_115_percent_v1"
+        env["GREENRAN_TASAM_ECONOMIC_SAFETY_ISOLATION_REQUIRED"] = "1"
+        env["GREENRAN_TASAM_ECONOMIC_SAFETY_ISOLATION"] = "blocked_and_critical_v1"
+        if energy_staircase:
+            env["GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT"] = (
+                "greenran.tasam.v2x.energy_staircase.v1"
+            )
+            env["GREENRAN_TASAM_ENERGY_STAIRCASE_HEALTHY_REQUIRED"] = "3"
+            env["GREENRAN_TASAM_ALLOW_DU_SLEEP"] = "1"
+            if safe_power_floor_ledger is not None:
+                env["GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER"] = str(
+                    safe_power_floor_ledger.resolve()
+                )
+        if mode == "asgard_v2x_window90_energy_frozen":
+            env["GREENRAN_TASAM_ONLINE_ROLLOUT_FRACTION"] = "1.0"
+            env["GREENRAN_TASAM_PILOT_FULL_ROLLOUT"] = "1"
+            env["GREENRAN_ONLINE_UPDATE_OWNER"] = "frozen_checkpoint_evaluation"
     # ``_common_env`` is also used by the historical full-control trainer.
     # An assistant-only online adaptation must never inherit that override:
     # it starts with the declared 10% canary and only its controller may
     # advance a promoted candidate through later rollout stages.
-    env["GREENRAN_TASAM_FORCE_FULL_ROLLOUT"] = "1" if mode == "train_no_armd" else "0"
+    env["GREENRAN_TASAM_FORCE_FULL_ROLLOUT"] = "1" if mode in {"train_no_armd", "sac_l2_online"} else "0"
     if not contract["controller_enabled"]:
         env["GREENRAN_TASAM_TRUE_ONLINE_ENABLED"] = "0"
         env["GREENRAN_TASAM_TRUE_ONLINE_EXTERNAL_CONTROLLER"] = "0"
@@ -1247,36 +1588,37 @@ def build_environment(
         env["GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS"] = "30"
         env["GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW"] = "10"
         env["GREENRAN_CONTROL_TRIAL_STATE"] = str(run_dir / "control_trial_state.json")
-    if mode == "combined_online":
+    if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
         # Do not inherit config/core/runtime.json's historical disabled
         # defaults.  This flag is campaign-local and is persisted in the
         # learning meter so a run cannot be mistaken for online learning.
         env["GREENRAN_ML_ENABLED"] = "1"
         env["GREENRAN_ML_RETRAIN_ENABLED"] = "true"
-        env["GREENRAN_TASAM_ECONOMIC_HEAD_ENABLED"] = "1"
-        env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = os.environ.get(
-            "GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT",
-            "applied_action_v2",
-        )
-        env["GREENRAN_TASAM_ECONOMIC_SAFETY_ISOLATION_REQUIRED"] = "1"
-        env["GREENRAN_TASAM_ECONOMIC_SAFETY_ISOLATION"] = "blocked_and_critical_v1"
         env["GREENRAN_TASAM_ONLINE_UPDATE_OWNER"] = "run_tasam_online_controlled.py"
-        env["GREENRAN_CONTROL_TRIAL_FRACTION"] = "0.10"
+        env["GREENRAN_TASAM_ONLINE_REPLAY_CONTRACT"] = str(contract.get("replay_contract", "legacy"))
+        env["GREENRAN_TASAM_ONLINE_SAM_MODE"] = str(contract.get("sam_mode", "tasam_selective"))
+        env["GREENRAN_TASAM_ONLINE_L2_WEIGHT"] = str(contract.get("l2_weight", 0.0))
+        env["GREENRAN_CONTROL_TRIAL_FRACTION"] = "1.0" if mode in {"sac_l2_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} else "0.10"
         # The control-trial guard follows the controller-owned rollout
         # manifest, but never exceeds the economic campaign cap.
         env["GREENRAN_TASAM_MAX_ROLLOUT_FRACTION"] = os.environ.get(
             "GREENRAN_TASAM_MAX_ROLLOUT_FRACTION",
-            str(max(0.0, min(float(max_rollout_fraction if max_rollout_fraction is not None else 0.50), 1.0))),
+            str(max(0.0, min(float(max_rollout_fraction if max_rollout_fraction is not None else (1.0 if mode in {"sac_l2_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} else 0.50)), 1.0))),
         )
         env["GREENRAN_CONTROL_TRIAL_ENABLED"] = "1"
-        env["GREENRAN_TASAM_ONLINE_ROLLOUT_FRACTION"] = "0.10"
-        # Controlled exploration for the online economic learner.  The
-        # applied-action contract scores only realized effects, and the
-        # orchestrator caps this proposal against the same-snapshot rApp
-        # candidate.  Safety states never use it.
-        env["GREENRAN_TASAM_ECONOMIC_BOOTSTRAP_POWER"] = os.environ.get(
-            "GREENRAN_TASAM_ECONOMIC_BOOTSTRAP_POWER", "25"
-        )
+        env["GREENRAN_TASAM_ONLINE_ROLLOUT_FRACTION"] = "1.0" if mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} else "0.10"
+        if mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+            env["GREENRAN_TASAM_PILOT_FULL_ROLLOUT"] = "1"
+        if mode == "combined_online":
+            env["GREENRAN_TASAM_ECONOMIC_HEAD_ENABLED"] = "1"
+            env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = os.environ.get(
+                "GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT", "applied_action_v2"
+            )
+            env["GREENRAN_TASAM_ECONOMIC_SAFETY_ISOLATION_REQUIRED"] = "1"
+            env["GREENRAN_TASAM_ECONOMIC_SAFETY_ISOLATION"] = "blocked_and_critical_v1"
+            env["GREENRAN_TASAM_ECONOMIC_BOOTSTRAP_POWER"] = os.environ.get(
+                "GREENRAN_TASAM_ECONOMIC_BOOTSTRAP_POWER", "25"
+            )
     env["GREENRAN_TASAM_E2_CONTROL"] = "1" if contract["actuation_enabled"] else "0"
     if contract.get("assistant_decision_mode"):
         env["GREENRAN_ASSISTANT_DECISION_MODE"] = str(contract["assistant_decision_mode"])
@@ -1289,8 +1631,11 @@ def build_environment(
         env["GREENRAN_CONTROL_TRIAL_MIN_RAN_DELTA"] = os.environ.get("GREENRAN_CONTROL_TRIAL_MIN_RAN_DELTA", "-0.01")
         env["GREENRAN_CONTROL_TRIAL_MIN_AI_DELTA"] = os.environ.get("GREENRAN_CONTROL_TRIAL_MIN_AI_DELTA", "-0.02")
         env["GREENRAN_CONTROL_TRIAL_STATE"] = str(run_dir / "control_trial_state.json")
-    if mode == "combined_online":
-        env["GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS"] = os.environ.get("GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS", "600")
+    if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+        env["GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS"] = os.environ.get(
+            "GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS",
+        "90" if mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} else "600",
+        )
         env["GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW"] = os.environ.get("GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW", "30")
         env["GREENRAN_CONTROL_TRIAL_CRITICAL_STREAK"] = os.environ.get("GREENRAN_CONTROL_TRIAL_CRITICAL_STREAK", "3")
         env["GREENRAN_CONTROL_TRIAL_MIN_CONFIDENCE"] = os.environ.get("GREENRAN_CONTROL_TRIAL_MIN_CONFIDENCE", "0.60")
@@ -1301,6 +1646,7 @@ def build_environment(
 
 
 def _controller_command(args: argparse.Namespace) -> list[str]:
+    contract = mode_contract(args.mode)
     command = [
         sys.executable,
         str(ONLINE_CONTROLLER),
@@ -1322,7 +1668,23 @@ def _controller_command(args: argparse.Namespace) -> list[str]:
         str(args.controller_poll_seconds),
         "--seed",
         str(args.seed),
+        "--replay-policy",
+        (
+            "v2x_window90"
+            if contract.get("replay_contract") == "greenran.tasam.v2x.window90.replay_80_20.v1"
+            else "v2x_80_20"
+            if contract.get("replay_contract") == "greenran.tasam.v2x.replay_80_20.v1"
+            else "legacy"
+        ),
+        "--sam-mode",
+        str(contract.get("sam_mode", "tasam_selective")),
+        "--l2-weight",
+        str(contract.get("l2_weight", 0.0)),
+        "--learning-rate",
+        "0.0001",
     ]
+    if contract.get("reward_contract"):
+        command.extend(["--reward-contract", str(contract["reward_contract"])])
     if args.prioritize_category_errors:
         command.extend([
             "--prioritize-category-errors",
@@ -1335,6 +1697,8 @@ def _controller_command(args: argparse.Namespace) -> list[str]:
     ])
     if args.experience_bank:
         command.extend(["--experience-bank", str(args.experience_bank)])
+    if getattr(args, "recent_experience_bank", None):
+        command.extend(["--recent-experience-bank", str(args.recent_experience_bank)])
     if args.mode in {"train_no_armd", "combined", "combined_actuation_smoke"}:
         if not args.experience_bank:
             command.append("--online-only")
@@ -1349,6 +1713,19 @@ def _controller_command(args: argparse.Namespace) -> list[str]:
         "--min-economic-transitions", str(args.min_economic_transitions),
         "--economic-update-min-transitions", str(getattr(args, "economic_update_min_transitions", 64)),
         "--sqlite-economic-replay",
+        ])
+    if args.mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+        command.extend([
+            "--max-rollout-fraction", "1.0",
+            "--shadow-min-decisions", "1",
+            "--stage-window-decisions", "18",
+            "--update-milestones", "18,36,54,72,90",
+        ])
+    if args.mode == "asgard_v2x_window90_energy_online":
+        command.extend([
+            "--allocation-head-output-dim", "3",
+            "--global-action-dim", "5",
+            "--economic-update-min-transitions", "0",
         ])
     return command
 
@@ -1524,11 +1901,99 @@ def run(args: argparse.Namespace) -> int:
     args.checkpoint = args.checkpoint.resolve()
     _validate_local_path(args.run_dir, "run-dir")
     _validate_local_path(args.checkpoint, "checkpoint")
+
+    # Sem este handler, o SIGTERM/SIGKILL do gate encerra o interpretador sem
+    # executar o bloco finally abaixo, e o trainer (sessão própria,
+    # start_new_session=True) sobrevive como órfão re-parentado.  O primeiro
+    # sinal dispara SystemExit(128+signum) para desenrolar pelo finally (que
+    # encerra controller/wall_runner via _terminate_group) mantendo o código
+    # de saída 143 esperado pelo gate; sinais repetidos são ignorados para
+    # não interromper a limpeza.
+    shutdown_signalled = threading.Event()
+
+    def _graceful_shutdown_signal(signum: int, _frame: Any) -> None:
+        if shutdown_signalled.is_set():
+            return
+        shutdown_signalled.set()
+        raise SystemExit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown_signal)
+    signal.signal(signal.SIGINT, _graceful_shutdown_signal)
+
+    if args.binary is not None:
+        args.binary = _validate_local_path(args.binary, "binário ns-3")
+        if not args.binary.is_file() or not os.access(args.binary, os.X_OK):
+            raise SystemExit(f"binário ns-3 ausente ou não executável: {args.binary}")
+        if args.mode in V2X_ENERGY_MODES or (
+            args.energy_enabled and args.profile.startswith("tasam_training_balanced_v6_v2x")
+        ):
+            # The energy V6 contract is tied to the current scenario/scheduler/
+            # PDCP evidence producers.  Refuse a stale executable before a
+            # campaign directory or manifest is created.
+            assert_v2x_binary_fresh(args.binary)
+        os.environ["GREENRAN_NS3_BIN"] = str(args.binary)
     if args.energy_calibration is not None:
         args.energy_calibration = _validate_local_path(args.energy_calibration, "calibração energética")
+    if args.safe_power_floor_ledger is not None:
+        args.safe_power_floor_ledger = _validate_local_path(
+            args.safe_power_floor_ledger, "ledger de piso seguro"
+        )
+        if not args.safe_power_floor_ledger.is_file():
+            raise SystemExit(
+                f"ledger de piso seguro ausente: {args.safe_power_floor_ledger}"
+            )
     energy_calibration = _resolve_energy_calibration(args.energy_calibration)
     if args.control_gate:
         args.control_gate = _validate_local_path(args.control_gate, "control-gate")
+    if args.mode in {"sac_l2_online", "tasam_v2x_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+        if args.experience_bank is None:
+            raise SystemExit("treino V2X do artigo exige --experience-bank histórico")
+        if args.mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} and args.replay_rows != 90:
+            raise SystemExit("piloto window90 exige replay de 90 transições (72/18)")
+        if args.mode not in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} and args.replay_rows != 600:
+            raise SystemExit("treino V2X do artigo exige replay de 600 transições (480/120)")
+        if args.prioritize_category_errors:
+            raise SystemExit("treino V2X do artigo não permite duplicação/priorização no replay 80/20")
+    if args.disable_app_overrides and args.mode not in {
+        "rapp_only", "rapp_only_actuating", "asgard_v2x_window90_online",
+        "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
+        "tasam_v2x_frozen",
+    }:
+        raise SystemExit(
+            "--disable-app-overrides só é permitido nos braços rApp-only e no piloto ASGARD window90"
+        )
+    slot_env: dict[str, str] = {}
+    slot_lease: SlotLease | None = None
+    parallel_slot = None
+    lease_held_by_parent = os.environ.get("GREENRAN_SLOT_LEASE_HELD", "") == "1"
+    if args.execution_slot:
+        if args.profile != BASELINE_MAX_PROFILE:
+            raise SystemExit(
+                "--execution-slot exige o perfil V2X baseline_max para manter a proveniência do cenário"
+            )
+        slots = resolve_slots(args.execution_slot)
+        if len(slots) != 1:
+            raise SystemExit("cada arm online deve reservar exatamente um execution-slot")
+        parallel_slot = slots[0]
+        assert_disk_capacity(ROOT / "runs", 2)
+        slot_env = parallel_slot.as_environment()
+    else:
+        # The feasibility runner owns the lease and launches this arm as a
+        # child.  In that arrangement the child intentionally does not take
+        # the same flock again, but it must still inherit the slot's resource
+        # profile for its manifest and systemd scope.  Ports alone are not
+        # sufficient evidence of parallel isolation.
+        inherited_slot = os.environ.get("GREENRAN_V2X_EXECUTION_SLOT", "").strip()
+        if inherited_slot in {"slot-a", "slot-b"}:
+            if args.profile != BASELINE_MAX_PROFILE:
+                raise SystemExit("slot herdado exige o perfil V2X baseline_max")
+            parallel_slot = resolve_slots(inherited_slot)[0]
+            slot_env = parallel_slot.as_environment()
+    arm_resource_profile = (
+        PARALLEL_PAIR_RESOURCE_PROFILE
+        if parallel_slot is not None
+        else ("baseline_max_v1" if args.profile == BASELINE_MAX_PROFILE else "standard")
+    )
     _validate_run_dir(args.run_dir)
     # ``disk_usage`` requires an existing path.  Creating only the requested
     # campaign parent keeps the new run isolated and never modifies an older
@@ -1540,15 +2005,30 @@ def run(args: argparse.Namespace) -> int:
             raise SystemExit(f"checkpoint TA-SAM ausente: {required}")
         _validate_checkpoint(
             args.checkpoint,
-            require_economic_head=args.mode in {"combined_online", "combined_actuation_smoke"},
+            require_economic_head=args.mode in {
+                "combined_online", "combined_actuation_smoke",
+                "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
+            },
         )
     # Delegation is verified before creating the run parent or manifest. A
     # campaign launched by ``robert`` must either receive real cgroup-v2
     # limits or stop without leaving a partial experiment behind.
-    try:
-        assert_cgroup_delegation()
-    except InfraBudgetError as exc:
-        raise SystemExit(str(exc)) from exc
+    scope_preflight: dict[str, Any] = {}
+    if args.profile == BASELINE_MAX_PROFILE:
+        baseline_budget = build_physical_budget(
+            1.0, unrestricted=True, resource_profile=arm_resource_profile
+        )
+        scope_preflight = probe_systemd_user_scope(baseline_budget["groups"]["simulator"])
+        if not scope_preflight.get("valid"):
+            raise SystemExit(
+                "backend systemd --user não aplicou o envelope baseline_max_v1: "
+                + str(scope_preflight.get("reason") or scope_preflight.get("stderr") or "unknown")
+            )
+    else:
+        try:
+            assert_cgroup_delegation()
+        except InfraBudgetError as exc:
+            raise SystemExit(str(exc)) from exc
     minimum_free = float(args.min_free_gib)
     available = _free_gib(args.run_dir.parent)
     if available < minimum_free:
@@ -1558,6 +2038,11 @@ def run(args: argparse.Namespace) -> int:
         )
     if args.run_dir.exists() and any(args.run_dir.iterdir()):
         raise SystemExit(f"run-dir não está vazio: {args.run_dir}")
+    if parallel_slot is not None and not lease_held_by_parent:
+        slot_lease = SlotLease(parallel_slot, args.run_dir)
+        slot_lease.__enter__()
+        slot_lease.publish_campaign_contract()
+        atexit.register(slot_lease.__exit__, None, None, None)
     args.run_dir.mkdir(parents=True, exist_ok=True)
     env = build_environment(
         args.mode,
@@ -1576,7 +2061,28 @@ def run(args: argparse.Namespace) -> int:
         vehicle_profile_manifest=args.vehicle_profile_manifest,
         artifact_budget_gib=args.artifact_budget_gib,
         artifact_min_free_gib=args.artifact_min_free_gib,
+        energy_enabled=bool(args.energy_enabled),
+        energy_staircase=bool(args.energy_staircase),
+        safe_power_floor_ledger=args.safe_power_floor_ledger,
+        disable_app_overrides=bool(args.disable_app_overrides),
+        infra_resource_profile=arm_resource_profile,
+        execution_slot_env=slot_env,
     )
+    if parallel_slot is not None:
+        # Keep the isolation contract authoritative even when the parent
+        # process inherited a stale baseline profile.  A slot arm must never
+        # silently consume the single-arm 12-CPU/8-GiB envelope.
+        env["GREENRAN_INFRA_RESOURCE_PROFILE"] = PARALLEL_PAIR_RESOURCE_PROFILE
+        parallel_budget = build_physical_budget(
+            1.0, unrestricted=True, resource_profile=PARALLEL_PAIR_RESOURCE_PROFILE
+        )
+        for group, limits in parallel_budget["groups"].items():
+            key = group.upper()
+            env[f"GREENRAN_CGROUP_SCOPE_{key}_CPU_QUOTA_US"] = str(limits["cpu_quota_us"])
+            env[f"GREENRAN_CGROUP_SCOPE_{key}_MEMORY_HIGH_BYTES"] = str(limits["memory_high_bytes"])
+            env[f"GREENRAN_CGROUP_SCOPE_{key}_IO_WEIGHT"] = str(limits["io_weight"])
+        if env.get("GREENRAN_INFRA_RESOURCE_PROFILE") != arm_resource_profile:
+            raise SystemExit("envelope paralelo V2X não pôde ser aplicado ao arm")
     if args.mode == "combined_actuation_smoke" and args.control_gate is None:
         # This is deliberately narrower than the scientific control gate:
         # it authorizes only the 10% native-actuation smoke and cannot be
@@ -1606,6 +2112,45 @@ def run(args: argparse.Namespace) -> int:
     manifest = {
         "schema": "greenran.tasam_online_arm.v1",
         "mode": args.mode,
+        "article_method": contract.get("article_method", ""),
+        "training_mode": "online_adaptive" if contract["controller_enabled"] else "frozen_evaluation",
+        "replay_contract": contract.get("replay_contract", ""),
+        "replay_ratio": "80/20" if contract.get("replay_contract") else "",
+        "reward_contract": contract.get("reward_contract", ""),
+        "reward_energy_enabled": bool(args.energy_enabled),
+        "energy_staircase_contract": env.get("GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT", ""),
+        "energy_staircase_config": str(ROOT / "config/greenran_v2x_energy_staircase.json")
+        if env.get("GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT") else "",
+        "energy_staircase_config_sha256": file_sha256(ROOT / "config/greenran_v2x_energy_staircase.json")
+        if env.get("GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT") and (ROOT / "config/greenran_v2x_energy_staircase.json").is_file() else "",
+        "energy_staircase_healthy_required": int(
+            env.get("GREENRAN_TASAM_ENERGY_STAIRCASE_HEALTHY_REQUIRED", "0")
+        ),
+        "safe_power_floor_ledger": env.get("GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER", ""),
+        "safe_power_floor_ledger_sha256": file_sha256(
+            Path(env["GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER"])
+        ) if env.get("GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER") else "",
+        "du_sleep_allowed": env.get("GREENRAN_TASAM_ALLOW_DU_SLEEP") == "1",
+        "economic_action_contract": env.get("GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT", ""),
+        "tasam_resource_headroom_ratio": 0.15 if args.mode in {
+            "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online",
+            "asgard_v2x_window90_energy_frozen",
+        } else None,
+        "resource_floor_policy": env.get("GREENRAN_TASAM_RESOURCE_FLOOR_POLICY", ""),
+        "reward_weight_snapshot": {
+            "max_energy_weight": 0.30,
+            "ewma_previous": 0.75,
+            "ewma_current": 0.25,
+            "healthy_exit_decisions": 3,
+            "v2x_base": 0.45,
+            "v2x_risk_slope": 0.35,
+            "equity_base": 0.25,
+            "equity_risk_slope": 0.20,
+        } if contract.get("reward_contract") else {},
+        "sam_mode": contract.get("sam_mode", ""),
+        "l2_weight": contract.get("l2_weight", 0.0),
+        "real_only_collection": bool(args.disable_app_overrides),
+        "scenario_control_override_allowed": not bool(args.disable_app_overrides),
         "seed": args.seed,
         "profile": args.profile,
         "expected_stages": [
@@ -1632,12 +2177,47 @@ def run(args: argparse.Namespace) -> int:
         ),
         "native_aggregated_evidence": env.get("GREENRAN_NS3_NATIVE_AGGREGATED_EVIDENCE") == "1",
         "native_evidence_period_ms": int(env.get("GREENRAN_NS3_NATIVE_EVIDENCE_PERIOD_MS", "100")),
+        "parallel_execution": {
+            "schema": "greenran.v2x.parallel_execution.v1",
+            "slot_id": env.get("GREENRAN_V2X_EXECUTION_SLOT", "serial"),
+            "e2_term_port": int(env.get("GREENRAN_E2_TERM_PORT", "36421")),
+            "e2_xapp_port": int(env.get("GREENRAN_E2_XAPP_PORT", "36422")),
+            "e2_local_port": int(env.get("GREENRAN_E2_LOCAL_PORT", "38470")),
+            "app_port_offset": int(env.get("GREENRAN_PORT_OFFSET", "0")),
+            "cgroup_root": env.get("GREENRAN_CGROUP_ROOT", ""),
+            "slot_config_sha256": file_sha256(ROOT / "config/greenran_v2x_parallel_slots.json")
+            if (ROOT / "config/greenran_v2x_parallel_slots.json").is_file() else "",
+        },
+        "resource_envelope": {
+            "profile": arm_resource_profile,
+            "requested_simulator_cpu_quota_us": build_physical_budget(
+                1.0, unrestricted=True, resource_profile=arm_resource_profile
+            )["groups"]["simulator"]["cpu_quota_us"],
+            "requested_simulator_cpu_period_us": 100000,
+            "requested_simulator_cpu_count": build_physical_budget(
+                1.0, unrestricted=True, resource_profile=arm_resource_profile
+            )["groups"]["simulator"]["cpu_quota_us"] // 100000,
+            "requested_simulator_memory_high_bytes": build_physical_budget(
+                1.0, unrestricted=True, resource_profile=arm_resource_profile
+            )["groups"]["simulator"]["memory_high_bytes"],
+            "control_groups_standard": True,
+        },
+        "cgroup_backend": env.get("GREENRAN_CGROUP_BACKEND", "delegated_v2"),
+        "systemd_user_scope_preflight": scope_preflight,
         "performance_min_rtf": float(args.performance_min_rtf),
         "ns3_binary": env.get("GREENRAN_NS3_BIN", ""),
         "ns3_binary_sha256": (
             file_sha256(Path(env["GREENRAN_NS3_BIN"]))
             if Path(env.get("GREENRAN_NS3_BIN", "")).is_file()
             else ""
+        ),
+        "build_provenance": (
+            build_provenance(Path(env["GREENRAN_NS3_BIN"]))
+            if (
+                args.energy_enabled and args.profile.startswith("tasam_training_balanced_v6")
+                and Path(env.get("GREENRAN_NS3_BIN", "")).is_file()
+            )
+            else {}
         ),
         "e2_control_enabled": env.get("GREENRAN_NS3_E2_CONTROL_ENABLED") == "1",
         "e2_file_logging_enabled": env.get("GREENRAN_NS3_ENABLE_E2_FILE_LOGGING") == "true",
@@ -1666,9 +2246,32 @@ def run(args: argparse.Namespace) -> int:
     cgroup_note = "disabled_by_smoke_policy"
     if cgroup_requested:
         try:
-            CgroupV2Controller().apply(build_physical_budget(1.0))
-            cgroup_enforced = True
-            cgroup_note = "kernel_cgroup_v2_applied"
+            resource_profile = arm_resource_profile
+            budget = build_physical_budget(
+                1.0,
+                unrestricted=(resource_profile in {"baseline_max_v1", PARALLEL_PAIR_RESOURCE_PROFILE}),
+                resource_profile=resource_profile,
+            )
+            cgroup_backend = env.get("GREENRAN_CGROUP_BACKEND", "delegated_v2")
+            if cgroup_backend == SYSTEMD_USER_SCOPE_BACKEND:
+                scope_preflight = probe_systemd_user_scope(budget["groups"]["simulator"])
+                if not scope_preflight.get("valid"):
+                    raise InfraBudgetError(
+                        "systemd_user_scope_preflight_failed: "
+                        + str(scope_preflight.get("reason") or scope_preflight.get("stderr") or "unknown")
+                    )
+                cgroup_enforced = True
+                cgroup_note = "systemd_user_scope_per_service"
+                manifest["systemd_user_scope_preflight"] = scope_preflight
+            else:
+                CgroupV2Controller().apply(budget)
+                cgroup_enforced = True
+                cgroup_note = "kernel_cgroup_v2_applied"
+            manifest["resource_envelope"].update({
+                "profile": resource_profile,
+                "effective_limits": budget["groups"],
+                "effective": True,
+            })
         except InfraBudgetError as exc:
             allow_unenforced = env.get("GREENRAN_CGROUP_ALLOW_UNENFORCED", "0").strip().lower() in {"1", "true", "yes", "on"}
             if not allow_unenforced:
@@ -1677,7 +2280,12 @@ def run(args: argparse.Namespace) -> int:
                 return 4
             env["GREENRAN_CGROUP_ENFORCE"] = "0"
             cgroup_note = f"unenforced:{exc}"
-    manifest["cgroup_enforcement"] = {"requested": cgroup_requested, "active": cgroup_enforced, "note": cgroup_note}
+    manifest["cgroup_enforcement"] = {
+        "requested": cgroup_requested,
+        "active": cgroup_enforced,
+        "backend": env.get("GREENRAN_CGROUP_BACKEND", "delegated_v2"),
+        "note": cgroup_note,
+    }
     _write_json(args.run_dir / "arm_manifest.json", manifest)
 
     infra_monitor = InfrastructureMonitor(args.run_dir)
@@ -1754,6 +2362,7 @@ def run(args: argparse.Namespace) -> int:
     native_actuation_stop: threading.Event | None = None
     native_actuation_result: dict[str, Any] = {}
     wall_status = 0
+    wall_runner: subprocess.Popen[Any] | None = None
     arm_started_monotonic = time.monotonic()
     controller_log = (args.run_dir / "online_controller.log").open("w", encoding="utf-8")
     try:
@@ -1829,6 +2438,11 @@ def run(args: argparse.Namespace) -> int:
         if native_actuation_thread is not None:
             native_actuation_thread.join(timeout=2.0)
         _terminate_group(decision_watcher)
+        # Saída anômala (ex.: SIGTERM do gate antes do wait() retornar):
+        # encerra também o wall runner e todo o seu grupo (ns-3/RIC), que
+        # caso contrário sobreviveria ao braço.  No fluxo normal o wait()
+        # já retornou (poll() != None) e este é no-op.
+        _terminate_group(wall_runner)
         _terminate_group(controller)
         controller_log.close()
         infra_stop.set()
@@ -1859,7 +2473,11 @@ def run(args: argparse.Namespace) -> int:
         # a false performance failure.
         minimum_sim_time_s=(
             5.0
-            if args.native_fidelity and args.mode != "combined_actuation_smoke"
+            if (
+                args.native_fidelity
+                and not args.smoke
+                and args.mode != "combined_actuation_smoke"
+            )
             else 0.0
         ),
     )
@@ -1909,6 +2527,14 @@ def run(args: argparse.Namespace) -> int:
     finite_simulation_completion = bool(
         args.native_fidelity
         and performance_evidence.get("valid")
+        # A performance sample after five seconds is enough to validate RTF,
+        # but never enough to claim that a 120 s/600 s simulation completed.
+        and float(performance_evidence.get("sim_time_observed_s", 0.0) or 0.0)
+        # The native performance recorder may report the terminal sample one
+        # scheduler tick below the requested value (e.g. 44.9 for a 45 s
+        # arm).  Use the same 250 ms completion tolerance as the feasibility
+        # evaluator; this does not relax any scored PDCP window or SLA gate.
+        >= float(args.sim_time) - 0.25
         and wall_status in {143, -15, 15}
         and not (args.run_dir / "ns3_supervisor.pid").exists()
     )
@@ -1925,6 +2551,15 @@ def run(args: argparse.Namespace) -> int:
             or finite_simulation_completion
         )
     )
+    _reconcile_wall_status(
+        args.run_dir,
+        wall_status,
+        stop_reason,
+        completion_verified=expected_target_termination,
+    )
+    externally_interrupted = bool(
+        wall_status in {143, -15, 15} and not expected_target_termination
+    )
     invalid_reason = ""
     if disk_guard_result:
         invalid_reason = f"disk_budget_guard:{disk_guard_result.get('reason', 'unknown')}"
@@ -1939,7 +2574,12 @@ def run(args: argparse.Namespace) -> int:
         ):
             invalid_reason = ns3_failure
     if (
-        args.mode in {"combined_shadow", "combined_actuation_smoke", "combined_online"}
+        args.mode in {
+            "combined_shadow", "combined_actuation_smoke", "combined_online",
+            "sac_l2_online", "sac_l2_frozen", "tasam_v2x_online", "tasam_v2x_frozen",
+            "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online",
+            "asgard_v2x_window90_energy_frozen",
+        }
         and not performance_evidence.get("valid")
         and not invalid_reason
     ):
@@ -1982,7 +2622,10 @@ def run(args: argparse.Namespace) -> int:
     wall_execution_valid = wall_status == 0 or expected_target_termination
     manifest.update(
         {
-            "status": "finished" if wall_execution_valid and feedback_valid and checkpoint_frozen and not disk_guard_result and not invalid_reason else "failed",
+            "status": (
+                "cancelled" if externally_interrupted else
+                ("finished" if wall_execution_valid and feedback_valid and checkpoint_frozen and not disk_guard_result and not invalid_reason else "failed")
+            ),
             "wall_runner_exit_code": wall_status,
             "target_reached": target_reached,
             "expected_target_termination": expected_target_termination,
@@ -2017,14 +2660,19 @@ def run(args: argparse.Namespace) -> int:
     online_status = _read_json(online_status_path)
     online_status.update(
         {
-            "status": "finished" if wall_execution_valid and feedback_valid and not invalid_reason else "invalid",
+            "status": (
+                "cancelled" if externally_interrupted else
+                ("finished" if wall_execution_valid and feedback_valid and not invalid_reason else "invalid")
+            ),
             "stopped_at": int(time.time()),
             "finished_at": int(time.time()),
             "shutdown_reason": (
                 stop_reason
                 if expected_target_termination and stop_reason
-                else ("finite_simulation_completed" if finite_simulation_completion else
+                else ("external_termination" if externally_interrupted else
+                      ("finite_simulation_completed" if finite_simulation_completion else
                       ("wall_time_complete" if wall_status == 0 else "wall_runner_failed"))
+                )
             ),
             "feedback_drained": feedback_drained,
             "simulation_performance": performance_evidence,
@@ -2035,7 +2683,10 @@ def run(args: argparse.Namespace) -> int:
     online_state = _read_json(online_state_path)
     if online_state:
         online_state.update({
-            "status": "finished" if wall_execution_valid and feedback_valid else "invalid",
+            "status": (
+                "cancelled" if externally_interrupted else
+                ("finished" if wall_execution_valid and feedback_valid else "invalid")
+            ),
             "finished_at": int(time.time()),
             "shutdown_reason": online_status["shutdown_reason"],
             "simulation_performance": performance_evidence,
@@ -2069,6 +2720,10 @@ def main() -> int:
         help="usa evidência nativa agregada v5 e perfil v9_fidelity",
     )
     parser.add_argument(
+        "--smoke", action="store_true",
+        help="aceita execução curta de smoke sem exigir a janela de desempenho de 5 s",
+    )
+    parser.add_argument(
         "--performance-min-rtf", type=float, default=0.10,
         help="RTF mínimo; v9_fidelity usa 0.016",
     )
@@ -2088,9 +2743,25 @@ def main() -> int:
     )
     parser.add_argument("--pairing-schedule-id", default="")
     parser.add_argument("--pairing-schedule-file", type=Path, default=None)
+    parser.add_argument(
+        "--execution-slot", choices=("slot-a", "slot-b"), default=None,
+        help="reserva um slot SCTP/cgroup exclusivo para execução paralela; omitido mantém serial",
+    )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument(
+        "--binary", type=Path, default=None,
+        help="binário ns-3 explícito para este arm; quando omitido usa GREENRAN_NS3_BIN/default",
+    )
     parser.add_argument("--energy-calibration", type=Path, default=None)
     parser.add_argument("--experience-bank", type=Path, default=None)
+    parser.add_argument(
+        "--recent-experience-bank", type=Path, default=None,
+        help="banco privado de transições recentes; obrigatório no replay V2X 80/20",
+    )
+    parser.add_argument(
+        "--disable-app-overrides", action="store_true",
+        help="coleta rApp-only: preserva rótulos de estágio, mas bloqueia overrides sintéticos",
+    )
     parser.add_argument("--control-gate", type=Path, default=None, help="gate aprovado para o braço combined")
     parser.add_argument("--control-fraction", type=float, default=0.10, help="fração canary do assistant_only_control")
     parser.add_argument("--min-free-gib", type=float, default=10.0)
@@ -2118,6 +2789,18 @@ def main() -> int:
     parser.add_argument("--economic-update-min-transitions", type=int, default=64)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--vehicle-profile-manifest", type=Path, default=None)
+    parser.add_argument(
+        "--energy-enabled", action="store_true",
+        help="habilita somente a subfase E2 de energia; o gate V2X estrito mantém isto desligado",
+    )
+    parser.add_argument(
+        "--energy-staircase", action="store_true",
+        help="habilita a escada segura V2X por DU e o candidato explícito de sono",
+    )
+    parser.add_argument(
+        "--safe-power-floor-ledger", type=Path, default=None,
+        help="ledger nativo validado de piso seguro por DU para a escada energética",
+    )
     args = parser.parse_args()
     return run(args)
 
