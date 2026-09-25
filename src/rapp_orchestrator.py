@@ -4961,17 +4961,37 @@ class RappResourceOptimizer:
                 ]
                 if not native_cells:
                     failsafe = True
+                    decision['tasam_association_evidence']['reason'] = (
+                        'native_association_missing_for_imsi'
+                    )
+                    decision['tasam_association_evidence']['valid'] = False
+                    decision['tasam_association_evidence']['mapping'] = {}
                     break
                 for cell_id in native_cells:
                     cells[cell_id].append({
                         key: value for key, value in policy.items() if key != 'cell_id'
                     })
-            if not all(cells[cell_id] for cell_id in (2, 3, 4)):
-                failsafe = True
-            if failsafe:
-                decision['tasam_association_evidence']['reason'] = 'native_association_policy_coverage_incomplete'
+        if not failsafe:
+            # Um DU sem UEs associados neste instante não é um gap de
+            # identidade: é mobilidade.  Cortar a célula vazia não é
+            # exigido pela política de energia e manter 100% nela é o
+            # padrão seguro; degradar TODO o bundle para failsafe por
+            # causa de uma célula vazia transformou mobilidade normal
+            # em bloqueio econômico permanente (r23, 47/47 failsafe).
+            empty_managed_cells = [
+                cell_id for cell_id in (2, 3, 4) if not cells[cell_id]
+            ]
+            if len(empty_managed_cells) == 3:
+                decision['tasam_association_evidence']['reason'] = (
+                    'native_association_policy_coverage_incomplete'
+                )
                 decision['tasam_association_evidence']['valid'] = False
                 decision['tasam_association_evidence']['mapping'] = {}
+                failsafe = True
+            else:
+                decision['tasam_association_evidence']['empty_managed_cells'] = (
+                    empty_managed_cells
+                )
             allocation['per_ue_floor_feasible'] = True
             allocation['floor_verified'] = True
             allocation['floor_by_cell_bp'] = projected.get('floor_by_cell_bp', {})
@@ -5004,7 +5024,14 @@ class RappResourceOptimizer:
                 'cells': [
                     {
                         'cell_id': cell_id,
-                        'tx_power_percent': int((power_by_cell or {}).get(cell_id, requested)),
+                        # DU vazio (sem UEs associados) permanece em 100%:
+                        # não há demanda a servir e o padrão seguro é não
+                        # cortar célula sem readback de identidade.
+                        'tx_power_percent': (
+                            100
+                            if not policies
+                            else int((power_by_cell or {}).get(cell_id, requested))
+                        ),
                         'ue_policies': policies,
                     }
                     for cell_id, policies in sorted(cells.items())
@@ -5019,7 +5046,10 @@ class RappResourceOptimizer:
                 bundle['schema'] = CONTROL_BUNDLE_V3_SCHEMA
                 bundle['economic_action_contract'] = ECONOMIC_ACTION_V3_CONTRACT
                 bundle['power_percent_by_cell'] = {
-                    str(cell_id): int(power) for cell_id, power in power_by_cell.items()
+                    str(cell_id): (
+                        100 if not cells.get(cell_id) else int(power)
+                    )
+                    for cell_id, power in power_by_cell.items()
                 }
                 if any(
                     sum(
@@ -5142,6 +5172,17 @@ class RappResourceOptimizer:
             ack = self.tasam_control.send(bundle, integration=integration)
             decision['tasam_control_bundle'] = bundle
             decision['tasam_control_ack'] = ack
+            decision['tasam_native_bundle_mode'] = str(bundle.get('mode') or '')
+            decision['native_ack_cell_ack_complete'] = bool(ack.get('cell_ack_complete'))
+            decision['native_ack_cell_results_count'] = (
+                len(ack.get('cell_results') or [])
+                if isinstance(ack, dict) else 0
+            )
+            decision['requested_power_by_cell'] = {
+                int(cell.get('cell_id')): int(cell.get('tx_power_percent', 0))
+                for cell in bundle.get('cells') or []
+                if isinstance(cell, dict)
+            }
             policy_applied = bool(ack.get('applied')) and not bool(ack.get('fallback'))
             decision['tasam_transport_ack'] = policy_applied
             cell_results = ack.get('cell_results') if isinstance(ack, dict) else None
@@ -5277,9 +5318,15 @@ class RappResourceOptimizer:
             return policy_applied or not integration
         except ControlBundleError as exc:
             decision['tasam_control_error'] = str(exc)
+            decision['native_ack_cell_ack_complete'] = False
             decision['ta_sam_actuation_applied'] = False
-            decision['energy_saver'] = 'BLOCKED'
-            decision['tasam_power_applied_percent'] = 100
+            # Um failsafe rejeitado não muda a categoria: ele JÁ É o estado
+            # seguro (100%).  Flipar BLOCKED aqui apagava o verdict do
+            # policy-engine sem tocar o motivo, produzindo o par
+            # reason=ECO MODE / decision=BLOCKED que destruiu o r23.
+            if str(bundle.get('mode') or '') != 'failsafe':
+                decision['energy_saver'] = 'BLOCKED'
+                decision['tasam_power_applied_percent'] = 100
             allocation['per_ue_application_status'] = 'e2_failed_failsafe'
             allocation['failsafe_required'] = True
             if integration and bundle.get('mode') != 'failsafe':
@@ -6347,6 +6394,30 @@ class RappResourceOptimizer:
                 # por que uma decisão não atuou economicamente.
                 'armd_safety_level': decision.get('armd_safety_level'),
                 'tasam_operating_permission': decision.get('tasam_operating_permission'),
+                'native_bundle_mode': decision.get('tasam_native_bundle_mode', ''),
+                'native_ack_cell_ack_complete': decision.get(
+                    'native_ack_cell_ack_complete'
+                ),
+                'native_ack_cell_results_count': decision.get(
+                    'native_ack_cell_results_count'
+                ),
+                'native_requested_power_by_cell': decision.get(
+                    'requested_power_by_cell'
+                ) or {},
+                'tasam_control_error': str(decision.get('tasam_control_error') or ''),
+                'tasam_infra_error': str(decision.get('tasam_infra_error') or ''),
+                'assoc_valid': bool(
+                    (decision.get('tasam_association_evidence') or {}).get('valid')
+                ),
+                'assoc_reason': str(
+                    (decision.get('tasam_association_evidence') or {}).get('reason') or ''
+                ),
+                'assoc_empty_cells': (
+                    decision.get('tasam_association_evidence') or {}
+                ).get('empty_managed_cells') or [],
+                'economic_rejection_reason': str(
+                    decision.get('economic_rejection_reason') or ''
+                ),
                 'assistant_rollout_fraction': decision.get('assistant_rollout_fraction'),
                 'assistant_rollout_allowed': decision.get('assistant_rollout_allowed'),
                 'assistant_rollout_applied': decision.get('assistant_rollout_applied'),

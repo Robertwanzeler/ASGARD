@@ -335,7 +335,16 @@ class ControlBundleClient:
                 and item.get("power_ack") is True
                 and item.get("cell_id") is not None
             }
-            cell_ack_complete = confirmed_cells >= {2, 3, 4}
+            # Um failsafe é o estado seguro por definição: o ACK global
+            # (applied=True) já confirma a aplicação.  Exigir acks per-célula
+            # de um failsafe rejeita applied=True e flipa a decisão para
+            # BLOCKED silenciosamente (r23: 47/47), mascarando a causa.
+            requires_cell_acks = normalized["mode"] != "failsafe"
+            cell_ack_complete = (
+                confirmed_cells >= {2, 3, 4}
+                if requires_cell_acks
+                else bool(ack.get("applied"))
+            )
             ack["cell_ack_complete"] = cell_ack_complete
         if (
             ack.get("schema") != ACK_SCHEMA

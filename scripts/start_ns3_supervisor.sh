@@ -143,6 +143,20 @@ while true; do
   fi
   child_pid=""
   sleep "$RESTART_DELAY"
+  # Higiene pós-mortem: se o braço (pai) desapareceu, o supervisor NÃO pode
+  # reiniciar o ns-3 — um restart recria/trunca os CSVs de evidência e
+  # destruiu as provas do r23 depois do kill.  Reparentado para o init
+  # (ppid=1) significa braço morto: sair sem reiniciar.
+  supervisor_ppid="$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+  if [[ -z "$supervisor_ppid" || "$supervisor_ppid" == "1" || "$supervisor_ppid" == "0" ]]; then
+    printf '[NS3_SUPERVISOR] braço pai desapareceu; saindo sem reiniciar em %s
+' "$(date --iso-8601=seconds)" >> "$NS3_LOG"
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+      kill "$child_pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE" "$SUPERVISOR_FILE"
+    exit 0
+  fi
   unset exit_code
   current_supervisor="$(cat "$SUPERVISOR_FILE" 2>/dev/null || true)"
   if [[ "$current_supervisor" != "$$" ]]; then
