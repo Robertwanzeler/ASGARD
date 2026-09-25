@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,6 +53,57 @@ class TasamOnlineControlledTests(unittest.TestCase):
                 publish_learning_meter(args, state)
             after = len(list(Path("/proc/self/fd").iterdir()))
             self.assertLessEqual(after, before + 3)
+
+    def test_shadow_evaluation_uses_trace_when_sqlite_contract_disabled(self):
+        """v2x window90 deve avaliar candidato no JSONL pdcp_real, não no SQLite.
+
+        Regressão do piloto r20: a invocação gravava --sqlite-db incondicionalmente;
+        no contrato v2x window90 o SQLite econômico é proibido e o banco do braço
+        não acumula transições aplicadas enquanto o bootstrap só propõe
+        FULL_POWER — o avaliador sempre morria e nenhuma promoção era possível.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "arm"
+            state_dir.mkdir()
+            (state_dir / "rapp_data_lake.db").write_bytes(b"sqlite")
+            trace = root / "recent_trace.jsonl"
+            trace.write_text("", encoding="utf-8")
+            captured: dict[str, object] = {}
+
+            def fake_run(argv, **_kwargs):
+                captured["argv"] = argv
+                out = Path(argv[argv.index("--output") + 1])
+                out.write_text(json.dumps({"candidates": {}}), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            args = SimpleNamespace(
+                state_dir=state_dir,
+                train_python="python3",
+                sqlite_economic_replay=False,
+            )
+            state: dict[str, object] = {}
+            from scripts import run_tasam_online_controlled as controlled
+
+            with mock.patch.object(controlled.subprocess, "run", fake_run):
+                evaluation, output = controlled.evaluate_candidate_shadow(
+                    args, state, root / "active", root / "candidate", trace
+                )
+            argv = captured["argv"]
+            self.assertIn("--trace", argv)
+            self.assertNotIn("--sqlite-db", argv)
+            self.assertEqual(Path(argv[argv.index("--trace") + 1]), trace)
+            self.assertEqual(evaluation, {"candidates": {}})
+            self.assertTrue(output.is_file())
+            # Contrato SQLite (legacy) mantém o comportamento anterior.
+            args.sqlite_economic_replay = True
+            with mock.patch.object(controlled.subprocess, "run", fake_run):
+                controlled.evaluate_candidate_shadow(
+                    args, state, root / "active", root / "candidate", trace
+                )
+            argv = captured["argv"]
+            self.assertIn("--sqlite-db", argv)
+            self.assertNotIn("--trace", argv)
 
     @staticmethod
     def _economic_sqlite_fixture(

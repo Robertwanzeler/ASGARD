@@ -2637,7 +2637,17 @@ def evaluate_candidate_shadow(
     """Evaluate active and candidate policies on the same real-PDCP trace."""
     output = candidate.parent / "candidate_shadow_evaluation.json"
     database = args.state_dir / "rapp_data_lake.db"
-    if not database.exists():
+    # A evidência econômica do piloto v2x window90 é o JSONL (recent_trace
+    # com pdcp_real sem proxy); o SQLite econômico é proibido nesse contrato
+    # e o banco do braço não acumula transições aplicadas enquanto o bootstrap
+    # só propõe FULL_POWER — o avaliador morria com "nenhum estado pdcp_real
+    # sem proxy encontrado" e nenhuma promoção era possível (ponto fixo do
+    # piloto r20).  No contrato SQLite (legacy) o comportamento permanece.
+    use_sqlite = bool(getattr(args, "sqlite_economic_replay", False))
+    evidence: list[str] = (
+        ["--sqlite-db", str(database)] if use_sqlite else ["--trace", str(trace)]
+    )
+    if use_sqlite and not database.exists():
         state["candidate_shadow_evaluation_error"] = f"SQLite ausente: {database}"
         return {}, output
     try:
@@ -2645,7 +2655,7 @@ def evaluate_candidate_shadow(
             [
                 str(args.train_python),
                 str(ROOT / "scripts/evaluate_tasam_same_trace_shadow.py"),
-                "--sqlite-db", str(database),
+                *evidence,
                 "--candidate", f"active={active}",
                 "--candidate", f"candidate={candidate}",
                 "--output", str(output),
