@@ -47,6 +47,10 @@ from greenran_paths import (
     SLICER_SOCKET_PATH,
     ENERGY_SOCKET_PATH,
     TASAM_CONTROL_SOCKET_PATH,
+    VEHICLE_INTENT_PATH,
+    VEHICLE_SAFETY_STATUS_PATH,
+    EXTENDED_METRICS_JSON_PATH,
+    get_fixed_service_imsis,
     as_str,
     ensure_runtime_dirs,
 )
@@ -82,6 +86,19 @@ XAPP_PID_PATHS = {
     "vehicle_control": as_str(XAPP_VEHICLE_PID_PATH),
     "tasam_actuator": as_str(XAPP_TASAM_PID_PATH),
 }
+
+
+def build_xapp_command(xapp_name, binary_path, config_file, flexric_lib, xapp_port):
+    """Build the command line for an xApp with its supported options.
+
+    All GreenRAN xApps use the same FlexRIC argument parser, including the
+    TA-SAM actuator.  Passing ``-x`` to the actuator is required for isolated
+    parallel slots; otherwise it silently falls back to FlexRIC's default
+    port (36422) and its transport ACK can be delivered by the wrong RIC.
+    """
+    command = [binary_path, "-c", config_file, "-p", f"{flexric_lib}/"]
+    command.extend(["-x", str(xapp_port)])
+    return command
 
 
 class XAppManager:
@@ -159,6 +176,58 @@ class XAppManager:
         if xapp_name in self.unavailable_xapps:
             return False
         return self._resolve_binary_path(xapp_name) is not None
+
+    def _vehicle_safety_c_command(self):
+        """Comando do xApp-VehicleSafety nativo (Fase 1), atrás de flag.
+
+        ``GREENRAN_VEHICLE_XAPP=c`` seleciona o binário C; qualquer problema
+        (flag ausente/valor diferente, binário não construído) devolve None e
+        o chamador usa o framework Python como fallback, com aviso explícito
+        quando a flag pedia o modo C.
+        """
+        mode = os.environ.get("GREENRAN_VEHICLE_XAPP", "python").strip().lower()
+        if mode != "c":
+            return None
+        candidate = (
+            Path(self.flexric_build)
+            / "examples"
+            / "xApp"
+            / "c"
+            / "xapp_vehicle_control"
+        )
+        if not (candidate.exists() and os.access(candidate, os.X_OK)):
+            print(
+                "[XAppManager] AVISO: GREENRAN_VEHICLE_XAPP=c mas binário "
+                "xapp_vehicle_control ausente; usando fallback Python"
+            )
+            return None
+        vehicle_imsis = ",".join(
+            str(value) for value in get_fixed_service_imsis()["vehicle"]
+        )
+        command = [
+            str(candidate),
+            "--metrics-path",
+            as_str(EXTENDED_METRICS_JSON_PATH),
+            "--intent-path",
+            as_str(VEHICLE_INTENT_PATH),
+            "--status-path",
+            as_str(VEHICLE_SAFETY_STATUS_PATH),
+            "--vehicle-imsis",
+            vehicle_imsis,
+            "--interval",
+            "2",
+        ]
+        command.extend(
+            [
+                "-c",
+                self.config_file,
+                "-p",
+                f"{self.flexric_lib}/",
+                "-x",
+                str(os.environ.get("GREENRAN_E2_XAPP_PORT", "36422")),
+            ]
+        )
+        return command
     
     def start(self, xapp_name):
         """
@@ -193,9 +262,20 @@ class XAppManager:
         
         try:
             if xapp_name == "vehicle_control":
-                command = [sys.executable, binary_path, "--interval", "2"]
+                vehicle_c_command = self._vehicle_safety_c_command()
+                if vehicle_c_command is not None:
+                    command = vehicle_c_command
+                    binary_path = command[0]
+                else:
+                    command = [sys.executable, binary_path, "--interval", "2"]
             else:
-                command = [binary_path, "-c", self.config_file, "-p", f"{self.flexric_lib}/"]
+                command = build_xapp_command(
+                    xapp_name,
+                    binary_path,
+                    self.config_file,
+                    self.flexric_lib,
+                    os.environ.get("GREENRAN_E2_XAPP_PORT", "36422"),
+                )
 
             # Keep every restart in the campaign log.  Replacing the file on
             # each restart hid the first E2/RC crash and made the native
@@ -316,7 +396,13 @@ class XAppManager:
                 'vehicle_control': 'xapp_vehicle_control.py',
                 'tasam_actuator': 'xapp_tasam_actuator',
             }.get(xapp_name, '')
-            if expected and expected not in cmdline:
+            if xapp_name == "vehicle_control":
+                is_python_vehicle = "xapp_vehicle_control.py" in cmdline
+                is_c_vehicle = "c/xapp_vehicle_control " in cmdline
+                if not (is_python_vehicle or is_c_vehicle):
+                    self._cleanup(xapp_name)
+                    return False
+            elif expected and expected not in cmdline:
                 self._cleanup(xapp_name)
                 return False
         except (FileNotFoundError, PermissionError):
