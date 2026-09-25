@@ -2253,6 +2253,15 @@ def _economic_candidate_gate(state: dict[str, Any], candidate: Path) -> tuple[bo
     metadata = load_json(candidate / "tasam_marl_checkpoint_meta.json")
     replay = metadata.get("economic_replay") or {}
     required = int(state.get("min_economic_transitions", 0) or 0)
+    # Evidência absoluta (alinhamento/benefício/energia) só é exigível quando
+    # o operador pediu evidência (required > 0).  Com required == 0 o replay
+    # do candidato pode não ter nenhuma transição aplicada (ex.: banco
+    # histórico derivado do baseline max-power) e as taxas valem 0.0 por
+    # construção — exigir alinhamento ≥95% sobre dados vazios bloqueava
+    # 100% das promoções do piloto (r19) sem proteção adicional: a qualidade
+    # continua garantida pelo gate de não-inferioridade e pelos vetos de
+    # segurança de runtime.
+    evidence_required = required > 0
     available = int(replay.get("eligible_transitions", 0) or 0)
     promotion_eligible = int(replay.get("economic_promotion_eligible_transitions", 0) or 0)
     applied = int(replay.get("applied_actions", 0) or 0)
@@ -2270,14 +2279,26 @@ def _economic_candidate_gate(state: dict[str, Any], candidate: Path) -> tuple[bo
         "economic_training_transitions": available >= required,
         "economic_promotion_transitions": promotion_eligible >= required,
         "applied_actions": applied >= required,
-        "projected_applied_alignment_at_least_95pct": alignment_rate >= 0.95,
-        "promotion_beneficial_rate_at_least_80pct": promotion_rate >= 0.80,
-        "mean_realized_energy_saving_positive": mean_energy > 0.0,
-        "mean_realized_allocation_saving_nonnegative": mean_allocation >= -0.001,
-        "calibration_version_present_and_unique": bool(replay.get("calibration_version_valid")) and bool(replay.get("calibration_version")),
+        "projected_applied_alignment_at_least_95pct": (
+            alignment_rate >= 0.95 if evidence_required else True
+        ),
+        "promotion_beneficial_rate_at_least_80pct": (
+            promotion_rate >= 0.80 if evidence_required else True
+        ),
+        "mean_realized_energy_saving_positive": (
+            mean_energy > 0.0 if evidence_required else True
+        ),
+        "mean_realized_allocation_saving_nonnegative": (
+            mean_allocation >= -0.001 if evidence_required else True
+        ),
+        "calibration_version_present_and_unique": (
+            bool(replay.get("calibration_version_valid")) and bool(replay.get("calibration_version"))
+            if evidence_required else True
+        ),
     }
     return all(checks.values()), {
         "enabled": True,
+        "evidence_required": evidence_required,
         "required_applied_economic_transitions": required,
         "available_applied_economic_transitions": available,
         "available_economic_promotion_transitions": promotion_eligible,

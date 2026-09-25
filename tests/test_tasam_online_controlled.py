@@ -855,6 +855,74 @@ class TasamOnlineControlledTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertFalse(gate["checks"]["mean_realized_allocation_saving_nonnegative"])
 
+    def test_economic_gate_without_required_evidence_skips_absolute_checks(self):
+        """required=0 não pode reprovar candidato por taxas absolutas sobre replay vazio.
+
+        Regressão do piloto r19: com banco histórico max-power (0 transições
+        aplicadas), alignment/beneficial/energia valem 0.0 por construção e o
+        gate absoluto bloqueava 100% das promoções.  Com required=0 a
+        identidade de contrato segue obrigatória; a qualidade fica no gate de
+        não-inferioridade.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = root / "candidate"
+            candidate.mkdir()
+            (candidate / "tasam_marl_checkpoint_meta.json").write_text(
+                json.dumps({
+                    "economic_action_contract": "applied_action_v2",
+                    "total_budget_fraction_bounds": [0.0, 1.0],
+                    "economic_replay": {
+                        "eligible_transitions": 0,
+                        "economic_promotion_eligible_transitions": 0,
+                        "applied_actions": 0,
+                        "projected_applied_alignment_rate": 0.0,
+                        "promotion_beneficial_rate": 0.0,
+                        "mean_realized_energy_saving_fraction": 0.0,
+                        "mean_realized_allocation_saving_fraction": 0.0,
+                    },
+                }), encoding="utf-8"
+            )
+            ok, gate = _economic_candidate_gate(
+                {"economic_action_contract": "applied_action_v2", "min_economic_transitions": 0},
+                candidate,
+            )
+            self.assertTrue(ok)
+            self.assertFalse(gate["evidence_required"])
+            self.assertTrue(gate["checks"]["contract_matches"])
+            self.assertTrue(gate["checks"]["projected_applied_alignment_at_least_95pct"])
+            self.assertTrue(gate["checks"]["mean_realized_energy_saving_positive"])
+            # required=0 com contagem > 0 também passa (>= required).
+            # Contrato divergente continua reprovando mesmo sem evidência.
+            (candidate / "tasam_marl_checkpoint_meta.json").write_text(
+                json.dumps({
+                    "economic_action_contract": "economic_action_v3_per_du_sleep",
+                    "total_budget_fraction_bounds": [0.0, 1.0],
+                    "economic_replay": {},
+                }), encoding="utf-8"
+            )
+            ok, gate = _economic_candidate_gate(
+                {"economic_action_contract": "applied_action_v2", "min_economic_transitions": 0},
+                candidate,
+            )
+            self.assertFalse(ok)
+            self.assertFalse(gate["checks"]["contract_matches"])
+            # v3 exige joint_action_dim == 14 mesmo sem evidência.
+            (candidate / "tasam_marl_checkpoint_meta.json").write_text(
+                json.dumps({
+                    "economic_action_contract": "economic_action_v3_per_du_sleep",
+                    "joint_action_dim": 11,
+                    "total_budget_fraction_bounds": [0.0, 1.0],
+                    "economic_replay": {},
+                }), encoding="utf-8"
+            )
+            ok, gate = _economic_candidate_gate(
+                {"economic_action_contract": "economic_action_v3_per_du_sleep", "min_economic_transitions": 0},
+                candidate,
+            )
+            self.assertFalse(ok)
+            self.assertFalse(gate["checks"]["v10_joint_action_dim"])
+
     def test_economic_v2_rollout_stops_at_fifty_percent_without_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
