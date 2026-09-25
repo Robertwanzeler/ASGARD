@@ -489,9 +489,13 @@ def _run_trainability_gate(
     # diagnostic gate, but allow the association/readback contract to settle;
     # the scientific/pilot duration remains unchanged at 120 s.
     gate_sim_time_s = 30.0
-    # A trainability probe must fail fast when the native chain is broken;
-    # the 120 s pilot remains governed by the user-facing wall-time limit.
-    gate_wall_time_s = min(float(args.wall_time), 360.0)
+    # A sonda de treinabilidade deve falhar rápido quando a cadeia nativa
+    # está quebrada; o piloto de 120 s continua regido pelo wall-time do
+    # usuário.  O piso de 5 s simulados exige RTF ≥ 0.0104 dentro da janela
+    # (5/480); o braço asgard (treino online + overhead de E2) opera perto
+    # de RTF 0.013 sob contenção — 360 s ficava na borda exata (r18 passou
+    # com 5.0 s por sorte; os smokes de 2026-09-25 falharam com 4.5-4.9 s).
+    gate_wall_time_s = min(float(args.wall_time), 480.0)
     schedule_file = gate_root / "pairing_schedule.json"
     schedule = canonical_schedule(args.profile, SEED, gate_sim_time_s, tick_s=0.25)
     write_schedule(schedule_file, schedule)
@@ -585,6 +589,15 @@ def _run_trainability_gate(
         )
         codes.update(arm_codes)
         stopped_after_native = stopped_after_native and arm_stopped
+        if label == "rapp":
+            # Libera coletores/portas do slot-a ANTES de o asgard começar:
+            # sem isso os processos remanescentes do baseline competem por
+            # CPU com o braço de treino durante toda a janela dele e deprimem
+            # o RTF exatamente no braço mais sensível.
+            _cleanup_finished_arm(
+                baseline_dir, gate_root / "cleanup_audit_rapp_interim",
+                reason="trainability_gate_serial_slot_handoff",
+            )
     arms = {
         "rapp": (baseline_dir, False),
         "asgard": (asgard_dir, True),
@@ -938,7 +951,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
             "profile": args.profile,
             "seed": SEED,
             "sim_time_s": 30.0,
-            "wall_time_s": min(float(args.wall_time), 360.0),
+            "wall_time_s": min(float(args.wall_time), 480.0),
             "trainability_gate": gate,
             "binary": str(_binary_from_args),
             "binary_sha256": sha256(_binary_from_args),
