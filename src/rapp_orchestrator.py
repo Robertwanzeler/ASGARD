@@ -4841,19 +4841,23 @@ class RappResourceOptimizer:
         except (TypeError, ValueError):
             sim_time_s = 0.0
         association_cells, association_evidence = self._native_association_cells(sim_time_s)
-        association_valid = (
-            set(association_cells) == {2, 3, 4}
-            and all(association_cells.get(cell) for cell in (2, 3, 4))
-            and set().union(*(association_cells.get(cell, set()) for cell in (2, 3, 4)))
-            == set(range(1, 21))
+        # Cobertura parcial é mobilidade, não quebra de identidade: exige-se
+        # apenas que PELO MENOS um UE tenha associação observada.  DUs vazios
+        # ficam em 100% no bundle e IMSIs sem associação seguem no scheduler
+        # stock; o gap fica registrado na evidência (r23/r24: exigir 3 DUs +
+        # 20 IMSIs perfeitos mantendria a campanha em failsafe eterno).
+        covered_imsis = (
+            set().union(*(association_cells.get(cell, set()) for cell in (2, 3, 4)))
+            if association_cells else set()
         )
+        association_valid = bool(covered_imsis) and bool(association_cells)
         # Keep a primary cell only for the SLA/floor projector.  The E2
         # bundle below uses every native cell membership, including a real
         # MC overlap, so scheduler preparation is sent to the same DUs that
         # exposed the RNTI in the native trace.
         association_map = {}
         if association_valid:
-            for imsi in range(1, 21):
+            for imsi in sorted(covered_imsis):
                 candidates = [
                     cell for cell in (2, 3, 4)
                     if imsi in association_cells.get(cell, set())
@@ -4873,16 +4877,27 @@ class RappResourceOptimizer:
                 if sum(imsi in association_cells.get(cell, set()) for cell in (2, 3, 4)) > 1
             ) if association_valid else [],
         }
+        unassociated_imsis = []
         if association_valid:
             # Replace only the serving-cell field used by the E2 shield and
             # projection.  SLA/service classification remains canonical by
-            # IMSI; radio control follows the observed RRC association.
+            # IMSI; radio control follows the observed RRC association.  Um
+            # IMSI sem associação nesta janela mantém a célula original da
+            # linha (scheduler stock) e é registrado como gap observável.
             for row in sla_rows + demand_rows:
                 try:
-                    row['cell_id'] = int(association_map[int(row['imsi'])])
+                    row['cell_id'] = int(
+                        association_map[int(row['imsi'])]
+                    )
                 except (KeyError, TypeError, ValueError):
-                    association_valid = False
-                    break
+                    try:
+                        unassociated_imsis.append(int(row['imsi']))
+                    except (TypeError, ValueError):
+                        pass
+        if unassociated_imsis:
+            decision['tasam_association_evidence']['skipped_imsis'] = (
+                sorted(set(unassociated_imsis))
+            )
         # The simulator may advance much more slowly than the controller.  A
         # fixed 30-second sim-time warm-up would keep sending the emergency
         # bundle even after the collector has a complete real-PDCP window.
@@ -4960,13 +4975,15 @@ class RappResourceOptimizer:
                     if imsi in association_cells.get(cell, set())
                 ]
                 if not native_cells:
-                    failsafe = True
-                    decision['tasam_association_evidence']['reason'] = (
-                        'native_association_missing_for_imsi'
+                    # Sem associação nativa para este IMSI nesta janela:
+                    # pular a política por-UE (scheduler stock serve a UE) e
+                    # registrar o gap; não degrada o bundle inteiro.
+                    skipped = decision['tasam_association_evidence'].setdefault(
+                        'skipped_policy_imsis', []
                     )
-                    decision['tasam_association_evidence']['valid'] = False
-                    decision['tasam_association_evidence']['mapping'] = {}
-                    break
+                    if imsi not in skipped:
+                        skipped.append(imsi)
+                    continue
                 for cell_id in native_cells:
                     cells[cell_id].append({
                         key: value for key, value in policy.items() if key != 'cell_id'

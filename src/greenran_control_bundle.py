@@ -121,8 +121,11 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
         raise ControlBundleError("at least one cell is required")
     normalized_cells: list[dict[str, Any]] = []
     seen_imsis: set[int] = set()
+    # Dispositivos MC (useMcUeDevices=true) aparecem legitimamente em dois
+    # DUs; duplicata com a flag de overlap é contrato, não erro (restringir
+    # a v3 rejeitava todo bundle econômico da campanha v6 — r24).
     allow_native_mc_overlap = bool(
-        v3 and bundle.get("association_mode") == "native_rrc_mc_overlap"
+        bundle.get("association_mode") == "native_rrc_mc_overlap"
     )
     for raw_cell in cells:
         if not isinstance(raw_cell, dict):
