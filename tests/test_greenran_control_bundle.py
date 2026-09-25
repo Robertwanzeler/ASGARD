@@ -102,3 +102,117 @@ def test_client_requires_applied_e2_ack(tmp_path, monkeypatch):
     ack = client.send(_bundle())
     assert ack["applied"] is True
     assert received["schema"] == SCHEMA
+
+
+def _failsafe():
+    from greenran_control_bundle import failsafe_bundle
+
+    return failsafe_bundle(
+        sequence=7,
+        cell_ids=(2, 3, 4),
+        reason='regression_test',
+        sim_time_s=12.5,
+    )
+
+
+def _v6(monkeypatch):
+    monkeypatch.setenv("GREENRAN_NATIVE_EVIDENCE_VERSION", "v6")
+
+
+def test_failsafe_ack_sem_cell_results_e_aceito(tmp_path, monkeypatch):
+    """r23: ack applied=True sem cell_results flipava BLOCKED silenciosamente.
+
+    Failsafe é o estado seguro por definição: o ACK global basta.
+    """
+    _v6(monkeypatch)
+    received = {}
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def settimeout(self, _):
+            pass
+
+        def connect(self, _):
+            pass
+
+        def sendall(self, payload):
+            received.update(json.loads(payload))
+
+        def recv(self, _):
+            return json.dumps({
+                "schema": ACK_SCHEMA,
+                "policy_id": received.get("policy_id"),
+                "sequence": received.get("sequence"),
+                "ack": True,
+                "applied": True,
+                "cell_results": [],
+                "observed_confirmations": 8,
+            }).encode()
+
+    monkeypatch.setattr("greenran_control_bundle.socket.socket", lambda *_: FakeSocket())
+    client = ControlBundleClient(
+        socket_path=tmp_path / "tasam.sock",
+        shadow_path=tmp_path / "bundle.json",
+        ack_path=tmp_path / "ack.json",
+    )
+    ack = client.send(_failsafe())
+    assert ack["applied"] is True
+    assert ack["cell_ack_complete"] is True
+
+
+def test_economico_sem_acks_por_celula_continua_rejeitado(tmp_path, monkeypatch):
+    """Bundle econômico v6 sem cobertura 2/3/4 nos acks segue inválido."""
+    _v6(monkeypatch)
+    audited = []
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def settimeout(self, _):
+            pass
+
+        def connect(self, _):
+            pass
+
+        def sendall(self, _):
+            pass
+
+        def recv(self, _):
+            return json.dumps({
+                "schema": ACK_SCHEMA,
+                "policy_id": "test-policy",
+                "sequence": 7,
+                "ack": True,
+                "applied": True,
+                "cell_results": [
+                    {"cell_id": 2, "scheduler_ack": True, "power_ack": True},
+                ],
+                "observed_confirmations": 8,
+            }).encode()
+
+    monkeypatch.setattr("greenran_control_bundle.socket.socket", lambda *_: FakeSocket())
+    client = ControlBundleClient(
+        socket_path=tmp_path / "tasam.sock",
+        shadow_path=tmp_path / "bundle.json",
+        ack_path=tmp_path / "ack.json",
+        audit_path=tmp_path / "audit.jsonl",
+    )
+    original_audit = client._audit
+
+    def spy(entry):
+        audited.append(entry)
+        original_audit(entry)
+
+    client._audit = spy
+    with pytest.raises(ControlBundleError):
+        client.send(_bundle())
+    assert audited and audited[-1].get("cell_ack_complete") is False
