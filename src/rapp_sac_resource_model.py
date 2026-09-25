@@ -471,6 +471,76 @@ def enforce_resource_state(snapshot: Dict[str, Any], preserve_allocation: bool =
     return result
 
 
+def enforce_tasam_headroom_envelope(
+    snapshot: Dict[str, Any], *, headroom_ratio: float = 0.15
+) -> Dict[str, Any]:
+    """Keep TA-SAM between each measured floor and 115% of that floor.
+
+    This envelope applies only to a TA-SAM-selected action.  The rApp live
+    policy has no equivalent optimization cap; both paths still pass through
+    the shared hard floor and SLA safety checks.  An infeasible floor never
+    becomes a successful allocation and is handed to the stock fail-safe.
+    """
+    result = dict(snapshot or {})
+    ratio = max(0.0, float(headroom_ratio))
+    floor_ran = max(0.0, _safe_float(result.get("floor_total_ran"), 0.0))
+    floor_ai = max(0.0, _safe_float(result.get("floor_total_ai"), 0.0))
+    budget = max(
+        0.0,
+        _safe_float(result.get("usable_budget", result.get("resource_budget", 1.0)), 1.0),
+    )
+    floor_feasible = floor_ran + floor_ai <= budget + 1e-9
+    cap_ran = floor_ran * (1.0 + ratio)
+    cap_ai = floor_ai * (1.0 + ratio)
+    requested_ran = max(floor_ran, _safe_float(result.get("r_ran"), floor_ran))
+    requested_ai = max(floor_ai, _safe_float(result.get("r_ai"), floor_ai))
+    bounded_ran = min(requested_ran, cap_ran)
+    bounded_ai = min(requested_ai, cap_ai)
+    if not floor_feasible:
+        result.update({
+            "tasam_headroom_envelope": {
+                "version": "tasam_floor_headroom_v1",
+                "applied": False,
+                "headroom_ratio": ratio,
+                "floor_ran": floor_ran,
+                "floor_ai": floor_ai,
+                "cap_ran": cap_ran,
+                "cap_ai": cap_ai,
+                "reason": "infeasible_floor",
+            },
+            "failsafe_required": True,
+            "failsafe_reason": "infeasible_ue_floors",
+            "floor_feasible": False,
+        })
+        return result
+    if bounded_ran + bounded_ai > budget + 1e-9:
+        # Preserve both floors and trim only the allowed headroom, in a
+        # deterministic proportion to the available headroom per domain.
+        extra_budget = max(0.0, budget - floor_ran - floor_ai)
+        extra_ran = max(0.0, bounded_ran - floor_ran)
+        extra_ai = max(0.0, bounded_ai - floor_ai)
+        extra_total = extra_ran + extra_ai
+        if extra_total > extra_budget:
+            scale = extra_budget / extra_total if extra_total else 0.0
+            bounded_ran = floor_ran + extra_ran * scale
+            bounded_ai = floor_ai + extra_ai * scale
+    result.update({
+        "r_ran": round(bounded_ran, 12),
+        "r_ai": round(bounded_ai, 12),
+        "tasam_headroom_envelope": {
+            "version": "tasam_floor_headroom_v1",
+            "applied": True,
+            "headroom_ratio": ratio,
+            "floor_ran": floor_ran,
+            "floor_ai": floor_ai,
+            "cap_ran": cap_ran,
+            "cap_ai": cap_ai,
+            "reason": "floor_plus_headroom",
+        },
+    })
+    return result
+
+
 def apply_baseline_resource_band(
     snapshot: Dict[str, Any],
     allocation_state: str | None,

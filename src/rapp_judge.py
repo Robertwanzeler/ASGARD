@@ -10,7 +10,13 @@ contract agreed for the GreenRAN experiment.
 from __future__ import annotations
 
 from copy import deepcopy
+import os
 from typing import Any, Dict, Iterable, Optional
+
+try:
+    from greenran_v2x_adaptive_reward import REWARD_CONTRACT, compose_adaptive_reward
+except ImportError:  # pragma: no cover - package import fallback
+    from .greenran_v2x_adaptive_reward import REWARD_CONTRACT, compose_adaptive_reward
 
 
 SEVERITY_RANK = {
@@ -727,6 +733,47 @@ class RAppJudge:
         observation = current_observation if isinstance(current_observation, dict) else {}
         config = config if isinstance(config, dict) else {}
         shared = config.get("shared_resources") if isinstance(config.get("shared_resources"), dict) else config
+
+        # New V2X article arms opt into the common compositor explicitly.
+        # Leaving this branch opt-in preserves every historical reward
+        # contract, including ARMD and economic replay diagnostics.
+        reward_contract = str(
+            shared.get("reward_contract")
+            or os.environ.get("GREENRAN_TASAM_REWARD_CONTRACT", "")
+        )
+        reward_config = dict(shared)
+        reward_config["reward_contract"] = reward_contract
+        if "reward" not in reward_config and isinstance(config.get("reward"), dict):
+            reward_config["reward"] = config["reward"]
+        if reward_contract == REWARD_CONTRACT:
+            adaptive = compose_adaptive_reward(
+                previous,
+                observation,
+                reward_config,
+                energy_enabled=shared.get(
+                    "energy_enabled",
+                    os.environ.get("GREENRAN_TASAM_REWARD_ENERGY_ENABLED", "0") == "1",
+                ),
+                energy_evidence=observation.get("energy_evidence"),
+            )
+            return {
+                "tasam_observed_error": adaptive["observed_error"],
+                "tasam_continuous_reward": adaptive["continuous_reward"],
+                "tasam_reward_source": "v2x_adaptive_real_metrics",
+                "tasam_error_components": {
+                    "v2x": adaptive["raw_components"]["v2x"],
+                    "equity": adaptive["raw_components"]["equity"],
+                    "adaptive_risk_v2x": adaptive["risk_v2x"],
+                    "adaptive_risk_equity": adaptive["risk_equity"],
+                    "energy_cost": adaptive["energy_cost"],
+                    "safety_reasons": adaptive["safety_reasons"],
+                },
+                "tasam_adaptive_reward": adaptive,
+                "reward_contract": REWARD_CONTRACT,
+                "reward_weight_snapshot": adaptive["snapshot"],
+                "energy_eligible": adaptive["energy_eligible"],
+                "adaptive_reward_state": adaptive["adaptive_reward_state"],
+            }
 
         def number(value: Any, default: float = 0.0) -> float:
             try:

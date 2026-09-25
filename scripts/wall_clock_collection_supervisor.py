@@ -94,14 +94,32 @@ def terminate_process(pid: int, *, grace_seconds: float = 8.0) -> str:
     return "terminated_forcefully"
 
 
-def stop_collection(state_dir: Path, *, keep_ric: bool) -> dict[str, str]:
+def stop_collection(
+    state_dir: Path, *, keep_ric: bool, drain_rapp_before_stop: bool = False,
+    rapp_drain_seconds: float = 0.0,
+) -> dict[str, str]:
     results: dict[str, str] = {}
-    for pid_name, tokens in PROCESS_SPECS:
+    specs = list(PROCESS_SPECS)
+    rapp_spec = next((item for item in specs if item[0] == "rapp.pid"), None)
+    if drain_rapp_before_stop and rapp_spec is not None:
+        specs = [item for item in specs if item[0] != "rapp.pid"]
+    for pid_name, tokens in specs:
         pid_path = state_dir / pid_name
         pid = read_pid(pid_path)
         if pid is None or not is_expected_process(pid, state_dir, tokens):
             continue
         results[pid_name] = terminate_process(pid)
+    if drain_rapp_before_stop and rapp_spec is not None:
+        # Native evidence and the final metric are already sealed by the
+        # simulator at this point.  Give the rApp a bounded interval to read
+        # that final snapshot and persist Judge feedback before its SIGTERM.
+        if rapp_drain_seconds > 0:
+            time.sleep(float(rapp_drain_seconds))
+        pid_name, tokens = rapp_spec
+        pid_path = state_dir / pid_name
+        pid = read_pid(pid_path)
+        if pid is not None and is_expected_process(pid, state_dir, tokens):
+            results[pid_name] = terminate_process(pid)
     if not keep_ric:
         ric_path = state_dir / "ric.pid"
         ric_pid = read_pid(ric_path)
@@ -191,7 +209,21 @@ def main() -> int:
         time.sleep(min(1.0, max(0.1, remaining)))
 
     shutdown_started = now_iso()
-    results = stop_collection(state_dir, keep_ric=bool(args.keep_ric))
+    drain_rapp = os.environ.get("GREENRAN_DRAIN_RAPP_BEFORE_STOP", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    try:
+        rapp_drain_seconds = max(
+            0.0, float(os.environ.get("GREENRAN_RAPP_DRAIN_SECONDS", "0"))
+        )
+    except ValueError:
+        rapp_drain_seconds = 0.0
+    results = stop_collection(
+        state_dir,
+        keep_ric=bool(args.keep_ric),
+        drain_rapp_before_stop=drain_rapp,
+        rapp_drain_seconds=rapp_drain_seconds,
+    )
     if args.post_stop_grace_seconds > 0:
         time.sleep(float(args.post_stop_grace_seconds))
     export_enabled = os.environ.get("GREENRAN_TASAM_EXPORT_ENABLED", "1").strip().lower() in {

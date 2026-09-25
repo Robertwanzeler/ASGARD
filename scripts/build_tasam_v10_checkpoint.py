@@ -36,6 +36,7 @@ def main() -> int:
     parser.add_argument("--parent", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=47)
+    parser.add_argument("--category-only", action="store_true")
     args = parser.parse_args()
     parent = args.parent.resolve()
     output = args.output.resolve()
@@ -69,11 +70,11 @@ def main() -> int:
         except (RuntimeError, TypeError, OSError):
             return False
 
-    load_if_compatible(trainer.actors, "tasam_marl_actors.pt")
     load_if_compatible(trainer.category_head, "tasam_marl_category_head.pt")
-    load_if_compatible(trainer.power_head, "tasam_marl_power_head.pt")
-    if not load_if_compatible(trainer.allocation_head, "tasam_marl_allocation_head.pt"):
-        pass
+    if not args.category_only:
+        load_if_compatible(trainer.actors, "tasam_marl_actors.pt")
+        load_if_compatible(trainer.power_head, "tasam_marl_power_head.pt")
+        load_if_compatible(trainer.allocation_head, "tasam_marl_allocation_head.pt")
 
     # Initialize DU2/3/4 power and total budget at the upper operating bound.
     with torch.no_grad():
@@ -92,12 +93,15 @@ def main() -> int:
             "allocation_target_contract": "capacity_budget_with_sla_floor_v1",
             "total_budget_fraction_bounds": [0.0, 1.0],
             "global_action_dim": 5,
+            "actor_hidden_dims": [300, 400, 400],
+            "activation": "tanh",
             "global_action_layout": [
                 "power_du_2", "power_du_3", "power_du_4", "ran_share", "total_budget_fraction"
             ],
             "joint_action_dim": 14,
             "power_levels": [0, *range(25, 101, 5)],
             "economic_sleep_contract": "handover_pdcp_window_10s_one_du_v1",
+            "economic_safety_isolation": "blocked_and_critical_v1",
             "initial_action": {
                 "power_percent_by_cell": {"2": 100, "3": 100, "4": 100},
                 "total_budget_fraction": 1.0,
@@ -105,10 +109,12 @@ def main() -> int:
             "parent_checkpoint": str(parent),
             "parent_checkpoint_sha256": sha256(parent / "tasam_marl_actors.pt"),
             "parent_metadata_sha256": sha256(meta_path),
-            "warm_start": True,
+            "warm_start": not args.category_only,
+            "category_only": bool(args.category_only),
             "parent_was_promoted": False,
             "replay_imported": False,
             "calibration_required": "sim_v3_sleep",
+            "economic_safety_isolation": "blocked_and_critical_v1",
         },
     )
     # export_checkpoint writes the actor/heads and metadata, but the online
@@ -125,11 +131,14 @@ def main() -> int:
             "global_state_dim": 13,
             "global_action_dim": 5,
             "joint_action_dim": 14,
-            "warm_start": True,
+            "warm_start": not args.category_only,
+            "category_only": bool(args.category_only),
             "parent_was_promoted": False,
             "replay_imported": False,
             "calibration_required": "sim_v3_sleep",
             "final_metrics": {},
+            "evaluation_eligible": False,
+            "promotion_eligible": False,
         }, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )

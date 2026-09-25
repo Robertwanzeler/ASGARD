@@ -36,13 +36,14 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from greenran_paths import STATE_DIR  # noqa: E402
+from greenran_api_security import require_mutation_token  # noqa: E402
 from greenran_runtime import load_runtime_config  # noqa: E402
 from services import CameraRegistryStore, GreenRANContextReader, VideoAnalysisStore, VigilanceEventStore  # noqa: E402
 from real_video_pipeline import RealVideoPipeline  # noqa: E402
 
 IA_PIPELINE = RealVideoPipeline()
 RUNTIME_CONFIG = load_runtime_config()
-APP_HOST = "0.0.0.0"
+APP_HOST = os.environ.get("GREENRAN_APP1_HOST", "127.0.0.1")
 APP_PORT = 5100
 
 app = Flask(__name__, template_folder=str(APP_DIR / "templates"))
@@ -264,6 +265,7 @@ def list_cameras():
 
 
 @app.route("/api/cameras", methods=["POST"])
+@require_mutation_token
 def upsert_camera():
     payload = request.get_json(silent=True) or {}
     camera = _enrich_camera_record(CAMERA_STORE.upsert_camera(payload))
@@ -276,6 +278,7 @@ def upsert_camera():
 
 
 @app.route("/api/cameras/<camera_id>/ingest-now", methods=["POST"])
+@require_mutation_token
 def ingest_camera_now(camera_id: str):
     result = CAMERA_STORE.process_camera_once(
         camera_id=camera_id,
@@ -295,6 +298,7 @@ def ingest_camera_now(camera_id: str):
 
 
 @app.route("/cameras/<camera_id>/ingest-now", methods=["POST"])
+@require_mutation_token
 def ingest_camera_now_form(camera_id: str):
     result = CAMERA_STORE.process_camera_once(
         camera_id=camera_id,
@@ -342,6 +346,7 @@ def ingest_camera_now_form(camera_id: str):
 
 
 @app.route("/cameras/configure", methods=["POST"])
+@require_mutation_token
 def configure_camera_form():
     payload = {
         "camera_id": request.form.get("camera_id", "").strip(),
@@ -385,6 +390,7 @@ def serve_media(relative_path: str):
 
 
 @app.route("/api/events/mock", methods=["POST"])
+@require_mutation_token
 def create_mock_event():
     payload = request.get_json(silent=True) or {}
     event = STORE.add_event(payload, network_context=CONTEXT.get_context())
@@ -397,6 +403,7 @@ def create_mock_event():
 
 
 @app.route("/api/video-analyses", methods=["POST"])
+@require_mutation_token
 def create_video_analysis():
     payload = request.get_json(silent=True) or {}
     analysis = ANALYSIS_STORE.add_analysis(
@@ -413,6 +420,7 @@ def create_video_analysis():
 
 
 @app.route("/api/videos/upload", methods=["POST"])
+@require_mutation_token
 def upload_video():
     uploaded = request.files.get("video")
     if uploaded is None or not uploaded.filename:
@@ -438,6 +446,7 @@ def upload_video():
 
 
 @app.route("/upload", methods=["POST"])
+@require_mutation_token
 def upload_video_form():
     uploaded = request.files.get("video")
     if uploaded is None or not uploaded.filename:
@@ -471,6 +480,7 @@ def upload_video_form():
 
 
 @app.route("/api/events/<event_id>/reveal-face", methods=["POST"])
+@require_mutation_token
 def reveal_face(event_id: str):
     payload = request.get_json(silent=True) or {}
     updated = STORE.reveal_face(event_id, reason=payload.get("reason", "security_validation"))

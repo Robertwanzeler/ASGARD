@@ -8,7 +8,7 @@ echo "=========================================="
 echo "  O-RAN Simulation - Integrated Runtime"
 echo "=========================================="
 
-BASE_DIR="${BASE_DIR:-/home/robert/orange_nuclear}"
+BASE_DIR="${BASE_DIR:-$PROJECT_DIR}"
 
 resolve_ric_binary() {
     local candidate

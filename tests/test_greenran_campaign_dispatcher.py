@@ -35,6 +35,7 @@ def _checkpoint(tmp_path: Path, *, economic: bool = True) -> Path:
         "uses_global_energy_infra_actor": True,
         "allocation_head_output_dim": 3 if economic else 2,
         "allocation_head_outputs": ["ran_share", "ai_share", "total_budget_fraction"] if economic else ["ran_share", "ai_share"],
+        "final_metrics": {"eval_return": 1.0},
     }
     (path / "tasam_marl_checkpoint_meta.json").write_text(json.dumps(metadata))
     (path / "tasam_marl_actors.pt").write_bytes(b"test")
@@ -198,6 +199,192 @@ def test_frozen_asgard_job_is_a_separate_fail_closed_kind(tmp_path, monkeypatch)
     spec = jobs.normalize_job(payload)
     assert spec.kind == "asgard_frozen_evaluation"
     assert "run_tasam_asgard_frozen_evaluation.py" in spec.command[1]
+
+
+def test_vehicle_smoke_is_one_interval_and_keeps_strict_window_contract(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    monkeypatch.setattr(jobs, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(jobs, "RUNS_ROOT", runs)
+    checkpoint = _checkpoint(tmp_path, economic=False)
+    payload = {
+        "schema": JOB_SCHEMA,
+        "job_id": "vehicle-smoke-test-001",
+        "kind": "vehicle_feasibility",
+        "campaign_dir": str(runs / "vehicle-smoke"),
+        "checkpoint": str(checkpoint),
+        "profile": "tasam_training_balanced_v4_v2x_gbr_priority",
+        "seed": 47,
+        "smoke": True,
+    }
+    spec = jobs.normalize_job(payload)
+    assert spec.command[spec.command.index("--intervals-us") + 1] == "4000"
+    assert spec.command[spec.command.index("--scored-windows") + 1] == "1"
+    assert spec.command[spec.command.index("--decision-target") + 1] == "0"
+    assert spec.command[spec.command.index("--warmup-seconds") + 1] == "30"
+    assert spec.command[spec.command.index("--window-seconds") + 1] == "10"
+
+
+def test_vehicle_matrix_is_fixed_to_two_phase_scientific_contract(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    monkeypatch.setattr(jobs, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(jobs, "RUNS_ROOT", runs)
+    checkpoint = _checkpoint(tmp_path, economic=False)
+    payload = {
+        "schema": JOB_SCHEMA,
+        "job_id": "vehicle-matrix-test-001",
+        "kind": "vehicle_feasibility_matrix",
+        "campaign_dir": str(runs / "vehicle-matrix"),
+        "checkpoint": str(checkpoint),
+        "profile": "tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback",
+        "selection_seed": 47,
+        "validation_seeds": [45, 46],
+        "intervals_us": [4000, 6000, 8000, 12000, 16000],
+    }
+    spec = jobs.normalize_job(payload)
+    assert spec.kind == "vehicle_feasibility_matrix"
+    assert "run_tasam_vehicle_feasibility_matrix.py" in spec.command[1]
+    assert spec.command[spec.command.index("--selection-seed") + 1] == "47"
+    assert spec.command[spec.command.index("--validation-seeds") + 1] == "45,46"
+    assert spec.command[spec.command.index("--intervals-us") + 1] == "4000,6000,8000,12000,16000"
+    assert "--decision-target" not in spec.command
+
+    payload["intervals_us"] = [4000, 8000]
+    with pytest.raises(JobValidationError, match="intervals_us"):
+        jobs.normalize_job(payload)
+    payload["intervals_us"] = [4000, 6000, 8000, 12000, 16000]
+    payload["profile"] = "tasam_training_balanced_v4_v2x_gbr_priority"
+    with pytest.raises(JobValidationError, match="contrato PDCP por PDU"):
+        jobs.normalize_job(payload)
+
+
+def test_article_online_job_is_rejected_in_favor_of_rapp_vs_asgard(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    monkeypatch.setattr(jobs, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(jobs, "RUNS_ROOT", runs)
+    checkpoint = _checkpoint(tmp_path, economic=False)
+    bank = tmp_path / "historical_bank.jsonl"
+    bank.write_text("{}\n")
+    payload = {
+        "schema": JOB_SCHEMA,
+        "job_id": "article-online-test-001",
+        "kind": "v2x_article_online",
+        "campaign_dir": str(runs / "article-online"),
+        "checkpoint": str(checkpoint),
+        "experience_bank": str(bank),
+        "profile": "tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback",
+        "training_seeds": [43, 44],
+        "evaluation_seeds": [45, 46, 47],
+        "stage": "train_baseline",
+    }
+    with pytest.raises(JobValidationError, match="comparador oficial"):
+        jobs.normalize_job(payload)
+
+
+def test_non_v2x_vehicle_smoke_keeps_decision_target(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    monkeypatch.setattr(jobs, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(jobs, "RUNS_ROOT", runs)
+    checkpoint = _checkpoint(tmp_path, economic=False)
+    payload = {
+        "schema": JOB_SCHEMA,
+        "job_id": "vehicle-smoke-nonv2x-001",
+        "kind": "vehicle_feasibility",
+        "campaign_dir": str(runs / "vehicle-smoke-nonv2x"),
+        "checkpoint": str(checkpoint),
+        "profile": "tasam_training_economic_vehicle_safe_v1",
+        "seed": 47,
+        "smoke": True,
+    }
+    spec = jobs.normalize_job(payload)
+    assert spec.command[spec.command.index("--decision-target") + 1] == "20"
+
+
+def test_asgard_frozen_rejects_empty_final_metrics(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    monkeypatch.setattr(jobs, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(jobs, "RUNS_ROOT", runs)
+    checkpoint = _checkpoint(tmp_path)
+    metadata_path = checkpoint / "tasam_marl_checkpoint_meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["final_metrics"] = {}
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(JobValidationError, match="final_metrics vazio"):
+        jobs.normalize_job({
+            "schema": JOB_SCHEMA,
+            "job_id": "frozen-empty-metrics-001",
+            "kind": "asgard_frozen_evaluation",
+            "campaign_dir": str(runs / "frozen-empty"),
+            "checkpoint": str(checkpoint),
+            "adaptation_dir": str(runs / "adaptation"),
+            "calibration": str(tmp_path / "calibration.json"),
+            "profile": "tasam_training_balanced_v3",
+            "seed": 47,
+        })
+
+
+def test_asgard_paired_job_requires_promoted_replay_and_approved_v2x_manifest(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    monkeypatch.setattr(jobs, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(jobs, "RUNS_ROOT", runs)
+    checkpoint = _checkpoint(tmp_path)
+    metadata_path = checkpoint / "tasam_marl_checkpoint_meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update({"parent_was_promoted": True, "replay_imported": True})
+    metadata_path.write_text(json.dumps(metadata))
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(json.dumps({"schema": "greenran.energy_calibration.v3"}))
+    manifest = tmp_path / "vehicle-v4.json"
+    manifest.write_text(json.dumps({
+        "schema": "greenran.autonomous_vehicle_feasibility.v4",
+        "manifest_version": 4,
+        "profile": "tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback",
+        "status": "passed",
+        "scientific_decision": "approved",
+        "promotion_eligible": True,
+        "metric_contract": "per_pdu_cohort_v1",
+        "scheduler_policy": "gbr_debt_rr_v1",
+            "loss_grace_ms": 1000,
+            "link_metric_contract": "vehicle_link_state_v2",
+            "connectivity_mode": "lte_anchored_mc",
+        "selected_interval_us": 4000,
+        "multi_seed_validation": {
+            "valid": True,
+            "required_seeds": [45, 46, 47],
+            "complete_seeds": [45, 46, 47],
+            "seed47_reused_from_phase1": True,
+            "provenance_compatible": True,
+        },
+        "provenance": {
+            "metric_contract": {
+                "pdcp_source": "native_pdcp_pdu_tx_rx",
+                "collector_mode": "pdcp_real",
+                "proxy_allowed": False,
+            }
+        },
+    }))
+    payload = {
+        "schema": JOB_SCHEMA,
+        "job_id": "asgard-paired-test-001",
+        "kind": "asgard_paired_evaluation",
+        "campaign_dir": str(runs / "asgard-paired"),
+        "checkpoint": str(checkpoint),
+        "calibration": str(calibration),
+        "vehicle_profile_manifest": str(manifest),
+        "profile": "tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback",
+        "seeds": [45, 46, 47],
+        "repetitions": 5,
+    }
+    spec = jobs.normalize_job(payload)
+    assert spec.kind == "asgard_paired_evaluation"
+    assert "run_tasam_asgard_paired_campaign.py" in spec.command[1]
+    assert spec.command[spec.command.index("--decision-target") + 1] == "0"
+    assert spec.command[spec.command.index("--sim-time") + 1] == "331.5"
 
 
 def test_shadow_job_requires_and_passes_a_calibration(tmp_path, monkeypatch):

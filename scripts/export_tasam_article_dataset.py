@@ -20,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from greenran_paths import RAPP_DB_PATH  # noqa: E402
+from energy_calibration import load_calibration, sleep_state_power_by_cell_w, sleep_state_power_w  # noqa: E402
+from greenran_v2x_adaptive_reward import REWARD_CONTRACT, compose_adaptive_reward  # noqa: E402
 from rapp_judge import RAppJudge, expected_verdict_for_stage  # noqa: E402
 
 SLICE_ORDER = ("eMBB", "mMTC", "URLLC")
@@ -67,7 +69,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=str(RAPP_DB_PATH), help="SQLite Data Lake path")
     parser.add_argument("--output-jsonl", required=True, help="Output transition JSONL")
     parser.add_argument("--summary-json", help="Optional summary JSON path")
+    parser.add_argument(
+        "--e2-audit-jsonl",
+        help="audit E2 do arm; vincula ACK por sequência nativa antes da recompensa adaptativa",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Maximum transitions to export")
+    parser.add_argument(
+        "--reward-contract", default="legacy",
+        help="Reward contract; the V2X adaptive contract is fail-closed and never downgrades to legacy",
+    )
+    parser.add_argument(
+        "--energy-enabled", action="store_true",
+        help="Enable the adaptive energy component; native energy evidence remains mandatory",
+    )
+    parser.add_argument(
+        "--energy-calibration", type=Path,
+        help="calibração usada para fixar a proveniência do componente energético",
+    )
     parser.add_argument("--since-ts", type=int, default=0, help="Only include samples at/after this timestamp")
     parser.add_argument("--until-ts", type=int, default=0, help="Only include samples at/before this timestamp")
     parser.add_argument(
@@ -300,6 +318,189 @@ def fetch_decision(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any]:
             decision.get("pdcp_coverage_json"), {}
         )
     return decision
+
+
+def load_e2_audit(path: Path | None) -> dict[int, bool]:
+    """Return acknowledgement state indexed by native control sequence."""
+    values: dict[int, bool] = {}
+    if path is None or not path.is_file():
+        return values
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+                sequence = int(row.get("sequence"))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            values[sequence] = bool(row.get("ack") is True and row.get("applied") is True)
+    return values
+
+
+def reconcile_native_context(cursor: sqlite3.Cursor, db_path: Path) -> None:
+    """Backfill only missing native row identity from the sidecar context."""
+    context_path = db_path.parent / "ns3_energy" / "NativeControlContext.csv"
+    if not context_path.is_file() or not table_exists(cursor, "tasam_control_observations"):
+        return
+    try:
+        import csv
+        with context_path.open(newline="", encoding="utf-8", errors="replace") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    sequence = int(row.get("NativeControlSequence", 0) or 0)
+                    decision_id = int(row.get("DecisionId", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                correlation = str(row.get("ActionCorrelationId") or "").strip()
+                if sequence <= 0 or decision_id <= 0 or not correlation:
+                    continue
+                cursor.execute(
+                    """
+                    UPDATE tasam_control_observations
+                       SET decision_id=COALESCE(NULLIF(decision_id, 0), ?),
+                           action_correlation_id=COALESCE(NULLIF(action_correlation_id, ''), ?),
+                           campaign_id=CASE WHEN campaign_id IS NULL OR campaign_id='' THEN ? ELSE campaign_id END,
+                           campaign_generation=CASE WHEN campaign_generation IS NULL OR campaign_generation='' THEN ? ELSE campaign_generation END
+                     WHERE native_control_sequence=?
+                    """,
+                    (
+                        decision_id, correlation,
+                        str(row.get("CampaignId") or "").strip(),
+                        str(row.get("SourceGeneration") or "").strip(), sequence,
+                    ),
+                )
+        cursor.connection.commit()
+    except (OSError, sqlite3.Error, csv.Error):
+        return
+
+
+def fetch_native_control_evidence(
+    cursor: sqlite3.Cursor, decision_id: int | None, e2_acks: dict[int, bool],
+) -> dict[str, Any]:
+    """Read the ns-3 readback that belongs to one rApp decision.
+
+    The function is read-only and intentionally requires a correlation id,
+    readback and matching E2 ACK.  A global campaign ACK cannot validate an
+    unrelated decision.
+    """
+    if decision_id is None or not table_exists(cursor, "tasam_control_observations"):
+        return {}
+    rows = cursor.execute(
+        """
+        select cell_id, tx_power_percent, action_correlation_id,
+               native_control_sequence, observation_kind, evidence_version
+        from tasam_control_observations
+        where decision_id=?
+        order by id asc
+        """,
+        (int(decision_id),),
+    ).fetchall()
+    correlations = {str(row[2] or "") for row in rows if str(row[2] or "")}
+    sequences = {int(row[3]) for row in rows if row[3] is not None}
+    kinds = {str(row[4] or "") for row in rows}
+    cells = {int(row[0]) for row in rows if row[0] is not None}
+    power_by_cell = {}
+    evidence_versions = {str(row[5] or "") for row in rows if str(row[5] or "")}
+    for row in rows:
+        if str(row[4] or "") != "power_readback":
+            continue
+        try:
+            power_by_cell[str(int(row[0]))] = float(row[1])
+        except (TypeError, ValueError):
+            continue
+    if len(correlations) != 1 or len(sequences) != 1:
+        return {"e2_ack_complete": False, "feedback_integrity_valid": False}
+    sequence = next(iter(sequences))
+    readback = "power_readback" in kinds or "state_snapshot" in kinds
+    ack = bool(e2_acks.get(sequence, False))
+    return {
+        "action_correlation_id": next(iter(correlations)),
+        "native_control_sequence": sequence,
+        "native_readback_observed": readback,
+        "e2_ack_complete": ack,
+        "e2_cell_ack_complete": bool(ack and cells >= {2, 3, 4}),
+        "feedback_integrity_valid": bool(readback and ack),
+        "cell_ids": sorted(cells),
+        "observation_kinds": sorted(kinds),
+        "power_percent_by_cell": power_by_cell,
+        "evidence_version": next(iter(evidence_versions), ""),
+    }
+
+
+def fetch_energy_evidence(
+    cursor: sqlite3.Cursor, decision_id: int | None, e2_acks: dict[int, bool],
+    calibration_path: Path | None = None,
+) -> dict[str, Any]:
+    """Recover native power evidence for both rApp and TA-SAM decisions.
+
+    rApp-only arms do not create an economic TA-SAM contract, so their native
+    power readback is not present in Judge feedback.  The energy command table
+    is the authoritative read-only source for that arm.
+    """
+    if decision_id is None or not table_exists(cursor, "tasam_control_observations"):
+        return {}
+    columns = {
+        str(row[1]) for row in cursor.execute("PRAGMA table_info(energy_commands)").fetchall()
+    } if table_exists(cursor, "energy_commands") else set()
+    row = fetch_one(
+        cursor,
+        "select * from energy_commands where decision_id=? order by id desc limit 1",
+        (int(decision_id),),
+    ) if columns else None
+    native = fetch_native_control_evidence(cursor, decision_id, e2_acks)
+    if (
+        not native.get("e2_ack_complete")
+        or not native.get("native_readback_observed")
+        or set(native.get("cell_ids") or []) != {2, 3, 4}
+        or not {"power_readback", "state_snapshot"}.issubset(
+            set(native.get("observation_kinds") or [])
+        )
+    ):
+        return {}
+    # Operational rApp rows deliberately remain outside the economic
+    # ``actuation_confirmed`` flag. Native per-cell readback is authoritative
+    # for both arms; the command row supplies provenance only.
+    observed = None
+    if row:
+        if "native_sim_power_w" in columns:
+            observed = row["native_sim_power_w"]
+        if observed is None and "observed_power_w" in columns:
+            observed = row["observed_power_w"]
+    reference = None
+    try:
+        calibration = load_calibration(calibration_path)
+        if observed is None:
+            observed = sleep_state_power_by_cell_w(
+                calibration, native.get("power_percent_by_cell") or {}
+            )
+        reference = sleep_state_power_w(calibration, active_cells=3, power_percent=100.0)
+    except (TypeError, ValueError, KeyError):
+        return {}
+    try:
+        observed_value = float(observed)
+        reference_value = float(reference)
+    except (TypeError, ValueError):
+        return {}
+    if not math.isfinite(observed_value) or not math.isfinite(reference_value) or reference_value <= 0.0:
+        return {}
+    return {
+        "native": True,
+        "e2_ack": True,
+        "evidence_version": str(
+            native.get("evidence_version")
+            or (row["native_observation_version"] if row and "native_observation_version" in columns else "")
+            or ""
+        ),
+        "action_correlation_id": str(
+            native.get("action_correlation_id")
+            or (row["action_correlation_id"] if row and "action_correlation_id" in columns else "")
+            or ""
+        ),
+        "power_w": observed_value,
+        "reference_power_w": reference_value,
+        "cost": max(0.0, min(1.0, observed_value / reference_value)),
+        "energy_model_version": str(row["calibration_version"] or "") if row and "calibration_version" in columns else "",
+        "source": "ns3_tasam_control_observations_calibrated_v3",
+    }
 
 
 def fetch_judge_outcome(
@@ -699,7 +900,10 @@ def stage_label(decision: dict[str, Any], conflict: dict[str, Any], metrics: dic
     return "baseline_healthy"
 
 
-def build_snapshot(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any] | None:
+def build_snapshot(
+    cursor: sqlite3.Cursor, timestamp: int, e2_acks: dict[int, bool] | None = None,
+    energy_calibration: Path | None = None,
+) -> dict[str, Any] | None:
     global_state = fetch_global_state(cursor, timestamp)
     if not global_state:
         return None
@@ -709,6 +913,10 @@ def build_snapshot(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any] | N
         return None
     metrics, metrics_alignment = fetch_metrics(cursor, timestamp)
     decision = fetch_decision(cursor, timestamp)
+    decision.update(fetch_native_control_evidence(cursor, decision.get("id"), e2_acks or {}))
+    energy_evidence = fetch_energy_evidence(
+        cursor, decision.get("id"), e2_acks or {}, energy_calibration
+    )
     judge_outcome = fetch_judge_outcome(
         cursor,
         timestamp,
@@ -735,6 +943,10 @@ def build_snapshot(cursor: sqlite3.Cursor, timestamp: int) -> dict[str, Any] | N
         "metrics": metrics,
         "metrics_alignment": metrics_alignment,
         "decision": decision,
+        "energy_evidence": energy_evidence,
+        "scenario_control_override": str(
+            decision.get("improvement_source") or ""
+        ).strip().lower() == "scenario_control_override",
         "judge_outcome": judge_outcome,
         "action": action,
         "shadow_comparison": shadow,
@@ -787,6 +999,8 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
     reward = compute_reward(current)
     judge_outcome = current.get("judge_outcome") or {}
     judge_feedback = judge_outcome.get("feedback") or {}
+    adaptive_active = str(getattr(args, "reward_contract", "legacy")) == REWARD_CONTRACT
+    adaptive_snapshot = judge_feedback.get("tasam_adaptive_reward") if adaptive_active else None
     judge_observed = bool(
         judge_feedback.get("outcome_observed")
         or judge_outcome.get("observed")
@@ -932,6 +1146,71 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
     if current_decision.get("training_run_invalid"):
         quality["valid_for_training"] = False
         quality["invalid_reason"] = current_decision.get("invalid_reason", "invalid_tasam_proposal")
+    if adaptive_active:
+        # The Judge is authoritative when it observed the real next snapshot.
+        # A missing Judge snapshot is still exported as invalid evidence; it
+        # must never silently fall back to the historical reward formula.
+        # Always compose the V2X reward from the native next PDCP snapshot.
+        # Persisted Judge snapshots from older cycles may contain the right
+        # verdict but omit the canonical vehicle metric names; reusing them
+        # would turn real p95/loss into ``*_missing`` and stall live replay.
+        next_metrics = dict(nxt.get("metrics") or {})
+        p95_us = next_metrics.get("latency_p95_per_ue_us")
+        if p95_us is None:
+            p95_us = next_metrics.get("latency_p95_us", next_metrics.get("cvar_per_ue_us"))
+        loss_fraction = next_metrics.get("global_packet_loss_rate")
+        adaptive_observation = {
+            "collection_quality": quality,
+            "pdcp_real": quality.get("pdcp_real"),
+            "proxy_latency_sample_count": quality.get("proxy_latency_sample_count"),
+            "e2_ack_complete": current_decision.get("e2_ack_complete"),
+            "decision_correlation_valid": bool(
+                current_decision.get("id")
+                and current_decision.get("action_correlation_id")
+            ),
+            "decision_id": current_decision.get("decision_id", current_decision.get("id")),
+            "action_correlation_id": current_decision.get("action_correlation_id"),
+            "vehicle_metrics": {
+                "max_latency_ms": (
+                    safe_float(p95_us) / 1000.0 if p95_us is not None else None
+                ),
+                "packet_loss_percent": (
+                    safe_float(loss_fraction) * 100.0
+                    if loss_fraction is not None else None
+                ),
+            },
+            "network_health": {},
+        }
+        adaptive_state = (adaptive_snapshot or {}).get("adaptive_reward_state") if isinstance(adaptive_snapshot, dict) else None
+        if isinstance(adaptive_state, dict):
+            adaptive_observation["adaptive_reward_state"] = adaptive_state
+        energy_evidence = (
+            nxt.get("energy_evidence")
+            or current.get("energy_evidence")
+            or judge_feedback.get("energy_evidence")
+        )
+        if not isinstance(energy_evidence, dict):
+            energy_evidence = {}
+        adaptive_snapshot = compose_adaptive_reward(
+            current_decision,
+            adaptive_observation,
+            {"reward_contract": REWARD_CONTRACT},
+            energy_enabled=bool(getattr(args, "energy_enabled", False)),
+            energy_evidence=energy_evidence,
+        )
+        reward_hint = safe_float(adaptive_snapshot.get("reward"), 0.0)
+        reward_source = "v2x_adaptive_reward_contract"
+        reward_components = dict(reward_components)
+        reward_components.update({
+            "reward_contract": REWARD_CONTRACT,
+            "adaptive_reward": adaptive_snapshot,
+            "reward_weight_snapshot": adaptive_snapshot.get("snapshot", {}),
+            "energy_eligible": bool(adaptive_snapshot.get("energy_eligible", False)),
+            "energy_evidence": energy_evidence,
+        })
+        if not adaptive_snapshot.get("evidence_valid", False):
+            quality["valid_for_training"] = False
+            quality["invalid_reason"] = "adaptive_reward_evidence_incomplete"
     action = dict(current.get("action") or {})
     decision = current.get("decision") or {}
     power_percent = action.get("power_percent", decision.get("energy_power_level"))
@@ -972,6 +1251,10 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
         "du_states": current["du_states"],
         "action": action,
         "decision": decision,
+        "action_correlation_valid": bool(
+            decision.get("id") and decision.get("action_correlation_id")
+        ),
+        "scenario_control_override": bool(current.get("scenario_control_override")),
         "decision_id": decision.get("decision_id", decision.get("id")),
         "snapshot_sequence_id": decision.get("snapshot_sequence_id") or current.get("metrics_alignment", {}).get("snapshot_sequence_id", current.get("timestamp")),
         "temporal_context": temporal_context,
@@ -1007,14 +1290,27 @@ def transition_record(current: dict[str, Any], nxt: dict[str, Any], args: argpar
         "tasam_continuous_reward": safe_float(judge_feedback.get("tasam_continuous_reward")),
         "tasam_reward_source": judge_feedback.get("tasam_reward_source", ""),
         "tasam_error_components": judge_feedback.get("tasam_error_components") or {},
+        "reward_contract": REWARD_CONTRACT if adaptive_active else "legacy",
+        "adaptive_reward": adaptive_snapshot if adaptive_active else {},
+        "energy_evidence": energy_evidence if adaptive_active else {},
+        "reward_weight_snapshot": (adaptive_snapshot or {}).get("snapshot", {}) if adaptive_active else {},
+        "energy_eligible": bool((adaptive_snapshot or {}).get("energy_eligible", False)) if adaptive_active else False,
         "tasam_action_applied": bool(judge_feedback.get("tasam_action_applied", False)),
         "tasam_category_credit": safe_float(judge_feedback.get("tasam_category_credit")),
         "tasam_category_penalty": safe_float(judge_feedback.get("tasam_category_penalty")),
         "tasam_category_error": bool(judge_feedback.get("tasam_category_error", False)),
         "tasam_training_category_credit": safe_float(judge_feedback.get("tasam_training_category_credit")),
         "tasam_training_category_penalty": safe_float(judge_feedback.get("tasam_training_category_penalty")),
-        "tasam_training_reward": safe_float(judge_feedback.get("tasam_training_reward", reward_hint)),
-        "tasam_online_reward": safe_float(judge_feedback.get("tasam_online_reward", reward_hint)),
+        # V2X adaptive reward is authoritative after native evidence has been
+        # recomposed above. Older Judge rows may contain a stale zero here.
+        "tasam_training_reward": (
+            reward_hint if adaptive_active
+            else safe_float(judge_feedback.get("tasam_training_reward", reward_hint))
+        ),
+        "tasam_online_reward": (
+            reward_hint if adaptive_active
+            else safe_float(judge_feedback.get("tasam_online_reward", reward_hint))
+        ),
         "tasam_energy_reward": safe_float(judge_feedback.get("tasam_energy_reward")),
         "tasam_allocation_reward": safe_float(judge_feedback.get("tasam_allocation_reward")),
         "tasam_sla_penalty": safe_float(judge_feedback.get("tasam_sla_penalty")),
@@ -1089,6 +1385,10 @@ def main() -> int:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+    reconcile_native_context(cursor, db_path)
+    args.e2_ack_by_sequence = load_e2_audit(
+        Path(args.e2_audit_jsonl).resolve() if args.e2_audit_jsonl else None
+    )
     required = [
         "marl_global_state_history",
         "marl_slice_state_history",
@@ -1104,7 +1404,9 @@ def main() -> int:
     ts_values = timestamps(cursor, args)
     snapshots: list[dict[str, Any]] = []
     for ts in ts_values:
-        snap = build_snapshot(cursor, ts)
+        snap = build_snapshot(
+            cursor, ts, args.e2_ack_by_sequence, args.energy_calibration
+        )
         if snap:
             snapshots.append(snap)
 

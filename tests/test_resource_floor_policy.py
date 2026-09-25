@@ -5,7 +5,7 @@ from pathlib import Path
 
 from src.rapp_data_lake import DataLake
 from src.rapp_orchestrator import RappResourceOptimizer
-from src.rapp_sac_resource_model import apply_baseline_resource_band, apply_per_ue_allocation, compute_shared_resource_snapshot, enforce_resource_floor, enforce_resource_state
+from src.rapp_sac_resource_model import apply_baseline_resource_band, apply_per_ue_allocation, compute_shared_resource_snapshot, enforce_resource_floor, enforce_resource_state, enforce_tasam_headroom_envelope
 
 
 def _config():
@@ -166,6 +166,24 @@ class TestResourceFloorPolicy(unittest.TestCase):
         self.assertGreaterEqual(preserved["r_ran"], 0.40)
         self.assertGreaterEqual(preserved["r_ai"], 0.30)
         self.assertGreater(preserved["r_ran"] + preserved["r_ai"], snapshot["floor_total_ran"] + snapshot["floor_total_ai"])
+
+    def test_tasam_headroom_caps_each_domain_at_fifteen_percent_above_floor(self):
+        snapshot = compute_shared_resource_snapshot(*_metrics(), _config(), {}, "ALLOWED")
+        snapshot.update({"r_ran": 1.0, "r_ai": 1.0})
+        bounded = enforce_tasam_headroom_envelope(snapshot)
+        self.assertTrue(bounded["tasam_headroom_envelope"]["applied"])
+        self.assertLessEqual(bounded["r_ran"], snapshot["floor_total_ran"] * 1.15 + 1e-9)
+        self.assertLessEqual(bounded["r_ai"], snapshot["floor_total_ai"] * 1.15 + 1e-9)
+        self.assertGreaterEqual(bounded["r_ran"], snapshot["floor_total_ran"])
+        self.assertGreaterEqual(bounded["r_ai"], snapshot["floor_total_ai"])
+
+    def test_tasam_headroom_fails_closed_when_floor_is_infeasible(self):
+        snapshot = compute_shared_resource_snapshot(*_metrics(), _config(), {}, "ALLOWED")
+        snapshot.update({"usable_budget": 0.01, "resource_budget": 0.01})
+        bounded = enforce_tasam_headroom_envelope(snapshot)
+        self.assertFalse(bounded["tasam_headroom_envelope"]["applied"])
+        self.assertTrue(bounded["failsafe_required"])
+        self.assertEqual(bounded["failsafe_reason"], "infeasible_ue_floors")
 
     def test_baseline_uses_fixed_state_band_instead_of_floor(self):
         metrics = _metrics()

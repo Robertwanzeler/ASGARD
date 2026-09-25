@@ -7,6 +7,8 @@ Exports to JSON file that can be imported via UI.
 """
 
 import json
+import os
+from pathlib import Path
 
 DASHBOARD = {
     "dashboard": {
@@ -71,7 +73,8 @@ DASHBOARD = {
 }
 
 # Save to file
-output_file = "/home/robert/orange_nuclear/push/drl_dashboard_import.json"
+project_root = Path(os.environ.get("GREENRAN_PROJECT_DIR", Path(__file__).resolve().parents[1]))
+output_file = project_root / "push" / "drl_dashboard_import.json"
 with open(output_file, 'w') as f:
     json.dump(DASHBOARD, f, indent=2)
 

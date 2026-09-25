@@ -1,4 +1,10 @@
 #!/bin/bash
-cd /home/robert/orange_nuclear
-export LD_LIBRARY_PATH=/home/robert/orange_nuclear/flexric/build_e2ap_v1/src/ric:/home/robert/orange_nuclear/flexric_lib:/home/robert/orange_nuclear/flexric/build_e2ap_v1/src/xApp:$LD_LIBRARY_PATH
-./flexric/build_e2ap_v1/examples/ric/nearRT-RIC -p /home/robert/orange_nuclear/flexric_lib/ -c flexric/flexric.conf
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/core_runtime.sh"
+load_greenran_runtime
+
+RIC_BIN="${GREENRAN_RIC_BIN:-$RIC_DIR/examples/ric/nearRT-RIC}"
+exec "$RIC_BIN" -p "$FLEXRIC_LIB" -c "$PROJECT_DIR/flexric/flexric.conf" \
+  -e "${GREENRAN_E2_TERM_PORT:-36421}" -x "${GREENRAN_E2_XAPP_PORT:-36422}"

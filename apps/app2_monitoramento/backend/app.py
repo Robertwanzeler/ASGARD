@@ -21,6 +21,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from greenran_paths import STATE_DIR  # noqa: E402
+from greenran_api_security import require_mutation_token  # noqa: E402
 from greenran_runtime import load_runtime_config  # noqa: E402
 from rapp_data_lake import DataLake  # noqa: E402
 from services import (  # noqa: E402
@@ -33,7 +34,7 @@ from services import (  # noqa: E402
 
 
 RUNTIME_CONFIG = load_runtime_config()
-APP_HOST = "0.0.0.0"
+APP_HOST = os.environ.get("GREENRAN_APP2_HOST", "127.0.0.1")
 APP_PORT = 5200
 
 app = Flask(__name__, template_folder=str(APP_DIR / "templates"))
@@ -157,6 +158,7 @@ def list_alerts():
 
 
 @app.route("/api/readings/mock", methods=["POST"])
+@require_mutation_token
 def create_mock_reading():
     payload = request.get_json(silent=True) or {}
     reading = STORE.add_reading(payload)

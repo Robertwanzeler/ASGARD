@@ -96,6 +96,7 @@ def _compact_judge_feedback_payload(decision_id, feedback, observation=None):
         "armd_credit", "tasam_credit", "tasam_state_credit",
         "tasam_resource_credit", "tasam_observed_error",
         "tasam_continuous_reward", "tasam_reward_source", "credit_assignment",
+        "energy_evidence",
         "reason", "decision_stage_name", "observed_stage_name",
         "stage_boundary_feedback", "nominal_expected_verdict",
     )
@@ -180,7 +181,7 @@ def _compact_economic_transition_payload(decision_id, decision, next_decision, f
         "tasam_online_reward", "tasam_energy_reward",
         "tasam_allocation_reward", "tasam_sla_penalty",
         "tasam_observed_verdict", "tasam_predicted_verdict",
-        "tasam_error_components", "energy_model_version",
+        "tasam_error_components", "energy_model_version", "energy_evidence",
     )
     decision_fields = (
         "decision_id", "timestamp", "metric_snapshot_id", "topology_id",
@@ -3620,6 +3621,46 @@ class DataLake:
         imported = 0
         resolved_path = str(path.resolve())
         try:
+            # A native callback can arrive while the controller is replacing
+            # the context sidecar. Reconcile identity by native sequence once
+            # the sidecar is complete; this never creates hardware evidence.
+            context_by_sequence = {}
+            context_path = path.parent / "NativeControlContext.csv"
+            if context_path.is_file():
+                import csv as _csv
+                with context_path.open(newline="", encoding="utf-8", errors="replace") as context_file:
+                    for context_row in _csv.DictReader(context_file):
+                        try:
+                            sequence = int(context_row.get("NativeControlSequence", 0) or 0)
+                            decision_id = int(context_row.get("DecisionId", 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        correlation = str(context_row.get("ActionCorrelationId") or "").strip()
+                        if sequence <= 0 or decision_id <= 0 or not correlation:
+                            continue
+                        context_by_sequence[sequence] = {
+                            "decision_id": decision_id,
+                            "correlation": correlation,
+                            "campaign": str(context_row.get("CampaignId") or "").strip(),
+                            "generation": str(context_row.get("SourceGeneration") or "").strip(),
+                        }
+            for sequence, context in context_by_sequence.items():
+                self.conn.execute(
+                    """
+                    UPDATE tasam_control_observations
+                       SET decision_id=COALESCE(NULLIF(decision_id, 0), ?),
+                           action_correlation_id=COALESCE(NULLIF(action_correlation_id, ''), ?),
+                           campaign_id=CASE WHEN campaign_id IS NULL OR campaign_id='' THEN ? ELSE campaign_id END,
+                           campaign_generation=CASE WHEN campaign_generation IS NULL OR campaign_generation='' THEN ? ELSE campaign_generation END
+                     WHERE native_control_sequence=?
+                    """,
+                    (
+                        context["decision_id"], context["correlation"],
+                        context["campaign"], context["generation"], sequence,
+                    ),
+                )
+            if context_by_sequence:
+                self.conn.commit()
             import csv
             stat = path.stat()
             inode = int(getattr(stat, "st_ino", 0) or 0)
@@ -4057,7 +4098,7 @@ class DataLake:
             return {"valid": False, "reason": "native_observation_cells_missing"}
         if expected_power_by_cell is not None and set(expected_power_by_cell) != expected_cells:
             return {"valid": False, "reason": "native_observation_power_cell_map_incomplete"}
-        if str(require_evidence_version) == "v5" and expected_cells != {2, 3, 4}:
+        if str(require_evidence_version) in {"v5", "v6"} and expected_cells != {2, 3, 4}:
             return {
                 "valid": False,
                 "reason": "native_observation_expected_three_du_cells",
@@ -4106,7 +4147,7 @@ class DataLake:
                 continue
             if action_correlation_id and str(row[21] or "") != str(action_correlation_id):
                 continue
-            if str(require_evidence_version) == "v5":
+            if str(require_evidence_version) in {"v5", "v6"}:
                 # Current evidence is never allowed to silently inherit a
                 # row from another campaign/generation or from a context
                 # sidecar that was not attached to this control action.
@@ -4133,11 +4174,21 @@ class DataLake:
             ) and cell_id not in selected_power:
                 selected_power[cell_id] = row
             if (
-                int(row[6] or 0) == transaction_id
-                and str(row[8] or "") == "state_snapshot"
-                and int(row[9] or 0) == 1
+                str(row[8] or "") == "state_snapshot"
                 and cell_id not in selected_policy
+                and (
+                    int(row[6] or 0) == transaction_id
+                    or (
+                        str(require_evidence_version) in {"v5", "v6"}
+                        and int(row[5] or 0) == transaction_id
+                    )
+                )
             ):
+                # A DU without attached UEs has no scheduler policy to
+                # activate, but it still emits a truthful native state
+                # snapshot for a per-cell power action.  The active scheduler
+                # cells are checked below; inactive cells are not promoted to
+                # scheduler evidence merely because power was changed.
                 selected_policy[cell_id] = row
         if set(selected_power) != expected_cells or set(selected_policy) != expected_cells:
             reason = "native_observation_missing_cell"
@@ -4161,21 +4212,31 @@ class DataLake:
                 "observed_power_cells": sorted(selected_power),
                 "observed_policy_cells": sorted(selected_policy),
             }
-        if any(
-            selected_policy[cell][14] in (None, 0)
-            or selected_policy[cell][16] is None
-            or not math.isfinite(float(selected_policy[cell][16]))
-            or (
-                str(require_evidence_version) == "v5"
-                and str(selected_policy[cell][15] or "") != "tasam_native_aggregate_v1"
-            )
-            for cell in expected_cells
-        ):
+        invalid_policy_cells = []
+        active_policy_cells = []
+        for cell in expected_cells:
+            policy_row = selected_policy[cell]
+            policy_active = int(policy_row[9] or 0) == 1
+            if policy_active:
+                active_policy_cells.append(cell)
+                if (
+                    policy_row[14] in (None, 0)
+                    or policy_row[16] is None
+                    or not math.isfinite(float(policy_row[16]))
+                ):
+                    invalid_policy_cells.append(cell)
+            if (
+                str(require_evidence_version) in {"v5", "v6"}
+                and str(policy_row[15] or "") != "tasam_native_aggregate_v1"
+            ):
+                invalid_policy_cells.append(cell)
+        if invalid_policy_cells:
             return {
                 "valid": False,
                 "reason": "native_observation_allocation_missing",
                 "observed_power_cells": sorted(selected_power),
                 "observed_policy_cells": sorted(selected_policy),
+                "invalid_policy_cells": sorted(set(invalid_policy_cells)),
             }
         powers = [float(selected_power[cell][3]) for cell in sorted(expected_cells)]
         return {
@@ -4192,6 +4253,9 @@ class DataLake:
             },
             "power_transaction_id": transaction_id,
             "scheduler_transaction_id": transaction_id,
+            "policy_active_cells": sorted(active_policy_cells),
+            "power_control_cells": sorted(expected_cells),
+            "policy_scope": "serving_cells_only",
             "evidence_version": require_evidence_version,
             "active_ues": sum(int(selected_policy[cell][2] or 0) for cell in expected_cells),
             "sim_time_s": max(float(selected_policy[cell][1]) for cell in expected_cells),

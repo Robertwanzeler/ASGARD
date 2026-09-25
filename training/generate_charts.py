@@ -12,6 +12,7 @@ Output:
 """
 
 import os
+from pathlib import Path
 import sqlite3
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -20,7 +21,8 @@ from datetime import datetime
 import numpy as np
 
 # Configurações
-INPUT_DIR = "/home/robert/orange_nuclear/ns-O-RAN-flexric/mmwave-LENA-oran"
+PROJECT_ROOT = Path(os.environ.get("GREENRAN_PROJECT_DIR", Path(__file__).resolve().parents[1]))
+INPUT_DIR = str(PROJECT_ROOT / "ns-O-RAN-flexric" / "mmwave-LENA-oran")
 DB_PATH = "/tmp/rapp_data_lake.db"
 OUTPUT_DIR = "./charts"
 

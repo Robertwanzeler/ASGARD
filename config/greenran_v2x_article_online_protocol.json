@@ -1,0 +1,110 @@
+{
+  "schema": "greenran.tasam.v2x.article_online_protocol.v1",
+  "article_method": "Task-Specific Sharpness-Aware O-RAN Resource Management Using Multi-Agent Reinforcement Learning",
+  "scenario_id": "greenran_v2x_20ue_3du",
+  "topology": {
+    "ue_count": 20,
+    "logical_du_count": 3,
+    "vehicle_imsis": [16, 17, 18, 19, 20]
+  },
+  "profile": "tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback",
+  "official_comparison": {
+    "control": {
+      "name": "rapp_only_actuating",
+      "description": "rApp nativa com E2, sem ARMD e sem TA-SAM"
+    },
+    "treatment": {
+      "name": "asgard",
+      "arm_mode": "combined",
+      "description": "rApp + ARMD + TA-SAM com checkpoint congelado"
+    },
+    "paired_seeds": [45, 46, 47],
+    "repetitions_per_seed": 5,
+    "sac_l2_is_official_comparator": false
+  },
+  "training": {
+    "mode": "online_adaptive",
+    "seeds": [43, 44],
+    "trainer": "article_sac",
+    "learning_rate": 0.0001,
+    "hidden_layers": [300, 400, 400],
+    "activation": "tanh",
+    "gamma": 0.99,
+    "tau": 0.01,
+    "batch_size": 128,
+    "baseline": {
+      "name": "sac_l2",
+      "reference_method_only": true,
+      "sam_mode": "l2",
+      "l2_weight": 0.0001,
+      "arm_mode": "sac_l2_online"
+    },
+    "proposed": {
+      "name": "ta_sam_selective",
+      "sam_mode": "tasam_selective",
+      "actor_rho_initial": 0.5,
+      "actor_rho_final": 0.01,
+      "critic_rho_initial": 0.5,
+      "critic_rho_final": 0.01,
+      "td_variance_threshold": 0.01,
+      "arm_mode": "tasam_v2x_online",
+      "armd": "assist",
+      "judge": true,
+      "safety_shield": true
+    }
+  },
+  "replay": {
+    "schema": "greenran.tasam.v2x.replay_80_20.v1",
+    "rows_per_update": 600,
+    "historical_ratio": 0.8,
+    "recent_ratio": 0.2,
+    "historical_rows": 480,
+    "recent_rows": 120,
+    "duplicate_fill_allowed": false,
+    "official_evaluation_allowed": false
+  },
+  "reward": {
+    "schema": "greenran.tasam.v2x.reward_adaptive.v1",
+    "update_cadence": "per_rapp_decision",
+    "ewma_previous": 0.75,
+    "ewma_current": 0.25,
+    "healthy_exit_decisions": 3,
+    "max_energy_weight": 0.30,
+    "v2x_base": 0.45,
+    "v2x_risk_slope": 0.35,
+    "equity_base": 0.25,
+    "equity_risk_slope": 0.20,
+    "p95_limit_ms": 20.0,
+    "loss_limit_percent": 1.0,
+    "strict_failure_is_critical": true,
+    "energy": {
+      "functional_phase_enabled": false,
+      "requires_native_e2_observation": true,
+      "requires_e2_ack": true,
+      "max_weight": 0.30
+    },
+    "source": "src/greenran_v2x_adaptive_reward.py"
+  },
+  "energy_staircase": {
+    "schema": "greenran.tasam.v2x.energy_staircase.v1",
+    "config": "config/greenran_v2x_energy_staircase.json",
+    "safe_floor_source": "native_telemetry_or_validated_checkpoint",
+    "healthy_decisions_to_descend": 3,
+    "allow_du_sleep": true,
+    "max_sleeping_dus": 1,
+    "rapp_reference_unrestricted": true
+  },
+  "evaluation": {
+    "seeds": [45, 46, 47],
+    "frozen": true,
+    "metric_contract": "per_pdu_cohort_v1",
+    "collector_mode": "pdcp_real",
+    "proxy_allowed": false,
+    "scored_windows": 30,
+    "window_seconds": 10,
+    "loss_percent_lt": 1.0,
+    "latency_p95_ms_lt": 20.0,
+    "min_tx_pdus_per_vehicle_window": 500,
+    "require_e2_ack": true
+  }
+}

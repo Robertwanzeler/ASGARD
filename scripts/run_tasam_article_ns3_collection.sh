@@ -84,7 +84,39 @@ CGROUP_PREFIX=()
 set_cgroup_prefix() {
   CGROUP_PREFIX=()
   if [[ "${GREENRAN_CGROUP_ENFORCE:-0}" == "1" ]]; then
-    CGROUP_PREFIX=(python3 "$PROJECT_ROOT/scripts/greenran_cgroup_exec.py" --group "$1" --)
+    local group="$1"
+    if [[ "${GREENRAN_CGROUP_BACKEND:-delegated_v2}" == "systemd_user_scope_v1" ]]; then
+      local group_key quota_key memory_key io_key quota memory io_weight quota_percent
+      group_key="${group^^}"
+      quota_key="GREENRAN_CGROUP_SCOPE_${group_key}_CPU_QUOTA_US"
+      memory_key="GREENRAN_CGROUP_SCOPE_${group_key}_MEMORY_HIGH_BYTES"
+      io_key="GREENRAN_CGROUP_SCOPE_${group_key}_IO_WEIGHT"
+      quota="${!quota_key:-}"
+      memory="${!memory_key:-}"
+      io_weight="${!io_key:-}"
+      if [[ ! "$quota" =~ ^[0-9]+$ || ! "$memory" =~ ^[0-9]+$ || ! "$io_weight" =~ ^[0-9]+$ ]]; then
+        echo "cgroup scope sem orçamento válido para grupo $group" >&2
+        return 2
+      fi
+      quota_percent=$((quota / 1000))
+      local scope_prefix scope_unit scope_ledger
+      scope_prefix="${GREENRAN_CGROUP_SCOPE_PREFIX:-greenran}"
+      scope_prefix="${scope_prefix//_/-}"
+      scope_prefix="${scope_prefix:0:80}"
+      scope_unit="${scope_prefix}-${group}-${BASHPID}-${RANDOM}.scope"
+      scope_ledger="${GREENRAN_CGROUP_SCOPE_LEDGER:-$GREENRAN_STATE_DIR/cgroup_scope_units.jsonl}"
+      printf '{"schema":"greenran.systemd_user_scope.v1","group":"%s","unit":"%s","cpu_quota_us":%s,"memory_high_bytes":%s,"io_weight_requested":%s}\n' \
+        "$group" "$scope_unit" "$quota" "$memory" "$io_weight" >> "$scope_ledger"
+      CGROUP_PREFIX=(
+        systemd-run --user --scope --quiet --collect
+        "--unit=$scope_unit"
+        "--property=CPUQuota=${quota_percent}%"
+        "--property=MemoryHigh=${memory}"
+        "--property=IOWeight=${io_weight}"
+      )
+    else
+      CGROUP_PREFIX=(python3 "$PROJECT_ROOT/scripts/greenran_cgroup_exec.py" --group "$group" --)
+    fi
   fi
 }
 
@@ -113,6 +145,8 @@ start_ric() {
   setsid "${CGROUP_PREFIX[@]}" "$ric_bin" \
     -c "$PROJECT_ROOT/flexric/flexric.conf" \
     -p "$PROJECT_ROOT/flexric_lib/" \
+    -e "${GREENRAN_E2_TERM_PORT:-36421}" \
+    -x "${GREENRAN_E2_XAPP_PORT:-36422}" \
     > "$GREENRAN_RIC_LOG" 2>&1 &
   echo $! > "$GREENRAN_RIC_PID"
   sleep 2
@@ -138,6 +172,8 @@ start_ns3() {
     GREENRAN_NS3_UE_SPEED_MAX="$GREENRAN_NS3_UE_SPEED_MAX" \
     GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH="$GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH" \
     GREENRAN_NS3_ENABLE_ENERGY_CSV="$GREENRAN_NS3_ENABLE_ENERGY_CSV" \
+    GREENRAN_E2_TERM_PORT="${GREENRAN_E2_TERM_PORT:-36421}" \
+    GREENRAN_E2_LOCAL_PORT="${GREENRAN_E2_LOCAL_PORT:-38470}" \
     GREENRAN_NS3_ENERGY_OUTPUT_DIR="$GREENRAN_NS3_ENERGY_OUTPUT_DIR" \
     GREENRAN_NS3_RNG_RUN="$GREENRAN_NS3_RNG_RUN" \
     GREENRAN_NS3_FIXED_POWER_PERCENT="$GREENRAN_NS3_FIXED_POWER_PERCENT" \

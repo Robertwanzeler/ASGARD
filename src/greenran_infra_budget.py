@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 
 
 GROUPS = ("simulator", "ric_xapps", "rapp_armd", "tasam", "collectors")
+SYSTEMD_USER_SCOPE_BACKEND = "systemd_user_scope_v1"
 CGROUP_ROOT = Path(os.environ.get("GREENRAN_CGROUP_ROOT", "/sys/fs/cgroup/greenran"))
 REQUIRED_CONTROLLERS = ("cpu", "memory", "io")
 CGROUP_ROOT_FILE = Path("/run/greenran-cgroup-root")
@@ -156,13 +158,24 @@ def _clamp(value: Any, low: float, high: float) -> float:
 def build_physical_budget(
     r_ai: Any = 1.0, *, unrestricted: bool = False,
     compute_fraction: Any | None = None, io_fraction: Any | None = None,
+    resource_profile: str = "standard",
 ) -> dict[str, Any]:
     """Translate the abstract AI share into concrete cgroup-v2 limits.
 
-    The simulator keeps two CPUs because throttling simulated time can bias a
-    paired experiment.  Control-plane groups scale between 25% and 100% while
-    retaining enough headroom for the 100 ms safety telemetry channel.
+    The default simulator budget remains two CPUs for historical campaigns.
+    ``baseline_max_v1`` is an explicit, versioned exception for the protected
+    V2X baseline: it reserves twelve CPUs and 8 GiB for ns-3 while keeping the
+    control-plane groups unchanged. ``parallel_pair_v1`` is a symmetric,
+    two-slot envelope for paired engineering arms; it reserves 6.8 CPUs and
+    2.5 GiB per simulator.  The control-plane groups are capped at one CPU
+    per slot so both simulators can use fourteen of the sixteen host CPUs
+    without starving the RIC/xApp and collector safety path.
+    Comparisons must select the same profile for every arm.
     """
+    if resource_profile not in {"standard", "baseline_max_v1", "parallel_pair_v1"}:
+        raise InfraBudgetError(f"unknown infrastructure resource profile: {resource_profile}")
+    if resource_profile in {"baseline_max_v1", "parallel_pair_v1"} and (not unrestricted or r_ai != 1.0):
+        raise InfraBudgetError(f"{resource_profile} exige r_ai=1.0 e não aceita escala parcial")
     fraction = 1.0 if unrestricted else _clamp(r_ai, 0.25, 1.0)
     compute_scale = 1.0 if unrestricted else _clamp(
         fraction if compute_fraction is None else compute_fraction, 0.25, 1.0
@@ -171,12 +184,17 @@ def build_physical_budget(
         fraction if io_fraction is None else io_fraction, 0.25, 1.0
     )
     period = 100_000
+    simulator_baseline = {
+        "baseline_max_v1": (1_200_000, 8 * 1024**3, 100),
+        "parallel_pair_v1": (680_000, int(2.5 * 1024**3), 100),
+        "standard": (200_000, 2 * 1024**3, 100),
+    }[resource_profile]
     baselines = {
-        "simulator": (200_000, 2 * 1024**3, 100),
-        "ric_xapps": (100_000, 768 * 1024**2, 100),
-        "rapp_armd": (200_000, 1024 * 1024**2, 100),
-        "tasam": (100_000, 1024 * 1024**2, 100),
-        "collectors": (100_000, 512 * 1024**2, 100),
+        "simulator": simulator_baseline,
+        "ric_xapps": ((25_000, 384 * 1024**2, 100) if resource_profile == "parallel_pair_v1" else (100_000, 768 * 1024**2, 100)),
+        "rapp_armd": ((35_000, 512 * 1024**2, 100) if resource_profile == "parallel_pair_v1" else (200_000, 1024 * 1024**2, 100)),
+        "tasam": ((25_000, 512 * 1024**2, 100) if resource_profile == "parallel_pair_v1" else (100_000, 1024 * 1024**2, 100)),
+        "collectors": ((15_000, 384 * 1024**2, 100) if resource_profile == "parallel_pair_v1" else (100_000, 512 * 1024**2, 100)),
     }
     groups: dict[str, dict[str, int]] = {}
     for name, (quota, memory, io_weight) in baselines.items():
@@ -189,12 +207,88 @@ def build_physical_budget(
         }
     return {
         "schema": "greenran.infra.budget.v1",
+        "resource_profile": resource_profile,
         "mode": "unrestricted" if unrestricted else "bounded",
         "compute_fraction": compute_scale,
         "io_fraction": io_scale,
         "groups": groups,
         "telemetry": {"safety_period_ms": 100, "analytic_period_ms": 1000},
         "persistence": {"sqlite_batch_rows": 100, "compress_logs": True},
+    }
+
+
+def systemd_user_scope_properties(limits: dict[str, int]) -> dict[str, str]:
+    """Translate one GreenRAN group budget into systemd user-scope properties.
+
+    ``CPUQuota`` uses a percentage where 100% represents one CPU.  The
+    project budget uses the cgroup-v2 100 ms period, therefore one percent is
+    1,000 microseconds of quota.  ``IOWeight`` is supplied when the user
+    manager exposes the IO controller; callers must record its absence rather
+    than claiming it was enforced.
+    """
+    try:
+        quota = int(limits["cpu_quota_us"])
+        memory = int(limits["memory_high_bytes"])
+        io_weight = int(limits["io_weight"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InfraBudgetError(f"invalid systemd user-scope limits: {exc}") from exc
+    if quota <= 0 or memory <= 0 or io_weight <= 0:
+        raise InfraBudgetError("systemd user-scope limits must be positive")
+    return {
+        "CPUQuota": f"{quota / 1000:g}%",
+        "MemoryHigh": str(memory),
+        "IOWeight": str(io_weight),
+    }
+
+
+def probe_systemd_user_scope(limits: dict[str, int]) -> dict[str, Any]:
+    """Prove user-systemd applies the required CPU and memory cgroup limits.
+
+    This is an alternative only for the versioned ``baseline_max_v1``
+    envelope.  It creates a short-lived scope, reads its effective cgroup-v2
+    files from inside that scope, and is collected immediately afterwards.
+    """
+    properties = systemd_user_scope_properties(limits)
+    unit = f"greenran-preflight-{os.getpid()}-{time.monotonic_ns()}.scope"
+    expected_cpu = f"{int(limits['cpu_quota_us'])} {int(limits['cpu_period_us'])}"
+    expected_memory = str(int(limits["memory_high_bytes"]))
+    probe = (
+        "scope=$(cut -d: -f3 /proc/self/cgroup | sed 's#^/##'); "
+        "base=/sys/fs/cgroup/$scope; "
+        "test \"$(cat \"$base/cpu.max\")\" = \"$EXPECTED_CPU\"; "
+        "test \"$(cat \"$base/memory.high\")\" = \"$EXPECTED_MEMORY\""
+    )
+    environment = dict(os.environ)
+    environment.update({"EXPECTED_CPU": expected_cpu, "EXPECTED_MEMORY": expected_memory})
+    command = [
+        "systemd-run", "--user", "--scope", "--quiet", "--collect",
+        f"--unit={unit}",
+        f"--property=CPUQuota={properties['CPUQuota']}",
+        f"--property=MemoryHigh={properties['MemoryHigh']}",
+        f"--property=IOWeight={properties['IOWeight']}",
+        "/bin/sh", "-ceu", probe,
+    ]
+    try:
+        completed = subprocess.run(
+            command, env=environment, text=True, capture_output=True, timeout=20.0, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "backend": SYSTEMD_USER_SCOPE_BACKEND,
+            "valid": False,
+            "unit": unit,
+            "properties": properties,
+            "reason": f"probe_error:{exc}",
+        }
+    return {
+        "backend": SYSTEMD_USER_SCOPE_BACKEND,
+        "valid": completed.returncode == 0,
+        "unit": unit,
+        "properties": properties,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+        "io_controller_verified": False,
     }
 
 

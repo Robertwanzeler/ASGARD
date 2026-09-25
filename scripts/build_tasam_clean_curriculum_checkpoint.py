@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a clean TA-SAM bootstrap checkpoint from a synthetic category head.
+"""Build a clean V2X bootstrap checkpoint from a synthetic category head.
 
 The policy and value networks are initialized from a fresh deterministic model.
 Only the ordinal category head is imported from the curriculum checkpoint.
@@ -81,7 +81,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         category_loss_weight=float(metadata.get("category_loss_weight") or 0.5),
         category_head_lr=float(metadata.get("category_head_lr") or 0.001),
         category_head_steps=int(metadata.get("category_head_steps") or 10),
-        allocation_head_output_dim=3 if args.economic_output_dim else 2,
+        allocation_head_output_dim=3 if getattr(args, "economic_output_dim", False) else 2,
         seed=int(args.seed),
     )
     category_state = torch.load(source_head, map_location="cpu", weights_only=False)
@@ -102,6 +102,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "historical_trace_copied": False,
         "category_head_source": str(source_head),
         "category_head_source_sha256": sha256(source_head),
+        "shared_category_head": True,
         "state_contract": REQUIRED_DIMS,
     }
     trainer.export_checkpoint(
@@ -115,10 +116,17 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "category_head_pretraining": curriculum,
             "category_head_pretrained": True,
             "category_head_training_source": "synthetic_curriculum",
+            "article_method": str(getattr(args, "article_method", "sac_l2")),
+            "sam_mode": str(getattr(args, "sam_mode", "l2")),
+            "l2_weight": float(getattr(args, "l2_weight", 0.0001)),
+            # A bootstrap has no observed online-learning result.  It can
+            # initialise an arm but may never be passed to frozen evaluation.
+            "evaluation_eligible": False,
+            "promotion_eligible": False,
             "actor_hidden_dims": list(actor_hidden),
             "critic_hidden_dims": list(critic_hidden),
             "activation": activation,
-            "economic_allocation_head": bool(args.economic_output_dim),
+                "economic_allocation_head": bool(getattr(args, "economic_output_dim", False)),
             "parent_checkpoint": str(source),
             "parent_checkpoint_sha256": sha256(source_head),
         },
@@ -134,12 +142,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "category_head_pretrained": True,
         "category_curriculum": curriculum,
         "initialization": initialization,
-        "final_metrics": {
+        "bootstrap_metrics": {
             "category_accuracy": float(((curriculum.get("training") or {}).get("best_validation") or {}).get("accuracy", 0.0) or 0.0),
             "conditional_recall": float((((curriculum.get("training") or {}).get("best_validation") or {}).get("per_category") or {}).get("CONDITIONAL", {}).get("recall", 0.0) or 0.0),
             "conditional_f1": float((((curriculum.get("training") or {}).get("best_validation") or {}).get("per_category") or {}).get("CONDITIONAL", {}).get("f1", 0.0) or 0.0),
             "training_reward_mean": 0.0,
         },
+        "final_metrics": {},
+        "article_method": str(getattr(args, "article_method", "sac_l2")),
+        "sam_mode": str(getattr(args, "sam_mode", "l2")),
+        "l2_weight": float(getattr(args, "l2_weight", 0.0001)),
+        "evaluation_eligible": False,
+        "promotion_eligible": False,
     }
     (output / "tasam_marl_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     hashes = {name: sha256(output / name) for name in COMPONENTS}
@@ -154,6 +168,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     final_meta["trace_jsonl"] = ""
     final_meta["replay_source"] = "none"
     final_meta["historical_replay_enabled"] = False
+    final_meta["article_method"] = str(getattr(args, "article_method", "sac_l2"))
+    final_meta["sam_mode"] = str(getattr(args, "sam_mode", "l2"))
+    final_meta["l2_weight"] = float(getattr(args, "l2_weight", 0.0001))
+    final_meta["evaluation_eligible"] = False
+    final_meta["promotion_eligible"] = False
     meta_path.write_text(json.dumps(final_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return {"output_checkpoint": str(output), "initialization": initialization}
 
@@ -163,6 +182,9 @@ def main() -> int:
     parser.add_argument("--source-checkpoint", type=Path, required=True)
     parser.add_argument("--output-checkpoint", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=47)
+    parser.add_argument("--article-method", choices=("sac_l2", "ta_sam_selective"), default="sac_l2")
+    parser.add_argument("--sam-mode", choices=("l2", "tasam_selective"), default="l2")
+    parser.add_argument("--l2-weight", type=float, default=0.0001)
     parser.add_argument("--economic-output-dim", action="store_true", help="export the 3-output economic allocation head")
     args = parser.parse_args()
     print(json.dumps(build(args), indent=2, ensure_ascii=False))

@@ -555,11 +555,37 @@ class MARLShadowRuntimeEvaluator:
             self._checkpoint_error = 'invalid checkpoint metadata'
             return
 
-        hidden_dims = self.checkpoint_meta.get('actor_hidden_dims') or [64, 64]
-        if not isinstance(hidden_dims, list):
-            hidden_dims = [64, 64]
+        # Older v10 exports did not persist actor_hidden_dims/activation even
+        # though the trainer used the article architecture (300/400/400,
+        # tanh).  Infer the shape from the actor state dict before building
+        # the runtime module; otherwise a valid economic bootstrap is
+        # rejected as the legacy 64/64 compatibility network.
+        state_dict = torch.load(ckpt_path, map_location='cpu')
+        state_keys = list(state_dict.keys()) if isinstance(state_dict, dict) else []
+        article_style_state = any('.concentration_head.' in key or '.backbone.' in key for key in state_keys)
+
+        hidden_dims = self.checkpoint_meta.get('actor_hidden_dims')
+        if not isinstance(hidden_dims, list) or not hidden_dims:
+            inferred = []
+            for key, value in (state_dict.items() if isinstance(state_dict, dict) else []):
+                if not key.endswith('.weight') or not hasattr(value, 'shape') or len(value.shape) != 2:
+                    continue
+                if '.backbone.' not in key:
+                    continue
+                # Linear layers in the actor backbone appear in order as
+                # backbone.0, backbone.2, ...; their output widths are the
+                # first dimension of each weight tensor.
+                try:
+                    layer_index = int(key.split('.backbone.', 1)[1].split('.', 1)[0])
+                except (IndexError, ValueError):
+                    continue
+                inferred.append((layer_index, int(value.shape[0])))
+            hidden_dims = [width for _, width in sorted(set(inferred))]
+        if not hidden_dims:
+            hidden_dims = [300, 400, 400] if article_style_state else [64, 64]
         hidden_dims = [max(1, _safe_int(dim, 64)) for dim in hidden_dims if _safe_int(dim, 0) > 0] or [64, 64]
-        activation_name = str(self.checkpoint_meta.get('activation', 'relu') or 'relu').strip().lower()
+        default_activation = 'tanh' if article_style_state else 'relu'
+        activation_name = str(self.checkpoint_meta.get('activation', default_activation) or default_activation).strip().lower()
 
         def _activation_factory():
             if activation_name == 'tanh':
@@ -592,8 +618,6 @@ class MARLShadowRuntimeEvaluator:
                 out = self.net(x)
                 total = torch.clamp(out.sum(dim=-1, keepdim=True), min=1e-9)
                 return out / total
-
-        state_dict = torch.load(ckpt_path, map_location='cpu')
 
         class _ArticleDirichletActor(nn.Module):
             def __init__(self, input_dim: int, hidden_dims: List[int], action_dim: int = 3) -> None:
@@ -712,8 +736,6 @@ class MARLShadowRuntimeEvaluator:
                     return shares
                 return torch.cat([shares, torch.sigmoid(raw[..., 2:3])], dim=-1)
 
-        state_keys = list(state_dict.keys()) if isinstance(state_dict, dict) else []
-        article_style_state = any('.concentration_head.' in key or '.backbone.' in key for key in state_keys)
         actor_cls = _ArticleDirichletActor if article_style_state else _LegacyActorNetwork
         actors = nn.ModuleList([actor_cls(du_state_dim, hidden_dims=hidden_dims, action_dim=action_dim) for _ in range(du_count)])
         try:

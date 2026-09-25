@@ -48,6 +48,7 @@ def main() -> int:
     parser.add_argument("--parent-was-promoted", action="store_true")
     parser.add_argument("--adaptation-dir")
     parser.add_argument("--min-free-gib", type=float)
+    parser.add_argument("--smoke", action="store_true", help="isolated one-interval vehicle feasibility smoke")
     args = parser.parse_args()
     if args.job:
         if args.kind:
@@ -71,6 +72,7 @@ def main() -> int:
             "parent_was_promoted": args.parent_was_promoted,
             "adaptation_dir": args.adaptation_dir,
             "min_free_gib": args.min_free_gib,
+            "smoke": args.smoke,
             "submitted_at": int(time.time()), "requested_by": "codex",
         }
         payload = {key: value for key, value in payload.items() if value is not None}

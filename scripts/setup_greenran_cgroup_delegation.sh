@@ -9,6 +9,7 @@ readonly DELEGATE_USER=robert
 readonly DELEGATE_GROUP=robert
 readonly REQUIRED_CONTROLLERS=(cpu memory io)
 readonly GREENRAN_GROUPS=(simulator ric_xapps rapp_armd tasam collectors)
+readonly GREENRAN_SLOT_IDS=(slot-a slot-b)
 readonly ROOT_POINTER=/run/greenran-cgroup-root
 
 fail() {
@@ -79,6 +80,24 @@ for group in "${GREENRAN_GROUPS[@]}"; do
 done
 enable_controllers "${GREENRAN_ROOT}/cgroup.subtree_control"
 
+# Parallel feasibility arms receive a second delegated level.  Each slot has
+# the same five resource groups as the serial tree, so a launcher can point
+# GREENRAN_CGROUP_ROOT at one slot without ever crossing into the other.
+readonly SLOTS_ROOT="${GREENRAN_ROOT}/slots"
+mkdir -p "${SLOTS_ROOT}"
+assert_empty "${SLOTS_ROOT}"
+enable_controllers "${SLOTS_ROOT}/cgroup.subtree_control"
+for slot_id in "${GREENRAN_SLOT_IDS[@]}"; do
+  slot_root="${SLOTS_ROOT}/${slot_id}"
+  mkdir -p "${slot_root}"
+  assert_empty "${slot_root}"
+  enable_controllers "${slot_root}/cgroup.subtree_control"
+  for group in "${GREENRAN_GROUPS[@]}"; do
+    [[ -e "${slot_root}/${group}" ]] || mkdir "${slot_root}/${group}"
+    assert_empty "${slot_root}/${group}"
+  done
+done
+
 # A process launched from a session scope starts below USER_CGROUP_ROOT. The
 # kernel requires write access to this ancestor's cgroup.procs for migration
 # into the delegated child. This is limited to robert's own user unit.
@@ -94,6 +113,25 @@ for group in "${GREENRAN_GROUPS[@]}"; do
   for filename in cpu.max memory.high io.weight cgroup.procs cpu.stat memory.current memory.peak io.stat; do
     [[ -e "${group_path}/${filename}" ]] || fail "arquivo cgroup ausente: ${group_path}/${filename}"
     chown "${DELEGATE_USER}:${DELEGATE_GROUP}" "${group_path}/${filename}"
+  done
+done
+
+chown "${DELEGATE_USER}:${DELEGATE_GROUP}" "${SLOTS_ROOT}"
+chown "${DELEGATE_USER}:${DELEGATE_GROUP}" "${SLOTS_ROOT}/cgroup.procs"
+for slot_id in "${GREENRAN_SLOT_IDS[@]}"; do
+  slot_root="${SLOTS_ROOT}/${slot_id}"
+  chown "${DELEGATE_USER}:${DELEGATE_GROUP}" "${slot_root}"
+  for filename in cgroup.procs cgroup.subtree_control; do
+    [[ -e "${slot_root}/${filename}" ]] || fail "arquivo cgroup ausente: ${slot_root}/${filename}"
+    chown "${DELEGATE_USER}:${DELEGATE_GROUP}" "${slot_root}/${filename}"
+  done
+  for group in "${GREENRAN_GROUPS[@]}"; do
+    group_path="${slot_root}/${group}"
+    chown "${DELEGATE_USER}:${DELEGATE_GROUP}" "${group_path}"
+    for filename in cpu.max memory.high io.weight cgroup.procs cpu.stat memory.current memory.peak io.stat; do
+      [[ -e "${group_path}/${filename}" ]] || fail "arquivo cgroup ausente: ${group_path}/${filename}"
+      chown "${DELEGATE_USER}:${DELEGATE_GROUP}" "${group_path}/${filename}"
+    done
   done
 done
 

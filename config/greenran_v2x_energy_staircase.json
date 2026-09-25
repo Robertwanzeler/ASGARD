@@ -1,0 +1,21 @@
+{
+  "schema": "greenran.tasam.v2x.energy_staircase.v1",
+  "economic_action_contract": "economic_action_v3_per_du_sleep",
+  "safe_floor_source": "native_telemetry_or_validated_checkpoint",
+  "du_cell_ids": [2, 3, 4],
+  "multipliers": [1.0, 1.05, 1.1, 1.15],
+  "power_quantization_percent": 5,
+  "active_power_percent_bounds": [25, 100],
+  "healthy_decisions_to_descend": 3,
+  "allow_du_sleep": true,
+  "max_sleeping_dus": 1,
+  "sleep_requirements": {
+    "handover_confirmed": true,
+    "association_valid": true,
+    "pdcp_window_valid": true,
+    "minimum_pdcp_window_seconds": 10
+  },
+  "failure_action": "restore_last_confirmed_rung_or_rapp_safety",
+  "rapp_reference_unrestricted": true,
+  "promotion_eligible": false
+}

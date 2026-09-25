@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from scripts.run_tasam_online_arm import (
     _decision_target_watcher_command,
     _native_actuation_evidence,
+    _reconcile_wall_status,
     build_environment,
     checkpoint_fingerprint,
     mode_contract,
@@ -17,6 +19,33 @@ from src.rapp_orchestrator import RappResourceOptimizer
 
 
 class TestTasamOnlineCampaign(unittest.TestCase):
+    def test_sigterm_is_cancelled_without_verified_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "wall_clock_status.json").write_text(
+                '{"phase": "running", "schema": "greenran.wall_clock_run.v1"}',
+                encoding="utf-8",
+            )
+            _reconcile_wall_status(
+                run_dir, 143, "", completion_verified=False
+            )
+            status = json.loads((run_dir / "wall_clock_status.json").read_text())
+        self.assertEqual(status["phase"], "cancelled")
+        self.assertEqual(status["reconciliation_reason"], "external_termination")
+
+    def test_verified_sigterm_can_finish_a_finite_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "wall_clock_status.json").write_text(
+                '{"phase": "running", "schema": "greenran.wall_clock_run.v1"}',
+                encoding="utf-8",
+            )
+            _reconcile_wall_status(
+                run_dir, 143, "", completion_verified=True
+            )
+            status = json.loads((run_dir / "wall_clock_status.json").read_text())
+        self.assertEqual(status["phase"], "finished")
+
     def test_native_ns3_recognizes_the_balanced_v3_online_profile(self):
         root = Path(__file__).resolve().parents[1]
         scenario = (
@@ -41,6 +70,30 @@ class TestTasamOnlineCampaign(unittest.TestCase):
         self.assertEqual(env["GREENRAN_ARMD_MODE"], "off")
         self.assertEqual(env["GREENRAN_TASAM_ADVISOR_ENABLED"], "0")
         self.assertEqual(env["GREENRAN_CONTROL_TRIAL_ENABLED"], "0")
+
+    def test_parallel_pair_environment_propagates_slot_ports_and_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = build_environment(
+                "rapp_only_actuating",
+                Path(tmp),
+                43,
+                "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max",
+                9000,
+                120,
+                native_fidelity=True,
+                infra_resource_profile="parallel_pair_v1",
+                execution_slot_env={
+                    "GREENRAN_V2X_EXECUTION_SLOT": "slot-b",
+                    "GREENRAN_E2_TERM_PORT": "36431",
+                    "GREENRAN_E2_XAPP_PORT": "36432",
+                    "GREENRAN_E2_LOCAL_PORT": "38570",
+                    "GREENRAN_PORT_OFFSET": "100",
+                },
+            )
+        self.assertEqual(env["GREENRAN_INFRA_RESOURCE_PROFILE"], "parallel_pair_v1")
+        self.assertEqual(env["GREENRAN_V2X_EXECUTION_SLOT"], "slot-b")
+        self.assertEqual(env["GREENRAN_E2_TERM_PORT"], "36431")
+        self.assertEqual(env["GREENRAN_E2_LOCAL_PORT"], "38570")
 
     def test_combined_contract_keeps_armd_context_and_frozen_tasam(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,7 +7,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/core_runtime.sh"
 load_greenran_runtime
 
-HOST="${APP1_HOST:-0.0.0.0}"
+HOST="${APP1_HOST:-127.0.0.1}"
 PORT="${APP1_PORT:-5100}"
 
 cd "$PROJECT_DIR"

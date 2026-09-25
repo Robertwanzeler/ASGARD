@@ -9,6 +9,7 @@ import os
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 import json
+from pathlib import Path
 
 class RANFeatureExtractor:
     """CNN-based feature extractor for RAN time series data"""
@@ -61,7 +62,12 @@ class RANFeatureExtractor:
 class TransferLearningPipeline:
     """Pipeline for transfer learning from synthetic to real data"""
     
-    def __init__(self, model_dir: str = "/home/robert/orange_nuclear/models"):
+    def __init__(self, model_dir: str | None = None):
+        if model_dir is None:
+            model_dir = os.environ.get(
+                "GREENRAN_MODELS_DIR",
+                str(Path(__file__).resolve().parents[2] / "models"),
+            )
         self.model_dir = model_dir
         self.feature_extractor = RANFeatureExtractor()
         self.is_pretrained = False

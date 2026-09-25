@@ -21,6 +21,7 @@ CATEGORY_TO_INDEX = {name: index for index, name in enumerate(CATEGORY_ORDER)}
 POWER_LEVELS = tuple(float(value) for value in range(25, 101, 5))
 V10_POWER_LEVELS = (0.0, *POWER_LEVELS)
 TEMPORAL_FEATURE_DIM = 10
+V2X_ADAPTIVE_REWARD_CONTRACT = "greenran.tasam.v2x.reward_adaptive.v1"
 
 
 def _select_power_levels() -> tuple[float, ...]:
@@ -740,12 +741,33 @@ def load_marl_transition_trace(path: str | Path) -> list[MARLTransitionRecord]:
         if len(behavior_actions) != len(du_states) or len(next_du_states) != len(du_states):
             continue
         feedback = payload.get('judge_feedback') or {}
-        reward = float(
-            payload.get(
-                'tasam_online_reward',
-                feedback.get('tasam_online_reward', payload.get('reward_hint', 0.0)),
-            ) or 0.0
-        )
+        if payload.get("reward_contract") == V2X_ADAPTIVE_REWARD_CONTRACT:
+            snapshot = payload.get("adaptive_reward")
+            if not isinstance(snapshot, dict) or "reward" not in snapshot:
+                continue
+            try:
+                authoritative = float(snapshot["reward"])
+                exported = [
+                    float(payload["tasam_online_reward"]),
+                    float(payload["tasam_training_reward"]),
+                    float(payload["reward_hint"]),
+                ]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(authoritative) or any(
+                not math.isfinite(value)
+                or not math.isclose(value, authoritative, rel_tol=0.0, abs_tol=1e-8)
+                for value in exported
+            ):
+                continue
+            reward = authoritative
+        else:
+            reward = float(
+                payload.get(
+                    'tasam_online_reward',
+                    feedback.get('tasam_online_reward', payload.get('reward_hint', 0.0)),
+                ) or 0.0
+            )
         if economic_v2 and economic_weight <= 0.0:
             reward = 0.0
         observed = payload.get('tasam_observed_verdict') or feedback.get('tasam_observed_verdict') or feedback.get('observed_verdict')

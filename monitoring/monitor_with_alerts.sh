@@ -11,7 +11,8 @@
 # =============================================================================
 
 # Configurações
-ORANGE_DIR="/home/robert/orange_nuclear"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORANGE_DIR="${GREENRAN_PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 DB_FILE="/tmp/rapp_data_lake.db"
 METRICS_FILE="/tmp/xapp_metrics/extended_metrics.json"
 TARGET_RECORDS=${1:-5000}

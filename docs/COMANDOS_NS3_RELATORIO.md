@@ -1217,10 +1217,391 @@ Este documento fornece um guia completo para executar o NS-3, rApps e xApps no c
 
 Para dúvidas adicionais, consulte a documentação do projeto e os scripts disponíveis nos diretórios `scripts/` e `src/`.
 
+## 16. Como Construir um xApp do Zero
+
+Esta seção ensina, passo a passo, como criar um xApp novo em C para o FlexRIC (E2AP v1) do projeto GreenRAN. O exemplo constrói um xApp chamado `meu_xapp` que se conecta ao nearRT-RIC, lista os nós E2 conectados e finaliza de forma limpa. **Cada linha de código está explicada**, para que qualquer pessoa consiga entender e construir sozinha.
+
+O caminho de referência no repositório é o exemplo `helloworld`, que serve de modelo:
+
+- `flexric/examples/xApp/c/helloworld/hw.c` — código-fonte mínimo de um xApp
+- `flexric/examples/xApp/c/helloworld/CMakeLists.txt` — regras de compilação do exemplo
+
+### 16.1 Pré-requisitos
+
+Antes de começar, verifique se o ambiente está pronto:
+
+```bash
+gcc --version
+```
+**Explicação linha a linha:**
+- `gcc --version` → verifica se o compilador C está instalado (necessário para compilar o xApp). Deve retornar algo como `gcc (Ubuntu ...) 11.x` ou superior.
+
+```bash
+cmake --version
+```
+**Explicação linha a linha:**
+- `cmake --version` → verifica se o CMake está instalado. Ele é o sistema de build do FlexRIC e o responsável por gerar os comandos de compilação.
+
+```bash
+ls /home/robert/orange_nuclear/flexric/build_e2ap_v1/examples/ric/nearRT-RIC
+```
+**Explicação linha a linha:**
+- `ls <caminho>` → confirma que o binário do nearRT-RIC já foi compilado. Se o arquivo não existir, o FlexRIC ainda não foi construído e você precisa compilá-lo antes.
+
+```bash
+ls /home/robert/orange_nuclear/flexric/flexric.conf
+```
+**Explicação linha a linha:**
+- `ls <caminho>` → confirma que o arquivo de configuração do FlexRIC existe. É ele que o xApp lê para descobrir o IP/porta do RIC.
+
+```bash
+ls /home/robert/orange_nuclear/flexric_lib/ | head
+```
+**Explicação linha a linha:**
+- `ls <caminho>` → lista as bibliotecas de Service Models (`.so`) do FlexRIC (KPM, RC etc.).
+- `| head` → mostra apenas as 10 primeiras, para não poluir o terminal.
+
+**Importante:** para testar o xApp, o nearRT-RIC precisa estar rodando (seção 7.2 deste documento). Sem o RIC ativo, o xApp não encontra nós E2.
+
+### 16.2 Entendendo a Anatomia de um xApp
+
+Todo xApp do FlexRIC segue o mesmo ciclo de vida, em 5 etapas:
+
+```
+1. init_fr_args()      → lê os argumentos da linha de comando (IP, portas, config)
+2. init_xapp_api()     → conecta o xApp ao RIC via socket SCTP
+3. e2_nodes_xapp_api() → descobre quais nós E2 (gNBs do NS-3) estão conectados
+4. [corpo do xApp]     → aqui entra a lógica: ler KPIs, subscrever KPM, tomar decisões
+5. try_stop_xapp_api() → desconecta e libera memória de forma segura
+```
+
+Nos próximos passos vamos construir esse ciclo linha por linha.
+
+### 16.3 Passo 1 — Criar o Diretório e o Código-Fonte
+
+```bash
+mkdir -p /home/robert/orange_nuclear/flexric/examples/xApp/c/meu_xapp
+```
+**Explicação linha a linha:**
+- `mkdir -p` → cria o diretório (e qualquer diretório pai que não exista, sem erro se já existir).
+- `/home/robert/orange_nuclear/flexric/examples/xApp/c/meu_xapp` → caminho onde ficam todos os xApps do projeto. Criar aqui garante que o xApp siga o padrão do repositório.
+
+```bash
+nano /home/robert/orange_nuclear/flexric/examples/xApp/c/meu_xapp/xapp_meu_xapp.c
+```
+**Explicação linha a linha:**
+- `nano <arquivo>` → abre o editor de texto para criar o arquivo do xApp. Você pode usar `vim` ou `code` se preferir.
+
+**Conteúdo completo do arquivo `xapp_meu_xapp.c`:**
+
+```c
+#include "../../../../src/xApp/e42_xapp_api.h"
+#include "../../../../src/util/alg_ds/alg/defer.h"
+#include "../../../../src/util/ngran_types.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <assert.h>
+
+int main(int argc, char *argv[])
+{
+  fr_args_t args = init_fr_args(argc, argv);
+
+  init_xapp_api(&args);
+  sleep(1);
+
+  e2_node_arr_xapp_t nodes = e2_nodes_xapp_api();
+  defer({ free_e2_node_arr_xapp(&nodes); });
+
+  assert(nodes.len > 0);
+
+  printf("xApp conectado! Nos E2 = %d\n", nodes.len);
+
+  for (size_t i = 0; i < nodes.len; i++) {
+    ngran_node_t ran_type = nodes.n[i].id.type;
+    printf("No E2 %ld: nb_id %d, mcc %d, mnc %d, tipo %s\n",
+           i,
+           nodes.n[i].id.nb_id.nb_id,
+           nodes.n[i].id.plmn.mcc,
+           nodes.n[i].id.plmn.mnc,
+           get_ngran_name(ran_type));
+
+    printf("Funcoes RAN suportadas:");
+    for (size_t j = 0; j < nodes.n[i].len_rf; j++)
+      printf(", %d", nodes.n[i].rf[j].id);
+    printf("\n");
+  }
+
+  while(try_stop_xapp_api() == false)
+    usleep(1000);
+
+  printf("xApp finalizado com SUCESSO\n");
+  return 0;
+}
+```
+
+**Explicação linha a linha — bloco dos includes:**
+
+- `#include "../../../../src/xApp/e42_xapp_api.h"` → importa a API principal do xApp: é daqui que vêm `fr_args_t`, `init_fr_args()`, `init_xapp_api()`, `e2_nodes_xapp_api()` e `try_stop_xapp_api()`. O caminho relativo (`../../../../`) sobe do diretório do xApp até a pasta `src/` do FlexRIC.
+- `#include "../../../../src/util/alg_ds/alg/defer.h"` → importa a macro `defer`, que executa um trecho de código automaticamente quando a função termina (parecido com o `defer` de Go). Usamos ela para liberar memória sem esquecer.
+- `#include "../../../../src/util/ngran_types.h"` → importa os tipos de nó RAN (`ngran_node_t`) e a função `get_ngran_name()`, que traduz o tipo do nó (gNB, gNB-CU, gNB-DU) em texto legível.
+- `#include <stdlib.h>` → biblioteca padrão C (conversões, `exit`, alocação).
+- `#include <stdio.h>` → biblioteca de entrada/saída: nos dá o `printf`.
+- `#include <unistd.h>` → nos dá `sleep()` e `usleep()` (pausas em segundos e microssegundos).
+- `#include <signal.h>` → permite tratar sinais do sistema (Ctrl+C). A API do xApp usa por baixo dos panos.
+- `#include <assert.h>` → nos dá o `assert()`, que aborta o programa se uma condição for falsa (usado para garantir que há nós E2 conectados).
+
+**Explicação linha a linha — início do main e conexão:**
+
+- `int main(int argc, char *argv[])` → ponto de entrada do programa. `argc`/`argv` recebem os argumentos da linha de comando (como `-c flexric.conf`).
+- `fr_args_t args = init_fr_args(argc, argv);` → cria a estrutura `args` que guarda todas as configurações, preenchida lendo os argumentos da linha de comando. É o que faz o `-c flexric/flexric.conf` e o `-p flexric_lib/` funcionarem quando você executar o xApp.
+- `init_xapp_api(&args);` → **conecta o xApp ao nearRT-RIC** via SCTP. Recebe o endereço de `args` (`&args`). A partir daqui o xApp é um cliente RIC válido.
+- `sleep(1);` → espera 1 segundo para dar tempo de a conexão E2 se estabelecer antes de consultar os nós.
+
+**Explicação linha a linha — descoberta dos nós E2:**
+
+- `e2_node_arr_xapp_t nodes = e2_nodes_xapp_api();` → pergunta ao RIC quais nós E2 estão conectados e guarda a lista em `nodes`. Cada elemento contém o ID do nó, o tipo (gNB monolítica ou split CU/DU) e as funções RAN que ele suporta (KPM, RC...).
+- `defer({ free_e2_node_arr_xapp(&nodes); });` → registra que, ao sair da função `main` (de qualquer forma, até com `return`), a memória de `nodes` será liberada. Evita vazamento de memória sem precisar chamar `free` manualmente em cada ponto de saída.
+- `assert(nodes.len > 0);` → verifica se pelo menos um nó E2 está conectado. Se `nodes.len` for 0 (nenhum gNB do NS-3 conectado ao RIC), o programa aborta aqui com mensagem de erro — é o sinal clássico de que o NS-3 não está rodando.
+
+**Explicação linha a linha — impressão das informações dos nós:**
+
+- `printf("xApp conectado! Nos E2 = %d\n", nodes.len);` → mostra quantos nós E2 foram encontrados. `%d` é substituído pelo número de nós.
+- `for (size_t i = 0; i < nodes.len; i++) {` → laço que percorre cada nó da lista. `i` é o índice do nó atual.
+- `ngran_node_t ran_type = nodes.n[i].id.type;` → guarda o tipo do nó atual (gNB, gNB-DU etc.) na variável `ran_type`.
+- `printf("No E2 %ld: nb_id %d, mcc %d, mnc %d, tipo %s\n", ...)` → imprime a identidade do nó: índice, ID da estação (`nb_id`), código de país (`mcc`), operadora (`mnc`) e o nome do tipo.
+- `i,` → argumento do `%ld` (índice do nó).
+- `nodes.n[i].id.nb_id.nb_id,` → argumento do `%d`: o identificador numérico da estação base.
+- `nodes.n[i].id.plmn.mcc,` → argumento do `%d`: o Mobile Country Code da rede.
+- `nodes.n[i].id.plmn.mnc,` → argumento do `%d`: o Mobile Network Code (operadora).
+- `get_ngran_name(ran_type));` → argumento do `%s`: converte o tipo numérico do nó em texto (ex: `ng-eNB`, `gNB`).
+- `printf("Funcoes RAN suportadas:");` → imprime o início da linha das funções RAN (sem quebrar linha ainda).
+- `for (size_t j = 0; j < nodes.n[i].len_rf; j++)` → laço interno que percorre as funções RAN que o nó suporta (ex: KPM com ID 2, RC com ID 3).
+- `printf(", %d", nodes.n[i].rf[j].id);` → imprime o ID de cada função RAN, separado por vírgula.
+- `printf("\n");` → finaliza a linha das funções RAN com quebra de linha.
+
+**Explicação linha a linha — encerramento:**
+
+- `while(try_stop_xapp_api() == false)` → tenta encerrar o xApp de forma limpa. A função pode falhar se ainda houver mensagens em trânsito, então ela é chamada em laço.
+- `usleep(1000);` → espera 1 milissegundo entre cada tentativa de parada, sem consumir CPU à toa.
+- `printf("xApp finalizado com SUCESSO\n");` → mensagem final confirmando que tudo terminou bem.
+- `return 0;` → retorna 0 para o sistema operacional, indicando execução sem erros.
+
+### 16.4 Passo 2 — Criar o CMakeLists.txt Local
+
+Agora criamos o arquivo que ensina o CMake a compilar o xApp:
+
+```bash
+nano /home/robert/orange_nuclear/flexric/examples/xApp/c/meu_xapp/CMakeLists.txt
+```
+**Explicação linha a linha:**
+- `nano <arquivo>` → cria/abre o arquivo de build do nosso xApp. O nome `CMakeLists.txt` é obrigatório — é o nome que o CMake procura.
+
+**Conteúdo completo do arquivo `CMakeLists.txt`:**
+
+```cmake
+add_executable(xapp_meu_xapp
+  xapp_meu_xapp.c
+  ../../../../src/util/alg_ds/alg/defer.c
+  )
+
+target_link_libraries(xapp_meu_xapp
+  PUBLIC
+  e42_xapp
+  -pthread
+  -lsctp
+  -ldl
+  )
+```
+
+**Explicação linha a linha:**
+
+- `add_executable(xapp_meu_xapp` → diz ao CMake: "quero gerar um programa executável chamado `xapp_meu_xapp`". O nome que você der aqui será o nome do binário.
+- `xapp_meu_xapp.c` → primeiro arquivo-fonte do executável: o nosso código principal criado no Passo 1.
+- `../../../../src/util/alg_ds/alg/defer.c` → segundo arquivo-fonte: a implementação da macro `defer` que usamos no código (é um arquivo C compartilhado com os outros exemplos, por isso o caminho relativo).
+- `)` → fecha a lista de fontes do `add_executable`.
+- `target_link_libraries(xapp_meu_xapp` → inicia a lista de bibliotecas que o executável precisa na hora de linkar (conectar as funções externas que ele usa).
+- `PUBLIC` → visibilidade das dependências: público significa que quem usar este alvo também herda essas bibliotecas.
+- `e42_xapp` → a biblioteca principal do FlexRIC (E2AP v1). Contém toda a implementação da API que importamos no `e42_xapp_api.h`.
+- `-pthread` → ativa a biblioteca de threads POSIX (a API do xApp roda threads internas para gerenciar a conexão).
+- `-lsctp` → ativa a biblioteca SCTP, o protocolo de transporte usado pela interface E2 entre RIC e gNBs.
+- `-ldl` → ativa a biblioteca de carregamento dinâmico (`dlopen`), usada pelo FlexRIC para carregar os Service Models (`.so`) em tempo de execução.
+- `)` → fecha a lista de bibliotecas.
+
+### 16.5 Passo 3 — Registrar o xApp no CMakeLists Pai
+
+O CMake precisa saber que o novo diretório existe. Registramos ele no arquivo pai:
+
+```bash
+nano /home/robert/orange_nuclear/flexric/examples/xApp/c/CMakeLists.txt
+```
+**Explicação linha a linha:**
+- `nano <arquivo>` → abre o CMakeLists que registra todos os xApps do projeto (é o mesmo arquivo que já contém `xapp_slicer`, `xapp_energy_saver` e `xapp_tasam_actuator`).
+
+**Linha a adicionar ao final do arquivo:**
+
+```cmake
+add_subdirectory(meu_xapp)
+```
+
+**Explicação linha a linha:**
+
+- `add_subdirectory(meu_xapp)` → diz ao CMake: "entre no diretório `meu_xapp` e processe o `CMakeLists.txt` de lá também". É o que faz nosso xApp entrar no build do projeto.
+
+**Alternativa (estilo usado pelos xApps do GreenRAN):** em vez de criar `CMakeLists.txt` no subdiretório, você pode registrar direto no arquivo pai:
+
+```cmake
+add_executable(xapp_meu_xapp meu_xapp/xapp_meu_xapp.c)
+target_link_libraries(xapp_meu_xapp e42_xapp sctp pthread)
+```
+
+**Explicação linha a linha:**
+- `add_executable(xapp_meu_xapp meu_xapp/xapp_meu_xapp.c)` → cria o executável apontando direto para o caminho do código-fonte, sem precisar de `CMakeLists.txt` local.
+- `target_link_libraries(xapp_meu_xapp e42_xapp sctp pthread)` → linka as mesmas bibliotecas essenciais em uma única linha (forma compacta).
+- **Observação:** se usar esta alternativa, o `defer.c` precisa entrar na lista de fontes ou o `defer` não vai linkar. Por isso a forma do `helloworld` (com CMakeLists local) é a recomendada para iniciantes.
+
+Escolha **uma** das duas formas, não as duas.
+
+### 16.6 Passo 4 — Compilar o xApp
+
+```bash
+cd /home/robert/orange_nuclear
+```
+**Explicação linha a linha:**
+- `cd <diretório>` → vai para a raiz do projeto, de onde os caminhos relativos (`flexric/...`) funcionam.
+
+```bash
+cmake --build flexric/build_e2ap_v1 --target xapp_meu_xapp -j$(nproc)
+```
+**Explicação linha a linha:**
+- `cmake --build` → comando moderno do CMake para compilar (equivale a rodar `make` no diretório de build).
+- `flexric/build_e2ap_v1` → diretório de build do FlexRIC já configurado (build com E2AP v1, o mesmo usado por todos os xApps do projeto).
+- `--target xapp_meu_xapp` → compila apenas o nosso alvo, sem recompilar o FlexRIC inteiro.
+- `-j$(nproc)` → usa todos os núcleos de CPU disponíveis para compilar mais rápido (`nproc` retorna o número de núcleos).
+
+**Forma equivalente com `make` (também funciona):**
+
+```bash
+make -C flexric/build_e2ap_v1 xapp_meu_xapp -j$(nproc)
+```
+**Explicação linha a linha:**
+- `make -C <dir>` → roda o `make` dentro do diretório de build sem precisar sair da raiz do projeto.
+- `xapp_meu_xapp` → nome do alvo (o mesmo definido no `add_executable`).
+- **Nota:** o CMake detecta sozinho que os `CMakeLists.txt` mudaram e reconfigura o build automaticamente antes de compilar. Não precisa rodar `cmake ..` manualmente.
+
+**Saída esperada (resumida):**
+
+```
+[ 50%] Building C object examples/xApp/c/meu_xapp/CMakeFiles/xapp_meu_xapp.dir/xapp_meu_xapp.c.o
+[100%] Linking C executable ../../../../../build_e2ap_v1/examples/xApp/c/xapp_meu_xapp
+[100%] Built target xapp_meu_xapp
+```
+
+### 16.7 Passo 5 — Executar e Testar o xApp
+
+Verifique que o binário foi gerado:
+
+```bash
+ls -la /home/robert/orange_nuclear/flexric/build_e2ap_v1/examples/xApp/c/xapp_meu_xapp
+```
+**Explicação linha a linha:**
+- `ls -la <arquivo>` → lista o arquivo com detalhes. Se aparecer na listagem (com `x` de executável), o build funcionou.
+
+Com o **nearRT-RIC rodando** (seção 7.2) e o **NS-3 conectado** (seção 1.1), execute:
+
+```bash
+cd /home/robert/orange_nuclear
+```
+**Explicação linha a linha:**
+- `cd <diretório>` → volta para a raiz do projeto.
+
+```bash
+export LD_LIBRARY_PATH=/home/robert/orange_nuclear/flexric/build_e2ap_v1/src/ric:/home/robert/orange_nuclear/flexric_lib:/home/robert/orange_nuclear/flexric/build_e2ap_v1/src/xApp:$LD_LIBRARY_PATH
+```
+**Explicação linha a linha:**
+- `export LD_LIBRARY_PATH=...` → informa ao sistema onde encontrar as bibliotecas `.so` em tempo de execução.
+- `flexric/build_e2ap_v1/src/ric` → bibliotecas internas do RIC.
+- `flexric_lib` → bibliotecas dos Service Models (KPM, RC).
+- `flexric/build_e2ap_v1/src/xApp` → bibliotecas da API do xApp.
+- `:$LD_LIBRARY_PATH` → preserva o que já existia na variável, adicionando no início.
+- **Nota:** este comando é o mesmo da seção 7.1 e vale apenas para o terminal atual.
+
+```bash
+./flexric/build_e2ap_v1/examples/xApp/c/xapp_meu_xapp -c flexric/flexric.conf -p flexric_lib/
+```
+**Explicação linha a linha:**
+- `./flexric/build_e2ap_v1/examples/xApp/c/xapp_meu_xapp` → executa o binário recém-compilado.
+- `-c flexric/flexric.conf` → (config) aponta o arquivo de configuração, de onde o xApp descobre o IP/porta do RIC. Lido pelo `init_fr_args()`.
+- `-p flexric_lib/` → (path) aponta o diretório dos Service Models `.so` que o xApp carrega dinamicamente.
+
+**Saída esperada:**
+
+```
+xApp conectado! Nos E2 = 1
+No E2 0: nb_id 10, mcc 1, mnc 1, tipo gNB
+Funcoes RAN suportadas: 2, 3
+xApp finalizado com SUCESSO
+```
+
+Se aparecer `Assertion nodes.len > 0 failed`, o NS-3 não está conectado ao RIC — suba o NS-3 primeiro (seção 1.1).
+
+### 16.8 Evoluindo o xApp (Próximos Passos)
+
+O xApp do exemplo conecta e lista nós, mas ainda não faz nada útil. Os próximos níveis de evolução, na ordem:
+
+| Nível | O que fazer | Referência no projeto |
+|-------|-------------|----------------------|
+| 1. Ler KPIs | Subscrever relatórios KPM periódicos (latência, throughput, PRB) | `flexric/examples/xApp/c/slicer/subscription_slicer.c` |
+| 2. Tomar decisões | Aplicar regras sobre os KPIs (ex: SLA de latência) | `flexric/examples/xApp/c/slicer/xapp_slicer.c` |
+| 3. Atuar na rede | Enviar comandos de controle RAN (RC) para o NS-3 | `flexric/examples/xApp/c/energy_saver/xapp_energy_saver.c` |
+| 4. Integrar com rApp | Ler/escrever intents em `/tmp/xapp_intents/*.txt` | `flexric/examples/xApp/c/tasam_actuator/xapp_tasam_actuator.c` |
+
+**Dica de estudo:** compare o `xapp_meu_xapp.c` com o `xapp_slicer.c` — a estrutura do `main` é idêntica; a diferença é a assinatura de serviços KPM (`report_service_style`) e o laço de processamento das indicações que chegam do RIC.
+
+### 16.9 Solução de Problemas no Build
+
+| Erro | Causa provável | Solução |
+|------|----------------|---------|
+| `fatal error: e42_xapp_api.h: No such file` | Caminho relativo do include errado | Confira que o `#include` usa `../../../../src/xApp/...` (4 níveis acima) |
+| `undefined reference to defer` | `defer.c` fora da lista de fontes | Adicione `../../../../src/util/alg_ds/alg/defer.c` no `add_executable` |
+| `cannot find -lsctp` | Biblioteca SCTP não instalada | `sudo apt install libsctp-dev` e rode o build de novo |
+| `No rule to make target 'xapp_meu_xapp'` | xApp não registrado no CMakeLists pai | Refaça o Passo 3 (seção 16.5) |
+| `Assertion nodes.len > 0 failed` | Build ok, mas sem nós E2 | NS-3 não está rodando/conectado — veja seções 1.1 e 11.2 |
+| `error while loading shared libraries` | `LD_LIBRARY_PATH` não exportado | Rode o `export` da seção 16.7 antes de executar |
+
+### 16.10 Checklist Final
+
+Resumo dos 5 passos para construir qualquer xApp do zero:
+
+```bash
+# 1. Criar o código
+mkdir -p flexric/examples/xApp/c/meu_xapp
+nano flexric/examples/xApp/c/meu_xapp/xapp_meu_xapp.c
+
+# 2. Criar o CMakeLists local
+nano flexric/examples/xApp/c/meu_xapp/CMakeLists.txt
+
+# 3. Registrar no CMakeLists pai (adicionar add_subdirectory)
+nano flexric/examples/xApp/c/CMakeLists.txt
+
+# 4. Compilar
+cmake --build flexric/build_e2ap_v1 --target xapp_meu_xapp -j$(nproc)
+
+# 5. Executar (com RIC e NS-3 rodando)
+export LD_LIBRARY_PATH=/home/robert/orange_nuclear/flexric/build_e2ap_v1/src/ric:/home/robert/orange_nuclear/flexric_lib:/home/robert/orange_nuclear/flexric/build_e2ap_v1/src/xApp:$LD_LIBRARY_PATH
+./flexric/build_e2ap_v1/examples/xApp/c/xapp_meu_xapp -c flexric/flexric.conf -p flexric_lib/
+```
+
+**Explicação linha a linha:**
+- Cada bloco `#` → comentário indicando o passo correspondente às seções 16.3 a 16.7.
+- Os comandos → resumo exato do que foi detalhado nas seções anteriores desta seção 16.
+
 ---
 
-**Data:** 24 de Agosto de 2026
-**Versão:** 1.1
+**Data:** 21 de Setembro de 2026
+**Versão:** 1.2
 **Projeto:** GreenRAN O-RAN
 **Autor:** Gerado automaticamente com base na análise do sistema
-**Atualizações:** Adicionada seção completa sobre rApps e xApps
+**Atualizações:** Adicionada seção completa sobre rApps e xApps; adicionada seção 16 — tutorial de construção de xApp do zero com explicação linha a linha

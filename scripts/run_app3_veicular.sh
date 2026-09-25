@@ -10,7 +10,7 @@ cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/scripts/core_runtime.sh" 2>/dev/null || true
 load_greenran_runtime 2>/dev/null || true
 
-HOST="${APP3_HOST:-0.0.0.0}"
+HOST="${APP3_HOST:-127.0.0.1}"
 PORT="${APP3_PORT:-5300}"
 
 GREEN='\033[0;32m'

@@ -80,3 +80,32 @@ def test_experiment_contract_requires_same_pair_and_frozen_checkpoint(tmp_path):
     combined_manifest["checkpoint_sha256_after"] = "changed"
     (combined / "arm_manifest.json").write_text(__import__("json").dumps(combined_manifest))
     assert not experiment_contract(baseline, combined)["valid"]
+
+
+def test_experiment_contract_requires_an_actuating_rapp_control_when_requested(tmp_path):
+    baseline = tmp_path / "rapp_only"
+    combined = tmp_path / "combined"
+    baseline.mkdir()
+    combined.mkdir()
+    energy_model = {"kind": "native"}
+    base_manifest = {
+        "mode": "rapp_only", "seed": 47, "profile": "fixed", "sim_time_s": 331.5,
+        "pairing_schedule_id": "pair-1", "status": "finished",
+        "contract": {"tasam_enabled": False, "armd_mode": "off", "actuation_enabled": False},
+        "energy_model": energy_model,
+    }
+    combined_manifest = {
+        "mode": "combined", "seed": 47, "profile": "fixed", "sim_time_s": 331.5,
+        "pairing_schedule_id": "pair-1", "status": "finished",
+        "contract": {"tasam_enabled": True, "armd_mode": "assist", "actuation_enabled": True,
+                     "frozen_checkpoint": True},
+        "checkpoint_sha256_before": "abc", "checkpoint_sha256_after": "abc",
+        "checkpoint_frozen_verified": True, "energy_model": energy_model,
+    }
+    (baseline / "arm_manifest.json").write_text(__import__("json").dumps(base_manifest))
+    (combined / "arm_manifest.json").write_text(__import__("json").dumps(combined_manifest))
+    report = experiment_contract(
+        baseline, combined, duration_s=331.5, expected_baseline_mode="rapp_only_actuating"
+    )
+    assert not report["valid"]
+    assert report["checks"]["expected_baseline_mode"] is False

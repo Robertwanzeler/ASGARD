@@ -534,6 +534,21 @@ PROFILES["tasam_training_balanced_v4_v2x_gbr_priority"] = [
     replace(stage) for stage in PROFILES["tasam_training_balanced_v3"]
 ]
 
+# v5 changes only the native evidence contract and V2X scheduler discipline:
+# no offered load, mobility, topology or application stimulus is altered.
+PROFILES["tasam_training_balanced_v5_v2x_gbr_deadline_nonmc"] = [
+    replace(stage) for stage in PROFILES["tasam_training_balanced_v3"]
+]
+PROFILES["tasam_training_balanced_v5_v2x_gbr_deadline_mc"] = [
+    replace(stage) for stage in PROFILES["tasam_training_balanced_v3"]
+]
+PROFILES["tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback"] = [
+    replace(stage) for stage in PROFILES["tasam_training_balanced_v3"]
+]
+PROFILES["tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max"] = [
+    replace(stage) for stage in PROFILES["tasam_training_balanced_v3"]
+]
+
 # Economic adaptation must contain enough CLEAR/ADVISORY windows for the
 # applied-action replay.  The balanced curriculum above intentionally
 # includes hard camera/vehicle/App2 pulses, which is useful for categorical

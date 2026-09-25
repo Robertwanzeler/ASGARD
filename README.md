@@ -1,54 +1,49 @@
-# Orange Nuclear / GreenRAN
+# Orange-Nuclear — Guia de instalação e debug
 
-Entrada rápida para o projeto GreenRAN O-RAN.
+Guia operacional para instalar e depurar o ambiente de simulação **Orange-Nuclear**:
 
-## Onde começar
-
-- visão atual do projeto: `docs/README.md`
-- estado consolidado GreenRAN: `docs/README_GREENRAN.md`
-- progresso histórico: `docs/PROGRESSO.md`
-
-## Estrutura principal
-
-- `src/`: núcleo do rApp, Data Lake, dashboard e integração de runtime
-- `apps/`: apps finais (`App1-Vigilancia`, `App2-Monitoramento`, `App3-Veicular`)
-- `scripts/`: automação de execução, coleta, treino e utilitários
-- `training/`: treinamento ML/GraphSAGE do core
-- `tests/`: testes centrais de integração/contrato
-- `docs/`: documentação técnica e experimental
-- `reports/`: relatórios finais curados, preservados fora de `runs/`
-- `config/`: configuração versionável do runtime e parâmetros
-
-## Comandos úteis
-
-Executar a suíte Python consolidada:
-
-```bash
-bash scripts/run_python_tests.sh
+```text
+FlexRIC + E2SIM + ns-O-RAN-flexric + ns-3/mmWave/LENA
 ```
 
-Executar o runtime principal:
+O foco é Ubuntu 24.04 em um servidor ou runtime separado. Este repositório contém documentação e verificações seguras; não contém os fontes, modelos ou resultados do simulador.
+
+## Comece aqui
+
+1. Leia o [Manual de instalação](MANUAL_INSTALACAO_ORAN.md).
+2. Use um diretório de runtime exclusivo, diferente de qualquer simulação em execução.
+3. Execute o [check_environment.sh](scripts/check_environment.sh) antes e depois da instalação.
+4. Consulte o [Guia de debug](GUIA_DEBUG_NS3_FLEXRIC.md) somente quando o build ou a execução apresentar erro.
+
+## Scripts seguros
+
+Os scripts não instalam pacotes, não clonam repositórios e não iniciam/paralisam processos:
 
 ```bash
-./scripts/run_greenran_v2.sh
+./scripts/check_environment.sh
+./scripts/check_environment.sh "$HOME/orange_nuclear_runtime"
+./scripts/show_install_commands.sh
 ```
 
-Exportar dataset veicular e treinar o GraphSAGE direto para a trilha ARMD-GreenRAN:
+O segundo script apenas imprime os comandos do manual para revisão e cópia manual.
+
+## Runtime isolado
+
+Os comandos do manual usam:
 
 ```bash
-python3 scripts/run_vehicle_graphsage_pipeline.py --hours 24
+export ORAN_DEBUG_ROOT="$HOME/orange_nuclear_runtime"
 ```
 
-O runner prefere `drlexp/.venv/bin/python` para o treino quando essa virtualenv existir.
+Não use o checkout de outra simulação como `ORAN_DEBUG_ROOT`. O Git de debug não altera `/home/robert/orange_nuclear`, contêineres existentes ou processos em execução.
 
-## Observações de repositório
+## Compatibilidade
 
-- `carla/`, `flexric/` e `ns-O-RAN-flexric/` são dependências grandes e aumentam muito o volume do repositório.
-- `runs/`, `charts/`, parte de `models/` e snapshots locais devem ser tratados como artefatos gerados, não como código-fonte principal.
-- relatórios finais que valem versionamento devem ir para `reports/`, não para `runs/`.
-- a documentação operacional mais atual está em `docs/`, não na raiz.
+- Ubuntu 24.04: alvo principal deste guia.
+- Ubuntu 22.04: alternativa recomendada quando ferramentas legadas do stack exigirem versões antigas.
+- O ns-3 atual usa C++, Python 3, CMake e Ninja/Make.
+- Python 3.8 só deve ser instalado em ambiente virtual quando uma ferramenta legada — especialmente GUI — exigir essa versão; não substitua o Python do sistema.
 
-# Submodules (pushed as branches)
-flexric -> branches/flexric
-ns-O-RAN-flexric -> branches/ns-O-RAN-flexric
+## Licença e origem
 
+O código de terceiros permanece nos repositórios originais. Este Git documenta o procedimento de instalação do stack Orange-Nuclear e não redistribui os fontes.

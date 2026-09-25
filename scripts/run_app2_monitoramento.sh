@@ -46,8 +46,8 @@ if pgrep -f "apps/app2_monitoramento/backend/app.py" > /dev/null; then
 else
     echo -e "${GREEN}Iniciando App2-Monitoramento...${NC}"
     setsid -f env PYTHONUNBUFFERED=1 python3 "$PROJECT_ROOT/apps/app2_monitoramento/backend/app.py" \
-        --host 0.0.0.0 \
-        --port 5200 \
+        --host "${APP2_HOST:-127.0.0.1}" \
+        --port "${APP2_PORT:-5200}" \
         > /tmp/app2_backend.log 2>&1
 fi
 

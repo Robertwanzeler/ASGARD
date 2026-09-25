@@ -38,6 +38,11 @@ from greenran_infra_budget import (  # noqa: E402
 
 
 DEFAULT_QUEUE = ROOT / "runs" / "agent_jobs"
+DISPATCHER_STARTED_AT = int(time.time())
+_CAMPAIGN_JOBS_MODULE = sys.modules.get("greenran_campaign_jobs")
+_CAMPAIGN_JOBS_MODULE_PATH = Path(
+    getattr(_CAMPAIGN_JOBS_MODULE, "__file__", ROOT / "src" / "greenran_campaign_jobs.py")
+).resolve()
 
 
 def _host_cgroup_probe() -> dict[str, Any]:
@@ -202,6 +207,9 @@ def _status(layout: dict[str, Path], job_id: str, payload: dict[str, Any]) -> No
     jobs_source = ROOT / "src" / "greenran_campaign_jobs.py"
     if jobs_source.is_file():
         payload.setdefault("campaign_jobs_source_sha256", _sha256(jobs_source))
+    payload.setdefault("dispatcher_started_at", DISPATCHER_STARTED_AT)
+    payload.setdefault("dispatcher_campaign_jobs_module", str(_CAMPAIGN_JOBS_MODULE_PATH))
+    payload.setdefault("dispatcher_imported_source_sha256", _sha256(_CAMPAIGN_JOBS_MODULE_PATH))
     atomic_json_write(layout["status"] / f"{job_id}.json", payload)
 
 
@@ -211,6 +219,48 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _binary_provenance(command: list[str] | None) -> dict[str, Any]:
+    """Return the executable identity embedded in a validated job command."""
+    if not command:
+        return {}
+    try:
+        index = command.index("--binary")
+        binary = Path(command[index + 1]).resolve()
+    except (ValueError, IndexError, TypeError):
+        return {}
+    payload: dict[str, Any] = {"binary_path": str(binary)}
+    if binary.is_file():
+        payload["binary_sha256"] = _sha256(binary)
+        payload["binary_size"] = binary.stat().st_size
+    else:
+        payload["binary_missing"] = True
+    return payload
+
+
+def _provenance(raw: dict[str, Any] | None = None, command: list[str] | None = None) -> dict[str, Any]:
+    profile = raw.get("profile") if isinstance(raw, dict) else None
+    payload: dict[str, Any] = {
+        "accepted_profile": profile,
+        "dispatcher_started_at": DISPATCHER_STARTED_AT,
+        "dispatcher_campaign_jobs_module": str(_CAMPAIGN_JOBS_MODULE_PATH),
+        "dispatcher_imported_source_sha256": _sha256(_CAMPAIGN_JOBS_MODULE_PATH),
+        "dispatcher_current_source_sha256": _sha256(ROOT / "src" / "greenran_campaign_jobs.py"),
+    }
+    payload.update(_binary_provenance(command))
+    return payload
+
+
+def _assert_campaign_jobs_module_fresh() -> None:
+    """Fail closed when a long-lived dispatcher has stale imported policy."""
+    current = _sha256(ROOT / "src" / "greenran_campaign_jobs.py")
+    loaded = _sha256(_CAMPAIGN_JOBS_MODULE_PATH)
+    if current != loaded:
+        raise JobValidationError(
+            "dispatcher carregou uma versão antiga de greenran_campaign_jobs.py; "
+            "reinicie o dispatcher antes de aceitar novos jobs"
+        )
 
 
 def _claim(layout: dict[str, Path]) -> Path | None:
@@ -296,6 +346,7 @@ def run_one(queue_root: Path) -> bool:
     host_cgroup_probe: dict[str, Any] | None = None
     try:
         raw = json.loads(claimed.read_text(encoding="utf-8"))
+        _assert_campaign_jobs_module_fresh()
         spec = normalize_job(raw)
         job_id = spec.job_id
         host_cgroup_probe = _host_cgroup_probe()
@@ -316,6 +367,7 @@ def run_one(queue_root: Path) -> bool:
             "kind": spec.kind, "state": "running", "started_at": started_at,
             "command": spec.command, "campaign_dir": str(spec.campaign_path),
             "cgroup_host_probe": host_cgroup_probe,
+            **_provenance(spec.payload, spec.command),
         })
         log_path = layout["logs"] / f"{job_id}.log"
         with log_path.open("a", encoding="utf-8") as log:
@@ -336,7 +388,7 @@ def run_one(queue_root: Path) -> bool:
                 campaign_manifest = {}
         experiment_status = str(campaign_manifest.get("status") or "")
         baseline_infeasible = (
-            spec.kind == "vehicle_feasibility"
+            spec.kind in {"vehicle_feasibility", "vehicle_feasibility_matrix"}
             and exit_code == 3
             and experiment_status == "baseline_infeasible"
             and not active_after
@@ -361,6 +413,7 @@ def run_one(queue_root: Path) -> bool:
             "log": str(log_path), "active_cgroup_pids": active_after,
             "post_exit_cleanup": cleanup,
             "cgroup_host_probe": host_cgroup_probe,
+            **_provenance(spec.payload, spec.command),
         }
         _status(layout, job_id, result)
         claimed.replace((layout["finished"] if success else layout["failed"]) / claimed.name)
@@ -370,6 +423,7 @@ def run_one(queue_root: Path) -> bool:
             "state": "rejected", "started_at": started_at, "finished_at": int(time.time()),
             "reason": str(exc),
             "cgroup_host_probe": host_cgroup_probe,
+            **_provenance(raw),
         }
         _status(layout, job_id, result)
         claimed.replace(layout["failed"] / claimed.name)

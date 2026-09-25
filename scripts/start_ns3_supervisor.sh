@@ -45,6 +45,15 @@ NS3_VEHICLE_PACKET_SIZE_BYTES="${GREENRAN_NS3_VEHICLE_PACKET_SIZE_BYTES:-800}"
 NS3_VEHICLE_PACKET_INTERVAL_US="${GREENRAN_NS3_VEHICLE_PACKET_INTERVAL_US:-4000}"
 NS3_ACTIVE_CELLS="${GREENRAN_NS3_ACTIVE_CELLS:-$NS3_MMWAVE_ENB_NODES}"
 
+if [[ "$RAN_PRESSURE" == "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max" ]]; then
+  NS3_USE_MC_UE_DEVICES=true
+  NS3_E2LTE_ENABLED=true
+  # E2-LTE provides the fallback readback. The rApp native contract keeps
+  # E2-NR disabled because that report path is not part of this campaign.
+  NS3_E2NR_ENABLED=false
+  NS3_E2DU_ENABLED=true
+fi
+
 mkdir -p "$STATE_DIR" "$NS3_ENERGY_OUTPUT_DIR"
 cd "$NS3_CWD"
 
@@ -78,7 +87,10 @@ while true; do
     "$NS3_CWD/DlE2PdcpStatsLte.txt" \
     "$NS3_CWD/UlE2PdcpStatsLte.txt" \
     "$NS3_CWD/DlE2RlcStatsLte.txt" \
-    "$NS3_CWD/UlE2RlcStatsLte.txt"
+    "$NS3_CWD/UlE2RlcStatsLte.txt" \
+    "$NS3_CWD/VehiclePdcpPduTrace.csv" \
+    "$NS3_CWD/VehicleLinkTrace.csv" \
+    "$NS3_CWD/VehicleCellSinrTrace.csv"
   GREENRAN_NS3_ENERGY_OUTPUT_DIR="$NS3_ENERGY_OUTPUT_DIR" \
   "$NS3_BIN" \
     --e2TermIp=127.0.0.1 \
@@ -110,6 +122,8 @@ while true; do
     --nativeEvidencePeriodMs="$NS3_NATIVE_EVIDENCE_PERIOD_MS" \
     --useMcUeDevices="$NS3_USE_MC_UE_DEVICES" \
     --enableE2FileLogging="$NS3_ENABLE_E2_FILE_LOGGING" \
+    --e2TermPort="${GREENRAN_E2_TERM_PORT:-36421}" \
+    --e2LocalPort="${GREENRAN_E2_LOCAL_PORT:-38470}" \
     --e2lteEnabled="$NS3_E2LTE_ENABLED" \
     --e2nrEnabled="$NS3_E2NR_ENABLED" \
     --e2du="$NS3_E2DU_ENABLED" \

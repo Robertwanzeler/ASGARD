@@ -1,0 +1,23 @@
+{
+  "schema": "greenran.v2x.parallel_slots.v1",
+  "max_parallel": 2,
+  "minimum_free_gib": 20.0,
+  "artifact_reserve_gib_per_slot": 4.0,
+  "cgroup_relative_root": "slots",
+  "slots": [
+    {
+      "slot_id": "slot-a",
+      "e2_term_port": 36421,
+      "e2_xapp_port": 36422,
+      "e2_local_port": 38470,
+      "app_port_offset": 0
+    },
+    {
+      "slot_id": "slot-b",
+      "e2_term_port": 36431,
+      "e2_xapp_port": 36432,
+      "e2_local_port": 38570,
+      "app_port_offset": 100
+    }
+  ]
+}

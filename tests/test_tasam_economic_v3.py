@@ -12,11 +12,14 @@ from greenran_infra_budget import build_physical_budget
 from tasam_economic_v3 import (
     CONTRACT,
     DUSleepCoordinator,
+    ENERGY_STAIRCASE_CONTRACT,
     EconomicActionV3Error,
+    build_energy_staircase,
     normalize_power_by_cell,
     project_total_budget_fraction,
     quantize_power_percent_v3,
     realized_economic_reward,
+    staircase_candidate,
 )
 
 
@@ -52,6 +55,16 @@ def test_v3_accepts_independent_du_power_and_zero_only_for_sleep():
     assert quantize_power_percent_v3(0) == 0
     with pytest.raises(EconomicActionV3Error):
         quantize_power_percent_v3(20)
+
+
+def test_v3_allows_only_explicit_native_mc_overlap():
+    bundle = _bundle()
+    bundle["association_mode"] = "native_rrc_mc_overlap"
+    bundle["cells"][1]["ue_policies"].append(dict(bundle["cells"][0]["ue_policies"][0]))
+    assert validate_bundle(bundle)["association_mode"] == "native_rrc_mc_overlap"
+    bundle.pop("association_mode")
+    with pytest.raises(ControlBundleError, match="duplicate IMSI"):
+        validate_bundle(bundle)
 
 
 def test_v3_rejects_two_sleeping_dus_and_unconfirmed_sleep():
@@ -94,3 +107,42 @@ def test_sleep_requires_handover_and_one_full_pdcp_window():
     assert event["cell_id"] == 2
     with pytest.raises(EconomicActionV3Error):
         coordinator.request_sleep(3, [3], [4])
+
+
+def test_energy_staircase_is_quantized_and_bounded_to_floor_times_115():
+    ladder = build_energy_staircase({2: 41, 3: 50, 4: 80})
+    assert ladder[2] == (45, 50)
+    assert ladder[3] == (50, 55, 60)
+    assert ladder[4] == (80, 85, 90, 95)
+    assert all(25 <= value <= 100 for values in ladder.values() for value in values)
+
+
+def test_energy_staircase_starts_high_then_descends_after_three_healthy_decisions():
+    floors = {2: 40, 3: 50, 4: 60}
+    requested = {2: 25, 3: 25, 4: 25}
+    selected, state = staircase_candidate(
+        floors, requested, state={"contract": ENERGY_STAIRCASE_CONTRACT}
+    )
+    assert selected == {2: 50, 3: 60, 4: 70}
+    state["last_observation_healthy"] = True
+    for _ in range(2):
+        selected, state = staircase_candidate(
+            floors, requested, state=state, healthy=True, healthy_required=3
+        )
+    assert selected == {2: 50, 3: 60, 4: 70}
+    selected, state = staircase_candidate(
+        floors, requested, state=state, healthy=True, healthy_required=3
+    )
+    assert selected == {2: 45, 3: 55, 4: 65}
+
+
+def test_energy_staircase_rejects_missing_floor_and_sleep_is_explicit():
+    with pytest.raises(EconomicActionV3Error):
+        build_energy_staircase(None)
+    ladder = build_energy_staircase({2: 25, 3: 25, 4: 25}, allow_sleep=True)
+    assert ladder[2][0] == 0
+    selected, _ = staircase_candidate(
+        {2: 25, 3: 25, 4: 25}, {2: 0, 3: 100, 4: 100},
+        allow_sleep=True,
+    )
+    assert selected[2] == 0

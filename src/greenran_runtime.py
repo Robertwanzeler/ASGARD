@@ -22,7 +22,7 @@ RUNTIME_CONFIG_PATH = CONFIG_DIR / "core" / "runtime.json"
 
 DEFAULT_RUNTIME_CONFIG: Dict[str, Any] = {
     "dashboard": {
-        "host": "0.0.0.0",
+        "host": "127.0.0.1",
         "port": 5000,
         "debug": False,
     },

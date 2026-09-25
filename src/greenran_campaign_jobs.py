@@ -23,16 +23,26 @@ ALLOWED_KINDS = {
     "actuation_smoke",
     "shadow",
     "vehicle_feasibility",
+    "vehicle_feasibility_matrix",
+    "v2x_article_online",
     "online_economic",
     "causal_pair_frozen",
     "asgard_frozen_evaluation",
+    "asgard_paired_evaluation",
     "energy_calibration",
     "simulation_revaluation",
 }
 SEEDS = {45, 46, 47}
+V2X_MATRIX_INTERVALS = (4000, 6000, 8000, 12000, 16000)
+V2X_MATRIX_SELECTION_SEED = 47
+V2X_MATRIX_VALIDATION_SEEDS = (45, 46)
 _OPTIMIZED_NS3_BINARY = PROJECT_ROOT / "ns-O-RAN-flexric/mmwave-LENA-oran/build-v9-optimized/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario-optimized"
+_RELEASE_NS3_BINARY = PROJECT_ROOT / "ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario"
+_SCHEDULER_SOURCE = PROJECT_ROOT / "ns-O-RAN-flexric/mmwave-LENA-oran/src/mmwave/model/mmwave-flex-tti-mac-scheduler.cc"
 NS3_BINARY = (
-    _OPTIMIZED_NS3_BINARY
+    _RELEASE_NS3_BINARY
+    if _RELEASE_NS3_BINARY.is_file() and _RELEASE_NS3_BINARY.stat().st_mtime >= _SCHEDULER_SOURCE.stat().st_mtime
+    else _OPTIMIZED_NS3_BINARY
     if _OPTIMIZED_NS3_BINARY.is_file()
     else PROJECT_ROOT / "ns-O-RAN-flexric/mmwave-LENA-oran/build/scratch/ns3.42-Energy_saving_with_cell_utilization_scenario-default"
 )
@@ -41,12 +51,35 @@ ONLINE_PROFILES = {
     "tasam_training_balanced_v4_v2x",
     "tasam_training_balanced_v4_v2x_gbr",
     "tasam_training_balanced_v4_v2x_gbr_priority",
+    "tasam_training_balanced_v5_v2x_gbr_deadline_nonmc",
+    "tasam_training_balanced_v5_v2x_gbr_deadline_mc",
+    "tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback",
+    "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max",
     "tasam_training_economic_v4",
 }
 VEHICLE_SAFE_PROFILE = "tasam_training_economic_vehicle_safe_v1"
 V2X_PROFILE = "tasam_training_balanced_v4_v2x"
 V2X_GBR_PROFILE = "tasam_training_balanced_v4_v2x_gbr"
 V2X_GBR_PRIORITY_PROFILE = "tasam_training_balanced_v4_v2x_gbr_priority"
+V2X_GBR_DEADLINE_NONMC_PROFILE = "tasam_training_balanced_v5_v2x_gbr_deadline_nonmc"
+V2X_GBR_DEADLINE_MC_PROFILE = "tasam_training_balanced_v5_v2x_gbr_deadline_mc"
+V2X_GBR_DEADLINE_MC_FALLBACK_PROFILE = "tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback"
+V2X_GBR_DEADLINE_MC_FALLBACK_BASELINE_MAX_PROFILE = "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max"
+V2X_FEASIBILITY_PROFILES = {
+    V2X_PROFILE,
+    V2X_GBR_PROFILE,
+    V2X_GBR_PRIORITY_PROFILE,
+    V2X_GBR_DEADLINE_NONMC_PROFILE,
+    V2X_GBR_DEADLINE_MC_PROFILE,
+    V2X_GBR_DEADLINE_MC_FALLBACK_PROFILE,
+    V2X_GBR_DEADLINE_MC_FALLBACK_BASELINE_MAX_PROFILE,
+}
+V2X_MATRIX_PROFILES = {
+    V2X_GBR_DEADLINE_NONMC_PROFILE,
+    V2X_GBR_DEADLINE_MC_PROFILE,
+    V2X_GBR_DEADLINE_MC_FALLBACK_PROFILE,
+    V2X_GBR_DEADLINE_MC_FALLBACK_BASELINE_MAX_PROFILE,
+}
 ONLINE_PROFILES.add(VEHICLE_SAFE_PROFILE)
 STARTUP_MIN_FREE_GIB = 15.8
 RUNTIME_MIN_FREE_GIB = 10.0
@@ -96,6 +129,24 @@ def _campaign_path(raw: Any, label: str = "campaign_dir") -> Path:
     return path
 
 
+def _article_campaign_path(raw: Any) -> Path:
+    """Allow explicit staged continuation only for the V2X article protocol."""
+    path = _inside_project(raw, "campaign_dir")
+    try:
+        path.relative_to(RUNS_ROOT)
+    except ValueError as exc:
+        raise JobValidationError(f"campaign_dir precisa estar em {RUNS_ROOT}: {path}") from exc
+    if path.exists() and any(path.iterdir()):
+        manifest = path / "campaign_manifest.json"
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise JobValidationError("campanha existente não é protocolo V2X do artigo") from exc
+        if data.get("schema") != "greenran.tasam.v2x.article_online_campaign.v1":
+            raise JobValidationError("campanha existente não é protocolo V2X do artigo")
+    return path
+
+
 def _seed(payload: dict[str, Any]) -> int:
     value = payload.get("seed")
     if type(value) is not int or value not in SEEDS:
@@ -103,7 +154,20 @@ def _seed(payload: dict[str, Any]) -> int:
     return value
 
 
-def _checkpoint(payload: dict[str, Any], *, economic: bool = False) -> Path:
+def _matrix_list(payload: dict[str, Any], field: str, expected: tuple[int, ...]) -> tuple[int, ...]:
+    """Validate the fixed scientific matrix; no partial/implicit variants."""
+    value = payload.get(field, list(expected))
+    if not isinstance(value, list) or any(type(item) is not int for item in value):
+        raise JobValidationError(f"{field} deve ser uma lista inteira")
+    values = tuple(value)
+    if values != expected:
+        raise JobValidationError(f"{field} deve ser exatamente {list(expected)}")
+    return values
+
+
+def _checkpoint(
+    payload: dict[str, Any], *, economic: bool = False, require_final_metrics: bool = False
+) -> Path:
     path = _inside_project(payload.get("checkpoint"), "checkpoint", require_exists=True)
     metadata_path = path / "tasam_marl_checkpoint_meta.json"
     actors = path / "tasam_marl_actors.pt"
@@ -132,6 +196,10 @@ def _checkpoint(payload: dict[str, Any], *, economic: bool = False) -> Path:
         raise JobValidationError("checkpoint econômico sem total_budget_fraction")
     if economic and v10 and metadata.get("economic_action_contract") != "economic_action_v3_per_du_sleep":
         raise JobValidationError("checkpoint v10 sem contrato econômico v3")
+    if require_final_metrics and not isinstance(metadata.get("final_metrics"), dict):
+        raise JobValidationError("checkpoint ASGARD sem final_metrics")
+    if require_final_metrics and not metadata.get("final_metrics"):
+        raise JobValidationError("checkpoint ASGARD com final_metrics vazio")
     return path
 
 
@@ -154,12 +222,82 @@ def _vehicle_profile_manifest(
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise JobValidationError(f"manifesto veicular inválido: {path}") from exc
+    erratum_path = path.parent / "assessment_erratum_v1.json"
+    if erratum_path.is_file():
+        try:
+            erratum = json.loads(erratum_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise JobValidationError(f"errata veicular inválida: {erratum_path}") from exc
+        if erratum.get("correction", {}).get("promotion_eligible") is False:
+            raise JobValidationError("campanha veicular possui errata não promocionável")
     if (
-        data.get("schema") != "greenran.autonomous_vehicle_feasibility.v1"
+        data.get("schema") not in {
+            "greenran.autonomous_vehicle_feasibility.v1",
+            "greenran.autonomous_vehicle_feasibility.v2",
+            "greenran.autonomous_vehicle_feasibility.v3",
+            "greenran.autonomous_vehicle_feasibility.v4",
+        }
         or data.get("status") != "passed"
         or int(data.get("selected_interval_us") or 0) not in {4000, 6000, 8000, 12000, 16000}
     ):
         raise JobValidationError("manifesto veicular não foi aprovado pela linha de base protegida")
+    if data.get("schema") == "greenran.autonomous_vehicle_feasibility.v2":
+        if (
+            int(data.get("manifest_version", 0) or 0) < 2
+            or not isinstance(data.get("provenance"), dict)
+            or data.get("scientific_decision") != "approved"
+        ):
+            raise JobValidationError("manifesto veicular v2 sem proveniência completa")
+        contract = data["provenance"].get("metric_contract") or {}
+        if (
+            contract.get("pdcp_source") != "native_pdcp_trace_unique_sim_epochs"
+            or contract.get("collector_mode") != "pdcp_real"
+            or contract.get("proxy_allowed") is not False
+        ):
+            raise JobValidationError("manifesto veicular v2 viola o contrato real-only")
+    if data.get("schema") == "greenran.autonomous_vehicle_feasibility.v3":
+        if (
+            data.get("metric_contract") != "per_pdu_cohort_v1"
+            or data.get("scheduler_policy") != "gbr_debt_rr_v1"
+            or int(data.get("loss_grace_ms", 0)) != 1000
+        ):
+            raise JobValidationError("manifesto veicular v3 sem contrato PDCP por PDU")
+        if data.get("profile") in {V2X_GBR_DEADLINE_MC_FALLBACK_PROFILE, V2X_GBR_DEADLINE_MC_FALLBACK_BASELINE_MAX_PROFILE}:
+            if data.get("link_metric_contract") != "vehicle_link_state_v2":
+                raise JobValidationError("manifesto v6 sem contrato de estado do link")
+            if data.get("connectivity_mode") != "lte_anchored_mc":
+                raise JobValidationError("manifesto v6 sem fallback LTE ancorado")
+    if data.get("schema") == "greenran.autonomous_vehicle_feasibility.v4":
+        if (
+            int(data.get("manifest_version", 0) or 0) < 4
+            or data.get("scientific_decision") != "approved"
+            or data.get("promotion_eligible") is not True
+            or data.get("metric_contract") != "per_pdu_cohort_v1"
+            or data.get("scheduler_policy") != "gbr_debt_rr_v1"
+            or int(data.get("loss_grace_ms", 0) or 0) != 1000
+        ):
+            raise JobValidationError("manifesto veicular v4 sem aprovação científica estrita")
+        contract = (data.get("provenance") or {}).get("metric_contract") or {}
+        if (
+            contract.get("pdcp_source") != "native_pdcp_pdu_tx_rx"
+            or contract.get("collector_mode") != "pdcp_real"
+            or contract.get("proxy_allowed") is not False
+        ):
+            raise JobValidationError("manifesto veicular v4 viola o contrato PDCP real")
+        matrix = data.get("multi_seed_validation") or {}
+        if (
+            matrix.get("valid") is not True
+            or tuple(matrix.get("required_seeds") or []) != (45, 46, 47)
+            or tuple(matrix.get("complete_seeds") or []) != (45, 46, 47)
+            or matrix.get("seed47_reused_from_phase1") is not True
+            or matrix.get("provenance_compatible") is not True
+        ):
+            raise JobValidationError("manifesto veicular v4 sem validação multi-seed compatível")
+        if data.get("profile") in {V2X_GBR_DEADLINE_MC_FALLBACK_PROFILE, V2X_GBR_DEADLINE_MC_FALLBACK_BASELINE_MAX_PROFILE} and (
+            data.get("link_metric_contract") != "vehicle_link_state_v2"
+            or data.get("connectivity_mode") != "lte_anchored_mc"
+        ):
+            raise JobValidationError("manifesto veicular v4 sem fallback LTE rastreável")
     if expected_profile is not None and data.get("profile") != expected_profile:
         raise JobValidationError(
             "manifesto veicular não corresponde ao perfil da campanha: "
@@ -199,7 +337,10 @@ def _common_arm(
     if profile not in ONLINE_PROFILES:
         raise JobValidationError(f"profile não permitido: {profile}")
     vehicle_manifest = None
-    if profile in {VEHICLE_SAFE_PROFILE, V2X_PROFILE, V2X_GBR_PROFILE, V2X_GBR_PRIORITY_PROFILE}:
+    if profile in {VEHICLE_SAFE_PROFILE, V2X_PROFILE, V2X_GBR_PROFILE, V2X_GBR_PRIORITY_PROFILE,
+                   V2X_GBR_DEADLINE_NONMC_PROFILE, V2X_GBR_DEADLINE_MC_PROFILE,
+                   V2X_GBR_DEADLINE_MC_FALLBACK_PROFILE,
+                   V2X_GBR_DEADLINE_MC_FALLBACK_BASELINE_MAX_PROFILE}:
         vehicle_manifest = _vehicle_profile_manifest(payload, expected_profile=profile)
     command = [
         sys.executable, str(PROJECT_ROOT / "scripts" / "run_tasam_online_arm.py"),
@@ -261,16 +402,67 @@ def normalize_job(payload: Any) -> JobSpec:
         profile = payload.get("profile", VEHICLE_SAFE_PROFILE)
         if profile not in ONLINE_PROFILES:
             raise JobValidationError(f"perfil de viabilidade não permitido: {profile}")
+        smoke = payload.get("smoke", False)
+        if type(smoke) is not bool:
+            raise JobValidationError("smoke deve ser booleano")
+        intervals = "4000" if smoke else "4000,6000,8000,12000,16000"
+        decision_target = 0 if profile in V2X_FEASIBILITY_PROFILES else (20 if smoke else 150)
+        wall_time = 900 if smoke else 43200
+        warmup_seconds = 30 if (smoke and profile in V2X_FEASIBILITY_PROFILES) else (0 if smoke else 30)
+        window_seconds = 10 if (smoke and profile in V2X_FEASIBILITY_PROFILES) else (2.5 if smoke else 10)
+        scored_windows = 1 if smoke else 30
+        execution_slot = payload.get("execution_slot")
+        if execution_slot is not None and execution_slot not in {"slot-a", "slot-b"}:
+            raise JobValidationError("execution_slot deve ser slot-a ou slot-b")
         command = [
             sys.executable, str(PROJECT_ROOT / "scripts" / "run_tasam_vehicle_feasibility.py"),
             "--output-root", str(campaign), "--checkpoint", str(checkpoint),
             "--binary", str(NS3_BINARY), "--profile", profile,
-            "--seed", str(_seed(payload)), "--decision-target", "150",
-            "--wall-time", "43200",
-            "--warmup-seconds", "30", "--window-seconds", "10", "--scored-windows", "30",
+            "--seed", str(_seed(payload)), "--intervals-us", intervals,
+            "--decision-target", str(decision_target),
+            "--wall-time", str(wall_time),
+            "--warmup-seconds", str(warmup_seconds), "--window-seconds", str(window_seconds),
+            "--scored-windows", str(scored_windows),
+            *( ["--smoke"] if smoke else [] ),
             "--min-tx-pdus", "500", "--min-free-gib", "10",
         ]
+        if execution_slot is not None:
+            command.extend(["--execution-slot", execution_slot])
         return JobSpec(job_id, kind, payload, command, campaign)
+    if kind == "vehicle_feasibility_matrix":
+        campaign = _campaign_path(payload.get("campaign_dir"))
+        checkpoint = _checkpoint(payload)
+        profile = payload.get("profile")
+        if profile not in V2X_MATRIX_PROFILES:
+            raise JobValidationError("matriz de viabilidade exige perfil V2X com contrato PDCP por PDU")
+        if payload.get("smoke") is True:
+            raise JobValidationError("matriz de viabilidade nunca aceita smoke")
+        selection_seed = payload.get("selection_seed", V2X_MATRIX_SELECTION_SEED)
+        if type(selection_seed) is not int or selection_seed != V2X_MATRIX_SELECTION_SEED:
+            raise JobValidationError("selection_seed da matriz deve ser 47")
+        validation_seeds = _matrix_list(payload, "validation_seeds", V2X_MATRIX_VALIDATION_SEEDS)
+        intervals = _matrix_list(payload, "intervals_us", V2X_MATRIX_INTERVALS)
+        parallel_slots = payload.get("parallel_slots")
+        if parallel_slots is not None:
+            if parallel_slots != ["slot-a", "slot-b"]:
+                raise JobValidationError("parallel_slots da matriz deve ser ['slot-a', 'slot-b']")
+        command = [
+            sys.executable, str(PROJECT_ROOT / "scripts" / "run_tasam_vehicle_feasibility_matrix.py"),
+            "--output-root", str(campaign), "--checkpoint", str(checkpoint),
+            "--binary", str(NS3_BINARY), "--profile", str(profile),
+            "--selection-seed", str(selection_seed),
+            "--validation-seeds", ",".join(str(seed) for seed in validation_seeds),
+            "--intervals-us", ",".join(str(interval) for interval in intervals),
+            "--wall-time", "43200", "--min-free-gib", "20",
+        ]
+        if parallel_slots is not None:
+            command.extend(["--parallel-slots", ",".join(parallel_slots)])
+        return JobSpec(job_id, kind, payload, command, campaign)
+    if kind == "v2x_article_online":
+        raise JobValidationError(
+            "v2x_article_online não é o comparador oficial; use vehicle_feasibility_matrix "
+            "para a baseline rApp e asgard_paired_evaluation para rApp × ASGARD"
+        )
     if kind == "online_economic":
         campaign = _campaign_path(payload.get("campaign_dir"))
         checkpoint = _checkpoint(payload, economic=True)
@@ -352,7 +544,7 @@ def normalize_job(payload: Any) -> JobSpec:
         return JobSpec(job_id, kind, payload, command, campaign)
     if kind == "asgard_frozen_evaluation":
         campaign = _campaign_path(payload.get("campaign_dir"), "campaign_dir")
-        checkpoint = _checkpoint(payload, economic=True)
+        checkpoint = _checkpoint(payload, economic=True, require_final_metrics=True)
         adaptation = _promoted_adaptation(payload, checkpoint)
         calibration = _calibration(payload)
         seed = _seed(payload)
@@ -365,6 +557,34 @@ def normalize_job(payload: Any) -> JobSpec:
             "--checkpoint", str(checkpoint), "--calibration", str(calibration),
             "--seed", str(seed), "--profile", str(profile),
             "--min-free-gib", "10", "--sim-time", "600", "--decisions", "300",
+        ]
+        return JobSpec(job_id, kind, payload, command, campaign)
+    if kind == "asgard_paired_evaluation":
+        campaign = _campaign_path(payload.get("campaign_dir"), "campaign_dir")
+        checkpoint = _checkpoint(payload, economic=True, require_final_metrics=True)
+        metadata = json.loads((checkpoint / "tasam_marl_checkpoint_meta.json").read_text(encoding="utf-8"))
+        if metadata.get("parent_was_promoted") is not True:
+            raise JobValidationError("checkpoint ASGARD sem pai promovido")
+        if metadata.get("replay_imported") is not True:
+            raise JobValidationError("checkpoint ASGARD sem replay compatível")
+        calibration = _calibration(payload)
+        profile = payload.get("profile", V2X_GBR_DEADLINE_MC_FALLBACK_PROFILE)
+        if profile not in V2X_FEASIBILITY_PROFILES:
+            raise JobValidationError("campanha ASGARD pareada exige perfil V2X estrito")
+        vehicle_manifest = _vehicle_profile_manifest(payload, expected_profile=profile)
+        raw_seeds = payload.get("seeds", sorted(SEEDS))
+        if not isinstance(raw_seeds, list) or tuple(raw_seeds) != tuple(sorted(SEEDS)):
+            raise JobValidationError("campanha ASGARD pareada exige seeds [45, 46, 47]")
+        repetitions = payload.get("repetitions", 5)
+        if type(repetitions) is not int or repetitions != 5:
+            raise JobValidationError("campanha ASGARD pareada exige cinco repetições por seed")
+        command = [
+            sys.executable, str(PROJECT_ROOT / "scripts" / "run_tasam_asgard_paired_campaign.py"),
+            "--campaign-dir", str(campaign), "--baseline-manifest", str(vehicle_manifest),
+            "--checkpoint", str(checkpoint), "--calibration", str(calibration),
+            "--profile", profile, "--seeds", "45", "46", "47",
+            "--repetitions", "5", "--wall-time", "43200", "--sim-time", "331.5",
+            "--decision-target", "0", "--min-free-gib", "20", "--execute",
         ]
         return JobSpec(job_id, kind, payload, command, campaign)
     if kind == "causal_pair_frozen":

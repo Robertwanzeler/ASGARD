@@ -39,8 +39,8 @@ RUNTIME_CONFIG = load_runtime_config()
 DEFAULT_INFLUX_HOST = RUNTIME_CONFIG["monitoring"]["influxdb_host"]
 DEFAULT_INFLUX_PORT = int(RUNTIME_CONFIG["monitoring"]["influxdb_port"])
 DEFAULT_INFLUX_DB = RUNTIME_CONFIG["monitoring"]["influxdb_db"]
-DEFAULT_INFLUX_USER = "admin"
-DEFAULT_INFLUX_PASSWORD = "admin"
+DEFAULT_INFLUX_USER = os.getenv("GREENRAN_INFLUXDB_USER", "")
+DEFAULT_INFLUX_PASSWORD = os.getenv("GREENRAN_INFLUXDB_PASSWORD", "")
 DEFAULT_INTERVAL = int(RUNTIME_CONFIG["monitoring"]["push_interval_seconds"])
 DEFAULT_STATS_DIR = as_str(NS3_DIR)
 
@@ -48,8 +48,7 @@ DEFAULT_STATS_DIR = as_str(NS3_DIR)
 class InfluxDBPusher:
     """Classe para push de métricas para InfluxDB."""
     
-    def __init__(self, host="localhost", port=8086, db="influx", 
-                 user="admin", password="admin"):
+    def __init__(self, host="localhost", port=8086, db="influx", user="", password=""):
         self.host = host
         self.port = port
         self.db = db

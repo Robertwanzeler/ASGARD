@@ -121,6 +121,9 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
         raise ControlBundleError("at least one cell is required")
     normalized_cells: list[dict[str, Any]] = []
     seen_imsis: set[int] = set()
+    allow_native_mc_overlap = bool(
+        v3 and bundle.get("association_mode") == "native_rrc_mc_overlap"
+    )
     for raw_cell in cells:
         if not isinstance(raw_cell, dict):
             raise ControlBundleError("cell entries must be objects")
@@ -134,7 +137,7 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
         for raw_ue in policies:
             imsi = int(raw_ue.get("imsi", 0))
             service = service_for_imsi(imsi)
-            if imsi in seen_imsis:
+            if imsi in seen_imsis and not allow_native_mc_overlap:
                 raise ControlBundleError(f"duplicate IMSI {imsi}")
             seen_imsis.add(imsi)
             normalized_ues.append({
@@ -321,6 +324,19 @@ class ControlBundleClient:
             }
             for cell in normalized["cells"]
         ]
+        native_version = os.environ.get("GREENRAN_NATIVE_EVIDENCE_VERSION", "v3").strip()
+        cell_ack_complete = True
+        if native_version in {"v5", "v6"}:
+            cell_results = ack.get("cell_results")
+            confirmed_cells = {
+                int(item.get("cell_id")) for item in cell_results or []
+                if isinstance(item, dict)
+                and item.get("scheduler_ack") is True
+                and item.get("power_ack") is True
+                and item.get("cell_id") is not None
+            }
+            cell_ack_complete = confirmed_cells >= {2, 3, 4}
+            ack["cell_ack_complete"] = cell_ack_complete
         if (
             ack.get("schema") != ACK_SCHEMA
             or ack.get("policy_id") != normalized["policy_id"]
@@ -328,6 +344,7 @@ class ControlBundleClient:
             or not ack.get("ack")
             or not ack.get("applied")
             or int(ack.get("observed_confirmations", 0) or 0) <= 0
+            or not cell_ack_complete
         ):
             self._audit(ack)
             raise ControlBundleError(f"invalid or incomplete E2 ACK: {ack}")

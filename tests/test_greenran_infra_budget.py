@@ -7,6 +7,7 @@ from src.greenran_infra_budget import (
     InfraBudgetError,
     ResourceAccumulator,
     build_physical_budget,
+    systemd_user_scope_properties,
     validate_physical_budget,
 )
 from src.greenran_infra_monitor import InfrastructureMonitor
@@ -29,6 +30,39 @@ def test_budget_maps_rai_to_physical_limits_and_preserves_safety_channel():
     separated = build_physical_budget(1.0, compute_fraction=0.5, io_fraction=0.25)
     assert separated["groups"]["tasam"]["cpu_quota_us"] == 50_000
     assert separated["groups"]["tasam"]["io_weight"] == 25
+
+
+def test_baseline_max_profile_reserves_twelve_cpus_and_eight_gib():
+    budget = validate_physical_budget(
+        build_physical_budget(1.0, unrestricted=True, resource_profile="baseline_max_v1")
+    )
+    assert budget["resource_profile"] == "baseline_max_v1"
+    assert budget["groups"]["simulator"]["cpu_quota_us"] == 1_200_000
+    assert budget["groups"]["simulator"]["cpu_period_us"] == 100_000
+    assert budget["groups"]["simulator"]["memory_high_bytes"] == 8 * 1024**3
+    with pytest.raises(InfraBudgetError):
+        build_physical_budget(0.5, unrestricted=False, resource_profile="baseline_max_v1")
+
+
+def test_parallel_pair_profile_is_symmetric_for_two_slots():
+    budget = validate_physical_budget(
+        build_physical_budget(1.0, unrestricted=True, resource_profile="parallel_pair_v1")
+    )
+    assert budget["groups"]["simulator"]["cpu_quota_us"] == 680_000
+    assert budget["groups"]["simulator"]["memory_high_bytes"] == int(2.5 * 1024**3)
+    assert sum(group["cpu_quota_us"] for group in budget["groups"].values()) * 2 <= 16 * 100_000
+    assert sum(group["memory_high_bytes"] for group in budget["groups"].values()) * 2 <= int(8.6 * 1024**3)
+
+
+def test_systemd_user_scope_properties_preserve_baseline_max_limits():
+    limits = build_physical_budget(
+        1.0, unrestricted=True, resource_profile="baseline_max_v1"
+    )["groups"]["simulator"]
+    assert systemd_user_scope_properties(limits) == {
+        "CPUQuota": "1200%",
+        "MemoryHigh": str(8 * 1024**3),
+        "IOWeight": "100",
+    }
 
 
 def test_cgroup_apply_writes_cpu_memory_high_io_and_never_memory_max(tmp_path):

@@ -9,10 +9,12 @@ their existing contracts; v3 is opt-in and fail-closed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Mapping
 
 
 CONTRACT = "economic_action_v3_per_du_sleep"
+ENERGY_STAIRCASE_CONTRACT = "greenran.tasam.v2x.energy_staircase.v1"
 POWER_LEVELS_V3 = (0, *range(25, 101, 5))
 ACTIVE_POWER_LEVELS_V3 = tuple(range(25, 101, 5))
 DU_CELL_IDS = (2, 3, 4)
@@ -20,6 +22,111 @@ DU_CELL_IDS = (2, 3, 4)
 
 class EconomicActionV3Error(ValueError):
     """Raised when a v3 action cannot be safely represented."""
+
+
+def _ceil_power_step(value: float) -> int:
+    """Quantize a positive safe floor upward to the actuator's 5% grid."""
+    return max(25, min(100, int(math.ceil(float(value) / 5.0) * 5)))
+
+
+def energy_staircase_levels(
+    safe_floor_percent: Any,
+    *,
+    allow_sleep: bool = False,
+) -> tuple[int, ...]:
+    """Return the auditable floor-to-115% candidate ladder for one DU.
+
+    The floor is supplied by native telemetry or a validated checkpoint.  The
+    helper never invents a floor: non-numeric, non-positive and non-finite
+    values are rejected.  Sleep is an explicit candidate and is not mixed
+    with the active-power ladder.
+    """
+    try:
+        floor = float(safe_floor_percent)
+    except (TypeError, ValueError) as exc:
+        raise EconomicActionV3Error("safe power floor is required") from exc
+    if not math.isfinite(floor) or floor <= 0.0 or floor > 100.0:
+        raise EconomicActionV3Error("safe power floor must be in (0,100]")
+    levels = tuple(dict.fromkeys(
+        _ceil_power_step(min(100.0, floor * multiplier))
+        for multiplier in (1.0, 1.05, 1.10, 1.15)
+    ))
+    return ((0,) + levels) if allow_sleep else levels
+
+
+def build_energy_staircase(
+    safe_floor_percent_by_cell: Mapping[Any, Any] | None,
+    *,
+    allow_sleep: bool = False,
+) -> dict[int, tuple[int, ...]]:
+    """Build a complete, per-DU staircase from native safe-floor evidence."""
+    if not isinstance(safe_floor_percent_by_cell, Mapping):
+        raise EconomicActionV3Error("per-DU safe power floors are required")
+    result: dict[int, tuple[int, ...]] = {}
+    for cell_id in DU_CELL_IDS:
+        value = safe_floor_percent_by_cell.get(cell_id, safe_floor_percent_by_cell.get(str(cell_id)))
+        result[cell_id] = energy_staircase_levels(value, allow_sleep=allow_sleep)
+    return result
+
+
+def staircase_candidate(
+    safe_floor_percent_by_cell: Mapping[Any, Any] | None,
+    requested_power_by_cell: Mapping[Any, Any] | None,
+    *,
+    allow_sleep: bool = False,
+    state: Mapping[Any, Any] | None = None,
+    healthy: bool = False,
+    healthy_required: int = 3,
+    critical: bool = False,
+) -> tuple[dict[int, int], dict[str, Any]]:
+    """Project one TA-SAM request onto the safe ladder.
+
+    A healthy observation advances one rung only after ``healthy_required``
+    consecutive healthy decisions.  Any critical/incomplete observation
+    restores the last confirmed rung.  This function is pure so the caller
+    can persist the returned state atomically with the decision.
+    """
+    ladders = build_energy_staircase(safe_floor_percent_by_cell, allow_sleep=allow_sleep)
+    requested = normalize_power_by_cell(requested_power_by_cell)
+    previous = dict(state or {})
+    streak = int(previous.get("healthy_streak", 0) or 0)
+    streak = streak + 1 if healthy and not critical else 0
+    required = max(1, int(healthy_required))
+    last_confirmed = dict(previous.get("last_confirmed_by_cell") or {})
+    rung_by_cell = dict(previous.get("rung_by_cell") or {})
+    selected: dict[int, int] = {}
+    for cell_id in DU_CELL_IDS:
+        ladder = ladders[cell_id]
+        active_ladder = tuple(level for level in ladder if level != 0)
+        if critical or not healthy:
+            current = int(last_confirmed.get(str(cell_id), last_confirmed.get(cell_id, active_ladder[-1])))
+        else:
+            current = int(rung_by_cell.get(str(cell_id), rung_by_cell.get(cell_id, active_ladder[-1])))
+            if streak >= required:
+                position = active_ladder.index(current) if current in active_ladder else len(active_ladder) - 1
+                current = active_ladder[max(0, position - 1)]
+        # The staircase controls the auditable candidate.  The raw actor
+        # request is deliberately not allowed to skip the conservative
+        # start or the three-decision confirmation gate.
+        requested_value = requested[cell_id]
+        sleep_selected = bool(allow_sleep and requested_value == 0 and not critical)
+        if sleep_selected:
+            current = 0
+        elif current not in active_ladder:
+            current = active_ladder[-1]
+        selected[cell_id] = current
+        rung_by_cell[cell_id] = current
+        if healthy and not critical:
+            last_confirmed[cell_id] = current
+    next_state = {
+        "contract": ENERGY_STAIRCASE_CONTRACT,
+        "healthy_streak": streak,
+        "healthy_required": required,
+        "rung_by_cell": {str(k): int(v) for k, v in rung_by_cell.items()},
+        "last_confirmed_by_cell": {str(k): int(v) for k, v in last_confirmed.items()},
+        "allow_sleep": bool(allow_sleep),
+    }
+    return selected, next_state
 
 
 def quantize_power_percent_v3(value: Any) -> int:

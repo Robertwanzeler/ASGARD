@@ -322,6 +322,32 @@ class TestArticleSACStateRoundTrip(unittest.TestCase):
         self.assertEqual(record.economic_weight, 1.0)
         self.assertAlmostEqual(record.reward, 0.42)
 
+    def test_v2x_loader_consumes_only_authoritative_adaptive_reward(self):
+        payload = {
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "adaptive_reward": {"reward": 0.73},
+            "tasam_online_reward": 0.73,
+            "tasam_training_reward": 0.73,
+            "reward_hint": 0.73,
+            "global_state": {"state_vector": [0.0] * 4},
+            "next_global_state": {"state_vector": [0.0] * 4},
+            "du_states": [{"state_vector": [0.0] * 3} for _ in range(3)],
+            "next_du_states": [{"state_vector": [0.0] * 3} for _ in range(3)],
+            "action": {"allocation": [[1.0 / 3.0] * 3] * 3},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            trace.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            record = load_marl_transition_trace(trace)
+        self.assertEqual(len(record), 1)
+        self.assertAlmostEqual(record[0].reward, 0.73)
+
+        payload["tasam_online_reward"] = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "invalid.jsonl"
+            trace.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            self.assertEqual(load_marl_transition_trace(trace), [])
+
     def test_three_output_trainer_normalizes_legacy_allocation_targets(self):
         def record(target):
             return MARLTransitionRecord(

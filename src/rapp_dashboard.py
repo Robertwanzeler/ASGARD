@@ -1982,7 +1982,7 @@ def ml_page():
     }
 
     # Try to load training report
-    report_path = '/home/robert/orange_nuclear/models/training_report.json'
+    report_path = str(Path(os.environ.get("GREENRAN_MODELS_DIR", Path(PROJECT_DIR) / "models")) / "training_report.json")
     if os.path.exists(report_path):
         try:
             with open(report_path, 'r') as f:

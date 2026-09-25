@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Sequence
 
 import numpy as np
@@ -13,6 +14,11 @@ try:
 except ImportError:  # pragma: no cover - fallback when imported as package
     from src.greenran_marl_topology import load_logical_du_topology
     from src.rapp_sac_resource_model import compute_shared_resource_snapshot
+
+try:
+    from greenran_v2x_adaptive_reward import REWARD_CONTRACT, compose_adaptive_reward
+except ImportError:  # pragma: no cover - direct package import fallback
+    from src.greenran_v2x_adaptive_reward import REWARD_CONTRACT, compose_adaptive_reward
 
 
 SLICE_ORDER = ("eMBB", "mMTC", "URLLC")
@@ -71,7 +77,7 @@ def build_balanced_vehicle_energy_reward(
     slice_state: dict[str, dict[str, Any]],
     metrics: dict[str, Any],
     resource_action: dict[str, Any],
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, Any]]:
     """Reward GreenRAN priorities while discouraging unnecessary full allocation.
 
     URLLC is the vehicle slice in the fixed GreenRAN topology.  The reward
@@ -80,6 +86,21 @@ def build_balanced_vehicle_energy_reward(
     80% of the usable budget.  Energy remains a proxy: no hardware power
     meter is available in the training trace.
     """
+    if metrics.get("reward_contract") == REWARD_CONTRACT:
+        adaptive = compose_adaptive_reward(
+            metrics.get("previous_decision"),
+            metrics,
+            {"reward_contract": REWARD_CONTRACT},
+            energy_enabled=os.environ.get("GREENRAN_TASAM_REWARD_ENERGY_ENABLED", "0") == "1",
+            energy_evidence=metrics.get("energy_evidence"),
+        )
+        return float(adaptive["reward"]), {
+            "reward_contract": REWARD_CONTRACT,
+            "adaptive_reward": adaptive,
+            "reward_weight_snapshot": adaptive["snapshot"],
+            "energy_eligible": bool(adaptive["energy_eligible"]),
+        }
+
     embb = slice_state["eMBB"]
     mmtc = slice_state["mMTC"]
     urllc = slice_state["URLLC"]
@@ -711,7 +732,7 @@ class OnlineGreenRANMARLEnv:
         # explicitly supplied live reference may override the local EWMA.
         explicit_reference_us = _safe_float(network_health.get("reference_cvar_us", 0.0), 0.0)
         cvar_reference_us = explicit_reference_us or self._cvar_reference_us or cvar_us
-        return {
+        result = {
             "throughput_kbps": _safe_float(camera_metrics.get("throughput_mbps", 0.0), 0.0) * 1000.0 * embb_completion,
             "cvar_per_ue_us": cvar_us * latency_scale,
             "cvar_observed_us": cvar_us,
@@ -723,8 +744,15 @@ class OnlineGreenRANMARLEnv:
             "total_active_ues": sum(_safe_int(slice_state[sid]["ue_count"], 0) for sid in SLICE_ORDER),
             "total_active_cameras": _safe_int(camera_metrics.get("active_cameras", 0), 0),
         }
+        if os.environ.get("GREENRAN_TASAM_REWARD_CONTRACT") == REWARD_CONTRACT:
+            result["reward_contract"] = REWARD_CONTRACT
+            result["collection_quality"] = network_health.get("collection_quality", {})
+            result["e2_ack_complete"] = network_health.get("e2_ack_complete")
+            result["decision_correlation_valid"] = network_health.get("decision_correlation_valid")
+            result["energy_evidence"] = network_health.get("energy_evidence", {})
+        return result
 
-    def _build_reward(self, slice_state: dict[str, dict[str, Any]], metrics: dict[str, Any], resource_action: dict[str, Any]) -> tuple[float, dict[str, float]]:
+    def _build_reward(self, slice_state: dict[str, dict[str, Any]], metrics: dict[str, Any], resource_action: dict[str, Any]) -> tuple[float, dict[str, Any]]:
         return build_balanced_vehicle_energy_reward(slice_state, metrics, resource_action)
 
     def _build_transition_record(

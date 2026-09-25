@@ -1,0 +1,16 @@
+[tool.pytest.ini_options]
+testpaths = [
+    "tests",
+    "apps/app1_vigilancia/tests",
+    "apps/app2_monitoramento/tests",
+    "apps/app3_veicular/tests",
+]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+pythonpath = [".", "src", "drlexp/src"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

@@ -20,20 +20,25 @@ import json
 import signal
 import subprocess
 from datetime import datetime
+from pathlib import Path
 
 DEFAULT_CHECK_INTERVAL = 30  # Verificar a cada 30 segundos
 HEARTBEAT_TIMEOUT = 60  # Reiniciar se sem heartbeat por 60 segundos
 HEALTH_FILE = "/tmp/xapp_health.json"
+PROJECT_ROOT = Path(os.environ.get("GREENRAN_PROJECT_DIR", Path(__file__).resolve().parents[1])).resolve()
+FLEXRIC_BUILD_DIR = Path(
+    os.environ.get("GREENRAN_FLEXRIC_BUILD_DIR", PROJECT_ROOT / "flexric" / "build_e2ap_v1")
+).resolve()
 
 XAPPS = {
     'SLICER': {
         'pattern': 'xapp_slicer',
-        'binary': '/home/robert/orange_nuclear/flexric/build_e2ap_v1/examples/xApp/c/xapp_slicer',
+        'binary': str(FLEXRIC_BUILD_DIR / 'examples/xApp/c/xapp_slicer'),
         'log': '/tmp/xapp_slicer.log'
     },
     'ENERGY': {
         'pattern': 'xapp_energy_saver',
-        'binary': '/home/robert/orange_nuclear/flexric/build_e2ap_v1/examples/xApp/c/xapp_energy_saver',
+        'binary': str(FLEXRIC_BUILD_DIR / 'examples/xApp/c/xapp_energy_saver'),
         'log': '/tmp/xapp_energy.log'
     }
 }
@@ -133,8 +138,8 @@ class WatchdogXApps:
         time.sleep(1)
         
         # Inicia novo processo
-        ric_dir = '/home/robert/orange_nuclear/flexric/build_e2ap_v1'
-        base_dir = '/home/robert/orange_nuclear'
+        ric_dir = str(FLEXRIC_BUILD_DIR)
+        base_dir = str(PROJECT_ROOT)
         
         env = os.environ.copy()
         env['LD_LIBRARY_PATH'] = f"{ric_dir}/src/ric:{base_dir}/flexric_lib:{ric_dir}/src/xApp"

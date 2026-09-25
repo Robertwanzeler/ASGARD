@@ -5,8 +5,13 @@ services:
       dockerfile: rapp.Dockerfile
     volumes:
       - /tmp:/tmp
+      - ./models:/app/models:ro
+      - ./drlexp/models:/app/drlexp/models:ro
+      - ./runs:/app/runs
     environment:
       - GREENRAN_STATE_DIR=/tmp
+      - GREENRAN_RUNS_DIR=/app/runs
+      - GREENRAN_DASHBOARD_HOST=127.0.0.1
 
   flexric-energy:
     build:
@@ -14,6 +19,9 @@ services:
       dockerfile: flexric.Dockerfile
     volumes:
       - /tmp:/tmp
+      - ./models:/app/models:ro
+      - ./drlexp/models:/app/drlexp/models:ro
+      - ./runs:/app/runs
 
   app2-simulator:
     build:
@@ -22,3 +30,6 @@ services:
     command: ["python3", "/app/apps/app2_monitoramento/backend/simulate_sensors.py", "--num-sensors", "20", "--interval", "2.0"]
     volumes:
       - /tmp:/tmp
+      - ./models:/app/models:ro
+      - ./drlexp/models:/app/drlexp/models:ro
+      - ./runs:/app/runs

@@ -82,11 +82,40 @@ def _validate_vehicle_profile_manifest(
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"manifesto veicular inválido: {path}: {exc}") from exc
     if (
-        payload.get("schema") != "greenran.autonomous_vehicle_feasibility.v1"
+        payload.get("schema") not in {
+            "greenran.autonomous_vehicle_feasibility.v1",
+            "greenran.autonomous_vehicle_feasibility.v2",
+            "greenran.autonomous_vehicle_feasibility.v4",
+        }
         or payload.get("status") != "passed"
         or int(payload.get("selected_interval_us") or 0) not in {4000, 6000, 8000, 12000, 16000}
     ):
         raise SystemExit("manifesto veicular não aprovado ou sem intervalo selecionado")
+    if payload.get("schema") == "greenran.autonomous_vehicle_feasibility.v2":
+        contract = (payload.get("provenance") or {}).get("metric_contract") or {}
+        if (
+            contract.get("pdcp_source") != "native_pdcp_trace_unique_sim_epochs"
+            or contract.get("collector_mode") != "pdcp_real"
+            or contract.get("proxy_allowed") is not False
+        ):
+            raise SystemExit("manifesto veicular v2 não comprova PDCP real sem proxy")
+    if payload.get("schema") == "greenran.autonomous_vehicle_feasibility.v4":
+        contract = (payload.get("provenance") or {}).get("metric_contract") or {}
+        matrix = payload.get("multi_seed_validation") or {}
+        if (
+            payload.get("scientific_decision") != "approved"
+            or payload.get("promotion_eligible") is not True
+            or payload.get("metric_contract") != "per_pdu_cohort_v1"
+            or contract.get("pdcp_source") != "native_pdcp_pdu_tx_rx"
+            or contract.get("collector_mode") != "pdcp_real"
+            or contract.get("proxy_allowed") is not False
+            or matrix.get("valid") is not True
+            or tuple(matrix.get("required_seeds") or []) != (45, 46, 47)
+            or tuple(matrix.get("complete_seeds") or []) != (45, 46, 47)
+            or matrix.get("seed47_reused_from_phase1") is not True
+            or matrix.get("provenance_compatible") is not True
+        ):
+            raise SystemExit("manifesto veicular v4 não comprova baseline multi-seed PDCP real")
     if expected_profile is not None and payload.get("profile") != expected_profile:
         raise SystemExit(
             "manifesto veicular pertence a outro perfil: "

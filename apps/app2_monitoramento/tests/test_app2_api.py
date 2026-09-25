@@ -39,6 +39,7 @@ class App2ApiTestCase(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
         os.environ.pop("GREENRAN_STATE_DIR", None)
+        os.environ.pop("GREENRAN_API_TOKEN", None)
 
     def _write_monitoring_snapshot(self, payload: dict) -> None:
         app_dir = Path(self.temp_dir) / "app2_monitoramento"
@@ -68,6 +69,24 @@ class App2ApiTestCase(unittest.TestCase):
         self.assertEqual(payload["reading"]["sensor_id"], "SOIL-01")
         self.assertIsNotNone(payload["alert"])
         self.assertEqual(payload["alert"]["level"], "warning")
+
+    def test_mutation_requires_token_for_non_loopback_client(self):
+        response = self.client.post(
+            "/api/readings/mock",
+            json={"sensor_id": "REMOTE-01", "type": "soil_moisture", "value": 10.0},
+            environ_base={"REMOTE_ADDR": "192.0.2.10"},
+        )
+        self.assertEqual(response.status_code, 503)
+
+    def test_mutation_accepts_bearer_token_from_environment(self):
+        os.environ["GREENRAN_API_TOKEN"] = "test-token"
+        response = self.client.post(
+            "/api/readings/mock",
+            json={"sensor_id": "REMOTE-02", "type": "soil_moisture", "value": 10.0},
+            headers={"Authorization": "Bearer test-token"},
+            environ_base={"REMOTE_ADDR": "192.0.2.10"},
+        )
+        self.assertEqual(response.status_code, 201)
 
     def test_report_endpoint_returns_default_structure(self):
         response = self.client.get("/api/report")

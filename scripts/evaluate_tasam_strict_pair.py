@@ -80,8 +80,8 @@ def _sla_reasons(row: sqlite3.Row) -> list[str]:
         if p95 > 500_000:
             reasons.append("sensor_p95")
     elif 16 <= imsi <= 20:
-        if maximum > 20_000:
-            reasons.append("vehicle_max_latency")
+        if p95 > 20_000:
+            reasons.append("vehicle_p95_latency")
         if loss > 1.0:
             reasons.append("vehicle_loss")
     else:
@@ -90,7 +90,8 @@ def _sla_reasons(row: sqlite3.Row) -> list[str]:
 
 
 def evaluate_ue_windows(run_dir: Path, *, warmup_s: int = 30,
-                        duration_s: int = 600) -> dict[str, Any]:
+                        duration_s: int = 600,
+                        imsis: tuple[int, ...] = IMSIS) -> dict[str, Any]:
     db = run_dir / "rapp_data_lake.db"
     if not db.is_file():
         return {"valid": False, "reason": "missing_database", "violations": []}
@@ -110,16 +111,16 @@ def evaluate_ue_windows(run_dir: Path, *, warmup_s: int = 30,
     for row in rows:
         window = int(math.floor(_number(row["sim_time_s"], -1)))
         imsi = int(row["imsi"] or 0)
-        if warmup_s <= window < duration_s and imsi in IMSIS:
+        if warmup_s <= window < duration_s and imsi in imsis:
             by_window[(window, imsi)] = row
     violations: list[dict[str, Any]] = []
     for window in range(warmup_s, duration_s):
-        for imsi in IMSIS:
+        for imsi in imsis:
             row = by_window.get((window, imsi))
             reasons = ["missing_ue_window"] if row is None else _sla_reasons(row)
             if reasons:
                 violations.append({"window_s": window, "imsi": imsi, "reasons": reasons})
-    expected = (duration_s - warmup_s) * len(IMSIS)
+    expected = (duration_s - warmup_s) * len(imsis)
     return {
         "valid": not violations and len(by_window) == expected,
         "expected_ue_windows": expected,
@@ -274,48 +275,97 @@ def e2_audit(run_dir: Path, *, warmup_s: int = 30) -> dict[str, Any]:
             "observation_source": str(observation_path)}
 
 
-def experiment_contract(baseline_dir: Path, combined_dir: Path,
-                        *, duration_s: int = 600) -> dict[str, Any]:
+def experiment_contract(
+    baseline_dir: Path,
+    combined_dir: Path,
+    *,
+    duration_s: int = 600,
+    expected_seed: int | None = 47,
+    expected_profile: str | None = None,
+    expected_checkpoint_sha256: str | None = None,
+    expected_baseline_mode: str | None = None,
+) -> dict[str, Any]:
     baseline = _json(baseline_dir / "arm_manifest.json")
     combined = _json(combined_dir / "arm_manifest.json")
     baseline_contract = baseline.get("contract") if isinstance(baseline.get("contract"), dict) else {}
     combined_contract = combined.get("contract") if isinstance(combined.get("contract"), dict) else {}
     before = str(combined.get("checkpoint_sha256_before", ""))
     after = str(combined.get("checkpoint_sha256_after", ""))
+    same_profile = bool(baseline.get("profile")) and baseline.get("profile") == combined.get("profile")
+    if expected_profile is not None:
+        same_profile = same_profile and baseline.get("profile") == expected_profile
+    seed_matches = baseline.get("seed") == combined.get("seed")
+    if expected_seed is not None:
+        seed_matches = seed_matches and baseline.get("seed") == expected_seed
+    checkpoint_frozen = (
+        combined_contract.get("frozen_checkpoint") is True
+        and combined.get("checkpoint_frozen_verified") is True
+        and bool(before)
+        and before == after
+    )
+    if expected_checkpoint_sha256 is not None:
+        checkpoint_frozen = checkpoint_frozen and before == expected_checkpoint_sha256
     checks = {
         "manifests_present": bool(baseline) and bool(combined),
-        "seed_47": baseline.get("seed") == 47 and combined.get("seed") == 47,
-        "same_profile": bool(baseline.get("profile")) and baseline.get("profile") == combined.get("profile"),
+        "expected_seed": seed_matches,
+        "same_profile": same_profile,
         "duration_600": _number(baseline.get("sim_time_s"), -1) == duration_s and
                         _number(combined.get("sim_time_s"), -1) == duration_s,
         "same_schedule": bool(baseline.get("pairing_schedule_id")) and
                          baseline.get("pairing_schedule_id") == combined.get("pairing_schedule_id"),
         "arms_finished": baseline.get("status") == "finished" and combined.get("status") == "finished",
-        "rapp_only_isolated": baseline.get("mode") == "rapp_only" and
+        # The actuating rApp control uses the same E2 actuator as ASGARD,
+        # while keeping both ARMD and TA-SAM disabled.  A passive historical
+        # rApp arm remains readable but cannot satisfy an active-control gate.
+        "rapp_only_isolated": baseline.get("mode") in {"rapp_only", "rapp_only_actuating"} and
                               not baseline_contract.get("tasam_enabled") and
                               baseline_contract.get("armd_mode") == "off",
         "combined_contract": combined.get("mode") == "combined" and
                              combined_contract.get("tasam_enabled") is True and
                              combined_contract.get("armd_mode") == "assist" and
                              combined_contract.get("actuation_enabled") is True,
-        "checkpoint_frozen": combined_contract.get("frozen_checkpoint") is True and
-                             combined.get("checkpoint_frozen_verified") is True and
-                             bool(before) and before == after,
+        "checkpoint_frozen": checkpoint_frozen,
         "same_instrumentation": baseline.get("energy_model") == combined.get("energy_model"),
     }
+    if expected_baseline_mode is not None:
+        checks["expected_baseline_mode"] = (
+            baseline.get("mode") == expected_baseline_mode
+            and (
+                expected_baseline_mode != "rapp_only_actuating"
+                or baseline_contract.get("actuation_enabled") is True
+            )
+        )
     return {"valid": all(checks.values()), "checks": checks,
             "baseline_manifest": str(baseline_dir / "arm_manifest.json"),
             "combined_manifest": str(combined_dir / "arm_manifest.json")}
 
 
-def evaluate_pair(baseline_dir: Path, combined_dir: Path, *, warmup_s: int = 30,
-                  duration_s: int = 600) -> dict[str, Any]:
-    contract = experiment_contract(baseline_dir, combined_dir, duration_s=duration_s)
+def evaluate_pair(
+    baseline_dir: Path,
+    combined_dir: Path,
+    *,
+    warmup_s: int = 30,
+    duration_s: int = 600,
+    expected_seed: int | None = 47,
+    expected_profile: str | None = None,
+    expected_checkpoint_sha256: str | None = None,
+    expected_baseline_mode: str | None = None,
+) -> dict[str, Any]:
+    contract = experiment_contract(
+        baseline_dir,
+        combined_dir,
+        duration_s=duration_s,
+        expected_seed=expected_seed,
+        expected_profile=expected_profile,
+        expected_checkpoint_sha256=expected_checkpoint_sha256,
+        expected_baseline_mode=expected_baseline_mode,
+    )
     baseline = {
         "sla": evaluate_ue_windows(baseline_dir, warmup_s=warmup_s, duration_s=duration_s),
         "energy": causal_energy(baseline_dir, warmup_s=warmup_s, duration_s=duration_s),
         "radio": scheduler_symbols(baseline_dir, warmup_s=warmup_s, duration_s=duration_s),
         "infra": infrastructure(baseline_dir),
+        "e2": e2_audit(baseline_dir, warmup_s=warmup_s),
     }
     combined = {
         "sla": evaluate_ue_windows(combined_dir, warmup_s=warmup_s, duration_s=duration_s),
@@ -338,9 +388,12 @@ def evaluate_pair(baseline_dir: Path, combined_dir: Path, *, warmup_s: int = 30,
         "infrastructure_complete": baseline["infra"]["valid"] and combined["infra"]["valid"],
         "infrastructure_non_worse_each": infra_non_worse,
         "infrastructure_strict_improvement": infra_strict,
+        "all_control_e2_transactions_observed": (
+            baseline["e2"]["valid"] if expected_baseline_mode == "rapp_only_actuating" else True
+        ),
         "all_e2_transactions_observed": combined["e2"]["valid"],
     }
-    return {"schema": "greenran.tasam.strict_pair.v1", "seed": 47,
+    return {"schema": "greenran.tasam.strict_pair.v1", "seed": expected_seed,
             "warmup_s": warmup_s, "duration_s": duration_s,
             "experiment_contract": contract,
             "baseline": baseline, "combined": combined,

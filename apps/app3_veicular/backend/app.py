@@ -10,6 +10,7 @@ App3-Veicular.
 from __future__ import annotations
 
 import sys
+import os
 import threading
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ from services import GreenRANContextReader, VehicleStateStore  # noqa: E402
 
 
 RUNTIME_CONFIG = load_runtime_config()
-APP_HOST = "0.0.0.0"
+APP_HOST = os.environ.get("GREENRAN_APP3_HOST", "127.0.0.1")
 APP_PORT = 5300
 
 app = Flask(__name__, template_folder=str(APP_DIR / "templates"))
