@@ -5059,6 +5059,16 @@ class RappResourceOptimizer:
                     io_fraction=decision.get('tasam_infra_io_budget'),
                 ),
             }
+            # Dispositivos MC aparecem em dois DUs; sem a flag o cliente
+            # rejeita o bundle como 'duplicate IMSI' (r24/r25).
+            if any(
+                sum(
+                    1 for cell_policies in cells.values()
+                    if any(int(item.get('imsi', 0)) == imsi for item in cell_policies)
+                ) > 1
+                for imsi in {int(p.get('imsi', 0)) for policies in cells.values() for p in policies}
+            ):
+                bundle['association_mode'] = 'native_rrc_mc_overlap'
             if (v3_contract or rapp_v3_candidate) and power_by_cell:
                 bundle['schema'] = CONTROL_BUNDLE_V3_SCHEMA
                 bundle['economic_action_contract'] = ECONOMIC_ACTION_V3_CONTRACT
