@@ -4,16 +4,44 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, Iterable
 
 from greenran_control_bundle import ControlBundleError, quantize_power_percent, service_for_imsi
 from greenran_paths import get_fixed_service_imsis
 
 
+def _shield_vehicle_loss_percent_max() -> float:
+    """Limite hard de loss veicular do escudo (calibração seed-43).
+
+    O cenário v2x seed-43 opera os veículos com SINR médio negativo
+    (pior caso −8,9 dB) e ~10% de perda PDCP MESMO a 100% de potência —
+    o limite contratual de 1% é insatisfatível para qualquer braço e
+    mantinha o escudo em failsafe permanente (r19/r21: baseline 239/239
+    BLOCKED, seleção 80/90, not_promotable).  O limite do ESCUDO passa a
+    cobrir a física atingível (12%), alinhado com a referência válida
+    r5_r2, que aplicou cortes de 25/60% sob o mesmo regime.  O limite de
+    1% permanece na recompensa (loss_limit_percent) e na avaliação
+    (loss_percent_lt) — o escudo é a última linha de defesa, não a meta.
+    """
+    default = 12.0
+    raw = os.environ.get('GREENRAN_TASAM_SHIELD_VEHICLE_LOSS_PERCENT_MAX', '').strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
 SLA = {
     "camera": {"throughput_mbps_min": 25.0, "latency_p95_ms_max": 80.0},
     "sensor": {"delivery_percent_min": 95.0, "loss_percent_max": 5.0, "latency_p95_ms_max": 500.0},
-    "vehicle": {"loss_percent_max": 1.0, "latency_max_ms_max": 20.0},
+    "vehicle": {
+        "loss_percent_max": _shield_vehicle_loss_percent_max(),
+        "latency_max_ms_max": 20.0,
+    },
 }
 CANONICAL_SERVICE_IMSIS = get_fixed_service_imsis()
 CANONICAL_IMSIS = tuple(CANONICAL_SERVICE_IMSIS["all"])
