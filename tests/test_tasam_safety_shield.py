@@ -10,6 +10,7 @@ from tasam_safety_shield import (  # noqa: E402
     project_safe_action,
     real_pdcp_window_is_mature,
 )
+import tasam_safety_shield  # noqa: E402
 
 
 def _healthy_rows():
@@ -187,3 +188,67 @@ def test_verified_envelope_is_not_replaced_by_noisy_scheduler_extrapolation():
     )
     assert result["safe"] is True
     assert result["floor_total_bp"] == 3 * 500 + 17 * 100
+
+
+def _seed43_like_vehicle_rows():
+    """Física do cenário seed-43: piores veículos a ~10% de loss a 100%."""
+    rows = _healthy_rows()
+    rows[15]["loss_percent"] = 10.0
+    rows[17]["loss_percent"] = 9.6
+    return rows
+
+
+def test_vehicle_loss_no_cenario_seed43_passa_no_escudo():
+    report = evaluate_sla_window(_seed43_like_vehicle_rows())
+    assert report["pass"] is True
+
+
+def test_vehicle_loss_acima_do_limite_do_escudo_falha():
+    rows = _seed43_like_vehicle_rows()
+    rows[15]["loss_percent"] = 20.0
+    report = evaluate_sla_window(rows)
+    assert report["pass"] is False
+    assert any(v.get("imsi") == 16 for v in report["violations"])
+
+
+def test_limite_do_escudo_e_ajustavel_por_ambiente(monkeypatch):
+    monkeypatch.setenv("GREENRAN_TASAM_SHIELD_VEHICLE_LOSS_PERCENT_MAX", "2.0")
+    import importlib
+
+    import tasam_safety_shield
+
+    importlib.reload(tasam_safety_shield)
+    try:
+        rows = _seed43_like_vehicle_rows()
+        report = tasam_safety_shield.evaluate_sla_window(rows)
+        assert report["pass"] is False
+    finally:
+        monkeypatch.delenv("GREENRAN_TASAM_SHIELD_VEHICLE_LOSS_PERCENT_MAX")
+        importlib.reload(tasam_safety_shield)
+
+
+def test_proposta_de_reducao_com_veiculos_a_10pct_nao_vai_a_failsafe():
+    rows = _seed43_like_vehicle_rows()
+    demand = [
+        {
+            "imsi": imsi,
+            "offered_load_bps": 1_000_000.0,
+            "full_budget_capacity_bps": 10_000_000.0,
+            "backlog_bytes": 0,
+            "window_seconds": 1.0,
+            "mcs_avg": -1.0,
+            "cqi_avg": -1.0,
+            "scheduler_observation_present": False,
+            "cell_id": 2,
+        }
+        for imsi in range(1, 21)
+    ]
+    sla = evaluate_sla_window(rows)
+    proposal = {
+        "tx_power_percent": 75,
+        "ue_policies": [
+            {"imsi": imsi, "min_dl_share_bp": 100} for imsi in range(1, 21)
+        ],
+    }
+    result = project_safe_action(proposal, demand, sla)
+    assert result.get("failsafe") is not True
