@@ -79,6 +79,7 @@ def _arm_command(
     binary: Path | None = None,
     profile: str = PROFILE,
     execution_slot: str | None = None,
+    safe_power_floor_ledger: Path | None = None,
 ) -> list[str]:
     binary_path = binary or globals().get("_binary_from_args")
     if binary_path is None:
@@ -98,6 +99,14 @@ def _arm_command(
         command.extend(["--execution-slot", execution_slot])
     if mode in {"asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen"}:
         command.append("--energy-staircase")
+    if safe_power_floor_ledger is not None:
+        # A escada de energia é fail-closed: sem o ledger de pisos derivado
+        # do baseline nativo, o braço cai no caminho full-power (r6g: 130/130
+        # failsafe na pareada). O treino recebia o ledger via piloto; a
+        # pareada frozen precisa recebê-lo aqui.
+        command.extend([
+            "--safe-power-floor-ledger", str(safe_power_floor_ledger),
+        ])
     return command
 
 
@@ -1045,6 +1054,14 @@ def _run_campaign(args: argparse.Namespace) -> int:
 
     frozen = root / "frozen" / "asgard"
     selection = _freeze_active_checkpoint(training_root, frozen)
+    floor_ledger_path = training_root / "baseline" / "safe_power_floor_ledger.json"
+    if not floor_ledger_path.is_file() or (
+        (read_json(floor_ledger_path).get("status") or "") != "validated"
+    ):
+        raise SystemExit(
+            "pareada exige o ledger de piso seguro validado do treino: "
+            f"{floor_ledger_path} ausente ou sem status=validated"
+        )
     paired = root / "paired"
     paired.mkdir()
     schedule = canonical_schedule(args.profile, SEED, WALL_TIME, tick_s=0.25)
@@ -1060,6 +1077,9 @@ def _run_campaign(args: argparse.Namespace) -> int:
             mode, arm_dir, frozen, schedule_file, schedule["schedule_id"], calibration,
             wall_time=args.wall_time, binary=_binary_from_args, profile=args.profile,
             execution_slot=slot,
+            safe_power_floor_ledger=(
+                floor_ledger_path if label == "asgard" else None
+            ),
         )
         for label, (mode, arm_dir, _require_asgard, slot) in arms.items()
     }
