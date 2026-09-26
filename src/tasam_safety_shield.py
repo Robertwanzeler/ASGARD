@@ -35,12 +35,34 @@ def _shield_vehicle_loss_percent_max() -> float:
     return value if math.isfinite(value) and value > 0 else default
 
 
+def _shield_vehicle_latency_p95_ms_max() -> float:
+    """Limite hard de latência P95 veicular do escudo.
+
+    A regra original avaliava o MAX por janela com 20 ms; um único pico de
+    retransmissão mmWave (21-36 ms medidos no r27, com P95 ~1 ms e perda
+    ~0%) reprovava TODOS os veículos e mantinha o escudo em failsafe
+    permanente a partir de ~30 s de simulação — nenhum braço cortava na
+    segunda metade do run (r26/r27).  O gate passa a usar P95, mesmo
+    estatístico da disciplina veicular do projeto
+    (tasam_autonomous_vehicle_safe_v1: latency_p95_ms_lt = 20.0).
+    """
+    default = 20.0
+    raw = os.environ.get('GREENRAN_TASAM_SHIELD_VEHICLE_LATENCY_P95_MS_MAX', '').strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
 SLA = {
     "camera": {"throughput_mbps_min": 25.0, "latency_p95_ms_max": 80.0},
     "sensor": {"delivery_percent_min": 95.0, "loss_percent_max": 5.0, "latency_p95_ms_max": 500.0},
     "vehicle": {
         "loss_percent_max": _shield_vehicle_loss_percent_max(),
-        "latency_max_ms_max": 20.0,
+        "latency_p95_ms_max": _shield_vehicle_latency_p95_ms_max(),
     },
 }
 CANONICAL_SERVICE_IMSIS = get_fixed_service_imsis()
@@ -92,6 +114,36 @@ def build_runtime_ue_inputs(snapshot: dict[str, Any] | None) -> tuple[list[dict[
         cell_id = canonical_cell_for_imsi(imsi)
         cell_symbol_totals[cell_id] += max(0, int(_number(ue.get("mmwave_sched_symbols"), 0)))
 
+    def _observed_rate(ue: dict[str, Any]) -> float:
+        return max(
+            0.0,
+            _number(ue.get("rx_throughput_kbps"), _number(ue.get("throughput_kbps"), 0.0)) * 1000.0,
+        )
+
+    # Capacidade por unidade de share medida a partir dos pares observados da
+    # própria célula.  Um UE sem símbolos na janela (starving/beam switch)
+    # não tem share próprio e a extrapolação individual dividiria por zero —
+    # isso saturava o piso em 10000bp (100% da célula) e colocava o escudo
+    # em failsafe permanente (r19-r27: ambos os braços param de cortar).
+    peer_capacity_bps: dict[int, float] = {}
+    peer_rate: dict[int, float] = {2: 0.0, 3: 0.0, 4: 0.0}
+    peer_share: dict[int, float] = {2: 0.0, 3: 0.0, 4: 0.0}
+    for imsi, ue in indexed.items():
+        cell_id = canonical_cell_for_imsi(imsi)
+        total_symbols = cell_symbol_totals[cell_id]
+        share = (
+            max(0, int(_number(ue.get("mmwave_sched_symbols"), 0))) / total_symbols
+            if total_symbols > 0 else 0.0
+        )
+        if share > 0.0:
+            peer_rate[cell_id] += _observed_rate(ue)
+            peer_share[cell_id] += share
+    for cell_id in (2, 3, 4):
+        if peer_share[cell_id] > 0.0:
+            peer_capacity_bps[cell_id] = peer_rate[cell_id] / peer_share[cell_id]
+        else:
+            peer_capacity_bps[cell_id] = 0.0
+
     sla_rows: list[dict[str, Any]] = []
     demand_rows: list[dict[str, Any]] = []
     for imsi in CANONICAL_IMSIS:
@@ -120,9 +172,11 @@ def build_runtime_ue_inputs(snapshot: dict[str, Any] | None) -> tuple[list[dict[
         observed_share = allocated_symbols / total_symbols if total_symbols > 0 else 0.0
         # Extrapolate the UE's measured rate to a full cell budget.  MCS/CQI
         # are retained below and add uncertainty headroom in the floor model.
+        # UEs without their own share inherit the peer-measured capacity so a
+        # starved window never saturates the per-UE floor at 100%.
         capacity_bps = (
             max(achieved_bps, offered_kbps * 1000.0) / observed_share
-            if observed_share > 0.0 else 0.0
+            if observed_share > 0.0 else peer_capacity_bps[cell_id]
         )
         has_real_latency = bool(ue.get("has_latency_samples"))
         provenance = str(ue.get("pdcp_provenance", ue.get("latency_source", "")) or "")
@@ -296,6 +350,10 @@ def project_safe_action(
 ) -> dict[str, Any]:
     """Project a proposal onto the feasible set or return an explicit fail-safe."""
     demand = [dict(item) for item in ue_demand]
+    ue_capacity_by_imsi = {
+        int(item.get("imsi", 0)): float(item.get("full_budget_capacity_bps", 0.0) or 0.0)
+        for item in demand
+    }
     proposed = {int(item.get("imsi", 0)): item for item in proposal.get("ue_policies", [])}
     floors: dict[int, int] = {}
     for item in demand:
@@ -311,7 +369,13 @@ def project_safe_action(
             # noisier instantaneous scheduler-share extrapolation.
             floors[imsi] = min(10_000, envelope_floor)
             continue
-        if item.get("scheduler_observation_present", True):
+        # A demand floor needs a measurable cell capacity.  Without symbols
+        # anywhere in the cell the extrapolation is meaningless: treating the
+        # missing capacity as a 100% floor synthesized a permanent fail-safe
+        # (r19-r27).  Missing traces and dark cells keep only verified
+        # envelopes, never an invented floor.
+        capacity_present = float(ue_capacity_by_imsi.get(imsi, 0.0) or 0.0) > 0.0
+        if item.get("scheduler_observation_present", True) and capacity_present:
             floors[imsi] = demand_floor_basis_points(item)
             continue
         # The scheduler trace may omit a UE even though its real PDCP window
