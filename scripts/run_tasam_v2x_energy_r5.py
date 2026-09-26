@@ -1013,6 +1013,13 @@ def _run_campaign(args: argparse.Namespace) -> int:
         "--energy-staircase",
         "--execution-slot", args.training_slot,
     ]
+    if args.baseline_source is not None:
+        # O baseline computa uma vez e fica congelado: o piloto valida o
+        # manifest sha + replay_90 + perfil antes de reusar e grava a
+        # proveniência no próprio report (mesmo caminho provado na r31).
+        pilot_command += [
+            "--resume-baseline", "--baseline-source", str(args.baseline_source),
+        ]
     pilot_rc = _run(pilot_command, log=root / "training_launcher.log")
     training_report = read_json(training_root / "campaign_report.json")
     if pilot_rc != 0 or training_report.get("status") != "pilot_complete":
@@ -1172,6 +1179,10 @@ def main() -> int:
     parser.add_argument(
         "--reuse-trainability-gate-root", type=Path, default=None,
         help="reutiliza por hash um gate de treinabilidade v6 aprovado, sem repeti-lo",
+    )
+    parser.add_argument(
+        "--baseline-source", type=Path, default=None,
+        help="reutiliza um baseline congelado (manifest sha validado pelo piloto); baseline computa uma vez",
     )
     parser.add_argument("--training-slot", choices=PAIR_SLOTS, default="slot-a")
     parser.add_argument(
