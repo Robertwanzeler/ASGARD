@@ -101,6 +101,7 @@ from energy_calibration import (
     state_power_w,
     observed_radio_power_w,
     sleep_state_power_by_cell_w,
+    sleep_state_power_w,
 )
 from greenran_control_bundle import (
     ControlBundleClient,
