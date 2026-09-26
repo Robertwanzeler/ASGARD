@@ -55,6 +55,35 @@ def test_pico_unico_de_latencia_veicular_nao_reprova_a_janela():
     assert any(v.get("imsi") == 16 for v in report["violations"])
 
 
+def test_throughput_de_camera_limitado_pela_carga_nao_reprova_a_janela():
+    """Assinatura r28: 22,6 Mbps entregues a 100% de potência com perda
+    0,01% e P95 ~1 ms — carga ofertada do cenário, não starvation.  O
+    gate do escudo (18.0, ajustável) cobre a física atingível; colapso
+    real de rádio (< 5 Mbps) continua reprovando."""
+    rows = _healthy_rows()
+    for imsi in (0, 1, 2):
+        rows[imsi]["throughput_mbps"] = 22.6
+    assert evaluate_sla_window(rows)["pass"] is True
+    faminta = _healthy_rows()
+    faminta[0]["throughput_mbps"] = 5.0
+    report = evaluate_sla_window(faminta)
+    assert report["pass"] is False
+    assert report["violations"][0]["imsi"] == 1
+
+
+def test_limite_de_camera_e_ajustavel_por_ambiente(monkeypatch):
+    monkeypatch.setenv("GREENRAN_TASAM_SHIELD_CAMERA_THROUGHPUT_MBPS_MIN", "10.0")
+    import importlib
+
+    import tasam_safety_shield
+
+    importlib.reload(tasam_safety_shield)
+    try:
+        assert tasam_safety_shield.SLA["camera"]["throughput_mbps_min"] == 10.0
+    finally:
+        importlib.reload(tasam_safety_shield)
+
+
 def test_missing_metric_and_starvation_are_hard_failures():
     rows = _healthy_rows()
     del rows[0]["throughput_mbps"]
