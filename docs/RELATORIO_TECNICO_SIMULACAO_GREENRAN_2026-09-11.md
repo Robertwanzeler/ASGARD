@@ -218,8 +218,9 @@ ou parcial, sem ser usada para sustentar a hipótese principal.
 
 As verificações do snapshot indicam que:
 
-- a suíte Python passou com **510 testes e 6 subtestes** quando executada com o
-  `PYTHONPATH` correto;
+- a suíte Python passou com **652 testes e 8 subtestes** quando executada
+  com o `PYTHONPATH` correto (atualizado em 26/09/2026; o snapshot
+  original registrou 510 testes e 6 subtestes);
 - Python compilou sem erros sintáticos;
 - os scripts shell passaram na verificação de sintaxe;
 - o fluxo ns-3 → E2 → FlexRIC → xApps → rApp está implementado;
@@ -349,6 +350,44 @@ medição consistente, ações TA-SAM confirmadas e comparação pareada entre
 ns-3, sem representar consumo físico medido. O treinamento online da DRL será
 continuado para buscar uma política mais estável e uma economia reproduzível,
 sempre mantendo o gate de SLA e a exigência de evidência aplicada.
+
+### 6.7 Cadeia window90 de 25–26/09/2026 (r26 → r31 → formal r6g/r6h)
+
+A trilha `tasam_v2x_energy_window90` (seed 43, 120 s de simulação, nove
+estágios do alternador) consolidou a plataforma e expôs três defeitos de
+contrato, todos corrigidos com regressão:
+
+1. **Baseline r26 (25/09)** — referência perfeita: seleção 90/90, RTF
+   0,0201, ledger de pisos nativo validado {2:60, 3:60, 4:60} com 49
+   sequências confirmadas. Congelado como baseline oficial da seed 43 e
+   reusado por `--baseline-source` (validação de sha no piloto) — o
+   baseline computa uma vez, por política.
+2. **r27–r29: escudo e relógio do Judge** — o escudo travava o run inteiro
+   em 100% por regras de SLA calibradas para extremos (latência veicular
+   avaliada no máximo em vez do P95; pisos saturados com share 0;
+   throughput de câmera 22,6 < 25 Mbps). Recalibrado (P95 20 ms, pisos com
+   capacidade de par, câmera 18 Mbps). A r29 então entregou o melhor run
+   econômico (cortes 70% ×1156 observações, sem recaída) mas falhou na
+   seleção (20/90) por `judge_feedback_pending`: a observação do Judge roda
+   antes do envio E2 e o carimbo `sim_time_s` só era gravado no send — o
+   TTL de 5 s simulados nunca vencia. Fix: `make_decision` grava o relógio
+   do row da Data Lake no topo da decisão.
+3. **r31 (26/09, piloto)** — primeiro piloto completo saudável: asgard
+   90/90, RTF 0,0179, 145+ outcomes consecutivos do Judge, 5 marcos de
+   treino, 3 promoções, 0 rollbacks. `not_promotable` por design
+   (`pilot_only_non_promotable`): a promoção vem da pareada.
+
+**Formal (driver r5)**: a r6g expôs o quarto defeito — a pareada frozen
+não recebia o `--safe-power-floor-ledger`, e a escada, fail-closed, caiu
+no caminho full-power (130/130 failsafe no asgard congelado, zero cortes).
+Correção com validação fail-fast (commit `ce381b4`). Investigou-se também
+a atomicidade POWER/COMMIT no ns-3: o gating foi revertido porque as
+células 2/4 falham legitimamente no PREPARE (IMSI anexado na célula 3) e
+a cobertura de 3 células por sequência do contrato v6 depende da
+aplicação incondicional; o hardening por célula fica registrado para a
+Fase 2. A r6h relança a cadeia completa com gate reusado por hash,
+baseline congelado e pareada com ledger. Veredito pendente no fechamento
+deste relatório.
 
 ## 7. Riscos de reprodutibilidade
 

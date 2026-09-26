@@ -33,7 +33,74 @@ Cada campanha cria, no próprio diretório, os seguintes artefatos:
 - `campaign_report.json`: validade, SLA, resultado por UE/janela e rejeição;
 - `interval_*/ns3_energy/E2NodeManifest.json`;
 - `interval_*/ns3_energy/TasamAssociationTrace.csv`;
-- `interval_*/ns3_energy/TasamControlObservations.csv`.
+- `interval_*/ns3_energy/TasamControlObservations.csv`;
+- nas campanhas `window90`: `arm/ns3_energy/VehicleCellSinrTrace.csv`,
+  `VehicleLinkTrace.csv`, `VehiclePdcpPduTrace.csv` e
+  `VehicleSchedulerTrace.csv` (traces veiculares por braço).
+
+## Cadeia formal window90 (26/09/2026)
+
+A campanha formal (`scripts/run_tasam_v2x_energy_r5.py`) é uma cadeia de
+quatro estágios com contratos fail-closed:
+
+1. **Gate de treinabilidade** (30 s de sim): exige transição nativa
+   econômica completa, PDCP real e cobertura das células 2/3/4 por
+   sequência. Reusável por hash via `--reuse-trainability-gate-root`
+   (o hash vincula binário + contrato; qualquer mudança no binário
+   invalida o reuso).
+2. **Piloto de treino**: baseline de referência + braço ASGARD online
+   (RL + Judge). O champion ativo é congelado no fim.
+3. **Freeze**: cópia do checkpoint ativo para `frozen/asgard` com
+   `selection_manifest.json` (shas de origem e destino).
+4. **Pareada frozen**: `rapp` (referência) vs `asgard` (campeão congelado,
+   sem aprendizado) sob o mesmo `pairing_schedule` — a evidência causal
+   do Δ energia. O piloto de treino não promove: `checkpoint.role` fica
+   em `pilot_only_non_promotable` por design.
+
+### Baseline congelado (política de reuso)
+
+O baseline é computado **uma vez** e fica fixo. O baseline oficial da
+seed 43 é `runs/tasam_v2x_energy_pair_seed43_20260925_r26/training`
+(seleção 90/90, RTF 0,0201, ledger validado {2:60, 3:60, 4:60}, 49
+sequências confirmadas). O driver repassa `--baseline-source` ao piloto,
+que valida manifest sha + `replay_90` + perfil antes de aceitar e grava
+a proveniência (shas) no próprio report. Sem o flag, o piloto mantém o
+comportamento autocontido (baseline próprio).
+
+### Ledger de piso seguro (fail-closed na pareada)
+
+A escada de energia só corta potência com o
+`safe_power_floor_ledger.json` derivado de readbacks nativos do baseline
+(`status=validated`). Sem o ledger, o braço é *rejeitado por design*
+para o caminho full-power. O treino sempre recebeu o ledger via piloto;
+a pareada do driver não recebia — a formal r6g (26/09) registrou
+**130/130 sequências em failsafe** no braço congelado (zero cortes,
+100% de potência) contra a referência cortando a 60%, invalidando a
+comparação. Correção: `_arm_command` recebe `safe_power_floor_ledger` e
+o estágio pareado injeta `training/baseline/safe_power_floor_ledger.json`
+com validação fail-fast (arquivo existente e `status=validated`).
+
+### Relógio do Judge (contrato de observação)
+
+A observação atrasada do Judge roda em `run()` **antes** do envio E2 do
+ciclo, então o carimbo de tempo simulado precisa existir já na
+**construção** da decisão (`make_decision` grava `decision['sim_time_s']`
+a partir do row da Data Lake). Fontes tardias (camera_metrics fixo em
+0.0, stamp no send) deixam `current_sim=None`, o TTL de 5 s simulados
+nunca vence e os pendentes só fecham no drain do desligamento — evidência
+r29: 45 outcomes (ids 1-3 e calda), seleção 20/90; após o fix (r31/r6g):
+183+ outcomes consecutivos desde o primeiro ciclo.
+
+### Atomicidade da transação E2 (hardening futuro)
+
+O gating POWER-exige-COMMIT foi implementado e **revertido**: nas células
+2/4 o `PrepareTasamSchedulerPolicy` falha legitimamente (o IMSI da
+política está anexado na célula 3) e o gating pulava o POWER dessas
+células, destruindo a cobertura de 3 células por sequência que o
+contrato v6 exige (gate: `native_proof=False` com 15 sequências aceitas).
+A aplicação incondicional por célula permanece, com rejeição pós-fato
+via `ClearTasamControl`. O hardening de atomicidade (por célula, sem
+quebrar o fan-out) fica registrado para a Fase 2.
 
 Depois da aprovação da baseline, a comparação congelada é executada por
 `scripts/run_tasam_asgard_paired_campaign.py` e avaliada por
@@ -66,12 +133,13 @@ quando um arquivo `test_*.py` não produz nenhum teste.
 
 ## Proveniência congelada da campanha atual
 
-Os manifestos registram os seguintes commits observados:
+Os manifestos registram os seguintes commits observados (atualizados em
+26/09/2026):
 
 | Componente | Commit |
 | --- | --- |
-| `flexric` | `93cd83249dba9a0bde6956fa074b6e05000bc835` |
-| `ns-O-RAN-flexric` | `fd8b0a99e9b87e3bc7be03eb62d146b4a32d4603` |
+| `flexric` | `af9510334bd3363b01432127330fbe05cfd22ba1` |
+| `ns-O-RAN-flexric` | `ded5aa046ca3d41fdb6956161173f44d0015d2c1` (mmwave-LENA-oran @ `70bf40f9`) |
 | `ns3-base` | `013ab259d8d8646e7f91783c2e1cd4fae4f3e08a` |
 
 Esses valores são registrados na proveniência dos artefatos; a promoção exige
