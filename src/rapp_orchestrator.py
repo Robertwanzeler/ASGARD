@@ -4841,6 +4841,12 @@ class RappResourceOptimizer:
             )
         except (TypeError, ValueError):
             sim_time_s = 0.0
+        # O relógio de simulação alimenta o TTL das transições do Judge
+        # (r29: sem este campo _sim_time() retornava None, o gate
+        # current_sim >= issued_sim + ttl nunca disparava e TODOS os
+        # pendentes econômicos acumulavam até o shutdown — 45/193
+        # outcomes, seleção 20/90, not_promotable).
+        decision['sim_time_s'] = sim_time_s
         association_cells, association_evidence = self._native_association_cells(sim_time_s)
         # Cobertura parcial é mobilidade, não quebra de identidade: exige-se
         # apenas que PELO MENOS um UE tenha associação observada.  DUs vazios
@@ -5698,6 +5704,7 @@ class RappResourceOptimizer:
                     payload.get('sim_time_s'),
                     (payload.get('resource_allocation') or {}).get('sim_time_s'),
                     ((payload.get('resource_allocation') or {}).get('live_energy_observation') or {}).get('sim_time_s'),
+                    (payload.get('tasam_control_bundle') or {}).get('sim_time_s'),
                 ):
                     try:
                         value = float(value)
