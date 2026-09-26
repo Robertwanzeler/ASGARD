@@ -1013,48 +1013,88 @@ def _run_campaign(args: argparse.Namespace) -> int:
         return 2
 
     training_root = root / "training"
-    pilot_command = [
-        sys.executable, str(PILOT), "--output-root", str(training_root),
-        "--binary", str(_binary_from_args), "--profile", args.profile, "--seed", str(SEED),
-        "--sim-time", str(int(SIM_TIME)), "--wall-time", str(int(WALL_TIME)),
-        "--decision-target", "0", "--performance-min-rtf", str(MIN_RTF),
-        "--energy-enabled", "--energy-calibration", str(calibration),
-        "--energy-staircase",
-        "--execution-slot", args.training_slot,
-    ]
-    if args.baseline_source is not None:
-        # O baseline computa uma vez e fica congelado: o piloto valida o
-        # manifest sha + replay_90 + perfil antes de reusar e grava a
-        # proveniência no próprio report (mesmo caminho provado na r31).
-        pilot_command += [
-            "--resume-baseline", "--baseline-source", str(args.baseline_source),
+    if args.reuse_training_root is not None:
+        training_root = args.reuse_training_root.resolve()
+        # O treino computa uma vez: a campanha nova reusa o campeão
+        # congelado de um treino anterior (validado e íntegro) e pula
+        # direto para a pareada. Fail-closed em qualquer evidência de
+        # staleness: report incompleto, ledger inválido, campeão ausente
+        # ou binário diferente do usado no treino.
+        reuse_report = read_json(training_root / "campaign_report.json")
+        if (reuse_report.get("status") or "") != "pilot_complete":
+            raise SystemExit(
+                "reuse-training-root exige campaign_report.json com "
+                f"status=pilot_complete em {training_root}"
+            )
+        reuse_arm_manifest = read_json(training_root / "asgard" / "arm" / "arm_manifest.json")
+        reuse_binary = str(reuse_arm_manifest.get("ns3_binary") or "")
+        if not reuse_binary or Path(reuse_binary).resolve() != Path(_binary_from_args).resolve():
+            raise SystemExit(
+                "campeão congelado foi treinado com outro binário ns-3 "
+                f"({reuse_binary or 'não registrado'}); recusando reuso"
+            )
+        # Com --baseline-source o treino não tem baseline/ próprio: o
+        # ledger vive na raiz registrada em baseline_provenance.
+        reuse_ledger = training_root / "baseline" / "safe_power_floor_ledger.json"
+        if not reuse_ledger.is_file():
+            reuse_provenance_root = str(
+                (reuse_report.get("baseline_provenance") or {}).get("campaign_root") or ""
+            )
+            if not reuse_provenance_root:
+                raise SystemExit(
+                    "treino reusado não tem ledger próprio nem "
+                    "baseline_provenance.campaign_root para localizá-lo"
+                )
+            reuse_ledger = Path(reuse_provenance_root) / "baseline" / "safe_power_floor_ledger.json"
+        training_report = reuse_report
+        reuse_ledger_path = reuse_ledger
+    else:
+        reuse_ledger_path = None
+        pilot_command = [
+            sys.executable, str(PILOT), "--output-root", str(training_root),
+            "--binary", str(_binary_from_args), "--profile", args.profile, "--seed", str(SEED),
+            "--sim-time", str(int(SIM_TIME)), "--wall-time", str(int(WALL_TIME)),
+            "--decision-target", "0", "--performance-min-rtf", str(MIN_RTF),
+            "--energy-enabled", "--energy-calibration", str(calibration),
+            "--energy-staircase",
+            "--execution-slot", args.training_slot,
         ]
-    pilot_rc = _run(pilot_command, log=root / "training_launcher.log")
-    training_report = read_json(training_root / "campaign_report.json")
-    if pilot_rc != 0 or training_report.get("status") != "pilot_complete":
-        report = {
-            "schema": "greenran.tasam.v2x.energy_engineering.report.v1",
-            "campaign_revision": "engineering_r13_energy_staircase",
-            "status": "pilot_training_incomplete",
-            "scientific_decision": "not_promotable",
-            "promotion_eligible": False,
-            "pilot_exit_code": pilot_rc,
-            "smoke": smoke_report,
-            "training_report": training_report,
-            "training_root": str(training_root),
-            "economic_action_contract": "economic_action_v3_per_du_sleep",
-            "energy_staircase_contract": "greenran.tasam.v2x.energy_staircase.v1",
-            "energy_staircase_config_sha256": sha256(ROOT / "config/greenran_v2x_energy_staircase.json"),
-            "du_sleep_policy": "at_most_one_du_after_handover_and_10s_pdcp",
-            "native_evidence_version": "v6",
-        }
-        write_json(root / "campaign_report.json", report)
-        write_json(root / "campaign_manifest.json", {**report, "profile": args.profile, "seed": SEED})
-        return pilot_rc or 2
+        if args.baseline_source is not None:
+            # O baseline computa uma vez e fica congelado: o piloto valida o
+            # manifest sha + replay_90 + perfil antes de reusar e grava a
+            # proveniência no próprio report (mesmo caminho provado na r31).
+            pilot_command += [
+                "--resume-baseline", "--baseline-source", str(args.baseline_source),
+            ]
+        pilot_rc = _run(pilot_command, log=root / "training_launcher.log")
+        training_report = read_json(training_root / "campaign_report.json")
+        if pilot_rc != 0 or training_report.get("status") != "pilot_complete":
+            report = {
+                "schema": "greenran.tasam.v2x.energy_engineering.report.v1",
+                "campaign_revision": "engineering_r13_energy_staircase",
+                "status": "pilot_training_incomplete",
+                "scientific_decision": "not_promotable",
+                "promotion_eligible": False,
+                "pilot_exit_code": pilot_rc,
+                "smoke": smoke_report,
+                "training_report": training_report,
+                "training_root": str(training_root),
+                "economic_action_contract": "economic_action_v3_per_du_sleep",
+                "energy_staircase_contract": "greenran.tasam.v2x.energy_staircase.v1",
+                "energy_staircase_config_sha256": sha256(ROOT / "config/greenran_v2x_energy_staircase.json"),
+                "du_sleep_policy": "at_most_one_du_after_handover_and_10s_pdcp",
+                "native_evidence_version": "v6",
+            }
+            write_json(root / "campaign_report.json", report)
+            write_json(root / "campaign_manifest.json", {**report, "profile": args.profile, "seed": SEED})
+            return pilot_rc or 2
 
     frozen = root / "frozen" / "asgard"
     selection = _freeze_active_checkpoint(training_root, frozen)
-    floor_ledger_path = training_root / "baseline" / "safe_power_floor_ledger.json"
+    if reuse_ledger_path is not None:
+        floor_ledger_path = reuse_ledger_path
+    else:
+        floor_ledger_path = training_root / "baseline" / "safe_power_floor_ledger.json"
     if not floor_ledger_path.is_file() or (
         (read_json(floor_ledger_path).get("status") or "") != "validated"
     ):
@@ -1203,6 +1243,10 @@ def main() -> int:
     parser.add_argument(
         "--baseline-source", type=Path, default=None,
         help="reutiliza um baseline congelado (manifest sha validado pelo piloto); baseline computa uma vez",
+    )
+    parser.add_argument(
+        "--reuse-training-root", type=Path, default=None,
+        help="reusa o treino completo de outra campanha (campeão + ledger), pulando o piloto; exige pilot_complete e binário idêntico",
     )
     parser.add_argument("--training-slot", choices=PAIR_SLOTS, default="slot-a")
     parser.add_argument(
