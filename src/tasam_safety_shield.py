@@ -57,8 +57,36 @@ def _shield_vehicle_latency_p95_ms_max() -> float:
     return value if math.isfinite(value) and value > 0 else default
 
 
+def _shield_camera_throughput_mbps_min() -> float:
+    """Limite hard de throughput por câmera no escudo (calibração seed-43).
+
+    O throughput ENTREGUE da câmera é limitado pela carga ofertada do
+    cenário, não pelo rádio: no r28 as três câmeras mediam 22,6 Mbps a
+    100% de potência com perda 0,01% e P95 ~1 ms — abaixo do gate
+    original de 25 Mbps (2e08b58), que era insatisfatível em qualquer
+    potência e mantinha o escudo em sla_violation permanente a partir de
+    ~30 s (trava remanescente r26-r28).  O gate passa a calibrar a física
+    atingível com margem anti-starvation (18.0 ≈ 80% do saudável medido;
+    starving real colapsa para < 5 Mbps).  A meta contratual de 25 Mbps
+    permanece na recompensa e na avaliação — o escudo é a última linha
+    de defesa, não a meta.
+    """
+    default = 18.0
+    raw = os.environ.get('GREENRAN_TASAM_SHIELD_CAMERA_THROUGHPUT_MBPS_MIN', '').strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
 SLA = {
-    "camera": {"throughput_mbps_min": 25.0, "latency_p95_ms_max": 80.0},
+    "camera": {
+        "throughput_mbps_min": _shield_camera_throughput_mbps_min(),
+        "latency_p95_ms_max": 80.0,
+    },
     "sensor": {"delivery_percent_min": 95.0, "loss_percent_max": 5.0, "latency_p95_ms_max": 500.0},
     "vehicle": {
         "loss_percent_max": _shield_vehicle_loss_percent_max(),
