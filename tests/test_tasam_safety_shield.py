@@ -22,7 +22,7 @@ def _healthy_rows():
         elif imsi <= 15:
             common.update(delivery_percent=95.0, loss_percent=5.0, latency_p95_ms=500.0)
         else:
-            common.update(loss_percent=1.0, latency_max_ms=20.0)
+            common.update(loss_percent=1.0, latency_p95_ms=1.5, latency_max_ms=20.0)
         rows.append(common)
     return rows
 
@@ -30,10 +30,29 @@ def _healthy_rows():
 def test_all_twenty_ues_must_meet_absolute_sla():
     assert evaluate_sla_window(_healthy_rows())["pass"] is True
     bad = _healthy_rows()
-    bad[15]["latency_max_ms"] = 20.01
+    bad[15]["latency_p95_ms"] = 20.01
     report = evaluate_sla_window(bad)
     assert report["pass"] is False
     assert report["violations"][0]["imsi"] == 16
+
+
+def test_pico_unico_de_latencia_veicular_nao_reprova_a_janela():
+    """Assinatura r26/r27: MAX 21-36 ms com P95 ~1,5 ms e perda ~0%.
+
+    O pico isolado de retransmissão mmWave é inevitável; a regra hard do
+    escudo usa o mesmo estatístico da disciplina veicular do projeto
+    (P95).  Um run inteiro travado a 100% por um pico é a falha que este
+    teste impede de voltar.
+    """
+    rows = _healthy_rows()
+    for offset, imsi in enumerate(range(15, 20)):
+        rows[imsi]["latency_max_ms"] = 21.0 + 3.0 * offset
+    assert evaluate_sla_window(rows)["pass"] is True
+    piorado = _healthy_rows()
+    piorado[15]["latency_p95_ms"] = 21.0
+    report = evaluate_sla_window(piorado)
+    assert report["pass"] is False
+    assert any(v.get("imsi") == 16 for v in report["violations"])
 
 
 def test_missing_metric_and_starvation_are_hard_failures():
@@ -252,3 +271,29 @@ def test_proposta_de_reducao_com_veiculos_a_10pct_nao_vai_a_failsafe():
     }
     result = project_safe_action(proposal, demand, sla)
     assert result.get("failsafe") is not True
+
+
+def test_ue_starving_sem_simbolos_nao_satura_o_piso_em_100_por_cento():
+    """Assinatura r19-r27: UE com share 0 gerava piso 10000bp (100% da
+    célula) e somas de 600-1100% → failsafe permanente.  Sem capacidade
+    mensurável o piso não pode ser inventado: a janela segue viável e o
+    corte é projetado."""
+    demand = []
+    for imsi in range(1, 21):
+        sem_simbolos = imsi in {16, 17}
+        demand.append({
+            "imsi": imsi,
+            "offered_load_bps": 1_000_000.0,
+            "full_budget_capacity_bps": 0.0 if sem_simbolos else 10_000_000.0,
+            "backlog_bytes": 0,
+            "window_seconds": 1.0,
+            "mcs_avg": -1.0,
+            "cqi_avg": -1.0,
+            "scheduler_observation_present": True,
+            "cell_id": 2 if imsi <= 6 else (3 if imsi <= 9 else 4),
+        })
+    sla = {"pass": True, "violations": []}
+    proposal = {"tx_power_percent": 60, "ue_policies": []}
+    result = project_safe_action(proposal, demand, sla)
+    assert result.get("failsafe") is not True, result.get("reason")
+    assert result.get("tx_power_percent") == 60
