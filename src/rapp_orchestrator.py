@@ -3324,6 +3324,15 @@ class RappResourceOptimizer:
             latest_extended = self.data_lake.get_latest_extended_metrics(limit=1)
             if latest_extended:
                 row = latest_extended[0]
+        # O relógio de simulação no TOPO da decisão: a observação atrasada
+        # do Judge roda no ciclo seguinte e compara current_sim >=
+        # issued_sim + ttl (5 s de sim).  Fontes anteriores (camera_metrics
+        # fixo em 0.0, send_tasam_bundle que só roda DEPOIS da observação)
+        # deixavam current_sim=None e os pendentes nunca fechavam (r29/r30:
+        # 3 outcomes, seleção 20/90).
+        decision['sim_time_s'] = float(
+            (row.get('sim_time_s') if isinstance(row, dict) else 0) or 0
+        )
 
         live_extended = _safe_read_json_file(EXTENDED_METRICS_PATH)
         live_global_metrics = live_extended.get('global_metrics', {}) or {}
