@@ -1135,7 +1135,7 @@ class DataLake:
                 issued_sim_time_s REAL,
                 ttl_s REAL NOT NULL DEFAULT 5.0,
                 expected_cells_json TEXT NOT NULL,
-                expected_power_percent REAL,
+                expected_power_percent TEXT,
                 status TEXT NOT NULL DEFAULT 'pending_confirmation',
                 confirmation_json TEXT DEFAULT '{}',
                 invalid_reason TEXT DEFAULT '',
@@ -4304,10 +4304,23 @@ class DataLake:
         native_control_sequence, issued_sim_time_s, ttl_s,
         expected_cells, expected_power_percent,
     ):
-        """Persist an E2 action before waiting for delayed native evidence."""
+        """Persist an E2 action before waiting for delayed native evidence.
+
+        ``expected_power_percent`` accepts a scalar or a per-cell mapping.
+        The per-cell mapping is the authoritative form: it must mirror the
+        bundle that actually went on the wire (r6g evidence — the global
+        summary said 100% while the wire carried a 70% per-DU candidate,
+        which made every confirmation mismatch the native readback).
+        """
         if not decision_id or not action_correlation_id or not native_control_sequence:
             return False
         now = int(time.time())
+        if isinstance(expected_power_percent, dict):
+            expected_power_payload = json.dumps(
+                {str(cell): float(value) for cell, value in expected_power_percent.items()}
+            )
+        else:
+            expected_power_payload = expected_power_percent
         try:
             self.conn.execute(
                 """
@@ -4325,13 +4338,51 @@ class DataLake:
                     str(campaign_id or ""), int(decision_id), str(action_correlation_id),
                     int(native_control_sequence), issued_sim_time_s, float(ttl_s),
                     json.dumps(sorted({int(value) for value in expected_cells})),
-                    expected_power_percent, now, now,
+                    expected_power_payload, now, now,
                 ),
             )
             self.conn.commit()
             return True
         except (sqlite3.Error, TypeError, ValueError):
             return False
+
+    def pending_native_expected_power(self, action_correlation_id):
+        """Return the registered wire power for a pending action.
+
+        Returns a ``{cell_id: percent}`` dict when the action was
+        registered with a per-cell map (the authoritative wire payload),
+        a scalar for legacy registrations, or ``None`` when unknown.
+        """
+        if not action_correlation_id:
+            return None
+        try:
+            row = self.conn.execute(
+                """
+                SELECT expected_power_percent FROM tasam_pending_native_actions
+                 WHERE action_correlation_id=?
+                """, (str(action_correlation_id),),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row or row[0] is None:
+            return None
+        raw = str(row[0]).strip()
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, dict):
+            try:
+                return {int(cell): float(percent) for cell, percent in value.items()}
+            except (TypeError, ValueError):
+                return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def resolve_pending_native_action(
         self, action_correlation_id, status, confirmation=None, reason="",

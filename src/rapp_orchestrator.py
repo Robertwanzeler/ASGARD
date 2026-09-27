@@ -5800,7 +5800,11 @@ class RappResourceOptimizer:
                     expected_power_by_cell = operational_power_by_cell
             native_confirmation = self.data_lake.confirm_native_control_observation(
                 contract.get('native_control_sequence') or previous.get('tasam_control_sequence'),
-                expected_power_by_cell
+                # The registered wire payload (bundle per-DU map) is the
+                # authoritative expectation; the global summary may have
+                # diverged from what actually went to E2 (r6g evidence).
+                self.data_lake.pending_native_expected_power(correlation_id)
+                or expected_power_by_cell
                 or applied.get('power_percent', (command or {}).get('applied_power_percent')),
                 expected_cells,
                 sim_time_s=bundle.get('sim_time_s'),
@@ -7081,6 +7085,20 @@ class RappResourceOptimizer:
                     and bundle.get('cells')
                     and decision.get('decision_id')
                 ):
+                    # The wire truth lives in the bundle: the global
+                    # ``tasam_power_percent`` summary can diverge from the
+                    # per-DU candidate that actually went to E2 (r6g: book
+                    # 100% vs wire 70% made 191 confirmations mismatch).
+                    registered_power_by_cell = (
+                        bundle.get('power_percent_by_cell')
+                        or {
+                            int(cell.get('cell_id')): float(cell.get('tx_power_percent'))
+                            for cell in bundle.get('cells') or []
+                            if cell.get('cell_id') is not None
+                            and cell.get('tx_power_percent') is not None
+                        }
+                        or None
+                    )
                     self.data_lake.register_pending_native_action(
                         os.environ.get('GREENRAN_CAMPAIGN_ID', ''),
                         decision.get('decision_id'),
@@ -7089,7 +7107,9 @@ class RappResourceOptimizer:
                         bundle.get('sim_time_s'),
                         float(bundle.get('ttl_ms') or 5000) / 1000.0,
                         [cell.get('cell_id') for cell in bundle.get('cells') or []],
-                        decision.get('tasam_power_percent'),
+                        registered_power_by_cell
+                        if registered_power_by_cell
+                        else decision.get('tasam_power_percent'),
                     )
                     self.data_lake.associate_energy_command_decision(
                         contract.get('correlation_id'), decision.get('decision_id')
