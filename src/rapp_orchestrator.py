@@ -6226,12 +6226,26 @@ class RappResourceOptimizer:
 
         def send_level(percent: float, why: str, override_reason: str = '') -> bool:
             """Send one canonical level and persist requested vs applied power."""
-            percent = self._canonical_energy_command_power(percent)
+            fixed_native_power = os.environ.get(
+                'GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT', ''
+            ).strip()
+            if fixed_native_power:
+                # Fixed-native calibration arm: the directive overrides the
+                # ladder state machine entirely, on the envelope's 5% grid.
+                try:
+                    percent = float(
+                        min(100.0, max(25.0, 5.0 * round(float(fixed_native_power) / 5.0)))
+                    )
+                except (TypeError, ValueError):
+                    percent = 100.0
+                decision['fixed_native_power_forced'] = percent
+            else:
+                percent = self._canonical_energy_command_power(percent)
             action = {
                 25.0: 'POWER_DOWN_ECO',
                 60.0: 'CONDITIONAL_REDUCE',
                 100.0: 'FULL_POWER',
-            }[percent]
+            }.get(percent, 'CONDITIONAL_REDUCE' if percent < 100.0 else 'FULL_POWER')
             decision['tasam_power_applied_percent'] = percent
             decision['power_safety_override_reason'] = override_reason
             decision['tasam_energy_action'] = action
