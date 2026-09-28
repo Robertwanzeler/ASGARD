@@ -1469,6 +1469,22 @@ def mode_contract(mode: str) -> dict[str, Any]:
             "energy_mode": True,
             "description": "baseline energético fixo: três DUs em 100% via E2",
         }
+    if mode == "native_sleep_calibration":
+        return {
+            "armd_mode": "off",
+            "tasam_enabled": False,
+            "tasam_mode": "shadow",
+            "controller_enabled": False,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": False,
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "energy_mode": True,
+            "description": (
+                "calibração nativa de sleep: um drain/commit por DU fora do "
+                "ciclo do rApp, evidência para o ledger v2"
+            ),
+        }
     if mode == "combined":
         return {
             "armd_mode": "assist",
@@ -1607,7 +1623,7 @@ def build_environment(
     # The rApp reference is also an energy-observation arm when requested.
     # It must use the same V3/native readback path, while remaining free of
     # TA-SAM's floor/headroom envelope.
-    if mode in {"rapp_only_actuating", "fixed_100_native"} and energy_enabled:
+    if mode in {"rapp_only_actuating", "fixed_100_native", "native_sleep_calibration"} and energy_enabled:
         env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = "economic_action_v3_per_du_sleep"
     if mode == "fixed_100_native":
         # Calibration directive, not a live candidate: the orchestrator must
@@ -1985,6 +2001,46 @@ def _parent_native_actuation_watch(
                 "evidence": evidence,
             })
         return
+
+
+def _parent_native_sleep_calibration(
+    run_dir: Path,
+    socket_dir: Path,
+    stop_event: threading.Event,
+    result: dict[str, Any],
+) -> None:
+    """Run the one-shot native drain/commit calibration inside a live arm.
+
+    The calibration module stays passive until the E2 actuator socket and
+    the native traces exist, then performs exactly one sleep transaction
+    outside the rApp decision cycle.  The arm continues to full sim time so
+    the wake path is also covered by the traces used by the ledger builder.
+    """
+    socket_path = socket_dir / "tasam_control.sock"
+    association = run_dir / "ns3_energy" / "TasamAssociationTrace.csv"
+    pdcp = run_dir / "ns3_energy" / "VehiclePdcpPduTrace.csv"
+    readiness_deadline = time.monotonic() + 600.0
+    while not stop_event.is_set() and time.monotonic() < readiness_deadline:
+        if socket_path.exists() and association.exists() and pdcp.exists():
+            break
+        stop_event.wait(1.0)
+    if not (socket_path.exists() and association.exists() and pdcp.exists()):
+        result.update({
+            "status": "runtime_not_ready",
+            "socket": str(socket_path),
+            "association_trace": str(association),
+            "pdcp_trace": str(pdcp),
+        })
+        return
+    # Give the runtime one association snapshot cycle so the calibration
+    # reads a complete three-DU baseline before selecting the source DU.
+    stop_event.wait(5.0)
+    try:
+        execute_native_sleep_calibration(
+            run_dir, socket_dir, stop_event, result
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence stays fail-closed
+        result.update({"status": "calibration_error", "error": str(exc)})
 
 
 def _terminate_group(process: subprocess.Popen[Any] | None) -> None:
@@ -2539,6 +2595,9 @@ def run(args: argparse.Namespace) -> int:
     native_actuation_thread: threading.Thread | None = None
     native_actuation_stop: threading.Event | None = None
     native_actuation_result: dict[str, Any] = {}
+    sleep_calibration_thread: threading.Thread | None = None
+    sleep_calibration_stop: threading.Event | None = None
+    sleep_calibration_result: dict[str, Any] = {"status": "not_started"}
     wall_status = 0
     wall_runner: subprocess.Popen[Any] | None = None
     arm_started_monotonic = time.monotonic()
@@ -2558,6 +2617,20 @@ def run(args: argparse.Namespace) -> int:
                 ["bash", str(WALL_RUNNER)], cwd=ROOT, env=env,
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
             )
+            if args.mode == "native_sleep_calibration":
+                sleep_calibration_stop = threading.Event()
+                sleep_calibration_thread = threading.Thread(
+                    target=_parent_native_sleep_calibration,
+                    args=(
+                        args.run_dir,
+                        Path(env["GREENRAN_SOCKET_DIR"]),
+                        sleep_calibration_stop,
+                        sleep_calibration_result,
+                    ),
+                    name="greenran-native-sleep-calibration",
+                    daemon=True,
+                )
+                sleep_calibration_thread.start()
             if int(args.decision_target or 0) > 0:
                 watcher_log = (args.run_dir / "decision_target.log").open("w", encoding="utf-8")
                 try:
@@ -2615,6 +2688,12 @@ def run(args: argparse.Namespace) -> int:
             native_actuation_stop.set()
         if native_actuation_thread is not None:
             native_actuation_thread.join(timeout=2.0)
+        if sleep_calibration_stop is not None:
+            sleep_calibration_stop.set()
+        if sleep_calibration_thread is not None:
+            # The calibration transaction may take up to its own internal
+            # deadline; a graceful drain gives the ledger its evidence file.
+            sleep_calibration_thread.join(timeout=30.0)
         _terminate_group(decision_watcher)
         # Saída anômala (ex.: SIGTERM do gate antes do wait() retornar):
         # encerra também o wall runner e todo o seu grupo (ns-3/RIC), que
@@ -2853,6 +2932,7 @@ def run(args: argparse.Namespace) -> int:
             "decision_target_watcher_exit_code": decision_watcher_exit_code,
             "decision_target_parent_watchdog": decision_target_result,
             "native_actuation_parent_watchdog": native_actuation_result,
+            "native_sleep_calibration": sleep_calibration_result,
             "feedback_drained": feedback_drained,
             "feedback_integrity_valid": feedback_valid,
             "native_actuation_feedback": native_actuation_feedback,

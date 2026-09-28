@@ -288,3 +288,18 @@ def test_frozen_policy_evidence_rejects_mutable_or_unacknowledged_arm(tmp_path: 
     valid, reason, _ = _frozen_policy_evidence(tmp_path, "sac_l2_frozen")
     assert valid is False
     assert reason == "evaluation_e2_ack_or_feedback_incomplete"
+
+
+def test_native_sleep_calibration_contract_and_environment(tmp_path: Path):
+    contract = mode_contract("native_sleep_calibration")
+    assert contract["controller_enabled"] is False
+    assert contract["actuation_enabled"] is True
+    assert contract["economic_action_contract"] == "economic_action_v3_per_du_sleep"
+    env = build_environment(
+        "native_sleep_calibration", tmp_path / "sleep", 43,
+        "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max",
+        9000, sim_time=120, native_fidelity=True, energy_enabled=True,
+    )
+    assert env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] == "economic_action_v3_per_du_sleep"
+    assert "GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT" not in env
+    assert env["GREENRAN_NATIVE_EVIDENCE_VERSION"] == "v6"
