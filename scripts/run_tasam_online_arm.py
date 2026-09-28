@@ -49,6 +49,13 @@ from greenran_infra_budget import (  # noqa: E402
 )
 from greenran_infra_monitor import InfrastructureMonitor  # noqa: E402
 from energy_calibration import load_calibration  # noqa: E402
+from tasam_dynamic_floor import (  # noqa: E402
+    DYNAMIC_FLOOR_CONTRACT,
+    DynamicFloorError,
+    load_baseline_signature,
+    load_dynamic_floor_ledger,
+)
+from tasam_native_sleep_calibration import execute_native_sleep_calibration  # noqa: E402
 try:
     from greenran_v2x_binary_freshness import assert_v2x_binary_fresh, build_provenance  # noqa: E402
 except ModuleNotFoundError:
@@ -69,7 +76,8 @@ PROFILE = "tasam_training_balanced_v3"
 BASELINE_MAX_PROFILE = "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max"
 PARALLEL_PAIR_RESOURCE_PROFILE = "parallel_pair_v1"
 MODES = {
-    "train_no_armd", "rapp_only", "rapp_only_actuating", "combined",
+    "train_no_armd", "rapp_only", "rapp_only_actuating", "fixed_100_native",
+    "native_sleep_calibration", "combined",
     "combined_shadow", "combined_online", "combined_actuation_smoke",
     # Article-faithful V2X arms.  They are separate from the legacy economic
     # modes so their replay, SAM choice and promotion criteria cannot leak
@@ -77,9 +85,17 @@ MODES = {
     "sac_l2_online", "sac_l2_frozen", "tasam_v2x_online", "tasam_v2x_frozen",
     "asgard_v2x_window90_online",
     "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
+    "asgard_v2x_window90_energy_dynamic",
 }
 V2X_ENERGY_MODES = {
     "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
+    "asgard_v2x_window90_energy_dynamic",
+}
+CALIBRATION_FIXED_POWER_LEVELS = {25, 45, 70, 100}
+V2X_WINDOW90_ONLINE_MODES = {
+    "asgard_v2x_window90_online",
+    "asgard_v2x_window90_energy_online",
+    "asgard_v2x_window90_energy_dynamic",
 }
 
 
@@ -624,6 +640,30 @@ def _validate_run_dir(run_dir: Path) -> None:
         raise SystemExit(f"artefato protegido recusado: {run_dir}")
 
 
+def _validate_fixed_native_power_percent(value: int, mode: str) -> int:
+    """Validate the fixed-native calibration percent for the energy baseline arm.
+
+    The physics calibration runs (ledger v2) need exact 45/70/25 on the wire,
+    so only the 5%-grid between 25 and 100 is accepted, and only in the
+    fixed_100_native mode.
+    """
+    try:
+        fixed = int(value)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            "--fixed-native-power-percent exige inteiro em passos de 5 entre 25 e 100"
+        )
+    if not 25 <= fixed <= 100 or fixed % 5:
+        raise SystemExit(
+            "--fixed-native-power-percent exige inteiro em passos de 5 entre 25 e 100"
+        )
+    if fixed != 100 and mode != "fixed_100_native":
+        raise SystemExit(
+            "--fixed-native-power-percent só é permitido no modo fixed_100_native"
+        )
+    return fixed
+
+
 def _validate_local_path(path: Path, label: str) -> Path:
     """Reject runtime inputs/outputs outside the local project workspace."""
     resolved = path.resolve()
@@ -908,7 +948,7 @@ def _validate_runtime_contract(env: dict[str, str], mode: str, checkpoint: Path)
     }:
         if mode == "combined_actuation_smoke" and env.get("GREENRAN_NS3_E2_CONTROL_ENABLED") != "1":
             raise SystemExit("smoke de atuação exige GREENRAN_NS3_E2_CONTROL_ENABLED=1")
-        if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} and (
+        if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", *V2X_WINDOW90_ONLINE_MODES} and (
             env.get("GREENRAN_ML_ENABLED") != "1"
             or env.get("GREENRAN_ML_RETRAIN_ENABLED", "").lower() != "true"
         ):
@@ -1318,6 +1358,30 @@ def mode_contract(mode: str) -> dict[str, Any]:
             "energy_mode": True,
             "description": "TA-SAM online V2X com atuação econômica V3 e energia nativa",
         }
+    if mode == "asgard_v2x_window90_energy_dynamic":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "assistant_only_control",
+            "assistant_decision_mode": "cooperative_hierarchy",
+            "controller_enabled": True,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": True,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.window90.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "dynamic_floor_contract": DYNAMIC_FLOOR_CONTRACT,
+            "pilot_rollout_100": True,
+            "energy_mode": True,
+            "description": (
+                "ASGARD online V2X com proposta por DU limitada pelo piso "
+                "dinâmico causal e safety isolation soberano"
+            ),
+        }
     if mode == "asgard_v2x_window90_energy_frozen":
         return {
             "armd_mode": "assist",
@@ -1392,6 +1456,19 @@ def mode_contract(mode: str) -> dict[str, Any]:
             "historical_replay": False,
             "description": "rApp nativa atuante (baseline com E2), sem ARMD e sem TA-SAM",
         }
+    if mode == "fixed_100_native":
+        return {
+            "armd_mode": "off",
+            "tasam_enabled": False,
+            "tasam_mode": "shadow",
+            "controller_enabled": False,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": False,
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "energy_mode": True,
+            "description": "baseline energético fixo: três DUs em 100% via E2",
+        }
     if mode == "combined":
         return {
             "armd_mode": "assist",
@@ -1464,6 +1541,9 @@ def build_environment(
     energy_enabled: bool = False,
     energy_staircase: bool = False,
     safe_power_floor_ledger: Path | None = None,
+    dynamic_floor_ledger: Path | None = None,
+    baseline_signature: Path | None = None,
+    fixed_native_power_percent: int = 100,
     disable_app_overrides: bool = False,
     infra_resource_profile: str | None = None,
     execution_slot_env: dict[str, str] | None = None,
@@ -1527,8 +1607,16 @@ def build_environment(
     # The rApp reference is also an energy-observation arm when requested.
     # It must use the same V3/native readback path, while remaining free of
     # TA-SAM's floor/headroom envelope.
-    if mode == "rapp_only_actuating" and energy_enabled:
+    if mode in {"rapp_only_actuating", "fixed_100_native"} and energy_enabled:
         env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = "economic_action_v3_per_du_sleep"
+    if mode == "fixed_100_native":
+        # Calibration directive, not a live candidate: the orchestrator must
+        # honor the exact requested percent (5%-step) instead of snapping to
+        # the legacy {25, 60, 100} ladder, which would turn 45 into 60 and
+        # 70 into 60 in the physics calibration runs.
+        env["GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT"] = str(
+            int(fixed_native_power_percent)
+        )
     elif contract.get("economic_action_contract"):
         env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = str(
             contract["economic_action_contract"]
@@ -1557,6 +1645,26 @@ def build_environment(
             env["GREENRAN_TASAM_ONLINE_ROLLOUT_FRACTION"] = "1.0"
             env["GREENRAN_TASAM_PILOT_FULL_ROLLOUT"] = "1"
             env["GREENRAN_ONLINE_UPDATE_OWNER"] = "frozen_checkpoint_evaluation"
+        if mode == "asgard_v2x_window90_energy_dynamic":
+            if dynamic_floor_ledger is None or baseline_signature is None:
+                raise ValueError(
+                    "dynamic ASGARD mode requires ledger v2 and r26 baseline signature"
+                )
+            env.pop("GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT", None)
+            env["GREENRAN_TASAM_ALLOW_DU_SLEEP"] = "1"
+            env["GREENRAN_TASAM_DYNAMIC_FLOOR_CONTRACT"] = DYNAMIC_FLOOR_CONTRACT
+            env["GREENRAN_TASAM_RESOURCE_FLOOR_POLICY"] = (
+                "adaptive_energy_envelope_v2"
+            )
+            env["GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER"] = str(
+                dynamic_floor_ledger.resolve()
+            )
+            env["GREENRAN_TASAM_BASELINE_SIGNATURE"] = str(
+                baseline_signature.resolve()
+            )
+            env["GREENRAN_TASAM_DYNAMIC_FLOOR_STATE"] = str(
+                run_dir / "dynamic_floor_state.json"
+            )
     # ``_common_env`` is also used by the historical full-control trainer.
     # An assistant-only online adaptation must never inherit that override:
     # it starts with the declared 10% canary and only its controller may
@@ -1588,7 +1696,7 @@ def build_environment(
         env["GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS"] = "30"
         env["GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW"] = "10"
         env["GREENRAN_CONTROL_TRIAL_STATE"] = str(run_dir / "control_trial_state.json")
-    if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+    if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", *V2X_WINDOW90_ONLINE_MODES}:
         # Do not inherit config/core/runtime.json's historical disabled
         # defaults.  This flag is campaign-local and is persisted in the
         # learning meter so a run cannot be mistaken for online learning.
@@ -1598,16 +1706,16 @@ def build_environment(
         env["GREENRAN_TASAM_ONLINE_REPLAY_CONTRACT"] = str(contract.get("replay_contract", "legacy"))
         env["GREENRAN_TASAM_ONLINE_SAM_MODE"] = str(contract.get("sam_mode", "tasam_selective"))
         env["GREENRAN_TASAM_ONLINE_L2_WEIGHT"] = str(contract.get("l2_weight", 0.0))
-        env["GREENRAN_CONTROL_TRIAL_FRACTION"] = "1.0" if mode in {"sac_l2_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} else "0.10"
+        env["GREENRAN_CONTROL_TRIAL_FRACTION"] = "1.0" if mode in {"sac_l2_online", *V2X_WINDOW90_ONLINE_MODES} else "0.10"
         # The control-trial guard follows the controller-owned rollout
         # manifest, but never exceeds the economic campaign cap.
         env["GREENRAN_TASAM_MAX_ROLLOUT_FRACTION"] = os.environ.get(
             "GREENRAN_TASAM_MAX_ROLLOUT_FRACTION",
-            str(max(0.0, min(float(max_rollout_fraction if max_rollout_fraction is not None else (1.0 if mode in {"sac_l2_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} else 0.50)), 1.0))),
+            str(max(0.0, min(float(max_rollout_fraction if max_rollout_fraction is not None else (1.0 if mode in {"sac_l2_online", *V2X_WINDOW90_ONLINE_MODES} else 0.50)), 1.0))),
         )
         env["GREENRAN_CONTROL_TRIAL_ENABLED"] = "1"
-        env["GREENRAN_TASAM_ONLINE_ROLLOUT_FRACTION"] = "1.0" if mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} else "0.10"
-        if mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+        env["GREENRAN_TASAM_ONLINE_ROLLOUT_FRACTION"] = "1.0" if mode in V2X_WINDOW90_ONLINE_MODES else "0.10"
+        if mode in V2X_WINDOW90_ONLINE_MODES:
             env["GREENRAN_TASAM_PILOT_FULL_ROLLOUT"] = "1"
         if mode == "combined_online":
             env["GREENRAN_TASAM_ECONOMIC_HEAD_ENABLED"] = "1"
@@ -1631,10 +1739,10 @@ def build_environment(
         env["GREENRAN_CONTROL_TRIAL_MIN_RAN_DELTA"] = os.environ.get("GREENRAN_CONTROL_TRIAL_MIN_RAN_DELTA", "-0.01")
         env["GREENRAN_CONTROL_TRIAL_MIN_AI_DELTA"] = os.environ.get("GREENRAN_CONTROL_TRIAL_MIN_AI_DELTA", "-0.02")
         env["GREENRAN_CONTROL_TRIAL_STATE"] = str(run_dir / "control_trial_state.json")
-    if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+    if mode in {"combined_online", "sac_l2_online", "tasam_v2x_online", *V2X_WINDOW90_ONLINE_MODES}:
         env["GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS"] = os.environ.get(
             "GREENRAN_CONTROL_TRIAL_TARGET_DECISIONS",
-        "90" if mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} else "600",
+        "90" if mode in V2X_WINDOW90_ONLINE_MODES else "600",
         )
         env["GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW"] = os.environ.get("GREENRAN_CONTROL_TRIAL_ROLLING_WINDOW", "30")
         env["GREENRAN_CONTROL_TRIAL_CRITICAL_STREAK"] = os.environ.get("GREENRAN_CONTROL_TRIAL_CRITICAL_STREAK", "3")
@@ -1714,14 +1822,14 @@ def _controller_command(args: argparse.Namespace) -> list[str]:
         "--economic-update-min-transitions", str(getattr(args, "economic_update_min_transitions", 64)),
         "--sqlite-economic-replay",
         ])
-    if args.mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+    if args.mode in V2X_WINDOW90_ONLINE_MODES:
         command.extend([
             "--max-rollout-fraction", "1.0",
             "--shadow-min-decisions", "1",
             "--stage-window-decisions", "18",
             "--update-milestones", "18,36,54,72,90",
         ])
-    if args.mode == "asgard_v2x_window90_energy_online":
+    if args.mode in {"asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_dynamic"}:
         command.extend([
             "--allocation-head-output-dim", "3",
             "--global-action-dim", "5",
@@ -1899,6 +2007,11 @@ def _terminate_group(process: subprocess.Popen[Any] | None) -> None:
 def run(args: argparse.Namespace) -> int:
     args.run_dir = args.run_dir.resolve()
     args.checkpoint = args.checkpoint.resolve()
+    if (
+        args.mode == "asgard_v2x_window90_energy_dynamic"
+        and args.run_dir.exists()
+    ):
+        raise SystemExit(f"modo dynamic não reutiliza run-dir existente: {args.run_dir}")
     _validate_local_path(args.run_dir, "run-dir")
     _validate_local_path(args.checkpoint, "checkpoint")
 
@@ -1920,6 +2033,9 @@ def run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _graceful_shutdown_signal)
     signal.signal(signal.SIGINT, _graceful_shutdown_signal)
 
+    dynamic_ledger_contract: dict[str, Any] | None = None
+    if args.mode == "asgard_v2x_window90_energy_dynamic" and args.binary is None:
+        raise SystemExit("modo dynamic exige --binary explícito para validar a proveniência física")
     if args.binary is not None:
         args.binary = _validate_local_path(args.binary, "binário ns-3")
         if not args.binary.is_file() or not os.access(args.binary, os.X_OK):
@@ -1942,21 +2058,59 @@ def run(args: argparse.Namespace) -> int:
             raise SystemExit(
                 f"ledger de piso seguro ausente: {args.safe_power_floor_ledger}"
             )
+    if args.dynamic_floor_ledger is not None:
+        args.dynamic_floor_ledger = _validate_local_path(
+            args.dynamic_floor_ledger, "ledger v2 do piso dinâmico"
+        )
+    if args.baseline_signature is not None:
+        args.baseline_signature = _validate_local_path(
+            args.baseline_signature, "assinatura SLA r26"
+        )
+    fixed_native_power = _validate_fixed_native_power_percent(
+        args.fixed_native_power_percent, args.mode
+    )
+    if args.mode == "asgard_v2x_window90_energy_dynamic":
+        if args.dynamic_floor_ledger is None or args.baseline_signature is None:
+            raise SystemExit(
+                "modo dynamic exige --dynamic-floor-ledger e --baseline-signature"
+            )
+        if not args.dynamic_floor_ledger.is_file() or not args.baseline_signature.is_file():
+            raise SystemExit("ledger v2 ou assinatura SLA r26 ausente")
+        try:
+            load_baseline_signature(
+                args.baseline_signature,
+                expected_seed=args.seed,
+                expected_profile=args.profile,
+                strict_contract=True,
+            )
+            dynamic_ledger_contract = load_dynamic_floor_ledger(
+                args.dynamic_floor_ledger,
+                expected_seed=args.seed,
+                expected_profile=args.profile,
+                baseline_signature_path=args.baseline_signature,
+            )
+        except DynamicFloorError as exc:
+            raise SystemExit(f"contrato do piso dinâmico inválido: {exc}") from exc
+    elif args.dynamic_floor_ledger is not None or args.baseline_signature is not None:
+        raise SystemExit(
+            "ledger v2 e assinatura SLA são exclusivos do modo dynamic"
+        )
     energy_calibration = _resolve_energy_calibration(args.energy_calibration)
     if args.control_gate:
         args.control_gate = _validate_local_path(args.control_gate, "control-gate")
-    if args.mode in {"sac_l2_online", "tasam_v2x_online", "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"}:
+    if args.mode in {"sac_l2_online", "tasam_v2x_online", *V2X_WINDOW90_ONLINE_MODES}:
         if args.experience_bank is None:
             raise SystemExit("treino V2X do artigo exige --experience-bank histórico")
-        if args.mode in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} and args.replay_rows != 90:
+        if args.mode in V2X_WINDOW90_ONLINE_MODES and args.replay_rows != 90:
             raise SystemExit("piloto window90 exige replay de 90 transições (72/18)")
-        if args.mode not in {"asgard_v2x_window90_online", "asgard_v2x_window90_energy_online"} and args.replay_rows != 600:
+        if args.mode not in V2X_WINDOW90_ONLINE_MODES and args.replay_rows != 600:
             raise SystemExit("treino V2X do artigo exige replay de 600 transições (480/120)")
         if args.prioritize_category_errors:
             raise SystemExit("treino V2X do artigo não permite duplicação/priorização no replay 80/20")
     if args.disable_app_overrides and args.mode not in {
-        "rapp_only", "rapp_only_actuating", "asgard_v2x_window90_online",
+        "rapp_only", "rapp_only_actuating", "fixed_100_native", "asgard_v2x_window90_online",
         "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
+        "asgard_v2x_window90_energy_dynamic",
         "tasam_v2x_frozen",
     }:
         raise SystemExit(
@@ -1999,7 +2153,7 @@ def run(args: argparse.Namespace) -> int:
     # campaign parent keeps the new run isolated and never modifies an older
     # experiment directory.
     args.run_dir.parent.mkdir(parents=True, exist_ok=True)
-    if args.mode not in {"rapp_only", "rapp_only_actuating"}:
+    if args.mode not in {"rapp_only", "rapp_only_actuating", "fixed_100_native"}:
         required = args.checkpoint / "tasam_marl_actors.pt"
         if not required.is_file():
             raise SystemExit(f"checkpoint TA-SAM ausente: {required}")
@@ -2008,8 +2162,17 @@ def run(args: argparse.Namespace) -> int:
             require_economic_head=args.mode in {
                 "combined_online", "combined_actuation_smoke",
                 "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
+                "asgard_v2x_window90_energy_dynamic",
             },
         )
+        if args.mode == "asgard_v2x_window90_energy_dynamic":
+            physics = (dynamic_ledger_contract or {}).get("physics_evidence") or {}
+            if file_sha256(args.binary) != str(physics.get("binary_sha256") or ""):
+                raise SystemExit("binário ns-3 difere do hash selado pela curva A/B/C")
+            if checkpoint_fingerprint(args.checkpoint) != str(
+                (dynamic_ledger_contract or {}).get("initial_checkpoint_sha256") or ""
+            ):
+                raise SystemExit("checkpoint inicial difere do checkpoint r26 selado")
     # Delegation is verified before creating the run parent or manifest. A
     # campaign launched by ``robert`` must either receive real cgroup-v2
     # limits or stop without leaving a partial experiment behind.
@@ -2064,6 +2227,9 @@ def run(args: argparse.Namespace) -> int:
         energy_enabled=bool(args.energy_enabled),
         energy_staircase=bool(args.energy_staircase),
         safe_power_floor_ledger=args.safe_power_floor_ledger,
+        dynamic_floor_ledger=args.dynamic_floor_ledger,
+        baseline_signature=args.baseline_signature,
+        fixed_native_power_percent=fixed_native_power,
         disable_app_overrides=bool(args.disable_app_overrides),
         infra_resource_profile=arm_resource_profile,
         execution_slot_env=slot_env,
@@ -2130,11 +2296,23 @@ def run(args: argparse.Namespace) -> int:
         "safe_power_floor_ledger_sha256": file_sha256(
             Path(env["GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER"])
         ) if env.get("GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER") else "",
+        "dynamic_floor_contract": env.get("GREENRAN_TASAM_DYNAMIC_FLOOR_CONTRACT", ""),
+        "fixed_native_power_percent": int(env.get("GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT", "0") or 0)
+        if args.mode == "fixed_100_native" else None,
+        "dynamic_floor_ledger": env.get("GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER", ""),
+        "dynamic_floor_ledger_sha256": file_sha256(
+            Path(env["GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER"])
+        ) if env.get("GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER") else "",
+        "baseline_signature": env.get("GREENRAN_TASAM_BASELINE_SIGNATURE", ""),
+        "baseline_signature_sha256": file_sha256(
+            Path(env["GREENRAN_TASAM_BASELINE_SIGNATURE"])
+        ) if env.get("GREENRAN_TASAM_BASELINE_SIGNATURE") else "",
+        "dynamic_floor_state": env.get("GREENRAN_TASAM_DYNAMIC_FLOOR_STATE", ""),
         "du_sleep_allowed": env.get("GREENRAN_TASAM_ALLOW_DU_SLEEP") == "1",
         "economic_action_contract": env.get("GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT", ""),
         "tasam_resource_headroom_ratio": 0.15 if args.mode in {
             "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online",
-            "asgard_v2x_window90_energy_frozen",
+            "asgard_v2x_window90_energy_frozen", "asgard_v2x_window90_energy_dynamic",
         } else None,
         "resource_floor_policy": env.get("GREENRAN_TASAM_RESOURCE_FLOOR_POLICY", ""),
         "reward_weight_snapshot": {
@@ -2578,7 +2756,7 @@ def run(args: argparse.Namespace) -> int:
             "combined_shadow", "combined_actuation_smoke", "combined_online",
             "sac_l2_online", "sac_l2_frozen", "tasam_v2x_online", "tasam_v2x_frozen",
             "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online",
-            "asgard_v2x_window90_energy_frozen",
+            "asgard_v2x_window90_energy_frozen", "asgard_v2x_window90_energy_dynamic",
         }
         and not performance_evidence.get("valid")
         and not invalid_reason
@@ -2592,6 +2770,43 @@ def run(args: argparse.Namespace) -> int:
         invalid_reason = "missing_real_pdcp_feedback"
     elif not invalid_reason and not checkpoint_frozen:
         invalid_reason = "frozen_checkpoint_mutated"
+    online_adaptation_state = _read_json(args.run_dir / "online_state.json")
+    dynamic_floor_state = _read_json(args.run_dir / "dynamic_floor_state.json")
+    online_updates_completed = int(
+        online_adaptation_state.get("updates_completed", 0) or 0
+    )
+    active_online_checkpoint = str(
+        online_adaptation_state.get("active_checkpoint")
+        or online_adaptation_state.get("candidate_checkpoint")
+        or online_adaptation_state.get("last_good_checkpoint")
+        or ""
+    )
+    active_online_checkpoint_sha256 = (
+        checkpoint_fingerprint(Path(active_online_checkpoint))
+        if active_online_checkpoint and Path(active_online_checkpoint).is_dir()
+        else ""
+    )
+    recorded_checkpoint_after = (
+        active_online_checkpoint_sha256
+        if args.mode == "asgard_v2x_window90_energy_dynamic"
+        and active_online_checkpoint_sha256
+        else checkpoint_after
+    )
+    if args.mode == "asgard_v2x_window90_energy_dynamic" and not invalid_reason:
+        if online_updates_completed < 1:
+            invalid_reason = "dynamic_asgard_online_update_missing"
+        elif int(dynamic_floor_state.get("actor_influenced_decisions", 0) or 0) < 1:
+            invalid_reason = "dynamic_asgard_authority_influence_missing"
+        else:
+            floor_values = (
+                dynamic_floor_state.get("floor_percent_by_cell") or {}
+            ).values()
+            try:
+                below_calibrated_floor = any(float(value) < 25.0 for value in floor_values)
+            except (TypeError, ValueError):
+                below_calibrated_floor = True
+            if below_calibrated_floor:
+                invalid_reason = "dynamic_floor_below_calibrated_25_percent"
     native_actuation = {}
     native_actuation_feedback = {}
     if args.mode == "combined_actuation_smoke":
@@ -2641,8 +2856,12 @@ def run(args: argparse.Namespace) -> int:
             "feedback_drained": feedback_drained,
             "feedback_integrity_valid": feedback_valid,
             "native_actuation_feedback": native_actuation_feedback,
-            "checkpoint_sha256_after": checkpoint_after,
+            "checkpoint_sha256_after": recorded_checkpoint_after,
             "checkpoint_frozen_verified": checkpoint_frozen,
+            "online_updates_completed": online_updates_completed,
+            "active_online_checkpoint": active_online_checkpoint,
+            "active_online_checkpoint_sha256": active_online_checkpoint_sha256,
+            "dynamic_floor_evidence": dynamic_floor_state,
             "invalid_reason": invalid_reason,
             "native_actuation_evidence": native_actuation,
             "simulation_performance": performance_evidence,
@@ -2800,6 +3019,18 @@ def main() -> int:
     parser.add_argument(
         "--safe-power-floor-ledger", type=Path, default=None,
         help="ledger nativo validado de piso seguro por DU para a escada energética",
+    )
+    parser.add_argument(
+        "--dynamic-floor-ledger", type=Path, default=None,
+        help="ledger v2 imutável do piso dinâmico da campanha",
+    )
+    parser.add_argument(
+        "--baseline-signature", type=Path, default=None,
+        help="relatório strict-pair r26 que fornece a assinatura SLA diferencial",
+    )
+    parser.add_argument(
+        "--fixed-native-power-percent", type=int, default=100,
+        help="potência nativa fixa (%%, passo 5, 25..100) do braço fixed_100_native",
     )
     args = parser.parse_args()
     return run(args)
