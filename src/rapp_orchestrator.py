@@ -5494,6 +5494,20 @@ class RappResourceOptimizer:
                 requested = 100
         if action_origin == 'armd_rapp_safety':
             power_by_cell = {cell_id: 100 for cell_id in DU_CELL_IDS}
+        fixed_native_power = os.environ.get(
+            'GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT', ''
+        ).strip()
+        if fixed_native_power:
+            # Fixed-native calibration arm: the wire map is the directive,
+            # never the energy-saver ladder selection that precedes it.
+            try:
+                fixed_percent = int(
+                    min(100.0, max(25.0, 5.0 * round(float(fixed_native_power) / 5.0)))
+                )
+            except (TypeError, ValueError):
+                fixed_percent = 100
+            power_by_cell = {cell_id: fixed_percent for cell_id in DU_CELL_IDS}
+            decision['fixed_native_power_forced'] = fixed_percent
         staircase_failsafe = False
         if power_by_cell and (v3_contract or rapp_v3_candidate):
             power_by_cell, staircase_failsafe = self._apply_energy_staircase(
