@@ -260,6 +260,90 @@ def test_evaluate_pair_accepts_scenario_signature_violations(tmp_path):
     assert report["passed"]
 
 
+def test_fixed_100_native_baseline_uses_the_same_e2_audit_contract(tmp_path):
+    baseline, combined = _pair(tmp_path, combined_mode="asgard_v2x_window90_energy_frozen")
+    manifest_path = baseline / "arm_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["mode"] = "fixed_100_native"
+    manifest["contract"]["actuation_enabled"] = True
+    manifest_path.write_text(json.dumps(manifest))
+    report = evaluate_pair(
+        baseline, combined, warmup_s=30, duration_s=90,
+        expected_seed=43, expected_baseline_mode="fixed_100_native",
+    )
+    assert report["experiment_contract"]["checks"]["rapp_only_isolated"]
+    assert report["criteria"]["all_control_e2_transactions_observed"]
+    assert report["passed"]
+
+
+def test_dynamic_pair_requires_36_percent_and_online_asgard_evidence(tmp_path):
+    baseline, combined = _pair(
+        tmp_path, combined_mode="asgard_v2x_window90_energy_dynamic"
+    )
+    manifest_path = combined / "arm_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["contract"]["frozen_checkpoint"] = False
+    manifest["checkpoint_frozen_verified"] = True
+    manifest["online_updates_completed"] = 1
+    manifest["active_online_checkpoint_sha256"] = "def"
+    manifest["checkpoint_sha256_after"] = "def"
+    manifest["dynamic_floor_evidence"] = {
+        "floor_percent_by_cell": {"2": 45, "3": 45, "4": 45},
+        "actor_influenced_decisions": 2,
+        "native_authority_events": [{
+            "native_control_sequence": 1,
+            "power_cells": [2],
+            "resource_cells": [],
+            "sleep_source_cell": 0,
+            "sleep_transaction_id": "",
+            "applied_power_percent_by_cell": {"2": 70, "3": 70, "4": 70},
+        }],
+    }
+    manifest_path.write_text(json.dumps(manifest))
+    report = evaluate_pair(
+        baseline,
+        combined,
+        warmup_s=30,
+        duration_s=90,
+        expected_seed=43,
+        expected_baseline_mode="rapp_only_actuating",
+        minimum_energy_saving_fraction=0.36,
+    )
+    assert report["energy_saving_fraction"] >= 0.36
+    assert report["criteria"]["energy_reduction_at_least_target"]
+    assert report["experiment_contract"]["checks"]["checkpoint_policy_valid"]
+    assert report["experiment_contract"]["checks"]["dynamic_native_authority_confirmed"]
+    assert report["passed"]
+
+    _energy_files(combined, 140_000.0, pct=70)
+    below_target = evaluate_pair(
+        baseline,
+        combined,
+        warmup_s=30,
+        duration_s=90,
+        expected_seed=43,
+        expected_baseline_mode="rapp_only_actuating",
+        minimum_energy_saving_fraction=0.36,
+    )
+    assert below_target["energy_saving_fraction"] < 0.36
+    assert not below_target["criteria"]["energy_reduction_at_least_target"]
+    assert not below_target["passed"]
+
+    manifest["online_updates_completed"] = 0
+    manifest_path.write_text(json.dumps(manifest))
+    failed = evaluate_pair(
+        baseline,
+        combined,
+        warmup_s=30,
+        duration_s=90,
+        expected_seed=43,
+        expected_baseline_mode="rapp_only_actuating",
+        minimum_energy_saving_fraction=0.36,
+    )
+    assert not failed["experiment_contract"]["checks"]["checkpoint_policy_valid"]
+    assert not failed["passed"]
+
+
 def test_evaluate_pair_flags_controller_attributable_violations(tmp_path):
     baseline, combined = _pair(tmp_path, combined_mode="asgard_v2x_window90_energy_frozen")
     conn = sqlite3.connect(combined / "rapp_data_lake.db")

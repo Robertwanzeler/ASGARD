@@ -316,6 +316,70 @@ def e2_audit(run_dir: Path, *, warmup_s: int = 30) -> dict[str, Any]:
             "observation_source": str(observation_path)}
 
 
+def dynamic_native_authority(run_dir: Path, evidence: dict[str, Any]) -> dict[str, Any]:
+    """Confirm that a recorded ASGARD authority decision reached ns-3.
+
+    The dynamic ledger is useful provenance but cannot substitute the native
+    scheduler/PHY readback.  A power decision, a discretionary-symbol cap or
+    a completed sleep transition must therefore match its E2 control sequence
+    in ``TasamControlObservations.csv``.
+    """
+    events = evidence.get("native_authority_events") or []
+    if not isinstance(events, list) or not events:
+        return {"valid": False, "reason": "native_authority_events_missing"}
+    path = run_dir / "ns3_energy" / "TasamControlObservations.csv"
+    try:
+        with path.open(newline="", encoding="utf-8", errors="replace") as handle:
+            rows = list(csv.DictReader(handle))
+    except OSError:
+        return {"valid": False, "reason": "native_control_trace_missing"}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        try:
+            sequence = int(event.get("native_control_sequence", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if sequence <= 0:
+            continue
+        sequence_rows = [
+            row for row in rows
+            if str(row.get("NativeControlSequence") or "") == str(sequence)
+        ]
+        applied_power = event.get("applied_power_percent_by_cell") or {}
+        for cell in event.get("power_cells") or []:
+            expected = applied_power.get(str(cell), applied_power.get(cell))
+            if expected is None:
+                continue
+            if any(
+                str(row.get("CellId") or "") == str(cell)
+                and int(round(_number(row.get("TxPowerPercent"), -1))) == int(expected)
+                and str(row.get("ObservationKind") or "") in {"power_readback", "state_snapshot"}
+                for row in sequence_rows
+            ):
+                return {"valid": True, "kind": "power", "sequence": sequence, "cell_id": int(cell)}
+        for cell in event.get("resource_cells") or []:
+            if any(
+                str(row.get("CellId") or "") == str(cell)
+                and 0 <= int(_number(row.get("RequestedDiscretionaryDlSymbolsBp"), 10_001)) < 10_000
+                and int(_number(row.get("RequestedDiscretionaryDlSymbolsBp"), -1)) ==
+                    int(_number(row.get("AppliedDiscretionaryDlSymbolsBp"), -2))
+                for row in sequence_rows
+            ):
+                return {"valid": True, "kind": "discretionary_symbol_budget", "sequence": sequence,
+                        "cell_id": int(cell)}
+        source = event.get("sleep_source_cell")
+        sleep_id = str(event.get("sleep_transaction_id") or "")
+        if source and sleep_id and any(
+            str(row.get("CellId") or "") == str(source)
+            and int(round(_number(row.get("TxPowerPercent"), -1))) == 0
+            and str(row.get("SleepTransactionId") or "") == sleep_id
+            for row in sequence_rows
+        ):
+            return {"valid": True, "kind": "sleep", "sequence": sequence, "cell_id": int(source)}
+    return {"valid": False, "reason": "native_authority_readback_missing"}
+
+
 def experiment_contract(
     baseline_dir: Path,
     combined_dir: Path,
@@ -346,6 +410,17 @@ def experiment_contract(
     )
     if expected_checkpoint_sha256 is not None:
         checkpoint_frozen = checkpoint_frozen and before == expected_checkpoint_sha256
+    adaptive_dynamic = combined.get("mode") == "asgard_v2x_window90_energy_dynamic"
+    dynamic_evidence = combined.get("dynamic_floor_evidence") or {}
+    dynamic_native = dynamic_native_authority(combined_dir, dynamic_evidence) if adaptive_dynamic else {"valid": True}
+    checkpoint_adaptive = bool(
+        adaptive_dynamic
+        and combined_contract.get("frozen_checkpoint") is False
+        and int(combined.get("online_updates_completed", 0) or 0) >= 1
+        and str(combined.get("active_online_checkpoint_sha256") or "")
+        and str(combined.get("active_online_checkpoint_sha256") or "") != before
+        and after == str(combined.get("active_online_checkpoint_sha256") or "")
+    )
     checks = {
         "manifests_present": bool(baseline) and bool(combined),
         "expected_seed": seed_matches,
@@ -360,7 +435,9 @@ def experiment_contract(
         # The actuating rApp control uses the same E2 actuator as ASGARD,
         # while keeping both ARMD and TA-SAM disabled.  A passive historical
         # rApp arm remains readable but cannot satisfy an active-control gate.
-        "rapp_only_isolated": baseline.get("mode") in {"rapp_only", "rapp_only_actuating"} and
+        "rapp_only_isolated": baseline.get("mode") in {
+            "rapp_only", "rapp_only_actuating", "fixed_100_native"
+        } and
                               not baseline_contract.get("tasam_enabled") and
                               baseline_contract.get("armd_mode") == "off",
         "combined_contract": (combined.get("mode") == "combined" or
@@ -368,18 +445,33 @@ def experiment_contract(
                              combined_contract.get("tasam_enabled") is True and
                              combined_contract.get("armd_mode") == "assist" and
                              combined_contract.get("actuation_enabled") is True,
-        "checkpoint_frozen": checkpoint_frozen,
+        "checkpoint_policy_valid": checkpoint_adaptive if adaptive_dynamic else checkpoint_frozen,
+        "dynamic_actor_influence": (
+            int(dynamic_evidence.get("actor_influenced_decisions", 0) or 0) >= 1
+            if adaptive_dynamic else True
+        ),
+        "dynamic_native_authority_confirmed": bool(dynamic_native.get("valid")),
+        "dynamic_floor_calibrated": (
+            set((dynamic_evidence.get("floor_percent_by_cell") or {}).keys())
+            == {"2", "3", "4"}
+            and all(
+                25.0 <= float(value) <= 100.0 and float(value) % 5.0 == 0.0
+                for value in (dynamic_evidence.get("floor_percent_by_cell") or {}).values()
+            )
+            if adaptive_dynamic else True
+        ),
         "same_instrumentation": baseline.get("energy_model") == combined.get("energy_model"),
     }
     if expected_baseline_mode is not None:
         checks["expected_baseline_mode"] = (
             baseline.get("mode") == expected_baseline_mode
             and (
-                expected_baseline_mode != "rapp_only_actuating"
+                expected_baseline_mode not in {"rapp_only_actuating", "fixed_100_native"}
                 or baseline_contract.get("actuation_enabled") is True
             )
         )
     return {"valid": all(checks.values()), "checks": checks,
+            "dynamic_native_authority": dynamic_native,
             "baseline_manifest": str(baseline_dir / "arm_manifest.json"),
             "combined_manifest": str(combined_dir / "arm_manifest.json")}
 
@@ -403,6 +495,7 @@ def evaluate_pair(
     expected_profile: str | None = None,
     expected_checkpoint_sha256: str | None = None,
     expected_baseline_mode: str | None = None,
+    minimum_energy_saving_fraction: float = 0.0,
 ) -> dict[str, Any]:
     contract = experiment_contract(
         baseline_dir,
@@ -449,16 +542,27 @@ def evaluate_pair(
         and combined["infra"]["memory_peak_bytes"] <= baseline["infra"]["memory_peak_bytes"]
         and combined["infra"]["management_tx_bytes"] <= baseline["infra"]["management_tx_bytes"] * 1.05
     )
+    baseline_energy = float(baseline["energy"].get("energy_j", 0.0) or 0.0)
+    combined_energy = float(combined["energy"].get("energy_j", 0.0) or 0.0)
+    energy_saving_fraction = (
+        (baseline_energy - combined_energy) / baseline_energy
+        if baseline_energy > 0.0 else -1.0
+    )
     criteria = {
         "experiment_contract_valid": contract["valid"],
         "sla_windows_complete": sla_complete,
         "sla_differential_non_worse": sla_complete and not attributable_keys,
         "causal_energy_complete": baseline["energy"]["valid"] and combined["energy"]["valid"],
         "energy_strictly_lower": combined["energy"]["energy_j"] < baseline["energy"]["energy_j"],
+        "energy_reduction_at_least_target": (
+            energy_saving_fraction >= float(minimum_energy_saving_fraction)
+        ),
         "infrastructure_complete": baseline["infra"]["valid"] and combined["infra"]["valid"],
         "infrastructure_overhead_bounded": overhead_bounded,
         "all_control_e2_transactions_observed": (
-            baseline["e2"]["valid"] if expected_baseline_mode == "rapp_only_actuating" else True
+            baseline["e2"]["valid"]
+            if expected_baseline_mode in {"rapp_only_actuating", "fixed_100_native"}
+            else True
         ),
         "all_e2_transactions_observed": combined["e2"]["valid"],
     }
@@ -473,7 +577,10 @@ def evaluate_pair(
         ),
     }
     return {"schema": "greenran.tasam.strict_pair.v1", "seed": expected_seed,
+            "profile": expected_profile,
             "warmup_s": warmup_s, "duration_s": duration_s,
+            "minimum_energy_saving_fraction": float(minimum_energy_saving_fraction),
+            "energy_saving_fraction": round(energy_saving_fraction, 8),
             "experiment_contract": contract,
             "baseline": baseline, "combined": combined,
             "radio_evidence": radio_evidence,
@@ -488,8 +595,23 @@ def main() -> int:
     parser.add_argument("baseline", type=Path)
     parser.add_argument("combined", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--warmup-s", type=int, default=30)
+    parser.add_argument("--duration-s", type=int, default=600)
+    parser.add_argument("--expected-seed", type=int, default=47)
+    parser.add_argument("--expected-profile")
+    parser.add_argument("--expected-baseline-mode")
+    parser.add_argument("--minimum-energy-saving-fraction", type=float, default=0.0)
     args = parser.parse_args()
-    report = evaluate_pair(args.baseline.resolve(), args.combined.resolve())
+    report = evaluate_pair(
+        args.baseline.resolve(),
+        args.combined.resolve(),
+        warmup_s=args.warmup_s,
+        duration_s=args.duration_s,
+        expected_seed=args.expected_seed,
+        expected_profile=args.expected_profile,
+        expected_baseline_mode=args.expected_baseline_mode,
+        minimum_energy_saving_fraction=args.minimum_energy_saving_fraction,
+    )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
