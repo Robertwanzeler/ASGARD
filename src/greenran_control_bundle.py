@@ -50,6 +50,7 @@ except ImportError:
 
 SCHEMA = "greenran.control.bundle.v2"
 V3_SCHEMA = "greenran.control.bundle.v3"
+V4_SCHEMA = "greenran.control.bundle.v4"
 ACK_SCHEMA = "greenran.control.ack.v2"
 POWER_LEVELS = tuple(range(25, 101, 5))
 UE_COUNT = 20
@@ -95,11 +96,72 @@ def _basis_points(value: Any, field: str) -> int:
     return parsed
 
 
+def _validate_sleep_transition(
+    transition: Any,
+    *,
+    normalized_power: dict[int, int],
+) -> dict[str, Any]:
+    """Validate the explicit, fail-closed sleep transaction used by v4."""
+    if not isinstance(transition, dict):
+        raise ControlBundleError("sleep_transition is required for a v4 sleep operation")
+    phase = str(transition.get("phase") or "").strip().lower()
+    if phase not in {"drain", "commit", "wake"}:
+        raise ControlBundleError("sleep_transition phase must be drain, commit or wake")
+    sleep_transaction_id = str(transition.get("sleep_transaction_id") or "").strip()
+    if not sleep_transaction_id:
+        raise ControlBundleError("sleep_transition requires sleep_transaction_id")
+    try:
+        source = int(transition.get("source_cell_id"))
+    except (TypeError, ValueError) as exc:
+        raise ControlBundleError("sleep_transition requires a canonical source_cell_id") from exc
+    if source not in normalized_power:
+        raise ControlBundleError("sleep_transition source is not a managed DU")
+    plan = transition.get("handover_plan") or []
+    if phase == "drain":
+        if normalized_power[source] == 0:
+            raise ControlBundleError("drain keeps the source DU active until native confirmation")
+        if not isinstance(plan, list) or not plan:
+            raise ControlBundleError("drain requires a non-empty handover_plan")
+        seen: set[int] = set()
+        for item in plan:
+            if not isinstance(item, dict):
+                raise ControlBundleError("handover_plan entries must be objects")
+            try:
+                imsi = int(item.get("imsi"))
+                target = int(item.get("target_cell_id"))
+            except (TypeError, ValueError) as exc:
+                raise ControlBundleError("handover_plan requires IMSI and target cell") from exc
+            if imsi in seen or not 1 <= imsi <= UE_COUNT or target not in normalized_power or target == source:
+                raise ControlBundleError("handover_plan is malformed")
+            seen.add(imsi)
+        if any(normalized_power[cell] != 100 for cell in normalized_power if cell != source):
+            raise ControlBundleError("drain temporarily keeps destination DUs at 100%")
+    elif phase == "commit":
+        if normalized_power[source] != 0:
+            raise ControlBundleError("sleep commit must set the confirmed source DU to zero")
+        required = ("handover_confirmed", "pdcp_window_valid", "association_valid")
+        if any(not transition.get(key) for key in required):
+            raise ControlBundleError("sleep commit requires native handover, association and PDCP confirmation")
+        if float(transition.get("pdcp_window_s", 0.0) or 0.0) < 10.0:
+            raise ControlBundleError("sleep commit requires a 10 second PDCP confirmation window")
+    elif normalized_power[source] != 100:
+        raise ControlBundleError("sleep wake must restore the source DU to 100%")
+    normalized = dict(transition)
+    normalized.update({
+        "phase": phase,
+        "sleep_transaction_id": sleep_transaction_id,
+        "source_cell_id": source,
+        "handover_plan": plan,
+    })
+    return normalized
+
+
 def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> dict[str, Any]:
     """Validate and normalize an actuator bundle without mutating the input."""
-    if not isinstance(bundle, dict) or bundle.get("schema") not in {SCHEMA, V3_SCHEMA}:
-        raise ControlBundleError(f"expected schema {SCHEMA} or {V3_SCHEMA}")
-    v3 = bundle.get("schema") == V3_SCHEMA
+    if not isinstance(bundle, dict) or bundle.get("schema") not in {SCHEMA, V3_SCHEMA, V4_SCHEMA}:
+        raise ControlBundleError(f"expected schema {SCHEMA}, {V3_SCHEMA} or {V4_SCHEMA}")
+    v3 = bundle.get("schema") in {V3_SCHEMA, V4_SCHEMA}
+    v4 = bundle.get("schema") == V4_SCHEMA
     if v3 and bundle.get("economic_action_contract") != ECONOMIC_ACTION_V3_CONTRACT:
         raise ControlBundleError(
             f"v3 bundle requires economic_action_contract={ECONOMIC_ACTION_V3_CONTRACT}"
@@ -164,10 +226,18 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
             )
         except EconomicActionV3Error as exc:
             raise ControlBundleError(str(exc)) from exc
+        if v4:
+            discretionary = _basis_points(
+                raw_cell.get("max_discretionary_dl_symbols_bp"),
+                "max_discretionary_dl_symbols_bp",
+            )
+        else:
+            discretionary = None
         normalized_cells.append({
             "cell_id": cell_id,
             "tx_power_percent": tx_power,
             "ue_policies": normalized_ues,
+            **({"max_discretionary_dl_symbols_bp": discretionary} if v4 else {}),
         })
     if require_all_ues and seen_imsis != set(range(1, UE_COUNT + 1)):
         missing = sorted(set(range(1, UE_COUNT + 1)) - seen_imsis)
@@ -185,7 +255,15 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
         if cell_power != normalized_power:
             raise ControlBundleError("power_percent_by_cell diverges from per-cell bundle power")
         sleeping = [cell for cell, power in normalized_power.items() if power == 0]
-        if sleeping:
+        if v4 and bundle.get("sleep_transition"):
+            normalized_sleep_transition = _validate_sleep_transition(
+                bundle.get("sleep_transition"), normalized_power=normalized_power,
+            )
+        else:
+            normalized_sleep_transition = None
+        if sleeping and v4 and normalized_sleep_transition is None:
+            raise ControlBundleError("v4 sleeping DU requires sleep_transition commit evidence")
+        if sleeping and not v4:
             sleep = bundle.get("du_sleep") or {}
             if not isinstance(sleep, dict):
                 raise ControlBundleError("du_sleep evidence is required for a sleeping DU")
@@ -198,11 +276,23 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
                 raise ControlBundleError("sleep source does not match the zero-power DU")
             if float(sleep.get("pdcp_window_s", 0.0) or 0.0) < 10.0:
                 raise ControlBundleError("DU sleep requires a 10 second PDCP confirmation window")
+        if v4 and normalized_sleep_transition is not None and (
+            normalized_sleep_transition["phase"] == "commit"
+        ):
+            source = int(normalized_sleep_transition["source_cell_id"])
+            source_policies = next(
+                (cell["ue_policies"] for cell in normalized_cells if cell["cell_id"] == source),
+                None,
+            )
+            if source_policies is None or source_policies:
+                raise ControlBundleError(
+                    "sleep commit requires an empty source-DU scheduler snapshot"
+                )
 
     normalized = dict(bundle)
     normalized_infra = validate_physical_budget(bundle.get("infra"))
     normalized.update({
-        "schema": V3_SCHEMA if v3 else SCHEMA,
+        "schema": V4_SCHEMA if v4 else V3_SCHEMA if v3 else SCHEMA,
         "policy_id": policy_id,
         "sequence": sequence,
         "issued_at_ns": issued_at_ns,
@@ -216,6 +306,8 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
             str(cell): int(power) for cell, power in normalized_power.items()
         }
         normalized["economic_action_contract"] = ECONOMIC_ACTION_V3_CONTRACT
+    if v4 and normalized_sleep_transition is not None:
+        normalized["sleep_transition"] = normalized_sleep_transition
     return normalized
 
 
