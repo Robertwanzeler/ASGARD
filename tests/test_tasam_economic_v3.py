@@ -7,7 +7,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from greenran_control_bundle import ControlBundleError, V3_SCHEMA, validate_bundle
+from greenran_control_bundle import ControlBundleError, V3_SCHEMA, V4_SCHEMA, validate_bundle
 from greenran_infra_budget import build_physical_budget
 from tasam_economic_v3 import (
     CONTRACT,
@@ -79,6 +79,55 @@ def test_v3_rejects_two_sleeping_dus_and_unconfirmed_sleep():
          "pdcp_window_s": 10.0},
     ))
     assert normalized["cells"][0]["tx_power_percent"] == 0
+
+
+def _v4_bundle(*, phase=None):
+    payload = _bundle({2: 25, 3: 75, 4: 100})
+    payload["schema"] = V4_SCHEMA
+    for cell in payload["cells"]:
+        cell["max_discretionary_dl_symbols_bp"] = 3000
+    if phase is not None:
+        payload["sleep_transition"] = phase
+    return payload
+
+
+def test_v4_requires_and_preserves_the_native_discretionary_symbol_cap():
+    normalized = validate_bundle(_v4_bundle())
+    assert normalized["schema"] == V4_SCHEMA
+    assert [cell["max_discretionary_dl_symbols_bp"] for cell in normalized["cells"]] == [3000, 3000, 3000]
+    missing = _v4_bundle()
+    missing["cells"][0].pop("max_discretionary_dl_symbols_bp")
+    with pytest.raises(ControlBundleError, match="max_discretionary"):
+        validate_bundle(missing)
+
+
+def test_v4_allows_zero_only_after_valid_sleep_commit():
+    payload = _v4_bundle()
+    source = payload["cells"][0]
+    moved = source["ue_policies"]
+    source["ue_policies"] = []
+    payload["cells"][1]["ue_policies"].extend(moved)
+    payload["power_percent_by_cell"] = {"2": 0, "3": 100, "4": 100}
+    payload["cells"][0]["tx_power_percent"] = 0
+    payload["cells"][1]["tx_power_percent"] = 100
+    payload["sleep_transition"] = {
+        "phase": "commit", "sleep_transaction_id": "sleep:7:2",
+        "source_cell_id": 2,
+        "handover_plan": [{"imsi": item["imsi"], "target_cell_id": 3} for item in moved],
+        "handover_confirmed": True, "association_valid": True,
+        "pdcp_window_valid": True, "pdcp_window_s": 10.0,
+    }
+    assert validate_bundle(payload)["cells"][0]["tx_power_percent"] == 0
+    payload["sleep_transition"]["pdcp_window_s"] = 9.9
+    with pytest.raises(ControlBundleError, match="10 second"):
+        validate_bundle(payload)
+    payload["sleep_transition"]["pdcp_window_s"] = 10.0
+    payload["cells"][1]["ue_policies"] = [
+        item for item in payload["cells"][1]["ue_policies"] if item["imsi"] != moved[0]["imsi"]
+    ]
+    payload["cells"][0]["ue_policies"] = [moved[0]]
+    with pytest.raises(ControlBundleError, match="empty source-DU"):
+        validate_bundle(payload)
 
 
 def test_v3_budget_uses_capacity_but_never_breaks_sla_floor():

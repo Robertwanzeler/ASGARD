@@ -6,9 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.run_tasam_online_arm import build_environment, mode_contract
+from scripts.run_tasam_online_arm import (
+    _validate_fixed_native_power_percent,
+    build_environment,
+    mode_contract,
+)
 from scripts.run_tasam_online_controlled import V2X_REPLAY_80_20_SCHEMA, build_v2x_replay_80_20
 from scripts.run_tasam_vehicle_feasibility import _frozen_policy_evidence
+from src.rapp_orchestrator import RappResourceOptimizer
 
 
 def _row(*, phase: str, episode: int, seed: int, timestamp: int, evaluation: bool = False) -> dict:
@@ -161,6 +166,85 @@ def test_energy_v3_modes_require_v6_native_evidence_and_full_economic_contract(t
     assert rapp_env["GREENRAN_NATIVE_EVIDENCE_VERSION"] == "v6"
     assert rapp_env["GREENRAN_TASAM_ECONOMIC_HEAD_ENABLED"] == "0"
     assert rapp_env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] == "economic_action_v3_per_du_sleep"
+
+
+def test_dynamic_energy_mode_keeps_online_asgard_and_disables_legacy_staircase(tmp_path: Path):
+    ledger = tmp_path / "ledger-v2.json"
+    signature = tmp_path / "r26-signature.json"
+    ledger.write_text("{}")
+    signature.write_text("{}")
+    contract = mode_contract("asgard_v2x_window90_energy_dynamic")
+    assert contract["controller_enabled"] is True
+    assert contract["frozen_checkpoint"] is False
+    assert contract["dynamic_floor_contract"] == "greenran.tasam.adaptive_energy_envelope.v2"
+    env = build_environment(
+        "asgard_v2x_window90_energy_dynamic",
+        tmp_path / "dynamic",
+        43,
+        "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max",
+        9000,
+        sim_time=120,
+        native_fidelity=True,
+        energy_enabled=True,
+        energy_staircase=True,
+        dynamic_floor_ledger=ledger,
+        baseline_signature=signature,
+        disable_app_overrides=True,
+    )
+    assert env["GREENRAN_TASAM_DYNAMIC_FLOOR_CONTRACT"] == "greenran.tasam.adaptive_energy_envelope.v2"
+    assert "GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT" not in env
+    assert env["GREENRAN_TASAM_ALLOW_DU_SLEEP"] == "1"
+    assert env["GREENRAN_TASAM_RESOURCE_FLOOR_POLICY"] == "adaptive_energy_envelope_v2"
+    assert env["GREENRAN_ML_RETRAIN_ENABLED"] == "true"
+
+
+def test_fixed_native_power_percent_flag_propagates_exact_percent(tmp_path: Path):
+    run_dir = tmp_path / "fixed-power"
+    for percent in (45, 70, 25, 100):
+        env = build_environment(
+            "fixed_100_native", run_dir / str(percent), 43,
+            "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max",
+            9000, sim_time=120, native_fidelity=True, energy_enabled=True,
+            fixed_native_power_percent=percent,
+        )
+        assert env["GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT"] == str(percent)
+        assert env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] == "economic_action_v3_per_du_sleep"
+    default_env = build_environment(
+        "fixed_100_native", run_dir / "default", 43,
+        "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max",
+        9000, sim_time=120, native_fidelity=True, energy_enabled=True,
+    )
+    assert default_env["GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT"] == "100"
+
+
+def test_fixed_native_power_percent_rejects_off_grid_or_misplaced_values():
+    for invalid in (20, 47, 105, 0, -25):
+        with pytest.raises(SystemExit, match="passos de 5"):
+            _validate_fixed_native_power_percent(invalid, "fixed_100_native")
+    with pytest.raises(SystemExit, match="fixed_100_native"):
+        _validate_fixed_native_power_percent(45, "asgard_v2x_window90_energy_dynamic")
+    with pytest.raises(SystemExit, match="fixed_100_native"):
+        _validate_fixed_native_power_percent(70, "rapp_only_actuating")
+    assert _validate_fixed_native_power_percent(45, "fixed_100_native") == 45
+    assert _validate_fixed_native_power_percent("70", "fixed_100_native") == 70
+
+
+def test_rapp_live_fixed_power_honors_five_percent_grid(monkeypatch):
+    def _fixed(percent: str):
+        monkeypatch.setenv("GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT", percent)
+        return RappResourceOptimizer._rapp_live_power_percent(object(), {})
+
+    assert _fixed("45") == 45.0
+    assert _fixed("70") == 70.0
+    assert _fixed("25") == 25.0
+    assert _fixed("100") == 100.0
+    assert _fixed("47") == 45.0
+    assert _fixed("110") == 100.0
+    assert _fixed("20") == 25.0
+    assert _fixed("abc") == 100.0
+    monkeypatch.delenv("GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT", raising=False)
+    fallback = RappResourceOptimizer._rapp_live_power_percent(RappResourceOptimizer, {})
+    assert fallback == 100.0
 
 
 def test_energy_staircase_is_opt_in_and_only_enabled_for_the_tasam_arm(tmp_path: Path):

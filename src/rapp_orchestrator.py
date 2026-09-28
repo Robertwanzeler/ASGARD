@@ -108,6 +108,7 @@ from greenran_control_bundle import (
     ControlBundleError,
     SCHEMA as CONTROL_BUNDLE_SCHEMA,
     V3_SCHEMA as CONTROL_BUNDLE_V3_SCHEMA,
+    V4_SCHEMA as CONTROL_BUNDLE_V4_SCHEMA,
     failsafe_bundle,
     quantize_power_percent,
 )
@@ -120,6 +121,17 @@ from tasam_economic_v3 import (
     project_total_budget_fraction,
     realized_economic_reward,
     staircase_candidate,
+)
+from tasam_dynamic_floor import (
+    DYNAMIC_FLOOR_CONTRACT,
+    DynamicFloorError,
+    atomic_write_state as atomic_write_dynamic_floor_state,
+    dynamic_floor_candidate,
+    load_baseline_signature,
+    load_dynamic_floor_ledger,
+    project_asgard_power,
+    project_discretionary_symbol_budget,
+    sha256_file as dynamic_floor_sha256,
 )
 from greenran_infra_budget import CgroupV2Controller, InfraBudgetError, build_physical_budget
 from tasam_safety_shield import (
@@ -403,6 +415,11 @@ class RappResourceOptimizer:
             'last_observation_healthy': False,
             'last_observation_critical': False,
         }
+        self._dynamic_floor_config = {}
+        self._dynamic_floor_signature = set()
+        self._dynamic_floor_state = {}
+        self._dynamic_floor_state_path = None
+        self._initialize_dynamic_floor()
         self.marl_shadow_evaluator = MARLShadowRuntimeEvaluator(RUNTIME_CONFIG.get('tasam_advisor', {}))
         if self.marl_shadow_evaluator.require_checkpoint and not self.marl_shadow_evaluator.checkpoint_loaded:
             raise RuntimeError(
@@ -1449,6 +1466,595 @@ class RappResourceOptimizer:
         ).strip() == ENERGY_STAIRCASE_CONTRACT
 
     @staticmethod
+    def _dynamic_floor_enabled() -> bool:
+        return os.environ.get(
+            'GREENRAN_TASAM_DYNAMIC_FLOOR_CONTRACT', ''
+        ).strip() == DYNAMIC_FLOOR_CONTRACT
+
+    def _initialize_dynamic_floor(self) -> None:
+        """Load the immutable ledger/signature and create resumable state."""
+        if not self._dynamic_floor_enabled():
+            return
+        ledger_path = Path(os.environ.get(
+            'GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER', ''
+        ).strip())
+        signature_path = Path(os.environ.get(
+            'GREENRAN_TASAM_BASELINE_SIGNATURE', ''
+        ).strip())
+        state_path = Path(os.environ.get(
+            'GREENRAN_TASAM_DYNAMIC_FLOOR_STATE',
+            str(Path(STATE_DIR) / 'dynamic_floor_state.json'),
+        ))
+        if not ledger_path.is_file() or not signature_path.is_file():
+            raise DynamicFloorError(
+                'dynamic floor requires ledger v2 and r26 baseline signature'
+            )
+        try:
+            expected_seed = int(os.environ.get(
+                'GREENRAN_TASAM_TRUE_ONLINE_SEED', '43'
+            ) or 43)
+        except (TypeError, ValueError) as exc:
+            raise DynamicFloorError('dynamic floor seed is invalid') from exc
+        expected_profile = str(os.environ.get(
+            'GREENRAN_COLLECTION_EVENT_PROFILE', ''
+        ) or '')
+        ledger = load_dynamic_floor_ledger(
+            ledger_path,
+            expected_seed=expected_seed,
+            expected_profile=expected_profile or None,
+            baseline_signature_path=signature_path,
+        )
+        signature = load_baseline_signature(
+            signature_path,
+            expected_seed=expected_seed,
+            expected_profile=expected_profile or None,
+            strict_contract=True,
+        )
+        state = {}
+        if state_path.is_file():
+            try:
+                state = json.loads(state_path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DynamicFloorError('dynamic-floor state is unreadable') from exc
+            if not isinstance(state, dict):
+                raise DynamicFloorError('dynamic-floor state must be an object')
+            if state.get('contract') != DYNAMIC_FLOOR_CONTRACT:
+                raise DynamicFloorError('dynamic-floor state contract mismatch')
+            if state.get('ledger_sha256') != ledger['ledger_sha256']:
+                raise DynamicFloorError('dynamic-floor state ledger mismatch')
+            if state.get('baseline_signature_sha256') != dynamic_floor_sha256(signature_path):
+                raise DynamicFloorError('dynamic-floor state baseline mismatch')
+            if int(state.get('seed', -1)) != expected_seed:
+                raise DynamicFloorError('dynamic-floor state seed mismatch')
+            if str(state.get('profile') or '') != expected_profile:
+                raise DynamicFloorError('dynamic-floor state profile mismatch')
+        if not state:
+            state = {
+                'contract': DYNAMIC_FLOOR_CONTRACT,
+                'seed': expected_seed,
+                'profile': expected_profile,
+                'ledger_sha256': ledger['ledger_sha256'],
+                'baseline_signature_sha256': dynamic_floor_sha256(signature_path),
+                'floor_percent_by_cell': dict(ledger['initial_floor_percent_by_cell']),
+                'minimum_floor_percent_by_cell': dict(ledger['minimum_floor_percent_by_cell']),
+                'previous_validated_floor_percent_by_cell': dict(
+                    ledger['previous_validated_floor_percent_by_cell']
+                ),
+                'descend_streak': 0,
+                'stable_streak': 0,
+                'retreats': 0,
+                'descent_enabled': True,
+                'projection_count': 0,
+                'applied_projection_count': 0,
+                'actor_influenced_decisions': 0,
+                'resource_influenced_decisions': 0,
+                'sleep_influenced_decisions': 0,
+                'native_authority_events': [],
+                'observed_windows': 0,
+                'window_sequence_id': 0,
+                'processed_window_ids': [],
+                'seen_attributable_violation_keys': [],
+                'sleep_transition': {},
+                'resource_budget_projection_count': 0,
+            }
+        self._dynamic_floor_config = ledger
+        self._dynamic_floor_signature = signature
+        self._dynamic_floor_state = state
+        self._dynamic_floor_state_path = state_path
+        self._persist_dynamic_floor_state()
+
+    def _persist_dynamic_floor_state(self) -> None:
+        if self._dynamic_floor_state_path is None:
+            return
+        atomic_write_dynamic_floor_state(
+            self._dynamic_floor_state_path, self._dynamic_floor_state
+        )
+
+    def _apply_adaptive_resource_budget(
+        self,
+        decision: dict,
+        allocation: dict,
+        power_by_cell: dict[int, int],
+    ) -> dict[int, int]:
+        """Turn the learned global allocation action into a native DL cap.
+
+        A missing/malformed economic head never invents a cut: the legacy
+        unconstrained value is retained and recorded.  A valid ASGARD action
+        is represented by an explicit per-DU cap in the v4 control bundle.
+        """
+        active_cells = tuple(cell for cell in DU_CELL_IDS if power_by_cell.get(cell, 100) != 0)
+        if not self._dynamic_floor_enabled():
+            return {cell: 10_000 for cell in active_cells}
+        advisor = decision.get('tasam_advisor') or {}
+        energy = advisor.get('energy_advice') or {}
+        proposal = decision.get('tasam_proposal') or {}
+        proposed_allocation = proposal.get('resource_allocation') or {}
+        total = (
+            energy.get('total_budget_fraction')
+            if energy.get('total_budget_fraction') is not None else
+            proposed_allocation.get('total_budget_fraction', allocation.get('total_budget_fraction'))
+        )
+        ran = (
+            energy.get('ran_share')
+            if energy.get('ran_share') is not None else
+            proposed_allocation.get('ran_share', allocation.get('ran_share'))
+        )
+        try:
+            caps, evidence = project_discretionary_symbol_budget(
+                total, ran, active_cells=active_cells,
+            )
+        except DynamicFloorError as exc:
+            decision['adaptive_resource_budget'] = {
+                'valid': False,
+                'reason': str(exc),
+                'applied_discretionary_dl_symbols_bp_by_cell': {
+                    str(cell): 10_000 for cell in active_cells
+                },
+            }
+            return {cell: 10_000 for cell in active_cells}
+        evidence.update({
+            'valid': True,
+            'applied_discretionary_dl_symbols_bp_by_cell': {
+                str(cell): int(value) for cell, value in caps.items()
+            },
+        })
+        decision['adaptive_resource_budget'] = evidence
+        state = dict(self._dynamic_floor_state)
+        state['resource_budget_projection_count'] = int(
+            state.get('resource_budget_projection_count', 0) or 0
+        ) + 1
+        state['last_resource_budget_projection'] = dict(evidence)
+        self._dynamic_floor_state = state
+        self._persist_dynamic_floor_state()
+        return caps
+
+    def _adaptive_sleep_transition(
+        self,
+        decision: dict,
+        power_by_cell: dict[int, int],
+        association_cells: dict[int, set[int]],
+        *,
+        sla_valid: bool,
+        pdcp_mature: bool,
+        sim_time_s: float,
+    ) -> tuple[dict[int, int], dict | None, bool]:
+        """Advance one fail-closed drain/commit/wake sleep transaction."""
+        if not self._dynamic_floor_enabled():
+            return power_by_cell, None, False
+        projection = decision.get('dynamic_floor_projection') or {}
+        requested = projection.get('requested_power_percent_by_cell') or {}
+        requested_sleep = []
+        for cell in DU_CELL_IDS:
+            raw_power = requested.get(str(cell), requested.get(cell, 100))
+            try:
+                requested_power = int(100 if raw_power is None else raw_power)
+            except (TypeError, ValueError):
+                requested_power = 100
+            if requested_power == 0:
+                requested_sleep.append(cell)
+        state = dict(self._dynamic_floor_state)
+        transition_state = dict(state.get('sleep_transition') or {})
+        phase = str(transition_state.get('phase') or '').lower()
+        source = int(transition_state.get('source_cell_id', 0) or 0)
+
+        def persist(next_state: dict) -> None:
+            state['sleep_transition'] = next_state
+            self._dynamic_floor_state = state
+            self._persist_dynamic_floor_state()
+
+        if phase == 'drain':
+            source_ues = {int(item) for item in transition_state.get('source_imsis', [])}
+            current_source = set(association_cells.get(source, set()))
+            all_present = set().union(*(association_cells.get(cell, set()) for cell in DU_CELL_IDS)) == set(range(1, 21))
+            if not sla_valid or not pdcp_mature:
+                persist({
+                    **transition_state, 'phase': 'wake', 'reason': 'drain_sla_or_pdcp_invalid',
+                })
+                decision['adaptive_sleep'] = dict(state['sleep_transition'])
+                return {cell: 100 for cell in DU_CELL_IDS}, {
+                    'phase': 'wake',
+                    'sleep_transaction_id': transition_state.get('sleep_transaction_id'),
+                    'source_cell_id': source,
+                }, True
+            if current_source:
+                # Handover still converging: source remains active, targets
+                # temporarily get the full safe envelope.
+                draining = {
+                    cell: (max(25, int((self._dynamic_floor_state.get('floor_percent_by_cell') or {}).get(str(cell), 25)))
+                           if cell == source else 100)
+                    for cell in DU_CELL_IDS
+                }
+                payload = {
+                    'phase': 'drain',
+                    'sleep_transaction_id': transition_state['sleep_transaction_id'],
+                    'source_cell_id': source,
+                    'handover_plan': list(transition_state.get('handover_plan') or []),
+                }
+                decision['adaptive_sleep'] = {**transition_state, 'native_source_empty': False}
+                return draining, payload, False
+            # The drain only enters its 10-second health window after the
+            # source snapshot is explicitly empty and all IMSIs remain
+            # observable on the remaining multi-connectivity legs.
+            if not all_present:
+                persist({
+                    **transition_state, 'phase': 'wake', 'reason': 'drain_empty_source_association_invalid',
+                })
+                decision['adaptive_sleep'] = dict(state['sleep_transition'])
+                return {cell: 100 for cell in DU_CELL_IDS}, {
+                    'phase': 'wake',
+                    'sleep_transaction_id': transition_state.get('sleep_transaction_id'),
+                    'source_cell_id': source,
+                }, True
+            empty_since = float(transition_state.get('source_empty_since_s', 0.0) or 0.0)
+            if empty_since <= 0.0:
+                transition_state['source_empty_since_s'] = float(sim_time_s)
+                persist(transition_state)
+                empty_since = float(sim_time_s)
+            if float(sim_time_s) - empty_since < 10.0:
+                draining = {cell: (25 if cell == source else 100) for cell in DU_CELL_IDS}
+                payload = {
+                    'phase': 'drain', 'sleep_transaction_id': transition_state['sleep_transaction_id'],
+                    'source_cell_id': source, 'handover_plan': list(transition_state.get('handover_plan') or []),
+                }
+                decision['adaptive_sleep'] = {**transition_state, 'native_source_empty': True}
+                return draining, payload, False
+            committed = {cell: (0 if cell == source else int(power_by_cell.get(cell, 100))) for cell in DU_CELL_IDS}
+            transition_state.update({
+                'phase': 'commit', 'committed_at_s': float(sim_time_s),
+                'handover_confirmed': True, 'association_valid': True,
+                'pdcp_window_valid': True,
+                'pdcp_window_s': float(sim_time_s) - empty_since,
+            })
+            persist(transition_state)
+            payload = {
+                'phase': 'commit', 'sleep_transaction_id': transition_state['sleep_transaction_id'],
+                'source_cell_id': source, 'handover_plan': list(transition_state.get('handover_plan') or []),
+                'handover_confirmed': True, 'association_valid': True,
+                'pdcp_window_valid': True, 'pdcp_window_s': float(sim_time_s) - empty_since,
+            }
+            decision['adaptive_sleep'] = dict(transition_state)
+            return committed, payload, False
+
+        if phase == 'commit':
+            current_source = set(association_cells.get(source, set()))
+            all_present = set().union(
+                *(association_cells.get(cell, set()) for cell in DU_CELL_IDS)
+            ) == set(range(1, 21))
+            if current_source or not all_present or not sla_valid or not pdcp_mature:
+                persist({
+                    **transition_state, 'phase': 'wake',
+                    'reason': 'sleep_commit_health_or_association_invalid',
+                })
+                decision['adaptive_sleep'] = dict(state['sleep_transition'])
+                return {cell: 100 for cell in DU_CELL_IDS}, {
+                    'phase': 'wake',
+                    'sleep_transaction_id': transition_state.get('sleep_transaction_id'),
+                    'source_cell_id': source,
+                }, True
+            committed = {
+                cell: (0 if cell == source else int(power_by_cell.get(cell, 100)))
+                for cell in DU_CELL_IDS
+            }
+            payload = {
+                'phase': 'commit',
+                'sleep_transaction_id': transition_state['sleep_transaction_id'],
+                'source_cell_id': source,
+                'handover_plan': list(transition_state.get('handover_plan') or []),
+                'handover_confirmed': True, 'association_valid': True,
+                'pdcp_window_valid': True,
+                'pdcp_window_s': max(10.0, float(transition_state.get('pdcp_window_s', 10.0) or 10.0)),
+            }
+            decision['adaptive_sleep'] = dict(transition_state)
+            return committed, payload, False
+
+        if phase == 'wake':
+            if requested_sleep:
+                decision['adaptive_sleep_rejected'] = 'sleep_wake_pending_actor_request'
+                return {cell: 100 for cell in DU_CELL_IDS}, {
+                    'phase': 'wake',
+                    'sleep_transaction_id': transition_state.get('sleep_transaction_id'),
+                    'source_cell_id': source,
+                }, True
+            persist({})
+            return power_by_cell, None, False
+
+        if not requested_sleep:
+            return power_by_cell, None, False
+        if len(requested_sleep) != 1:
+            decision['adaptive_sleep_rejected'] = 'multiple_sleep_requests'
+            return {cell: 100 for cell in DU_CELL_IDS}, None, True
+        source = requested_sleep[0]
+        source_ues = set(association_cells.get(source, set()))
+        if not source_ues:
+            decision['adaptive_sleep_rejected'] = 'source_association_unavailable'
+            return power_by_cell, None, False
+        plan = []
+        target_load = {cell: len(association_cells.get(cell, set())) for cell in DU_CELL_IDS if cell != source}
+        for imsi in sorted(source_ues):
+            candidates = [cell for cell in target_load if imsi in association_cells.get(cell, set())]
+            if not candidates:
+                decision['adaptive_sleep_rejected'] = f'imsi_{imsi}_has_no_mc_destination'
+                return power_by_cell, None, False
+            target = min(candidates, key=lambda cell: (target_load[cell], cell))
+            target_load[target] += 1
+            plan.append({'imsi': imsi, 'target_cell_id': target})
+        sleep_id = f"sleep:{decision.get('tasam_control_sequence', 0)}:{source}:{int(sim_time_s * 1000)}"
+        next_state = {
+            'phase': 'drain', 'sleep_transaction_id': sleep_id,
+            'source_cell_id': source, 'source_imsis': sorted(source_ues),
+            'handover_plan': plan, 'requested_at_s': float(sim_time_s),
+        }
+        persist(next_state)
+        draining = {cell: (max(25, int(power_by_cell.get(cell, 25))) if cell == source else 100)
+                    for cell in DU_CELL_IDS}
+        payload = {
+            'phase': 'drain', 'sleep_transaction_id': sleep_id,
+            'source_cell_id': source, 'handover_plan': plan,
+        }
+        decision['adaptive_sleep'] = dict(next_state)
+        return draining, payload, False
+
+    def _apply_dynamic_floor(
+        self,
+        decision: dict,
+        requested_power_by_cell: dict[int, int],
+    ) -> tuple[dict[int, int], bool]:
+        """Project ASGARD's active proposal onto the current safety floor."""
+        if not self._dynamic_floor_enabled():
+            return requested_power_by_cell, False
+        selected_assistant = str(decision.get('selected_assistant') or '').lower()
+        if selected_assistant not in {'ta_sam', 'joint'}:
+            decision['dynamic_floor_applied'] = False
+            decision['dynamic_floor_reason'] = 'non_asgard_action'
+            return requested_power_by_cell, False
+        try:
+            selected, evidence = project_asgard_power(
+                requested_power_by_cell,
+                self._dynamic_floor_state.get('floor_percent_by_cell') or {},
+                isolated=False,
+            )
+        except DynamicFloorError as exc:
+            decision['dynamic_floor_applied'] = False
+            decision['dynamic_floor_reason'] = str(exc)
+            decision['tasam_v3_action_error'] = str(exc)
+            return {cell: 100 for cell in DU_CELL_IDS}, True
+        decision['dynamic_floor_projected'] = True
+        decision['dynamic_floor_applied'] = False
+        decision['dynamic_floor_contract'] = DYNAMIC_FLOOR_CONTRACT
+        decision['dynamic_floor_projection'] = evidence
+        sleep_candidates = [
+            cell for cell, power in requested_power_by_cell.items()
+            if int(power) == 0
+        ]
+        decision['dynamic_sleep_requested_cells'] = sorted(sleep_candidates)
+        decision['dynamic_floor_state_before'] = dict(self._dynamic_floor_state)
+        decision['dynamic_floor_reason'] = 'asgard_proposal_clamped_to_dynamic_floor'
+        return selected, False
+
+    def _record_dynamic_floor_application(
+        self,
+        decision: dict,
+        bundle: dict,
+        *,
+        accepted: bool,
+        failsafe: bool,
+    ) -> None:
+        if not self._dynamic_floor_enabled() or not decision.get('dynamic_floor_projected'):
+            return
+        projection = dict(decision.get('dynamic_floor_projection') or {})
+        applied_by_cell = {
+            str(cell.get('cell_id')): int(cell.get('tx_power_percent', 100))
+            for cell in bundle.get('cells') or []
+            if isinstance(cell, dict) and cell.get('cell_id') is not None
+        }
+        dynamically_applied = bool(accepted and not failsafe and bundle.get('mode') != 'failsafe')
+        requested_by_cell = projection.get('requested_power_percent_by_cell') or {}
+        effective_actor_cells = [
+            int(cell) for cell in projection.get('actor_influenced_cells') or []
+            if applied_by_cell.get(str(cell)) == requested_by_cell.get(str(cell))
+        ] if dynamically_applied else []
+        resource_budget = dict(decision.get('adaptive_resource_budget') or {})
+        requested_caps = resource_budget.get(
+            'applied_discretionary_dl_symbols_bp_by_cell'
+        ) or {}
+        effective_resource_cells = []
+        if dynamically_applied:
+            for cell in bundle.get('cells') or []:
+                if not isinstance(cell, dict):
+                    continue
+                cell_id = str(cell.get('cell_id'))
+                raw_cap = cell.get('max_discretionary_dl_symbols_bp')
+                try:
+                    applied_cap = 10_000 if raw_cap is None else int(raw_cap)
+                    requested_cap = int(requested_caps[cell_id])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if applied_cap < 10_000 and applied_cap == requested_cap:
+                    effective_resource_cells.append(int(cell_id))
+        sleep_transition = dict(bundle.get('sleep_transition') or {})
+        sleep_source = int(sleep_transition.get('source_cell_id', 0) or 0)
+        sleep_influenced = bool(
+            dynamically_applied
+            and str(sleep_transition.get('phase') or '').lower() == 'commit'
+            and sleep_source in DU_CELL_IDS
+            and applied_by_cell.get(str(sleep_source)) == 0
+        )
+        actor_influenced = bool(
+            effective_actor_cells or effective_resource_cells or sleep_influenced
+        )
+        decision['dynamic_floor_applied'] = dynamically_applied
+        decision['dynamic_floor_overridden_by_isolation'] = bool(failsafe)
+        decision['dynamic_floor_applied_power_percent_by_cell'] = applied_by_cell
+        decision['dynamic_floor_actor_influenced_cells'] = effective_actor_cells
+        decision['dynamic_floor_resource_influenced_cells'] = effective_resource_cells
+        decision['dynamic_floor_sleep_influenced'] = sleep_influenced
+        decision['dynamic_floor_actor_influenced'] = actor_influenced
+        state = dict(self._dynamic_floor_state)
+        state['projection_count'] = int(state.get('projection_count', 0) or 0) + 1
+        if dynamically_applied:
+            state['applied_projection_count'] = int(
+                state.get('applied_projection_count', 0) or 0
+            ) + 1
+            if actor_influenced:
+                state['actor_influenced_decisions'] = int(
+                    state.get('actor_influenced_decisions', 0) or 0
+                ) + 1
+            if effective_resource_cells:
+                state['resource_influenced_decisions'] = int(
+                    state.get('resource_influenced_decisions', 0) or 0
+                ) + 1
+            if sleep_influenced:
+                state['sleep_influenced_decisions'] = int(
+                    state.get('sleep_influenced_decisions', 0) or 0
+                ) + 1
+            if actor_influenced:
+                events = list(state.get('native_authority_events') or [])
+                events.append({
+                    'native_control_sequence': int(
+                        decision.get('tasam_control_sequence', 0) or 0
+                    ),
+                    'power_cells': effective_actor_cells,
+                    'resource_cells': effective_resource_cells,
+                    'sleep_source_cell': sleep_source if sleep_influenced else 0,
+                    'sleep_transaction_id': str(
+                        sleep_transition.get('sleep_transaction_id') or ''
+                    ),
+                    'applied_power_percent_by_cell': applied_by_cell,
+                })
+                state['native_authority_events'] = events[-128:]
+        state['last_projection'] = {
+            'snapshot_sequence_id': decision.get('snapshot_sequence_id'),
+            'power_transaction_id': decision.get('tasam_control_sequence'),
+            'requested_power_percent_by_cell': projection.get(
+                'requested_power_percent_by_cell', {}
+            ),
+            'floor_percent_by_cell': projection.get('floor_percent_by_cell', {}),
+            'selected_power_percent_by_cell': projection.get(
+                'selected_power_percent_by_cell', {}
+            ),
+            'applied_power_percent_by_cell': applied_by_cell,
+            'actor_proposal_influenced_cells': list(
+                projection.get('actor_influenced_cells') or []
+            ),
+            'actor_influenced_cells': effective_actor_cells,
+            'actor_influenced': actor_influenced,
+            'resource_influenced_cells': effective_resource_cells,
+            'sleep_influenced': sleep_influenced,
+            'sleep_transaction_id': str(sleep_transition.get('sleep_transaction_id') or ''),
+            'accepted': bool(accepted),
+            'safety_isolated': bool(failsafe),
+            'isolation_reason': str(
+                decision.get('economic_safety_isolation_reason')
+                or bundle.get('reason') or ''
+            ),
+        }
+        self._dynamic_floor_state = state
+        self._persist_dynamic_floor_state()
+
+    def _advance_dynamic_floor_from_observation(
+        self,
+        previous: dict,
+        current_decision: dict,
+        *,
+        economic_valid: bool,
+        actuation_confirmed: bool,
+    ) -> None:
+        """Bind the next real PDCP window to the preceding E2 transaction."""
+        if not self._dynamic_floor_enabled() or not previous.get('dynamic_floor_applied'):
+            return
+        snapshot = self.data_lake.sla_violation_keys(
+            current_decision.get('metric_snapshot_id')
+        )
+        violations = {
+            (int(window), int(imsi), str(reason))
+            for window, imsi, reason in snapshot.get('violation_keys', [])
+        }
+        prior_association = (previous.get('tasam_association_evidence') or {}).get('mapping') or {}
+        affected_cells = {
+            int(prior_association.get(str(imsi), prior_association.get(imsi)))
+            for _window, imsi, _reason in violations
+            if prior_association.get(str(imsi), prior_association.get(imsi)) is not None
+        }
+        healthy = bool(
+            snapshot.get('valid')
+            and not violations
+            and economic_valid
+            and actuation_confirmed
+        )
+        prior_window_sequence = int(
+            self._dynamic_floor_state.get('window_sequence_id', 0) or 0
+        )
+        floor, state = dynamic_floor_candidate(
+            self._dynamic_floor_state,
+            current_violations=violations,
+            baseline_signature=self._dynamic_floor_signature,
+            start_percent=self._dynamic_floor_config['initial_floor_percent_by_cell'],
+            minimum_percent=self._dynamic_floor_config['minimum_floor_percent_by_cell'],
+            window_id=(
+                current_decision.get('snapshot_sequence_id')
+                or current_decision.get('metric_snapshot_id')
+            ),
+            power_transaction_id=(
+                (previous.get('economic_action') or {}).get('native_control_sequence')
+                or previous.get('tasam_control_sequence')
+            ),
+            window_healthy=healthy,
+            isolation_reason=str(
+                current_decision.get('economic_safety_isolation_reason') or ''
+            ),
+            affected_cells=affected_cells or DU_CELL_IDS,
+        )
+        if int(state.get('window_sequence_id', 0) or 0) == prior_window_sequence:
+            current_decision['dynamic_floor_state'] = dict(state)
+            return
+        state['observed_windows'] = int(state.get('window_sequence_id', 0) or 0)
+        observation = {
+            'window_sequence_id': state.get('window_sequence_id'),
+            'snapshot_sequence_id': current_decision.get('snapshot_sequence_id'),
+            'metric_snapshot_id': current_decision.get('metric_snapshot_id'),
+            'window_s': snapshot.get('window_s'),
+            'power_transaction_id': state.get('last_power_transaction_id'),
+            'healthy': healthy,
+            'sla_evidence_valid': bool(snapshot.get('valid')),
+            'violation_keys': sorted(violations),
+            'attributable_violation_keys': state.get('attributable_last_window', []),
+            'new_attributable_violation_keys': state.get(
+                'new_attributable_last_window', []
+            ),
+            'affected_cells': state.get('affected_cells_last_window', []),
+            'floor_percent_by_cell': {str(k): int(v) for k, v in floor.items()},
+            'safety_isolated': bool(current_decision.get('economic_safety_isolated')),
+            'isolation_reason': str(
+                current_decision.get('economic_safety_isolation_reason') or ''
+            ),
+        }
+        state['last_observation'] = observation
+        previous['dynamic_floor_observation'] = observation
+        current_decision['dynamic_floor_state'] = dict(state)
+        self._dynamic_floor_state = state
+        self._persist_dynamic_floor_state()
+
+    @staticmethod
     def _safe_power_floor_by_cell(decision: dict, allocation: dict, contract: dict) -> dict | None:
         """Read only an explicit native/checkpoint safe power-floor ledger.
 
@@ -1497,6 +2103,8 @@ class RappResourceOptimizer:
         requested_power_by_cell: dict[int, int],
     ) -> tuple[dict[int, int], bool]:
         """Project only TA-SAM's economic action onto the safe ladder."""
+        if self._dynamic_floor_enabled():
+            return self._apply_dynamic_floor(decision, requested_power_by_cell)
         if not self._energy_staircase_enabled():
             return requested_power_by_cell, False
         selected_assistant = str(decision.get('selected_assistant') or '').lower()
@@ -1841,6 +2449,11 @@ class RappResourceOptimizer:
             generation = str(
                 os.environ.get('GREENRAN_NATIVE_SOURCE_GENERATION', '') or ''
             ).strip()
+            sleep_transaction_id = str(
+                ((contract.get('sleep_transition') or {}).get('sleep_transaction_id'))
+                or ((decision.get('adaptive_sleep') or {}).get('sleep_transaction_id'))
+                or ''
+            ).strip()
             sim_time = decision.get('sim_time_s')
             if sim_time is None:
                 sim_time = ((decision.get('resource_allocation') or {}).get('sim_time_s'))
@@ -1848,11 +2461,11 @@ class RappResourceOptimizer:
                 if needs_header:
                     handle.write(
                         'NativeControlSequence,DecisionId,ActionCorrelationId,'
-                        'CampaignId,SourceGeneration,SimTime\n'
+                        'CampaignId,SourceGeneration,SimTime,SleepTransactionId\n'
                     )
                 handle.write(
                     f'{sequence},{decision_id},{correlation},{campaign},{generation},'
-                    f'{"" if sim_time is None else sim_time}\n'
+                    f'{"" if sim_time is None else sim_time},{sleep_transaction_id}\n'
                 )
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -1863,6 +2476,7 @@ class RappResourceOptimizer:
                 'action_correlation_id': correlation,
                 'campaign_id': campaign,
                 'source_generation': generation,
+                'sleep_transaction_id': sleep_transaction_id,
             }
             return True
         except (OSError, TypeError, ValueError) as exc:
@@ -4596,7 +5210,13 @@ class RappResourceOptimizer:
             )
         return mapping, evidence
 
-    def _native_association_cells(self, sim_time_s):
+    def _native_association_cells(
+        self,
+        sim_time_s,
+        *,
+        allow_empty_cell=None,
+        allow_empty_sleep_transaction=None,
+    ):
         """Return the native RRC IMSI set currently visible on each DU.
 
         In MC runs an IMSI can legitimately be present in more than one
@@ -4639,6 +5259,18 @@ class RappResourceOptimizer:
                 """,
                 tuple(params),
             ).fetchall()
+            snapshot_rows = conn.execute(
+                f"""
+                SELECT cell_id, sim_time_s, association_epoch, attached_ue_count,
+                       sleep_transaction_id
+                  FROM tasam_native_association_snapshots
+                 WHERE cell_id IN (2, 3, 4)
+                   AND sim_time_s <= ?
+                   {filters}
+                 ORDER BY cell_id ASC, sim_time_s ASC, id ASC
+                """,
+                tuple(params),
+            ).fetchall()
         except Exception:
             return {}, 'association_query_failed'
 
@@ -4672,6 +5304,34 @@ class RappResourceOptimizer:
             )
             selected[cell_id] = (key[0], key[1], cell_events[key])
 
+        # v7 snapshots are authoritative for a changed cell and, unlike the
+        # historical row stream, can explicitly represent zero attached UEs.
+        snapshots = {}
+        for row in snapshot_rows:
+            try:
+                cell_id, row_time, epoch, count, sleep_id = (
+                    int(row[0]), float(row[1]), str(row[2] or ''), int(row[3]), str(row[4] or ''),
+                )
+            except (TypeError, ValueError):
+                continue
+            if cell_id in DU_CELL_IDS and count >= 0:
+                snapshots[cell_id] = (row_time, epoch, count, sleep_id)
+        for cell_id, (row_time, epoch, count, snapshot_sleep_id) in snapshots.items():
+            cell_rows = events.get(cell_id, {}).get((row_time, epoch), [])
+            if count == 0:
+                if (
+                    cell_id != allow_empty_cell
+                    or not allow_empty_sleep_transaction
+                    or snapshot_sleep_id != str(allow_empty_sleep_transaction)
+                ):
+                    return {}, 'association_empty_du_without_matching_sleep_transaction'
+                cell_rows = []
+            elif len(cell_rows) != count:
+                # A partially flushed trace is never used for a handover
+                # decision; wait for the next complete snapshot instead.
+                continue
+            selected[cell_id] = (row_time, epoch, cell_rows)
+
         missing_cells = sorted({2, 3, 4} - set(selected))
         if missing_cells:
             return {}, f'association_incomplete_missing_cells:{missing_cells}'
@@ -4693,7 +5353,11 @@ class RappResourceOptimizer:
         missing_imsis = sorted(imsi for imsi, cells in coverage.items() if not cells)
         if missing_imsis:
             return {}, f'association_incomplete_missing_imsis:{missing_imsis}'
-        if any(not association_cells[cell_id] for cell_id in (2, 3, 4)):
+        allowed_empty = None if allow_empty_cell is None else int(allow_empty_cell)
+        if any(
+            not association_cells[cell_id] and cell_id != allowed_empty
+            for cell_id in (2, 3, 4)
+        ):
             return {}, 'association_incomplete_empty_du'
         return association_cells, evidence
 
@@ -4737,6 +5401,21 @@ class RappResourceOptimizer:
         using ``tasam_power_percent`` would silently turn an observation into
         an unselected TA-SAM intervention.
         """
+        fixed_native_power = os.environ.get('GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT', '').strip()
+        if fixed_native_power:
+            try:
+                requested_fixed = float(fixed_native_power)
+            except (TypeError, ValueError):
+                # A malformed baseline must not quietly become an economic
+                # cut; use the only safe fixed reference.
+                return 100
+            if not math.isfinite(requested_fixed):
+                return 100
+            # Calibration directive (fixed-native arm): honor the exact
+            # requested percent on the envelope's 5% grid instead of the
+            # legacy {25, 60, 100} ladder, so physics calibration runs at
+            # 45/70 keep their identity on the wire and in the readbacks.
+            return float(min(100.0, max(25.0, 5.0 * round(requested_fixed / 5.0))))
         contract = decision.get('economic_action') or {}
         live = contract.get('live_candidate') or {}
         candidates = (
@@ -4826,7 +5505,15 @@ class RappResourceOptimizer:
             if staircase_failsafe:
                 action_origin = 'armd_rapp_safety'
                 economic_candidate = False
-        if power_by_cell and any(power == 0 for power in power_by_cell.values()):
+        # V3 zero-power requests need legacy ``du_sleep`` evidence here.
+        # V4 obtains that evidence from the explicit drain transaction below;
+        # rejecting the raw ASGARD request before the drain starts would make
+        # the adaptive sleep path unreachable.
+        if (
+            power_by_cell
+            and any(power == 0 for power in power_by_cell.values())
+            and not self._dynamic_floor_enabled()
+        ):
             sleep_evidence = decision.get('du_sleep') or contract.get('projected', {}).get('du_sleep') or {}
             sleep_ready = (
                 isinstance(sleep_evidence, dict)
@@ -4856,7 +5543,19 @@ class RappResourceOptimizer:
         # pendentes econômicos acumulavam até o shutdown — 45/193
         # outcomes, seleção 20/90, not_promotable).
         decision['sim_time_s'] = sim_time_s
-        association_cells, association_evidence = self._native_association_cells(sim_time_s)
+        sleep_state = dict(self._dynamic_floor_state.get('sleep_transition') or {})
+        allow_empty_cell = (
+            sleep_state.get('source_cell_id')
+            if str(sleep_state.get('phase') or '').lower() in {'drain', 'commit'}
+            else None
+        )
+        association_cells, association_evidence = self._native_association_cells(
+            sim_time_s,
+            allow_empty_cell=allow_empty_cell,
+            allow_empty_sleep_transaction=(
+                sleep_state.get('sleep_transaction_id') if allow_empty_cell is not None else None
+            ),
+        )
         # Cobertura parcial é mobilidade, não quebra de identidade: exige-se
         # apenas que PELO MENOS um UE tenha associação observada.  DUs vazios
         # ficam em 100% no bundle e IMSIs sem associação seguem no scheduler
@@ -4950,6 +5649,19 @@ class RappResourceOptimizer:
             demand_rows,
             shield_sla,
         )
+        sleep_transition = None
+        sleep_failsafe = False
+        if power_by_cell and self._dynamic_floor_enabled() and association_valid:
+            power_by_cell, sleep_transition, sleep_failsafe = self._adaptive_sleep_transition(
+                decision,
+                power_by_cell,
+                association_cells,
+                sla_valid=bool(sla_report.get('pass')) and not warmup,
+                pdcp_mature=pdcp_mature,
+                sim_time_s=sim_time_s,
+            )
+            if sleep_transition is not None:
+                decision['sleep_transition'] = dict(sleep_transition)
         # ``energy_saver=BLOCKED`` is the rApp's categorical advisory, not an
         # ARMD hard veto.  In assistant-only mode it must not prevent a valid
         # TA-SAM proposal from reaching E2; only the central safety detector,
@@ -4968,7 +5680,7 @@ class RappResourceOptimizer:
             or allocation.get('floor_verified') is False
             or not association_valid
         )
-        failsafe = preexisting_failsafe or bool(projected.get('failsafe'))
+        failsafe = preexisting_failsafe or bool(projected.get('failsafe')) or sleep_failsafe
         if failsafe:
             # A failed native precondition is recovered by the same safe
             # origin as an ARMD hard veto.  It must never be attributed to a
@@ -5031,6 +5743,11 @@ class RappResourceOptimizer:
             allocation['floor_estimator'] = 'offered_load_cqi_mcs_backlog_v3'
         else:
             requested = 100
+        resource_caps = (
+            self._apply_adaptive_resource_budget(decision, allocation, power_by_cell)
+            if not failsafe and power_by_cell and self._dynamic_floor_enabled()
+            else {cell: 10_000 for cell in DU_CELL_IDS}
+        )
         now_ns = time.time_ns()
         if failsafe:
             reason = (
@@ -5061,11 +5778,16 @@ class RappResourceOptimizer:
                         # não há demanda a servir e o padrão seguro é não
                         # cortar célula sem readback de identidade.
                         'tx_power_percent': (
-                            100
-                            if not policies
-                            else int((power_by_cell or {}).get(cell_id, requested))
+                            int((power_by_cell or {}).get(cell_id, requested))
+                            if policies or (
+                                isinstance(sleep_transition, dict)
+                                and str(sleep_transition.get('phase') or '') == 'commit'
+                                and int(sleep_transition.get('source_cell_id', -1)) == cell_id
+                            )
+                            else 100
                         ),
                         'ue_policies': policies,
+                        'max_discretionary_dl_symbols_bp': int(resource_caps.get(cell_id, 0)),
                     }
                     for cell_id, policies in sorted(cells.items())
                 ],
@@ -5086,11 +5808,20 @@ class RappResourceOptimizer:
             ):
                 bundle['association_mode'] = 'native_rrc_mc_overlap'
             if (v3_contract or rapp_v3_candidate) and power_by_cell:
-                bundle['schema'] = CONTROL_BUNDLE_V3_SCHEMA
+                bundle['schema'] = (
+                    CONTROL_BUNDLE_V4_SCHEMA if self._dynamic_floor_enabled()
+                    else CONTROL_BUNDLE_V3_SCHEMA
+                )
                 bundle['economic_action_contract'] = ECONOMIC_ACTION_V3_CONTRACT
                 bundle['power_percent_by_cell'] = {
                     str(cell_id): (
-                        100 if not cells.get(cell_id) else int(power)
+                        int(power)
+                        if cells.get(cell_id) or (
+                            isinstance(sleep_transition, dict)
+                            and str(sleep_transition.get('phase') or '') == 'commit'
+                            and int(sleep_transition.get('source_cell_id', -1)) == cell_id
+                        )
+                        else 100
                     )
                     for cell_id, power in power_by_cell.items()
                 }
@@ -5103,7 +5834,9 @@ class RappResourceOptimizer:
                 ):
                     bundle['association_mode'] = 'native_rrc_mc_overlap'
                 bundle['mode'] = ECONOMIC_ACTION_V3_CONTRACT
-                if any(power == 0 for power in power_by_cell.values()):
+                if self._dynamic_floor_enabled() and isinstance(sleep_transition, dict):
+                    bundle['sleep_transition'] = dict(sleep_transition)
+                elif any(power == 0 for power in power_by_cell.values()):
                     bundle['du_sleep'] = dict(decision.get('du_sleep') or {})
         if failsafe:
             # A safe bundle may be emitted after the Judge selected TA-SAM
@@ -5358,6 +6091,12 @@ class RappResourceOptimizer:
                 'failsafe_stock_scheduler' if ack.get('fallback') else
                 ('e2_ack_pending_confirmation' if ack.get('applied') else 'shadow_only')
             )
+            self._record_dynamic_floor_application(
+                decision,
+                bundle,
+                accepted=policy_applied,
+                failsafe=bool(failsafe or ack.get('fallback')),
+            )
             return policy_applied or not integration
         except ControlBundleError as exc:
             decision['tasam_control_error'] = str(exc)
@@ -5372,6 +6111,9 @@ class RappResourceOptimizer:
                 decision['tasam_power_applied_percent'] = 100
             allocation['per_ue_application_status'] = 'e2_failed_failsafe'
             allocation['failsafe_required'] = True
+            self._record_dynamic_floor_application(
+                decision, bundle, accepted=False, failsafe=True,
+            )
             if integration and bundle.get('mode') != 'failsafe':
                 self._tasam_control_sequence += 1
                 recovery = failsafe_bundle(
@@ -6049,7 +6791,17 @@ class RappResourceOptimizer:
         elif not aligned:
             invalid_reason = 'projected_applied_power_divergence_over_5pp'
         economic_valid = not invalid_reason
-        if self._energy_staircase_enabled() and previous.get('energy_staircase_applied'):
+        self._advance_dynamic_floor_from_observation(
+            previous,
+            current_decision,
+            economic_valid=economic_valid,
+            actuation_confirmed=actuation_confirmed,
+        )
+        if (
+            self._energy_staircase_enabled()
+            and not self._dynamic_floor_enabled()
+            and previous.get('energy_staircase_applied')
+        ):
             staircase_healthy = bool(
                 economic_valid
                 and not outcome.get('critical_violation')

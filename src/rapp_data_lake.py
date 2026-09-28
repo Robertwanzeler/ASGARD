@@ -978,6 +978,12 @@ class DataLake:
                 association_epoch TEXT DEFAULT '',
                 native_allocated_dl_symbols INTEGER,
                 native_dl_symbol_capacity INTEGER,
+                requested_discretionary_dl_symbols_bp INTEGER,
+                applied_discretionary_dl_symbols_bp INTEGER,
+                mandatory_dl_symbols INTEGER,
+                discretionary_dl_symbols INTEGER,
+                withheld_dl_symbols INTEGER,
+                sleep_transaction_id TEXT DEFAULT '',
                 native_allocation_source TEXT DEFAULT '',
                 native_allocation_fraction REAL,
                 campaign_id TEXT DEFAULT '',
@@ -1007,6 +1013,12 @@ class DataLake:
             ("association_epoch", "TEXT DEFAULT ''"),
             ("native_allocated_dl_symbols", "INTEGER"),
             ("native_dl_symbol_capacity", "INTEGER"),
+            ("requested_discretionary_dl_symbols_bp", "INTEGER"),
+            ("applied_discretionary_dl_symbols_bp", "INTEGER"),
+            ("mandatory_dl_symbols", "INTEGER"),
+            ("discretionary_dl_symbols", "INTEGER"),
+            ("withheld_dl_symbols", "INTEGER"),
+            ("sleep_transaction_id", "TEXT DEFAULT ''"),
             ("native_allocation_source", "TEXT DEFAULT ''"),
             ("native_allocation_fraction", "REAL"),
             ("campaign_id", "TEXT DEFAULT ''"),
@@ -1115,6 +1127,33 @@ class DataLake:
             ON tasam_native_associations(campaign_id, source_generation,
                                          transaction_id, native_control_sequence,
                                          decision_id, action_correlation_id)
+        """)
+        # A change-based UE trace cannot express an empty cell.  Snapshot
+        # rows make a successful drain observable without treating absence of
+        # an IMSI row as proof of handover.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasam_native_association_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                sim_time_s REAL NOT NULL,
+                cell_id INTEGER NOT NULL,
+                association_epoch TEXT DEFAULT '',
+                attached_ue_count INTEGER NOT NULL,
+                campaign_id TEXT DEFAULT '',
+                source_generation TEXT DEFAULT '',
+                evidence_version TEXT DEFAULT 'v1',
+                transaction_id INTEGER DEFAULT 0,
+                native_control_sequence INTEGER,
+                decision_id INTEGER,
+                action_correlation_id TEXT DEFAULT '',
+                sleep_transaction_id TEXT DEFAULT '',
+                imported_at INTEGER NOT NULL,
+                UNIQUE(source_path, sim_time_s, cell_id, association_epoch)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasam_native_association_snapshot_lookup
+            ON tasam_native_association_snapshots(cell_id, sim_time_s)
         """)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasam_observation_transaction
@@ -3742,6 +3781,12 @@ class DataLake:
                             (None if row.get("DecisionId") in (None, "") else int(row.get("DecisionId"))),
                             str(row.get("ActionCorrelationId") or "").strip(),
                             (None if row.get("NativeControlSequence") in (None, "") else int(row.get("NativeControlSequence"))),
+                            (None if row.get("RequestedDiscretionaryDlSymbolsBp") in (None, "") else int(row.get("RequestedDiscretionaryDlSymbolsBp"))),
+                            (None if row.get("AppliedDiscretionaryDlSymbolsBp") in (None, "") else int(row.get("AppliedDiscretionaryDlSymbolsBp"))),
+                            (None if row.get("MandatoryDlSymbols") in (None, "") else int(row.get("MandatoryDlSymbols"))),
+                            (None if row.get("DiscretionaryDlSymbols") in (None, "") else int(row.get("DiscretionaryDlSymbols"))),
+                            (None if row.get("WithheldDlSymbols") in (None, "") else int(row.get("WithheldDlSymbols"))),
+                            str(row.get("SleepTransactionId") or "").strip(),
                         )
                     except (KeyError, TypeError, ValueError):
                         self._last_native_import_invalid_rows += 1
@@ -3755,17 +3800,24 @@ class DataLake:
                            nominal_tx_power_dbm, observation_kind, policy_active,
                            policy_expiry_sim_time, source_generation,
                            association_epoch, native_allocated_dl_symbols,
-                           native_dl_symbol_capacity, native_allocation_source,
+                           native_dl_symbol_capacity,
+                           requested_discretionary_dl_symbols_bp,
+                           applied_discretionary_dl_symbols_bp,
+                           mandatory_dl_symbols, discretionary_dl_symbols,
+                           withheld_dl_symbols, sleep_transaction_id,
+                           native_allocation_source,
                            native_allocation_fraction,
                            campaign_id, campaign_generation, decision_id,
                            action_correlation_id, native_control_sequence,
                            evidence_version, imported_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (resolved_path, values[0], values[1], values[2], values[6],
                          values[2], values[3], values[4], values[5], values[7],
                          values[8], values[9], values[10], values[11], values[12],
-                         values[13], values[14], values[15],
+                         values[13], values[14],
+                         values[22], values[23], values[24], values[25], values[26], values[27],
+                         values[15],
                          (None if values[14] in (None, 0) else
                           max(0.0, min(1.0, float(values[13]) / float(values[14])))),
                          values[16], values[18], values[19], values[20], values[21],
@@ -3865,6 +3917,53 @@ class DataLake:
             new_offset = start + len(complete)
             text = io.StringIO(header + complete.decode("utf-8", errors="replace"))
             for row in csv.DictReader(text):
+                observation_kind = str(row.get("ObservationKind") or "ue_association").strip()
+                if observation_kind == "cell_snapshot":
+                    try:
+                        sim_time = float(row["Time"])
+                        cell_id = int(row["CellId"])
+                        attached = int(row.get("AttachedUeCount", 0) or 0)
+                        transaction_id = int(
+                            row.get("TransactionId")
+                            or row.get("PowerTransactionId")
+                            or row.get("SchedulerTransactionId")
+                            or 0
+                        )
+                        native_control_sequence = (
+                            None if row.get("NativeControlSequence") in (None, "")
+                            else int(row.get("NativeControlSequence"))
+                        )
+                        decision_id = (
+                            None if row.get("DecisionId") in (None, "")
+                            else int(row.get("DecisionId"))
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        self._last_native_import_invalid_rows += 1
+                        continue
+                    if cell_id not in (2, 3, 4) or attached < 0 or not math.isfinite(sim_time):
+                        self._last_native_import_invalid_rows += 1
+                        continue
+                    cursor = self.conn.execute(
+                        """INSERT OR IGNORE INTO tasam_native_association_snapshots
+                           (source_path, sim_time_s, cell_id, association_epoch,
+                            attached_ue_count, campaign_id, source_generation,
+                            evidence_version, transaction_id, native_control_sequence,
+                            decision_id, action_correlation_id, sleep_transaction_id,
+                            imported_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            resolved_path, sim_time, cell_id,
+                            str(row.get("AssociationEpoch") or "").strip(), attached,
+                            str(row.get("CampaignId") or os.environ.get("GREENRAN_CAMPAIGN_ID", "")).strip(),
+                            str(row.get("SourceGeneration") or "").strip(),
+                            str(row.get("EvidenceVersion") or "v1").strip(), transaction_id,
+                            native_control_sequence, decision_id,
+                            str(row.get("ActionCorrelationId") or "").strip(),
+                            str(row.get("SleepTransactionId") or "").strip(), int(time.time()),
+                        ),
+                    )
+                    imported += int(cursor.rowcount or 0)
+                    continue
                 try:
                     sim_time = float(row["Time"])
                     cell_id = int(row["CellId"])
@@ -4536,6 +4635,130 @@ class DataLake:
             "service_mismatch_imsis": sorted(set(service_mismatch), key=lambda value: int(value) if value.isdigit() else value),
             "topology_valid": topology_valid,
             "reason": reason,
+        }
+
+    def sla_violation_keys(self, metric_snapshot_id=None) -> dict:
+        """Return strict-pair-compatible SLA keys for one real PDCP window.
+
+        The runtime dynamic floor and the offline strict-pair evaluator must
+        classify the same evidence.  This method deliberately mirrors the
+        evaluator's per-IMSI thresholds and key shape ``(window, imsi,
+        reason)`` while binding the rows to the metric snapshot that closes
+        the previous E2 action.
+        """
+        expected_groups = get_fixed_service_imsis()
+        expected = sorted({
+            int(imsi)
+            for service, values in expected_groups.items()
+            if service in {'camera', 'sensor', 'vehicle'}
+            for imsi in values
+        })
+        try:
+            resolved_metric_id = int(metric_snapshot_id or 0) or None
+        except (TypeError, ValueError):
+            resolved_metric_id = None
+        try:
+            if resolved_metric_id:
+                metric = self.conn.execute(
+                    "SELECT timestamp FROM extended_metrics WHERE id=?",
+                    (resolved_metric_id,),
+                ).fetchone()
+                timestamp = metric[0] if metric else None
+            else:
+                metric = self.conn.execute(
+                    "SELECT MAX(timestamp) FROM ue_metrics WHERE pdcp_provenance='pdcp_real'"
+                ).fetchone()
+                timestamp = metric[0] if metric else None
+            if timestamp is None:
+                return {
+                    "valid": False,
+                    "reason": "real_pdcp_sla_rows_missing",
+                    "metric_snapshot_id": resolved_metric_id,
+                    "violation_keys": [],
+                }
+            rows = self.conn.execute(
+                """SELECT id, imsi, throughput_kbps, latency_p95_us,
+                          latency_max_us, packet_loss_percent, tx_pdus,
+                          rx_pdus, backlog_bytes, latency_is_proxy,
+                          pdcp_provenance, has_latency_samples, sim_time_s
+                     FROM ue_metrics
+                    WHERE timestamp=?
+                    ORDER BY id""",
+                (timestamp,),
+            ).fetchall()
+        except sqlite3.Error:
+            return {
+                "valid": False,
+                "reason": "real_pdcp_sla_query_failed",
+                "metric_snapshot_id": resolved_metric_id,
+                "violation_keys": [],
+            }
+
+        by_imsi = {int(row[1] or 0): row for row in rows if int(row[1] or 0) in expected}
+        sim_times = [float(row[12] or 0.0) for row in by_imsi.values()]
+        window = int(math.floor(max(sim_times))) if sim_times else -1
+        keys: set[tuple[int, int, str]] = set()
+        details = []
+        for imsi in expected:
+            row = by_imsi.get(imsi)
+            reasons = []
+            if row is None:
+                reasons.append("missing_ue_window")
+            else:
+                throughput = float(row[2] or 0.0)
+                p95 = float(row[3] if row[3] is not None else row[4] or 0.0)
+                packet_loss = row[5]
+                tx_pdus = float(row[6] or 0.0)
+                rx_pdus = float(row[7] or 0.0)
+                backlog = float(row[8] or 0.0)
+                real = (
+                    int(row[9] or 0) == 0
+                    and str(row[10] or "") == "pdcp_real"
+                    and int(row[11] or 0) == 1
+                )
+                if not real:
+                    reasons.append("non_real_or_missing_pdcp")
+                loss = (
+                    max(0.0, float(packet_loss))
+                    if packet_loss is not None else
+                    (100.0 if tx_pdus <= 0 else 100.0 * max(0.0, 1.0 - rx_pdus / tx_pdus))
+                )
+                if tx_pdus <= 0 or rx_pdus <= 0 or (backlog > 0 and throughput <= 0):
+                    reasons.append("disconnected_or_unserved")
+                if 1 <= imsi <= 3:
+                    if throughput < 25_000:
+                        reasons.append("camera_throughput")
+                    if p95 > 80_000:
+                        reasons.append("camera_p95")
+                elif 4 <= imsi <= 15:
+                    delivery = 0.0 if tx_pdus <= 0 else 100.0 * rx_pdus / tx_pdus
+                    if delivery < 95.0:
+                        reasons.append("sensor_delivery")
+                    if loss > 5.0:
+                        reasons.append("sensor_loss")
+                    if p95 > 500_000:
+                        reasons.append("sensor_p95")
+                elif 16 <= imsi <= 20:
+                    if p95 > 20_000:
+                        reasons.append("vehicle_p95_latency")
+                    if loss > 1.0:
+                        reasons.append("vehicle_loss")
+            for reason in reasons:
+                keys.add((window, imsi, reason))
+            if reasons:
+                details.append({"window_s": window, "imsi": imsi, "reasons": reasons})
+
+        complete = len(by_imsi) == len(expected) and window >= 0
+        return {
+            "valid": complete,
+            "reason": "ok" if complete else "pdcp_metric_snapshot_incomplete",
+            "timestamp": int(timestamp),
+            "metric_snapshot_id": resolved_metric_id,
+            "window_s": window,
+            "expected_imsis": expected,
+            "observed_imsis": sorted(by_imsi),
+            "violation_keys": sorted(keys),
+            "violations": details,
         }
 
     def record_app2_snapshot(self, snapshot=None, sensors=None, timestamp=None):
