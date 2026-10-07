@@ -303,6 +303,15 @@
 {% endblock %}
 
 {% block content %}
+<div id="historical-banner" class="row mb-3" style="display:none;">
+    <div class="col-md-12">
+        <div class="alert alert-warning mb-0" style="border-left:4px solid #ff9800;">
+            <strong>🗂 MODO HISTÓRICO</strong> — nenhum run ativo: exibindo os dados gravados de um
+            <strong>run concluído</strong>. KPIs "ao vivo", estágio ativo e xApps refletem o último
+            estado congelado, não o presente. <span id="historical-run-dir"></span>
+        </div>
+    </div>
+</div>
 <div class="row mb-3">
     <div class="col-md-12">
         <div class="card" style="border-left: 4px solid #00bcd4;">
@@ -1069,7 +1078,7 @@ function liveAge(value) {
 function liveStateClass(value) {
     const normalized = String(value || '').toLowerCase();
     if (['running', 'allowed', 'ok', 'protected', 'protegida', 'real', 'pdcp_real'].includes(normalized)) return 'live-good';
-    if (['conditional', 'warning', 'stale', 'waiting_dataset', 'guarda'].includes(normalized)) return 'live-warn';
+    if (['conditional', 'warning', 'stale', 'historical', 'waiting_dataset', 'guarda'].includes(normalized)) return 'live-warn';
     if (['blocked', 'rollback', 'critical', 'stopped', 'proxy', 'parada'].includes(normalized)) return 'live-bad';
     return 'live-muted';
 }
@@ -1146,8 +1155,16 @@ function updateLiveCollection(data) {
     const latestDecision = data.latest_decision || {};
 
     const status = String(data.status || 'unknown').toLowerCase();
+    const historicalBanner = document.getElementById('historical-banner');
+    if (historicalBanner) {
+        historicalBanner.style.display = status === 'historical' ? '' : 'none';
+        if (status === 'historical') {
+            const rd = document.getElementById('historical-run-dir');
+            if (rd) rd.textContent = `Origem dos dados: ${data.run_dir || '—'}`;
+        }
+    }
     const pulseDot = document.getElementById('live-pulse-dot');
-    pulseDot.className = `live-pulse-dot ${status === 'running' ? '' : status === 'stale' ? 'stale' : 'dead'}`;
+    pulseDot.className = `live-pulse-dot ${status === 'running' ? '' : (status === 'stale' || status === 'historical') ? 'stale' : 'dead'}`;
     liveSet('live-run-status', data.status_label || status.toUpperCase(), liveStateClass(status));
     document.getElementById('live-run-age').textContent = `status ${liveAge(freshness.status_age_s)} · métricas ${liveAge(freshness.metrics_age_s)}`;
     document.getElementById('live-pulse-text').textContent = `Pulso ${liveAge(freshness.status_age_s)} · atualização a cada 2s`;
