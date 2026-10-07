@@ -1424,7 +1424,12 @@ def _db_latest_age_s():
         import sqlite3
         con = sqlite3.connect(str(RAPP_DB_PATH))
         try:
-            row = con.execute("SELECT MAX(timestamp) FROM metrics_history").fetchone()
+            row = con.execute(
+                "SELECT MAX(ts) FROM ("
+                " SELECT MAX(timestamp) AS ts FROM metrics_history"
+                " UNION ALL SELECT MAX(timestamp) FROM extended_metrics"
+                " UNION ALL SELECT MAX(timestamp) FROM decisions_history)"
+            ).fetchone()
         finally:
             con.close()
         if row and row[0]:
