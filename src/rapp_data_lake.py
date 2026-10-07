@@ -5763,10 +5763,16 @@ class DataLake:
         
         return results
 
-    def get_recent_conflicts(self, minutes=60, limit=50):
-        """Retorna eventos recentes de conflito O-RAN."""
+    def get_recent_conflicts(self, minutes=60, limit=50, end_timestamp=None):
+        """Retorna eventos recentes de conflito O-RAN.
+
+        ``end_timestamp`` permite consultar uma janela relativa ao fim de um
+        run histórico, em vez de comparar os dados congelados com o relógio
+        atual do servidor.
+        """
         cursor = self.conn.cursor()
-        cutoff = int(time.time()) - minutes * 60
+        end = int(end_timestamp or time.time())
+        cutoff = end - minutes * 60
 
         cursor.execute("""
             SELECT timestamp, datetime, source_agent, target_agent, conflict_type,
@@ -5774,17 +5780,18 @@ class DataLake:
                    threshold_value, decision, mitigation_action, reason,
                    confidence, graph_path
             FROM conflict_events
-            WHERE timestamp >= ?
+            WHERE timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp DESC
             LIMIT ?
-        """, (cutoff, limit))
+        """, (cutoff, end, limit))
 
         return [dict(row) for row in cursor.fetchall()]
 
-    def get_conflict_stats(self, hours=24):
+    def get_conflict_stats(self, hours=24, end_timestamp=None):
         """Retorna estatísticas agregadas dos conflitos O-RAN."""
         cursor = self.conn.cursor()
-        cutoff = int(time.time()) - hours * 3600
+        end = int(end_timestamp or time.time())
+        cutoff = end - hours * 3600
 
         stats = {
             'total': 0,
@@ -5799,9 +5806,9 @@ class DataLake:
         cursor.execute("""
             SELECT conflict_type, affected_service, affected_kpi, COUNT(*) as count
             FROM conflict_events
-            WHERE timestamp >= ?
+            WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY conflict_type, affected_service, affected_kpi
-        """, (cutoff,))
+        """, (cutoff, end))
 
         for row in cursor.fetchall():
             conflict_type = row['conflict_type'] or 'unknown'
@@ -5820,9 +5827,10 @@ class DataLake:
                    affected_service, affected_kpi, observed_value, threshold_value,
                    mitigation_action, reason
             FROM conflict_events
+            WHERE timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp DESC
             LIMIT 1
-        """)
+        """, (cutoff, end))
         row = cursor.fetchone()
         if row:
             stats['latest'] = dict(row)

@@ -29,13 +29,14 @@
         border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: 16px;
         padding: 14px;
-        overflow-x: auto;
+        overflow: hidden;
     }
 
     .conflict-graph {
         width: 100%;
-        min-width: 980px;
-        height: 420px;
+        min-width: 0;
+        height: auto;
+        aspect-ratio: 1120 / 420;
         display: block;
     }
 
@@ -180,6 +181,18 @@
         margin-bottom: 6px;
         font-size: 0.92rem;
     }
+
+    .conflict-details { border: 1px solid rgba(143,211,255,.12); border-radius: 12px; background: rgba(7,16,35,.22); margin-bottom: 20px; }
+    .conflict-details > summary { cursor: pointer; list-style: none; padding: 14px 16px; color: #d9eaff !important; font-weight: 600; }
+    .conflict-details > summary::-webkit-details-marker { display: none; }
+    .conflict-details > summary::before { content: '▸'; color: #8fd3ff; margin-right: 8px; }
+    .conflict-details[open] > summary::before { content: '▾'; }
+    .conflict-details-body { padding: 0 14px 14px; background: #101a32; color: #d9eaff !important; border-radius: 0 0 12px 12px; }
+    .conflict-details-body .card { background: #16213e !important; }
+    .conflict-details-body .table { --bs-table-bg: transparent; --bs-table-color: #d9eaff; margin-bottom: 0; }
+    .conflict-details-body .table td, .conflict-details-body .table th { background: transparent !important; color: #d9eaff !important; border-color: rgba(143,211,255,.14) !important; }
+    .conflict-events-table { min-width: 980px; }
+    .derived-learning-note { color: #9fb8cf !important; font-size: .9rem; margin: 0 0 12px; }
 </style>
 
 <div class="conflict-hero">
@@ -187,12 +200,12 @@
     <p class="conflict-subtitle">
         Esta visão acompanha relações entre agentes, parâmetros de controle e KPIs críticos.
         O rApp usa esse grafo operacional para impedir que energia, ML ou DRL sobrescrevam
-        os SLAs de App1-Vigilância e App2-Monitoramento.
+        os SLAs de App1-Vigilância e App2-Monitoramento.{% if historical %} Os dados desta página são do run histórico.{% endif %}
     </p>
 </div>
 
 <div class="card">
-    <div class="card-header"><h5>Estado Atual das Aplicações</h5></div>
+    <div class="card-header"><h5>{% if historical %}Estado do Snapshot{% else %}Estado Atual das Aplicações{% endif %}</h5></div>
     <div class="card-body">
         {% set camera_sla = service_slas.camera if service_slas else {} %}
         {% set app3_sla = service_slas.app3 if service_slas else {} %}
@@ -202,7 +215,7 @@
                 <div class="sla-presence-card">
                     <h6>App1-Vigilância</h6>
                     <p>
-                        <span class="badge" style="background: {% if camera_sla.status == 'PROTEGIDA' %}#00ff88{% elif camera_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000;">
+                        <span class="badge" style="background: {% if camera_sla.status == 'PROTEGIDA' %}#00ff88{% elif camera_sla.status == 'GUARDA' %}#ffaa00{% elif camera_sla.status == 'HISTÓRICO' %}#8fd3ff{% elif camera_sla.status == 'SEM DADOS' %}#53657a{% else %}#ff4444{% endif %}; color: #000;">
                             {{ camera_sla.status or 'INATIVA' }}
                         </span>
                     </p>
@@ -242,7 +255,7 @@
             </div>
         </div>
         <p class="mt-3 mb-0" style="color:#b8c7d9 !important;">
-            Apps saudáveis podem não aparecer nos eventos recentes abaixo. Esta faixa mostra o estado vivo de App1, App2 e App3 mesmo quando só um deles está em conflito.
+            {% if historical %}Os estados acima pertencem ao mesmo snapshot histórico do run.{% else %}Apps saudáveis podem não aparecer nos eventos recentes abaixo.{% endif %}
         </p>
     </div>
 </div>
@@ -250,7 +263,7 @@
 <div class="row">
     <div class="col-md-3">
         <div class="card">
-            <div class="card-header"><h6>Total 24h</h6></div>
+            <div class="card-header"><h6>{% if conflict_stats.scope == 'run' %}Total no run{% else %}Total 24h{% endif %}</h6></div>
             <div class="card-body"><div class="metric-value">{{ conflict_stats.total }}</div></div>
         </div>
     </div>
@@ -274,9 +287,9 @@
     </div>
 </div>
 
-<div class="card">
-    <div class="card-header"><h5>Grafo Operacional do Cenário</h5></div>
-    <div class="card-body">
+<details class="conflict-details">
+    <summary>Grafo operacional do cenário</summary>
+    <div class="conflict-details-body">
         <div class="graph-shell">
             <svg class="conflict-graph" viewBox="0 0 1120 420" role="img" aria-label="Grafo de conflitos O-RAN do GreenRAN">
                 <defs>
@@ -379,7 +392,7 @@
             <span><span class="legend-dot" style="background:#ff4444;"></span>Mitigação</span>
         </div>
     </div>
-</div>
+</details>
 
 <div class="row">
     <div class="col-md-4">
@@ -413,7 +426,6 @@
                 <strong>{{ "%.2f"|format(c.observed_value or 0) }}</strong>
                 contra limiar <strong>{{ "%.2f"|format(c.threshold_value or 0) }}</strong>.
                 Mitigação aplicada: <strong>{{ c.mitigation_action }}</strong>.
-                <div class="mt-2 text-muted">{{ c.graph_path }}</div>
             </div>
         {% else %}
             <div class="text-muted">Nenhum conflito recente para interpretar.</div>
@@ -421,10 +433,13 @@
     </div>
 </div>
 
-<div class="card">
-    <div class="card-header"><h5>Grafo Aprendido pelos Dados</h5></div>
-    <div class="card-body">
+<details class="conflict-details" {% if historical %}open{% endif %}>
+    <summary>Grafo aprendido pelos dados</summary>
+    <div class="conflict-details-body">
         {% if learned_report and learned_report.summary %}
+            {% if learned_report.generated_from_events %}
+                <p class="derived-learning-note">Relações observadas nos eventos deste run; ainda não há um relatório separado de treinamento.</p>
+            {% endif %}
             <div class="row">
                 <div class="col-md-2">
                     <div class="learning-stat">
@@ -541,20 +556,16 @@
                 e quais ainda precisam de mais amostras do cenário.
             </div>
         {% else %}
-            <div class="text-muted">
-                O pipeline de aprendizado ainda não foi executado. Gere os artefatos com
-                <code>python3 scripts/export_conflict_dataset.py</code> e
-                <code>python3 scripts/learn_conflict_matrix.py</code>.
-            </div>
+            <div class="text-muted">Ainda não há relações aprendidas para este run.</div>
         {% endif %}
     </div>
-</div>
+</details>
 
-<div class="card">
-    <div class="card-header"><h5>Eventos de Conflito Recentes (60 min)</h5></div>
-    <div class="card-body">
+<details class="conflict-details" {% if historical %}open{% endif %}>
+    <summary>{% if historical %}Eventos do run · janela final de 60 min{% else %}Eventos recentes · 60 min{% endif %} · {{ recent_conflicts|length }} registros</summary>
+    <div class="conflict-details-body">
         <div class="table-responsive">
-        <table class="table align-middle">
+        <table class="table align-middle conflict-events-table">
             <thead>
                 <tr>
                     <th>Timestamp</th>
@@ -587,12 +598,7 @@
                     <td>{{ "%.2f"|format(c.observed_value or 0) }}</td>
                     <td>{{ "%.2f"|format(c.threshold_value or 0) }}</td>
                     <td>{{ c.mitigation_action }}</td>
-                    <td>
-                        {{ c.reason[:70] }}{% if c.reason|length > 70 %}...{% endif %}
-                        {% if c.graph_path %}
-                            <div class="text-muted small">{{ c.graph_path[:90] }}{% if c.graph_path|length > 90 %}...{% endif %}</div>
-                        {% endif %}
-                    </td>
+                    <td>{{ c.reason or 'Sem motivo registrado.' }}</td>
                 </tr>
             {% else %}
                 <tr><td colspan="9" class="text-muted">Nenhum conflito registrado no período.</td></tr>
@@ -601,5 +607,5 @@
         </table>
         </div>
     </div>
-</div>
+</details>
 {% endblock %}

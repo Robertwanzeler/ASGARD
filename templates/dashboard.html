@@ -299,16 +299,93 @@
         .live-kpi-grid, .live-info-grid, .live-stage-grid { grid-template-columns: 1fr 1fr; }
         .live-kpi-value { font-size: 1.1rem; }
     }
+    .live-collection-panel.historical-mode .live-only { display: none !important; }
+    .live-collection-panel.historical-mode .card-body { display: none; }
+    .live-collection-panel.historical-mode.expanded .card-body { display: block; }
+    .live-history-summary { font-size: .92rem; color: #dbe8f8; padding: .4rem .25rem 0; }
+    #historical-banner .alert { padding: .45rem .9rem; font-size: .86rem; }
+    .ops-priority-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .ops-priority-card, .ops-attention-panel { background: rgba(7, 16, 35, .78); border: 1px solid rgba(143, 211, 255, .15); border-radius: 12px; padding: 14px 16px; height: 100%; }
+    .ops-priority-card { border-top: 3px solid #8fd3ff; }
+    .ops-priority-card[data-level="critical"] { border-top-color: #ff6666; }
+    .ops-priority-card[data-level="warning"] { border-top-color: #ffaa00; }
+    .ops-priority-card[data-level="ok"] { border-top-color: #00ff88; }
+    .ops-priority-card[data-level="info"] { border-top-color: #8fd3ff; }
+    .ops-kicker { color: #8da6c3; font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 5px; }
+    .ops-value { color: #fff; font-size: 1.35rem; font-weight: 700; line-height: 1.2; overflow-wrap: anywhere; }
+    .ops-value.live-good { color: #00ff88 !important; }
+    .ops-value.live-warn { color: #ffaa00 !important; }
+    .ops-value.live-bad { color: #ff6666 !important; }
+    .ops-value.live-muted { color: #a8b7ca !important; }
+    .ops-detail { color: #a8b7ca; font-size: .78rem; line-height: 1.4; margin-top: 6px; overflow-wrap: anywhere; }
+    .ops-attention-panel { margin-top: 12px; background: rgba(15, 52, 96, .3); }
+    .ops-attention-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .ops-attention-title { color: #d9eaff; font-size: .82rem; letter-spacing: .08em; text-transform: uppercase; }
+    .ops-attention-count { color: #8da6c3; font-size: .76rem; }
+    .ops-attention-list { display: grid; gap: 7px; }
+    .ops-attention-item { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 9px; align-items: start; padding: 8px 10px; border-radius: 8px; background: rgba(255,255,255,.035); border-left: 3px solid #8fd3ff; }
+    .ops-attention-item.critical { border-left-color: #ff6666; }
+    .ops-attention-item.warning { border-left-color: #ffaa00; }
+    .ops-attention-item.info { border-left-color: #8fd3ff; }
+    .ops-attention-severity { font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+    .ops-attention-item.critical .ops-attention-severity { color: #ff6666; }
+    .ops-attention-item.warning .ops-attention-severity { color: #ffaa00; }
+    .ops-attention-item.info .ops-attention-severity { color: #8fd3ff; }
+    .ops-attention-body { min-width: 0; }
+    .ops-attention-body strong { color: #fff; display: block; font-size: .82rem; }
+    .ops-attention-body span { color: #a8b7ca; font-size: .76rem; overflow-wrap: anywhere; }
+    .ops-details { border: 1px solid rgba(143, 211, 255, .12); border-radius: 10px; background: rgba(7, 16, 35, .22); }
+    .ops-details > summary { cursor: pointer; list-style: none; color: #d9eaff; font-size: .86rem; font-weight: 600; padding: 11px 14px; }
+    .ops-details > summary::-webkit-details-marker { display: none; }
+    .ops-details > summary::before { content: '▸'; color: #8fd3ff; margin-right: 8px; }
+    .ops-details[open] > summary::before { content: '▾'; }
+    .ops-details-body { padding: 0 12px 12px; }
+    .live-details { margin-top: 14px; border: 1px solid rgba(143, 211, 255, .12); border-radius: 9px; background: rgba(7, 16, 35, .2); }
+    .live-details > summary { cursor: pointer; list-style: none; color: #d9eaff; font-size: .82rem; letter-spacing: .06em; text-transform: uppercase; padding: 9px 11px; }
+    .live-details > summary::-webkit-details-marker { display: none; }
+    .live-details > summary::before { content: '▸'; color: #8fd3ff; margin-right: 7px; }
+    .live-details[open] > summary::before { content: '▾'; }
+    .live-details-body { padding: 0 10px 10px; }
+    @media (max-width: 768px) { .ops-priority-grid { grid-template-columns: 1fr; } .ops-attention-item { grid-template-columns: 1fr; gap: 2px; } }
 </style>
 {% endblock %}
 
 {% block content %}
+{# A página principal fica focada nos KPIs e análises; detalhes do runtime
+   continuam disponíveis nas rotas/API sem ocupar o primeiro viewport. #}
+{% if false %}
 <div id="historical-banner" class="row mb-3" style="display:none;">
     <div class="col-md-12">
         <div class="alert alert-warning mb-0" style="border-left:4px solid #ff9800;">
-            <strong>🗂 MODO HISTÓRICO</strong> — nenhum run ativo: exibindo os dados gravados de um
-            <strong>run concluído</strong>. KPIs "ao vivo", estágio ativo e xApps refletem o último
-            estado congelado, não o presente. <span id="historical-run-dir"></span>
+            <strong>🗂 MODO HISTÓRICO</strong> — run concluído; os KPIs refletem o último estado congelado, não o presente. <span id="historical-run-dir"></span>
+        </div>
+    </div>
+</div>
+<div class="row mb-3">
+    <div class="col-md-12">
+        <div class="ops-priority-grid">
+            <div id="ops-run-card" class="ops-priority-card" data-level="info">
+                <div class="ops-kicker">Estado do run</div>
+                <div id="ops-run-status" class="ops-value live-muted">Aguardando runtime</div>
+                <div id="ops-run-detail" class="ops-detail">Sem leitura de frescor.</div>
+            </div>
+            <div id="ops-health-card" class="ops-priority-card" data-level="info">
+                <div class="ops-kicker">Saúde operacional</div>
+                <div id="ops-health-status" class="ops-value live-muted">Aguardando métricas</div>
+                <div id="ops-health-detail" class="ops-detail">P95/CVaR, throughput, PDCP e guardas.</div>
+            </div>
+            <div id="ops-decision-card" class="ops-priority-card" data-level="info">
+                <div class="ops-kicker">Última decisão rApp</div>
+                <div id="ops-decision-status" class="ops-value live-muted">Aguardando decisão</div>
+                <div id="ops-decision-detail" class="ops-detail">Motivo, estágio e confiança.</div>
+            </div>
+        </div>
+        <div class="ops-attention-panel">
+            <div class="ops-attention-header">
+                <div class="ops-attention-title">Atenções operacionais</div>
+                <div id="ops-attention-count" class="ops-attention-count">Aguardando avaliação</div>
+            </div>
+            <div id="ops-attention-list" class="ops-attention-list"><div class="live-muted">Lendo sinais do runtime…</div></div>
         </div>
     </div>
 </div>
@@ -340,8 +417,9 @@
             <div class="card-header">
                 <div class="live-panel-header">
                     <h5 class="mb-0">● Coleta online ao vivo</h5>
-                    <div class="live-pulse"><span id="live-pulse-dot" class="live-pulse-dot"></span><span id="live-pulse-text">Conectando ao runtime…</span></div>
+                    <div class="live-pulse live-only"><span id="live-pulse-dot" class="live-pulse-dot"></span><span id="live-pulse-text">Conectando ao runtime…</span></div>
                 </div>
+                <div id="live-history-summary" class="live-history-summary" style="display:none"></div>
             </div>
             <div class="card-body">
                 <div class="live-kpi-grid">
@@ -361,17 +439,17 @@
                         <div id="live-snapshots" class="live-kpi-value">—</div>
                         <div id="live-rate" class="live-kpi-sub">ritmo —</div>
                     </div>
-                    <div class="live-kpi">
+                    <div class="live-kpi live-only">
                         <div class="live-kpi-label">Estágio ativo</div>
                         <div id="live-stage" class="live-kpi-value">—</div>
                         <div id="live-stage-sub" class="live-kpi-sub">ciclo —</div>
                     </div>
                     <div class="live-kpi">
-                        <div class="live-kpi-label">PDCP / proveniência</div>
+                        <div class="live-kpi-label">PDCP</div>
                         <div id="live-pdcp" class="live-kpi-value">—</div>
                         <div id="live-pdcp-sub" class="live-kpi-sub">—</div>
                     </div>
-                    <div class="live-kpi">
+                    <div class="live-kpi live-only">
                         <div class="live-kpi-label">Treino online</div>
                         <div id="live-training-status" class="live-kpi-value">—</div>
                         <div id="live-training-sub" class="live-kpi-sub">—</div>
@@ -386,9 +464,16 @@
                     <div class="live-info-box"><div class="live-info-label">Guardas</div><div id="live-guards" class="live-info-value">—</div></div>
                 </div>
 
-                <div class="live-section-title">Cobertura dos nove estágios</div>
-                <div id="live-stages" class="live-stage-grid"><div class="live-muted">Carregando estágios…</div></div>
+                <details class="live-details" open>
+                    <summary>Cobertura dos nove estágios</summary>
+                    <div class="live-details-body">
+                        <div id="live-stages" class="live-stage-grid"><div class="live-muted">Carregando estágios…</div></div>
+                    </div>
+                </details>
 
+                <details class="live-details" open>
+                    <summary>Qualidade temporal, throughput e alocação</summary>
+                    <div class="live-details-body">
                 <div class="row g-3 mt-1">
                     <div class="col-lg-7">
                         <div class="live-section-title">P95 e CVaR recentes</div>
@@ -399,26 +484,43 @@
                         <div class="live-chart-wrap"><canvas id="liveResourceChart"></canvas></div>
                     </div>
                 </div>
+                <div class="row g-3 mt-1">
+                    <div class="col-lg-7">
+                        <div class="live-section-title">Throughput entregue e guardas</div>
+                        <div class="live-chart-wrap"><canvas id="liveThroughputChart"></canvas></div>
+                    </div>
+                </div>
+                    </div>
+                </details>
 
+                <details class="live-details" open>
+                    <summary>Última decisão e transporte xApps</summary>
+                    <div class="live-details-body">
                 <div class="row g-3 mt-1">
                     <div class="col-lg-7">
                         <div class="live-section-title">Última decisão</div>
                         <div id="live-last-decision" class="live-info-box">—</div>
                     </div>
-                    <div class="col-lg-5">
+                    <div class="col-lg-5 live-only">
                         <div class="live-section-title">xApps / transporte</div>
                         <div id="live-xapps" class="live-info-box">—</div>
                     </div>
                 </div>
+                    </div>
+                </details>
                 <p id="live-footnote" class="live-footnote">Aguardando dados do runtime.</p>
             </div>
         </div>
     </div>
 </div>
 
+{% endif %}
 <!-- NOVO: Timeline de Períodos -->
 <div class="row">
     <div class="col-md-12">
+        <details class="ops-details" open>
+            <summary>Contexto temporal da simulação e alternância de tráfego</summary>
+            <div class="ops-details-body">
         <div class="card" style="border-left: 4px solid #ff6600;">
             <div class="card-header" style="background: linear-gradient(90deg, #0f3460 0%, #1a1a2e 100%);">
                 <h5 class="mb-0">⏱️ Períodos de Simulação (Alternância)</h5>
@@ -453,6 +555,8 @@
                 </div>
             </div>
         </div>
+            </div>
+        </details>
     </div>
 </div>
 
@@ -464,14 +568,14 @@
                 <h5 class="mb-0">Latência P95</h5>
             </div>
             <div class="card-body text-center">
-                {% if metrics and metrics.global_metrics %}
-                    <div class="metric-value {% if metrics.global_metrics.latency_p95_us > 80000 %}status-critical{% elif metrics.global_metrics.latency_p95_us > 60000 %}status-warning{% else %}status-ok{% endif %}">
+                {% if metrics and metrics.global_metrics and metrics.global_metrics.latency_p95_us %}
+                    <div class="metric-value {% if metrics.global_metrics.latency_p95_us >= 120000 %}status-critical{% elif metrics.global_metrics.latency_p95_us >= 80000 %}status-warning{% else %}status-ok{% endif %}">
                         {{ "%.1f"|format(metrics.global_metrics.latency_p95_us / 1000) }} ms
                     </div>
                 {% else %}
                     <div class="metric-value status-warning">N/A</div>
                 {% endif %}
-                <div class="metric-label">95% dos pacotes abaixo deste valor</div>
+                <div class="metric-label">95% dos pacotes abaixo deste valor{% if metrics and metrics.data_mode == 'historical_db' %} · snapshot do run{% endif %}</div>
             </div>
         </div>
     </div>
@@ -482,12 +586,12 @@
                 <h5 class="mb-0">Câmeras Ativas</h5>
             </div>
             <div class="card-body text-center">
-                {% if metrics %}
-                    <div class="metric-value status-ok">{{ metrics.active_cameras }}</div>
+                {% if metrics and metrics.active_cameras is not none %}
+                    <div class="metric-value {% if metrics.data_mode == 'historical_db' %}status-warning{% else %}status-ok{% endif %}">{{ metrics.active_cameras }}</div>
                 {% else %}
                     <div class="metric-value status-warning">N/A</div>
                 {% endif %}
-                <div class="metric-label">Câmeras de vigilância</div>
+                <div class="metric-label">Câmeras de vigilância{% if metrics and metrics.data_mode == 'historical_db' %} · histórico{% endif %}</div>
             </div>
         </div>
     </div>
@@ -520,12 +624,15 @@
                 {% set slicer_ok = xapp_status.SLICER.status == 'RUNNING' if xapp_status.SLICER else false %}
                 {% set energy_ok = xapp_status.ENERGY.status == 'RUNNING' if xapp_status.ENERGY else false %}
                 {% set vehicle_ok = xapp_status.VEHICLE.status == 'RUNNING' if xapp_status.VEHICLE else false %}
+                {% set xapps_native_e2 = xapp_status and xapp_status.SLICER and xapp_status.ENERGY and xapp_status.VEHICLE and xapp_status.SLICER.status == 'NOT_USED_NATIVE_E2' and xapp_status.ENERGY.status == 'NOT_USED_NATIVE_E2' and xapp_status.VEHICLE.status == 'NOT_USED_NATIVE_E2' %}
                 {% if slicer_ok and energy_ok and vehicle_ok %}
                     <div class="metric-value status-ok">✓</div>
+                {% elif xapps_native_e2 %}
+                    <div class="metric-value" style="color:#8fd3ff;">—</div>
                 {% else %}
                     <div class="metric-value status-warning">⚠</div>
                 {% endif %}
-                <div class="metric-label">SLICER, ENERGY & VEHICLE</div>
+                <div class="metric-label">{% if xapps_native_e2 %}Native E2 · sem processo xApp{% else %}SLICER, ENERGY & VEHICLE{% endif %}</div>
             </div>
         </div>
     </div>
@@ -583,10 +690,6 @@
                             <div class="armd-cell-value">{{ armd.domain or 'n/a' }}</div>
                         </div>
                         <div class="armd-cell">
-                            <div class="armd-cell-label">Source</div>
-                            <div class="armd-cell-value">{{ armd.source or 'n/a' }}</div>
-                        </div>
-                        <div class="armd-cell">
                             <div class="armd-cell-label">Escopo</div>
                             <div class="armd-cell-value">{{ (armd.policy_scope or [])|join(', ') if armd.policy_scope else 'n/a' }}</div>
                         </div>
@@ -631,16 +734,16 @@
                     <div class="col-lg-4">
                         <div class="sla-grid-card">
                             <div class="text-center mb-3">
-                                <span class="badge" style="background: {% if camera_sla.status == 'PROTEGIDA' %}#00ff88{% elif camera_sla.status == 'GUARDA' %}#ffaa00{% else %}#ff4444{% endif %}; color: #000; font-size: 1rem; padding: 8px 15px;">
+                                <span class="badge" style="background: {% if camera_sla.status == 'PROTEGIDA' %}#00ff88{% elif camera_sla.status == 'GUARDA' %}#ffaa00{% elif camera_sla.status == 'HISTÓRICO' %}#8fd3ff{% elif camera_sla.status == 'SEM DADOS' %}#53657a{% else %}#ff4444{% endif %}; color: #000; font-size: 1rem; padding: 8px 15px;">
                                     CÂMERAS {{ camera_sla.status or 'INATIVA' }}
                                 </span>
                             </div>
                             <p>Ativas: <strong>{{ camera_sla.active or 0 }}</strong></p>
-                            <p>Throughput mín: <strong style="color: {% if (camera_sla.throughput_mbps or 0) >= 30 %}#00ff88{% elif (camera_sla.throughput_mbps or 0) >= 25 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(camera_sla.throughput_mbps or 0) }} Mbps</strong></p>
-                            <p>Latência máx: <strong style="color: {% if (camera_sla.latency_ms or 0) < 60 %}#00ff88{% elif (camera_sla.latency_ms or 0) < 80 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(camera_sla.latency_ms or 0) }} ms</strong></p>
+                            <p>Throughput mín: <strong style="color: {% if camera_sla.status == 'HISTÓRICO' %}#8fd3ff{% elif (camera_sla.throughput_mbps or 0) >= 30 %}#00ff88{% elif (camera_sla.throughput_mbps or 0) >= 25 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(camera_sla.throughput_mbps or 0) }} Mbps</strong></p>
+                            <p>Latência máx: <strong style="color: {% if camera_sla.status == 'HISTÓRICO' %}#8fd3ff{% elif (camera_sla.latency_ms or 0) < 60 %}#00ff88{% elif (camera_sla.latency_ms or 0) < 80 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.1f"|format(camera_sla.latency_ms or 0) }} ms</strong></p>
                             <p>Proposta: <strong style="color: #8fd3ff;">{{ camera_sla.proposal_status or 'idle' }}</strong></p>
                             <p>Runtime: <strong style="color: {% if camera_sla.runtime_status == 'ok' %}#00ff88{% elif camera_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ camera_sla.runtime_status or 'idle' }}</strong></p>
-                            <p>SLA: <strong style="color: {% if camera_sla.runtime_status == 'ok' %}#00ff88{% elif camera_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ camera_sla.reason or 'Sem dados' }}</strong></p>
+                            <p>SLA: <strong style="color: {% if camera_sla.status == 'HISTÓRICO' %}#8fd3ff{% elif camera_sla.runtime_status == 'ok' %}#00ff88{% elif camera_sla.runtime_status == 'warning' %}#ffaa00{% else %}#ff4444{% endif %};">{{ camera_sla.reason or 'Sem dados' }}</strong></p>
                         </div>
                     </div>
                     <div class="col-lg-4">
@@ -755,6 +858,8 @@
                         <td>
                             {% if xapp_status[name].status == 'RUNNING' %}
                                 <span class="badge badge-ok">RODANDO</span>
+                            {% elif xapp_status[name].status == 'NOT_USED_NATIVE_E2' %}
+                                <span class="badge" style="background:#244b70;color:#d9eaff;">NATIVE E2</span>
                             {% elif xapp_status[name].status == 'UNRESPONSIVE' %}
                                 <span class="badge badge-warning">UNRESPONSIVE</span>
                             {% else %}
@@ -772,7 +877,7 @@
         <!-- Decisões Recentes -->
         <div class="card">
             <div class="card-header">
-                <h5 class="mb-0">Estatísticas (24h)</h5>
+                        <h5 class="mb-0">Estatísticas ({% if metrics and metrics.data_mode == 'historical_db' %}run histórico{% else %}24h{% endif %})</h5>
             </div>
             <div class="card-body">
                 <table class="table table-sm">
@@ -902,6 +1007,9 @@
     </div>
 </div>
 
+<details class="ops-details mb-3" open>
+    <summary>Energia e histórico de comandos</summary>
+    <div class="ops-details-body">
 <div class="row">
     <!-- Painel de Energia -->
     <div class="col-md-4">
@@ -931,6 +1039,8 @@
         </div>
     </div>
 </div>
+    </div>
+</details>
 
 <div class="row mt-3">
     <div class="col-md-12">
@@ -942,7 +1052,7 @@
                 {% set resource_window = resource_summary.window_1h or {} %}
                 <div class="row text-center">
                     <div class="col-md-2">
-                        <div class="metric-label">Amostras (1h)</div>
+                        <div class="metric-label">Amostras ({% if resource_summary.window_scope == 'run' %}run{% else %}1h{% endif %})</div>
                         <div class="metric-value">{{ resource_window.samples or 0 }}</div>
                     </div>
                     <div class="col-md-2">
@@ -1062,6 +1172,7 @@
 <script>
 let liveQualityChart = null;
 let liveResourceChart = null;
+let liveThroughputChart = null;
 
 function liveEscape(value) {
     return String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'}[ch]));
@@ -1077,7 +1188,7 @@ function liveAge(value) {
 
 function liveStateClass(value) {
     const normalized = String(value || '').toLowerCase();
-    if (['running', 'allowed', 'ok', 'protected', 'protegida', 'real', 'pdcp_real'].includes(normalized)) return 'live-good';
+    if (['running', 'allowed', 'ok', 'healthy', 'protected', 'protegida', 'real', 'pdcp_real'].includes(normalized)) return 'live-good';
     if (['conditional', 'warning', 'stale', 'historical', 'waiting_dataset', 'guarda'].includes(normalized)) return 'live-warn';
     if (['blocked', 'rollback', 'critical', 'stopped', 'proxy', 'parada'].includes(normalized)) return 'live-bad';
     return 'live-muted';
@@ -1109,9 +1220,12 @@ function updateLiveCharts(data) {
     if (typeof Chart === 'undefined') return;
     const metrics = data.recent_metrics || [];
     const labels = metrics.map(item => new Date(Number(item.timestamp || 0) * 1000).toLocaleTimeString());
+    const limits = (data.operational_summary || {}).limits || {};
     const qualityDatasets = [
         { label: 'P95 (ms)', data: metrics.map(item => item.p95_ms), borderColor: '#00ff88', backgroundColor: 'rgba(0,255,136,.10)', tension: .25, pointRadius: 0 },
-        { label: 'CVaR (ms)', data: metrics.map(item => item.cvar_ms), borderColor: '#ffaa00', backgroundColor: 'rgba(255,170,0,.08)', tension: .25, pointRadius: 0 }
+        { label: 'CVaR (ms)', data: metrics.map(item => item.cvar_ms), borderColor: '#ffaa00', backgroundColor: 'rgba(255,170,0,.08)', tension: .25, pointRadius: 0 },
+        { label: 'Meta P95', data: metrics.map(() => Number(limits.p95_target_ms || 80)), borderColor: '#00ff88', borderDash: [5, 4], pointRadius: 0, borderWidth: 1.5 },
+        { label: 'Meta CVaR', data: metrics.map(() => Number(limits.cvar_target_ms || 120)), borderColor: '#ffaa00', borderDash: [5, 4], pointRadius: 0, borderWidth: 1.5 }
     ];
     const qualityCanvas = document.getElementById('liveQualityChart');
     if (qualityCanvas) {
@@ -1121,6 +1235,22 @@ function updateLiveCharts(data) {
             liveQualityChart.data.labels = labels;
             liveQualityChart.data.datasets = qualityDatasets;
             liveQualityChart.update('none');
+        }
+    }
+
+    const throughputDatasets = [
+        { label: 'Throughput (Mbps)', data: metrics.map(item => Number(item.throughput_kbps || 0) / 1000), borderColor: '#8fd3ff', backgroundColor: 'rgba(143,211,255,.10)', tension: .25, pointRadius: 0 },
+        { label: 'SLA mínimo', data: metrics.map(() => Number(limits.throughput_min_mbps || 25)), borderColor: '#ff6666', borderDash: [5, 4], pointRadius: 0, borderWidth: 1.5 },
+        { label: 'Guarda', data: metrics.map(() => Number(limits.throughput_guard_mbps || 30)), borderColor: '#ffaa00', borderDash: [3, 3], pointRadius: 0, borderWidth: 1.5 }
+    ];
+    const throughputCanvas = document.getElementById('liveThroughputChart');
+    if (throughputCanvas) {
+        if (!liveThroughputChart) {
+            liveThroughputChart = new Chart(throughputCanvas.getContext('2d'), { type: 'line', data: { labels, datasets: throughputDatasets }, options: liveChartOptions('Mbps') });
+        } else {
+            liveThroughputChart.data.labels = labels;
+            liveThroughputChart.data.datasets = throughputDatasets;
+            liveThroughputChart.update('none');
         }
     }
 
@@ -1153,16 +1283,49 @@ function updateLiveCollection(data) {
     const guards = data.guards || {};
     const counts = (data.database || {}).counts || {};
     const latestDecision = data.latest_decision || {};
+    const operational = data.operational_summary || {};
+    const operationalLevel = operational.level || 'info';
+    const operationalItems = operational.items || [];
 
     const status = String(data.status || 'unknown').toLowerCase();
+    const historical = status === 'historical';
+    const setOpsCard = (id, level) => {
+        const card = document.getElementById(id);
+        if (card) card.dataset.level = level || 'info';
+    };
+    setOpsCard('ops-run-card', status === 'running' ? 'ok' : (status === 'historical' ? 'info' : 'critical'));
+    setOpsCard('ops-health-card', operationalLevel);
+    setOpsCard('ops-decision-card', String(latestDecision.decision || '').toLowerCase() === 'blocked' ? 'warning' : (String(latestDecision.decision || '').toLowerCase() === 'conditional' ? 'warning' : operationalLevel));
+    liveSet('ops-run-status', data.status_label || status.toUpperCase(), liveStateClass(status));
+    const runDetail = document.getElementById('ops-run-detail');
+    if (runDetail) runDetail.textContent = `status ${liveAge(freshness.status_age_s)} · métricas ${liveAge(freshness.metrics_age_s)}`;
+    liveSet('ops-health-status', operational.label || 'SEM AVALIAÇÃO', liveStateClass(operationalLevel));
+    const healthDetail = document.getElementById('ops-health-detail');
+    if (healthDetail) healthDetail.textContent = `P95 ${Number(telemetry.p95_ms || 0).toFixed(1)} ms · CVaR ${Number(telemetry.cvar_ms || 0).toFixed(1)} ms · ${(Number(telemetry.throughput_kbps || 0) / 1000).toFixed(2)} Mbps · ${provenance.pdcp_real ? 'PDCP real' : (provenance.proxy_samples ? 'PDCP proxy' : 'sem PDCP')}`;
+    const decisionValue = latestDecision.decision || 'SEM DECISÃO';
+    liveSet('ops-decision-status', decisionValue, liveStateClass(decisionValue));
+    const decisionDetail = document.getElementById('ops-decision-detail');
+    if (decisionDetail) decisionDetail.textContent = `${latestDecision.stage || collection.stage || 'sem estágio'} · confiança ${(Number(latestDecision.confidence || 0) * 100).toFixed(1)}% · ${latestDecision.reason || 'sem motivo registrado'}`;
+    const attentionList = document.getElementById('ops-attention-list');
+    if (attentionList) {
+        const panelLabels = { live: 'coleta', quality: 'qualidade', sla: 'SLA', decision: 'decisão', allocation: 'alocação' };
+        attentionList.innerHTML = operationalItems.map(item => `
+            <div class="ops-attention-item ${liveEscape(item.severity)}">
+                <div class="ops-attention-severity">${liveEscape(item.severity)}</div>
+                <div class="ops-attention-body"><strong>${liveEscape(item.title)} <span class="live-muted">· painel ${liveEscape(panelLabels[item.panel] || item.panel || 'coleta')}</span></strong><span>${liveEscape(item.detail)}</span></div>
+            </div>
+        `).join('') || '<div class="live-muted">Nenhuma atenção operacional registrada.</div>';
+    }
+    const attentionCount = document.getElementById('ops-attention-count');
+    if (attentionCount) attentionCount.textContent = `${Number(operational.critical_count || 0)} crítico(s) · ${Number(operational.warning_count || 0)} alerta(s)`;
     const historicalBanner = document.getElementById('historical-banner');
     if (historicalBanner) {
-        historicalBanner.style.display = status === 'historical' ? '' : 'none';
-        if (status === 'historical') {
-            const rd = document.getElementById('historical-run-dir');
-            if (rd) rd.textContent = `Origem dos dados: ${data.run_dir || '—'}`;
+        historicalBanner.style.display = historical ? '' : 'none';
+        if (historical) {
         }
     }
+    const livePanel = document.querySelector('.live-collection-panel');
+    if (livePanel) livePanel.classList.toggle('historical-mode', historical);
     const pulseDot = document.getElementById('live-pulse-dot');
     pulseDot.className = `live-pulse-dot ${status === 'running' ? '' : (status === 'stale' || status === 'historical') ? 'stale' : 'dead'}`;
     liveSet('live-run-status', data.status_label || status.toUpperCase(), liveStateClass(status));
@@ -1185,16 +1348,15 @@ function updateLiveCollection(data) {
 
     const pdcpText = provenance.pdcp_real ? 'PDCP REAL' : (provenance.proxy_samples ? 'PROXY' : 'SEM DADO');
     liveSet('live-pdcp', pdcpText, provenance.pdcp_real && !provenance.proxy_samples ? 'live-good' : 'live-warn');
-    document.getElementById('live-pdcp-sub').textContent = `${provenance.real_samples || 0} real · ${provenance.proxy_samples || 0} proxy · ${provenance.effective_source || '—'}`;
+    document.getElementById('live-pdcp-sub').textContent = `${provenance.real_samples || 0} real · ${provenance.proxy_samples || 0} proxy`;
     const trainingStatus = training.status || 'unknown';
     liveSet('live-training-status', trainingStatus === 'waiting_dataset' ? 'AGUARDANDO' : trainingStatus.toUpperCase(), liveStateClass(trainingStatus));
     document.getElementById('live-training-sub').textContent = training.reason || `${training.updates_completed || 0} updates concluídos`;
 
     document.getElementById('live-latency').textContent = `${Number(telemetry.p95_ms || 0).toFixed(1)} / ${Number(telemetry.cvar_ms || 0).toFixed(1)} ms`;
-    document.getElementById('live-throughput').textContent = `${(Number(telemetry.throughput_kbps || 0) / 1000).toFixed(2)} Mbps · ${telemetry.throughput_source || '—'}`;
+    document.getElementById('live-throughput').textContent = `${(Number(telemetry.throughput_kbps || 0) / 1000).toFixed(2)} Mbps`;
     document.getElementById('live-allocation').textContent = `${(Number(guards.r_ran || 0) * 100).toFixed(1)}% RAN / ${(Number(guards.r_ai || 0) * 100).toFixed(1)}% IA`;
-    const guardOk = !guard.rollback && !guards.rollback && Number(guard.floor_violations || 0) === 0 && Number(guards.per_ue_floor_violations || 0) === 0 && guards.floor_feasible !== false;
-    liveSet('live-guards', guardOk ? 'OK · floor viável' : 'ATENÇÃO', guardOk ? 'live-good' : 'live-bad');
+    liveSet('live-guards', operational.label || 'SEM AVALIAÇÃO', liveStateClass(operationalLevel));
 
     document.getElementById('live-stages').innerHTML = (collection.stages || []).map(stage => `
         <div class="live-stage ${stage.active ? 'active' : ''}"><span class="live-stage-name">${liveEscape(stage.name)}</span><span class="live-stage-count">${Number(stage.count || 0)}</span></div>
@@ -1215,7 +1377,23 @@ function updateLiveCollection(data) {
         const required = xapp.socket_required ? 'obrigatório' : 'opcional';
         return `<div class="d-flex justify-content-between align-items-center mb-1"><span>${name}</span><span class="${liveStateClass(xappStatus)}">${liveEscape(xappStatus)}</span><span class="live-kpi-sub mb-0">${liveEscape(transport)} · socket ${required}</span></div>`;
     }).join('');
-    document.getElementById('live-footnote').textContent = `Run: ${data.run_dir || '—'} · collector ${provenance.collector_mode || '—'} · overrides de cenário ${provenance.scenario_override_active ? 'ativos' : 'não ativos'} · SQLite ${Number(counts.extended_metrics || 0).toLocaleString('pt-BR')} métricas`;
+    document.getElementById('live-footnote').textContent = `${Number(counts.extended_metrics || 0).toLocaleString('pt-BR')} métricas registradas`;
+
+    const histSummary = document.getElementById('live-history-summary');
+    if (histSummary) {
+        histSummary.style.display = historical ? '' : 'none';
+        if (historical) {
+            const stagesList = collection.stages || [];
+            const stagesCovered = stagesList.filter(s => Number(s.count || 0) > 0).length;
+            const pctText = provenance.pdcp_real ? 'PDCP REAL' : (provenance.proxy_samples ? 'PDCP PROXY' : 'SEM PDCP');
+            histSummary.innerHTML =
+                `📊 <strong>${Number(decisionCount || 0).toLocaleString('pt-BR')}</strong> decisões · ` +
+                `<strong>${stagesCovered}/${stagesList.length || 9}</strong> estágios · ${pctText} · ` +
+                `CVaR <strong>${Number(telemetry.cvar_ms || 0).toFixed(1)} ms</strong> · ` +
+                `${(Number(telemetry.throughput_kbps || 0) / 1000).toFixed(2)} Mbps ` +
+                `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-2 ms-2" onclick="document.querySelector('.live-collection-panel').classList.toggle('expanded')">detalhes</button>`;
+        }
+    }
     updateLiveCharts(data);
 }
 
@@ -1234,8 +1412,10 @@ async function refreshLiveCollection() {
     }
 }
 
-refreshLiveCollection();
-setInterval(refreshLiveCollection, 2000);
+if (document.querySelector('.live-collection-panel')) {
+    refreshLiveCollection();
+    setInterval(refreshLiveCollection, 2000);
+}
 </script>
 <script>
 const ctx = document.getElementById('latencyChart').getContext('2d');
@@ -1494,26 +1674,30 @@ function fetchEnergyStats() {
         const container = document.getElementById('energy-stats');
         
         // Current state
-        const current = currentData;
-        const currentPower = current.power_percent || 100;
-        const currentSavings = current.savings_percent || 0;
-        const currentAction = current.action || 'UNKNOWN';
+        const current = currentData || {};
+        const historicalEnergy = current.data_mode === 'historical' || current.action === 'UNKNOWN';
+        const currentPower = Number.isFinite(Number(current.power_percent)) ? Number(current.power_percent) : null;
+        const currentSavings = Number.isFinite(Number(current.savings_percent)) ? Number(current.savings_percent) : null;
+        const currentAction = historicalEnergy ? 'SEM COMANDO ATUAL' : (current.action || 'UNKNOWN');
         const modelPowerW = Number.isFinite(Number(current.model_power_w)) ? Number(current.model_power_w) : null;
         
         // Calculate color based on savings
-        let savingsColor = '#ff4444'; // Red - low savings
-        if (currentSavings >= 75) savingsColor = '#00ff88'; // Green - high savings
-        else if (currentSavings >= 50) savingsColor = '#28a745'; // Green
-        else if (currentSavings >= 25) savingsColor = '#ffaa00'; // Yellow
+        let savingsColor = '#8fd3ff';
+        if (currentSavings !== null) {
+            savingsColor = '#ff4444'; // Red - low savings
+            if (currentSavings >= 75) savingsColor = '#00ff88'; // Green - high savings
+            else if (currentSavings >= 50) savingsColor = '#28a745'; // Green
+            else if (currentSavings >= 25) savingsColor = '#ffaa00'; // Yellow
+        }
         
         // History stats
         if (!historyData || !historyData.total_commands || historyData.total_commands === 0) {
             container.innerHTML = `
                 <div class="text-center mb-3">
-                    <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings.toFixed(1)}%</div>
-                    <div style="color: #aaa; font-size: 0.9rem;">ECONOMIA ATUAL</div>
+                    <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings === null ? '—' : `${currentSavings.toFixed(1)}%`}</div>
+                    <div style="color: #aaa; font-size: 0.9rem;">${historicalEnergy ? 'SEM COMANDO ATUAL' : 'ECONOMIA ATUAL'}</div>
                     <div style="color: #fff; font-size: 1.1rem; margin-top: 5px;">${currentAction}</div>
-                    <div style="color: #888; font-size: 0.85rem;">Potência: ${currentPower}%${modelPowerW !== null ? ` · ${modelPowerW.toFixed(1)} W modelados` : ''}</div>
+                    <div style="color: #888; font-size: 0.85rem;">${currentPower === null ? 'Potência: indisponível' : `Potência: ${currentPower}%`}${modelPowerW !== null ? ` · ${modelPowerW.toFixed(1)} W modelados` : ''}</div>
                 </div>
                 <div class="text-center text-muted">Aguardando dados...</div>
             `;
@@ -1530,11 +1714,11 @@ function fetchEnergyStats() {
         
         let html = `
             <div class="text-center mb-3">
-                <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings.toFixed(1)}%</div>
-                <div style="color: #aaa; font-size: 0.9rem;">ECONOMIA ATUAL</div>
+                <div style="color: ${savingsColor}; font-size: 2.5rem; font-weight: bold;">${currentSavings === null ? '—' : `${currentSavings.toFixed(1)}%`}</div>
+                <div style="color: #aaa; font-size: 0.9rem;">${historicalEnergy ? 'SEM COMANDO ATUAL' : 'ECONOMIA ATUAL'}</div>
                 <div style="background: #0f3460; padding: 8px; border-radius: 5px; margin-top: 8px;">
                     <div style="color: ${savingsColor}; font-size: 1.2rem; font-weight: bold;">${currentAction}</div>
-                    <div style="color: #ccc; font-size: 0.85rem;">Potência: ${currentPower}%${modelPowerW !== null ? ` · ${modelPowerW.toFixed(1)} W modelados` : ''}</div>
+                    <div style="color: #ccc; font-size: 0.85rem;">${currentPower === null ? 'Potência: indisponível' : `Potência: ${currentPower}%`}${modelPowerW !== null ? ` · ${modelPowerW.toFixed(1)} W modelados` : ''}</div>
                 </div>
             </div>
             <div class="row text-center">

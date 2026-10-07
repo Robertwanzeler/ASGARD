@@ -1,38 +1,130 @@
 {% extends "base.html" %}
 {% block title %}Padrões - GreenRAN rApp{% endblock %}
 {% block content %}
-<div class="row">
-    <div class="col-md-6">
-        <div class="card">
-            <div class="card-header"><h5>Padrão Atual</h5></div>
-            <div class="card-body">
-                {% if summary.current_analysis %}
-                <p><strong>Padrão:</strong> <span style="color: #00ff88;">{{ summary.current_analysis.pattern }}</span></p>
-                <p><strong>Hora:</strong> {{ summary.current_analysis.hour }}:00</p>
-                <p><strong>Dia:</strong> {{ summary.current_analysis.day_name }}</p>
-                <p><strong>Atividade:</strong> {% if summary.current_analysis.low_activity %}<span style="color: #00ff88;">Baixa</span>{% else %}<span style="color: #ffaa00;">Normal</span>{% endif %}</p>
-                <p><strong>Confiança:</strong> <span style="color: {% if summary.current_analysis.confidence >= 0.7 %}#00ff88{% elif summary.current_analysis.confidence >= 0.4 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.0f"|format(summary.current_analysis.confidence * 100) }}%</span></p>
-                {% else %}
-                <p class="text-muted">Sem dados</p>
-                {% endif %}
+<style>
+    .pattern-hero { background: linear-gradient(135deg,#101a32,#16213e 55%,#0b1325); border:1px solid rgba(143,211,255,.18); border-radius:16px; padding:20px; margin-bottom:20px; }
+    .pattern-hero h4 { color:#fff !important; margin-bottom:6px; }
+    .pattern-hero p { color:#b8c7d9 !important; margin:0; }
+    .pattern-badge { display:inline-block; border-radius:999px; padding:4px 10px; margin-bottom:10px; font-size:.78rem; font-weight:700; letter-spacing:.04em; }
+    .pattern-badge.history { background:rgba(143,211,255,.15); color:#8fd3ff !important; border:1px solid rgba(143,211,255,.35); }
+    .pattern-badge.runtime { background:rgba(0,255,136,.12); color:#00ff88 !important; border:1px solid rgba(0,255,136,.3); }
+    .pattern-card { height:100%; border:1px solid rgba(143,211,255,.12); border-radius:14px; background:linear-gradient(180deg,rgba(15,52,96,.5),rgba(9,18,35,.86)); padding:16px; }
+    .pattern-card h6 { color:#fff !important; margin-bottom:12px; }
+    .pattern-card p { color:#c8d7e6 !important; margin-bottom:7px; }
+    .pattern-value { font-size:1.65rem; font-weight:700; color:#00ff88 !important; }
+    .pattern-muted { color:#9fb2c4 !important; font-size:.88rem; }
+    .pattern-details { border:1px solid rgba(143,211,255,.12); border-radius:12px; background:rgba(7,16,35,.3); margin-bottom:20px; }
+    .pattern-details > summary { cursor:pointer; list-style:none; padding:14px 16px; color:#d9eaff !important; font-weight:600; }
+    .pattern-details > summary::-webkit-details-marker { display:none; }
+    .pattern-details > summary::before { content:'▸'; color:#8fd3ff; margin-right:8px; }
+    .pattern-details[open] > summary::before { content:'▾'; }
+    .pattern-details-body { padding:0 14px 14px; background:#101a32; border-radius:0 0 12px 12px; }
+    .pattern-table { --bs-table-bg:transparent; --bs-table-color:#d9eaff; margin:0; }
+    .pattern-table th, .pattern-table td { background:transparent !important; color:#d9eaff !important; border-color:rgba(143,211,255,.14) !important; vertical-align:middle; }
+    .pattern-table th { color:#fff !important; }
+    .pattern-bar { display:inline-block; height:7px; min-width:3px; border-radius:99px; background:#00ff88; vertical-align:middle; }
+    .pattern-empty { color:#a9b8c7 !important; padding:14px 0; margin:0; }
+    @media (max-width: 700px) { .pattern-table { min-width:640px; } .pattern-details-body { overflow-x:auto; } }
+</style>
+
+<div class="pattern-hero">
+    <span class="pattern-badge {% if historical %}history{% else %}runtime{% endif %}">
+        {% if historical %}HISTÓRICO · SNAPSHOT CONCLUÍDO{% else %}RUNTIME · OBSERVAÇÃO ATUAL{% endif %}
+    </span>
+    <h4>Análise de padrões</h4>
+    <p>{% if historical %}Leitura congelada no último snapshot do run; não representa progresso em tempo real.{% else %}Leitura dos padrões observados no runtime atual.{% endif %}</p>
+</div>
+
+{% set current = summary.current_analysis or {} %}
+<div class="row g-3 mb-4">
+    <div class="col-lg-4">
+        <div class="pattern-card">
+            <h6>Padrão identificado</h6>
+            <div class="pattern-value">
+                {% if current.pattern == 'peak_hours' %}Pico de atividade
+                {% elif current.pattern == 'business_hours' %}Horário comercial
+                {% elif current.pattern == 'night_low_activity' %}Baixa atividade noturna
+                {% elif current.pattern == 'weekend_low_activity' %}Baixa atividade no fim de semana
+                {% elif current.pattern == 'low_activity' %}Baixa atividade
+                {% elif current.pattern %}Atividade normal
+                {% else %}Sem classificação{% endif %}
             </div>
+            <p class="pattern-muted mt-2">{{ current.datetime or 'Sem referência temporal' }}</p>
+            <p>Confiança: <strong>{{ "%.0f"|format((current.confidence or 0) * 100) }}%</strong></p>
+            <p>Amostras usadas: <strong>{{ current.sample_count or 0 }}</strong></p>
         </div>
     </div>
-    <div class="col-md-6">
-        <div class="card">
-            <div class="card-header"><h5>Janela de Economia</h5></div>
-            <div class="card-body">
-                {% if window and window.window_start %}
-                <p><strong>Início:</strong> <span style="color: #00ff88;">{{ window.window_start }}</span></p>
-                <p><strong>Fim:</strong> {{ window.window_end }}</p>
-                <p><strong>Duração:</strong> {{ window.duration_hours }} horas</p>
-                <p><strong>Confiança:</strong> <span style="color: {% if window.confidence >= 0.7 %}#00ff88{% elif window.confidence >= 0.4 %}#ffaa00{% else %}#ff4444{% endif %};">{{ "%.0f"|format(window.confidence * 100) }}%</span></p>
-                <p><strong>Dias:</strong> {{ window.day_names|join(', ') }}</p>
-                {% else %}
-                <p class="text-muted">Sem dados suficientes para definir janela</p>
-                {% endif %}
-            </div>
+    <div class="col-lg-4">
+        <div class="pattern-card">
+            <h6>Condição observada</h6>
+            <p>Câmeras ativas: <strong>{{ "%.1f"|format(current.current_cameras or 0) }}</strong></p>
+            <p>Latência média: <strong>{{ "%.2f"|format((current.current_latency_us or 0) / 1000) }} ms</strong></p>
+            <p>Período: <strong>{{ current.hour if current.hour is not none else '—' }}:00 · {{ current.day_name or '—' }}</strong></p>
+            <p>Tendência: <strong>{% if current.trend == 'increasing' %}subindo{% elif current.trend == 'decreasing' %}descendo{% elif current.trend == 'stable' %}estável{% else %}sem base suficiente{% endif %}</strong></p>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="pattern-card">
+            <h6>Janela de economia</h6>
+            {% if window and window.window_start %}
+                <div class="pattern-value">{{ window.window_start }}–{{ window.window_end }}</div>
+                <p class="mt-2">Duração: <strong>{{ window.duration_hours }} h</strong></p>
+                <p>Confiança: <strong>{{ "%.0f"|format((window.confidence or 0) * 100) }}%</strong></p>
+                <p class="pattern-muted">{{ window.reason }}</p>
+            {% else %}
+                <div class="pattern-value">Indeterminada</div>
+                <p class="pattern-muted mt-2">{{ window.reason if window else 'Sem dados suficientes para recomendar uma janela.' }}</p>
+            {% endif %}
         </div>
     </div>
 </div>
+
+<details class="pattern-details" open>
+    <summary>Padrões por hora · últimos 7 dias do run</summary>
+    <div class="pattern-details-body">
+        {% if hourly %}
+        {% set max_latency = hourly|map(attribute='avg_latency_us')|max or 1 %}
+        <div class="table-responsive">
+            <table class="table table-sm pattern-table">
+                <thead><tr><th>Hora</th><th>Câmeras médias</th><th>Latência média</th><th>Baixa atividade</th><th>Confiança</th></tr></thead>
+                <tbody>
+                {% for item in hourly %}
+                    <tr>
+                        <td><strong>{{ "%02d"|format(item.hour) }}:00</strong></td>
+                        <td>{{ "%.1f"|format(item.avg_cameras or 0) }}</td>
+                        <td>{{ "%.2f"|format((item.avg_latency_us or 0) / 1000) }} ms <span class="pattern-bar" style="width:{{ [((item.avg_latency_us or 0) / max_latency * 90), 3]|max }}px"></span></td>
+                        <td>{{ "%.0f"|format((item.low_activity_ratio or 0) * 100) }}%</td>
+                        <td>{{ "%.0f"|format((item.confidence or 0) * 100) }}%</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}<p class="pattern-empty">Não há amostras horárias suficientes neste run.</p>{% endif %}
+    </div>
+</details>
+
+<details class="pattern-details" open>
+    <summary>Padrões por dia da semana</summary>
+    <div class="pattern-details-body">
+        {% if daily %}
+        <div class="table-responsive">
+            <table class="table table-sm pattern-table">
+                <thead><tr><th>Dia</th><th>Câmeras médias</th><th>Latência média</th><th>Amostras</th><th>Perfil</th></tr></thead>
+                <tbody>
+                {% for item in daily %}
+                    <tr>
+                        <td><strong>{{ item.day_name }}</strong></td>
+                        <td>{{ "%.1f"|format(item.avg_cameras or 0) }}</td>
+                        <td>{{ "%.2f"|format((item.avg_latency_us or 0) / 1000) }} ms</td>
+                        <td>{{ item.data_days or 0 }}</td>
+                        <td>{% if item.is_weekend %}fim de semana{% else %}dia útil{% endif %}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}<p class="pattern-empty">Não há amostras diárias suficientes neste run.</p>{% endif %}
+    </div>
+</details>
 {% endblock %}

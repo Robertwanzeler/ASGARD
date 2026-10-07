@@ -136,7 +136,7 @@ class PatternRecognition:
         
         return ema
     
-    def analyze_current(self, window_minutes=30):
+    def analyze_current(self, window_minutes=30, include_historical=False):
         """
         Analisa o estado atual e detecta padrões.
         
@@ -163,9 +163,37 @@ class PatternRecognition:
         # Calcula média móvel simples para comparação
         sma_latency = self.calculate_moving_average('latency', window_minutes)
         sma_cameras = self.calculate_moving_average('cameras', window_minutes)
+
+        # Runs históricos deste projeto podem não ter linhas em
+        # ``metrics_history``; a coleta nativa persiste o mesmo sinal em
+        # ``extended_metrics``. Use o último snapshot congelado nesse caso,
+        # sem rotulá-lo como se fosse o relógio atual.
+        extended_latest = None
+        if include_historical or (current_latency == 0 and current_cameras == 0):
+            try:
+                row = self.dl.conn.execute(
+                    """
+                    SELECT timestamp, datetime, global_avg_latency_us,
+                           total_active_cameras
+                    FROM extended_metrics
+                    ORDER BY timestamp DESC LIMIT 1
+                    """
+                ).fetchone()
+                if row:
+                    extended_latest = dict(row)
+                    current_latency = float(extended_latest.get('global_avg_latency_us') or 0)
+                    current_cameras = float(extended_latest.get('total_active_cameras') or 0)
+                    sma_latency = current_latency
+                    sma_cameras = current_cameras
+                    if include_historical and extended_latest.get('timestamp'):
+                        now = datetime.fromtimestamp(int(extended_latest['timestamp']))
+                        current_hour = now.hour
+                        current_dow = now.weekday()
+            except Exception:
+                extended_latest = None
         
         # Analisa tendência
-        trend = self.analyze_trend('latency', window_minutes * 2)
+        trend = self.analyze_trend('latency', window_minutes * 2, include_historical=include_historical)
         
         # Detecta baixa atividade
         is_low_activity = (
@@ -176,6 +204,14 @@ class PatternRecognition:
         # Calcula confiança baseado em dados históricos da mesma hora
         pattern_data = self.dl.get_pattern_data(hour=current_hour, day_of_week=current_dow)
         sample_count = pattern_data['sample_count'] if pattern_data else 0
+        if not sample_count and extended_latest:
+            try:
+                sample_count = int(self.dl.conn.execute(
+                    "SELECT COUNT(*) FROM extended_metrics WHERE timestamp >= ?",
+                    (int(extended_latest['timestamp']) - 30 * 60,)
+                ).fetchone()[0] or 0)
+            except Exception:
+                sample_count = 0
         
         # Confiança aumenta com mais amostras
         if sample_count >= THRESHOLDS['min_samples_for_pattern']:
@@ -188,7 +224,7 @@ class PatternRecognition:
                                                  current_cameras, current_latency)
         
         self.current_analysis = {
-            'timestamp': int(time.time()),
+            'timestamp': int(now.timestamp()),
             'datetime': now.isoformat(),
             'hour': current_hour,
             'day_of_week': current_dow,
@@ -238,7 +274,7 @@ class PatternRecognition:
         else:
             return 'normal'
     
-    def analyze_trend(self, metric='latency', window_minutes=60):
+    def analyze_trend(self, metric='latency', window_minutes=60, include_historical=False):
         """
         Analisa tendência de uma métrica.
         
@@ -251,6 +287,20 @@ class PatternRecognition:
         """
         # Pega métricas em duas metades da janela
         recent = self.dl.get_recent_metrics(window_minutes)
+
+        if len(recent) < 4:
+            extended = self._extended_pattern_rows(
+                max(1, (window_minutes + 59) // 60),
+                include_historical=include_historical,
+            )
+            if len(extended) >= 4:
+                recent = [
+                    {
+                        'latency_us': float(row.get('global_avg_latency_us') or 0),
+                        'cameras_active': float(row.get('total_active_cameras') or 0),
+                    }
+                    for row in extended
+                ]
         
         if not recent or len(recent) < 4:
             return 'unknown'
@@ -278,7 +328,29 @@ class PatternRecognition:
         else:
             return 'stable'
     
-    def detect_seasonal_patterns(self, days_back=7):
+    def _extended_pattern_rows(self, days_back=7, include_historical=False):
+        """Fallback de padrões para a coleta nativa em extended_metrics."""
+        try:
+            row = self.dl.conn.execute(
+                "SELECT MAX(timestamp) AS latest FROM extended_metrics"
+            ).fetchone()
+            latest = int(row['latest'] or 0) if row else 0
+            if not latest:
+                return []
+            cutoff = 0 if include_historical else latest - days_back * 86400
+            rows = self.dl.conn.execute(
+                """
+                SELECT timestamp, datetime, global_avg_latency_us, total_active_cameras
+                FROM extended_metrics
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+                """, (cutoff,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def detect_seasonal_patterns(self, days_back=7, include_historical=False):
         """
         Detecta padrões sazonais por hora do dia.
         
@@ -291,6 +363,22 @@ class PatternRecognition:
                 - confidence: confiança no padrão
         """
         hourly_stats = self.dl.get_hourly_stats(days_back * 24)
+        if not hourly_stats:
+            hourly_stats = []
+            grouped = defaultdict(list)
+            for row in self._extended_pattern_rows(days_back, include_historical):
+                try:
+                    dt = datetime.fromtimestamp(int(row['timestamp']))
+                    grouped[dt.hour].append(row)
+                except (TypeError, ValueError, OSError):
+                    continue
+            for hour, rows in grouped.items():
+                hourly_stats.append({
+                    'hour': hour,
+                    'avg_cameras': sum(float(r.get('total_active_cameras') or 0) for r in rows) / len(rows),
+                    'avg_latency': sum(float(r.get('global_avg_latency_us') or 0) for r in rows) / len(rows),
+                    'sample_count': len(rows),
+                })
         
         patterns = defaultdict(lambda: {
             'cameras_sum': 0,
@@ -326,7 +414,7 @@ class PatternRecognition:
         
         return sorted(results, key=lambda x: x['hour'])
     
-    def detect_day_of_week_pattern(self, days_back=7):
+    def detect_day_of_week_pattern(self, days_back=7, include_historical=False):
         """
         Detecta padrões por dia da semana.
         
@@ -339,6 +427,22 @@ class PatternRecognition:
                 - energy_saves: número de economias permitidas
         """
         daily_stats = self.dl.get_daily_stats(days_back)
+        if not daily_stats:
+            daily_stats = []
+            grouped = defaultdict(list)
+            for row in self._extended_pattern_rows(days_back, include_historical):
+                try:
+                    dt = datetime.fromtimestamp(int(row['timestamp']))
+                    grouped[dt.weekday()].append(row)
+                except (TypeError, ValueError, OSError):
+                    continue
+            for dow, rows in grouped.items():
+                daily_stats.append({
+                    'day_of_week': dow,
+                    'avg_cameras': sum(float(r.get('total_active_cameras') or 0) for r in rows) / len(rows),
+                    'avg_latency': sum(float(r.get('global_avg_latency_us') or 0) for r in rows) / len(rows),
+                    'sample_count': len(rows),
+                })
         
         patterns = defaultdict(lambda: {
             'cameras_sum': 0,
@@ -367,7 +471,7 @@ class PatternRecognition:
         
         return sorted(results, key=lambda x: x['day_of_week'])
     
-    def calculate_energy_window(self, days_back=7):
+    def calculate_energy_window(self, days_back=7, include_historical=False):
         """
         Calcula janela ótima de economia de energia.
         
@@ -383,8 +487,8 @@ class PatternRecognition:
                 - exclude_days: dias excluídos
                 - reason: justificativa
         """
-        hourly_patterns = self.detect_seasonal_patterns(days_back)
-        daily_patterns = self.detect_day_of_week_pattern(days_back)
+        hourly_patterns = self.detect_seasonal_patterns(days_back, include_historical=include_historical)
+        daily_patterns = self.detect_day_of_week_pattern(days_back, include_historical=include_historical)
         
         # Identifica horários de baixa atividade
         low_activity_hours = []
@@ -629,13 +733,13 @@ class PatternRecognition:
             'extended_thresholds': self.extended_thresholds
         }
     
-    def get_extended_metrics_history(self, minutes=60):
+    def get_extended_metrics_history(self, minutes=60, include_historical=False):
         """Retorna histórico de métricas estendidas."""
         try:
             if not self.dl.conn:
                 return []
             cursor = self.dl.conn.cursor()
-            cutoff = int(time.time()) - (minutes * 60)
+            cutoff = 0 if include_historical else int(time.time()) - (minutes * 60)
             cursor.execute("""
                 SELECT timestamp, datetime, sim_time_s,
                        global_worst_latency_us, global_avg_latency_us,
@@ -688,14 +792,14 @@ class PatternRecognition:
             print(f"[PatternEngine] ERRO ao buscar métricas UE: {e}")
             return []
     
-    def analyze_extended_metrics(self, window_minutes=30):
+    def analyze_extended_metrics(self, window_minutes=30, include_historical=False):
         """
         Analisa métricas estendidas (throughput, jitter, packet loss).
         
         Returns:
             Dict com análise completa das métricas expandidas.
         """
-        history = self.get_extended_metrics_history(window_minutes)
+        history = self.get_extended_metrics_history(window_minutes, include_historical=include_historical)
         
         if not history:
             return {
@@ -801,7 +905,7 @@ class PatternRecognition:
             },
         }
     
-    def analyze_link_quality(self, window_minutes=30):
+    def analyze_link_quality(self, window_minutes=30, include_historical=False):
         """
         Analisa qualidade do enlace usando MCS.
         
@@ -814,7 +918,7 @@ class PatternRecognition:
         Returns:
             Dict com análise de qualidade do enlace.
         """
-        history = self.get_extended_metrics_history(window_minutes)
+        history = self.get_extended_metrics_history(window_minutes, include_historical=include_historical)
         
         if not history:
             return {

@@ -1,42 +1,119 @@
 {% extends "base.html" %}
 {% block title %}Decisões - GreenRAN rApp{% endblock %}
 {% block content %}
-<div class="card">
-    <div class="card-header"><h5>Histórico de Decisões (60 min)</h5></div>
-    <div class="card-body">
-        <table class="table">
-            <thead><tr><th>Timestamp</th><th>Decisão</th><th>Estado</th><th>Razão</th></tr></thead>
-            <tbody>
-            {% for d in recent_decisions %}
-            <tr>
-                <td>{{ d.datetime }}</td>
-                <td>
-                    {% if d.decision == 'ALLOWED' %}
-                        <span class="badge badge-ok">{{ d.decision }}</span>
-                    {% elif d.decision == 'BLOCKED' %}
-                        <span class="badge badge-critical">{{ d.decision }}</span>
-                    {% elif d.decision == 'CONDITIONAL' %}
-                        <span class="badge badge-warning">{{ d.decision }}</span>
-                    {% else %}
-                        {{ d.decision }}
-                    {% endif %}
-                </td>
-                <td>
-                    {% if d.estado == 'NORMAL' %}
-                        <span class="badge badge-ok">{{ d.estado }}</span>
-                    {% elif d.estado == 'CONDITIONAL' %}
-                        <span class="badge badge-warning">{{ d.estado }}</span>
-                    {% elif d.estado == 'CRITICAL' %}
-                        <span class="badge badge-critical">{{ d.estado }}</span>
-                    {% else %}
-                        {{ d.estado }}
-                    {% endif %}
-                </td>
-                <td>{{ d.reason[:60] }}{% if d.reason|length > 60 %}...{% endif %}</td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
+<style>
+    .decision-hero { border: 1px solid rgba(143,211,255,.18); border-left: 4px solid #8fd3ff; border-radius: 12px; background: linear-gradient(110deg, rgba(15,52,96,.9), rgba(22,33,62,.9)); padding: 16px 18px; margin-bottom: 16px; }
+    .decision-kicker { color: #8fd3ff !important; font-size: .73rem; text-transform: uppercase; letter-spacing: .08em; }
+    .decision-title { color: #fff !important; font-size: 1.45rem; font-weight: 700; margin: 3px 0 5px; }
+    .decision-subtitle { color: #b8c7d9 !important; font-size: .85rem; }
+    .decision-badge { display: inline-block; border-radius: 999px; padding: 5px 10px; font-size: .72rem; font-weight: 700; letter-spacing: .05em; background: #244b70; color: #d9eaff !important; }
+    .decision-badge.historical { background: #66501a; color: #ffe2a4 !important; }
+    .decision-card { height: 100%; border: 1px solid rgba(143,211,255,.12); border-radius: 12px; background: rgba(22,33,62,.94); padding: 14px 16px; }
+    .decision-card-label { color: #8da6c3 !important; font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; }
+    .decision-card-value { color: #fff !important; font-size: 1.55rem; font-weight: 700; margin-top: 5px; }
+    .decision-card-note { color: #a8b7ca !important; font-size: .76rem; margin-top: 4px; }
+    .decision-card.allowed { border-top: 3px solid #00ff88; }
+    .decision-card.blocked { border-top: 3px solid #ff6666; }
+    .decision-card.conditional { border-top: 3px solid #ffaa00; }
+    .decision-card.neutral { border-top: 3px solid #8fd3ff; }
+    .decision-panel { border: 1px solid rgba(143,211,255,.12); border-radius: 12px; background: rgba(22,33,62,.94); padding: 16px; height: 100%; }
+    .decision-panel-title { color: #d9eaff !important; font-size: .8rem; text-transform: uppercase; letter-spacing: .07em; }
+    .decision-latest { font-size: 2rem; font-weight: 700; margin-top: 5px; }
+    .decision-latest.allowed { color: #00ff88 !important; }
+    .decision-latest.blocked { color: #ff6666 !important; }
+    .decision-latest.conditional { color: #ffaa00 !important; }
+    .decision-meta { color: #a8b7ca !important; font-size: .8rem; line-height: 1.55; }
+    .decision-reason { color: #dce8f5 !important; background: rgba(255,255,255,.04); border-left: 3px solid #8fd3ff; border-radius: 8px; padding: 10px 12px; margin-top: 12px; overflow-wrap: anywhere; }
+    .decision-progress { height: 9px; border-radius: 5px; overflow: hidden; background: #0b1427; display: flex; margin-top: 12px; }
+    .decision-progress span { display: block; height: 100%; }
+    .decision-progress .allowed { background: #00ff88; }
+    .decision-progress .blocked { background: #ff6666; }
+    .decision-progress .conditional { background: #ffaa00; }
+    .decision-section { border: 1px solid rgba(143,211,255,.12); border-radius: 10px; background: rgba(7,16,35,.22); margin-top: 14px; }
+    .decision-section > summary { cursor: pointer; list-style: none; padding: 11px 14px; color: #d9eaff !important; font-weight: 600; font-size: .87rem; }
+    .decision-section > summary::-webkit-details-marker { display: none; }
+    .decision-section > summary::before { content: '▸'; color: #8fd3ff; margin-right: 8px; }
+    .decision-section[open] > summary::before { content: '▾'; }
+    .decision-section-body { padding: 0 14px 14px; }
+    .decision-table { min-width: 850px; }
+    .decision-table td, .decision-table th { color: #d6e1ee !important; border-color: rgba(255,255,255,.08) !important; padding: 8px 7px; vertical-align: top; }
+    .decision-table th { color: #fff !important; font-size: .74rem; text-transform: uppercase; letter-spacing: .04em; }
+    .decision-table td { font-size: .8rem; }
+    .decision-table .reason { min-width: 300px; max-width: 520px; overflow-wrap: anywhere; color: #b8c7d9 !important; }
+    .decision-empty { color: #9fb0c5 !important; padding: 10px 0; }
+</style>
+
+<div class="decision-hero">
+    <div class="d-flex justify-content-between align-items-start gap-3 flex-wrap">
+        <div>
+            <div class="decision-kicker">Controle e julgamento</div>
+            <div class="decision-title">Decisões do rApp</div>
+            <div class="decision-subtitle">{% if historical %}Resumo congelado do run concluído{% else %}Resumo do runtime atual{% endif %}</div>
+        </div>
+        <span class="decision-badge {% if historical %}historical{% endif %}">{{ 'HISTÓRICO' if historical else 'RUNTIME' }}</span>
     </div>
 </div>
+
+<div class="row g-3">
+    <div class="col-sm-6 col-lg-3"><div class="decision-card neutral"><div class="decision-card-label">Total</div><div class="decision-card-value">{{ decision_stats.total or 0 }}</div><div class="decision-card-note">{% if decision_stats.scope == 'run' %}decisões do run{% else %}últimas 24 horas{% endif %}</div></div></div>
+    <div class="col-sm-6 col-lg-3"><div class="decision-card allowed"><div class="decision-card-label">ALLOWED</div><div class="decision-card-value">{{ decision_stats.allowed or 0 }}</div><div class="decision-card-note">ação liberada</div></div></div>
+    <div class="col-sm-6 col-lg-3"><div class="decision-card conditional"><div class="decision-card-label">CONDITIONAL</div><div class="decision-card-value">{{ decision_stats.conditional or 0 }}</div><div class="decision-card-note">ação sob guarda</div></div></div>
+    <div class="col-sm-6 col-lg-3"><div class="decision-card blocked"><div class="decision-card-label">BLOCKED</div><div class="decision-card-value">{{ decision_stats.blocked or 0 }}</div><div class="decision-card-note">ação bloqueada</div></div></div>
+</div>
+
+{% set total = decision_stats.total or 0 %}
+<div class="decision-progress" title="Distribuição das decisões">
+    <span class="allowed" style="width: {{ ((decision_stats.allowed or 0) / total * 100) if total else 0 }}%"></span>
+    <span class="conditional" style="width: {{ ((decision_stats.conditional or 0) / total * 100) if total else 0 }}%"></span>
+    <span class="blocked" style="width: {{ ((decision_stats.blocked or 0) / total * 100) if total else 0 }}%"></span>
+</div>
+
+<div class="row g-3 mt-1">
+    <div class="col-lg-7"><div class="decision-panel">
+        <div class="decision-panel-title">Última decisão</div>
+        {% set latest = latest_decision or {} %}{% set latest_name = (latest.decision or 'SEM DECISÃO')|upper %}
+        <div class="decision-latest {% if latest_name == 'ALLOWED' %}allowed{% elif latest_name == 'BLOCKED' %}blocked{% elif latest_name == 'CONDITIONAL' %}conditional{% endif %}">{{ latest_name }}</div>
+        <div class="decision-meta">{{ latest.datetime or 'sem registro' }} · confiança {{ "%.1f"|format((latest.confidence or 0) * 100) }}%</div>
+        <div class="decision-meta">Estágio: {{ latest.stage or 'não informado' }}{% if latest.cycle %} · ciclo {{ latest.cycle }}{% endif %}{% if latest.energy_state %} · energia {{ latest.energy_state }}{% endif %}</div>
+        <div class="decision-reason">{{ latest.reason or 'Nenhum motivo registrado.' }}</div>
+    </div></div>
+    <div class="col-lg-5"><div class="decision-panel">
+        <div class="decision-panel-title">Leitura operacional</div>
+        {% if latest_name == 'BLOCKED' %}
+        <div class="decision-latest blocked">BLOQUEIO ATIVO</div>
+        <div class="decision-meta">A última ação preservou as guardas do experimento.</div>
+        {% elif latest_name == 'CONDITIONAL' %}
+        <div class="decision-latest conditional">SOB GUARDA</div>
+        <div class="decision-meta">A ação depende das condições registradas no ciclo.</div>
+        {% elif latest_name == 'ALLOWED' %}
+        <div class="decision-latest allowed">LIBERADO</div>
+        <div class="decision-meta">A ação foi autorizada pelo rApp.</div>
+        {% else %}
+        <div class="decision-latest">SEM DADOS</div>
+        <div class="decision-meta">Não há decisão persistida para avaliar.</div>
+        {% endif %}
+        <div class="decision-meta mt-3">A distribuição acima resume {{ total }} decisões.</div>
+    </div></div>
+</div>
+
+<details class="decision-section">
+    <summary>Histórico detalhado · {{ recent_decisions|length }} registros</summary>
+    <div class="decision-section-body">
+        {% if recent_decisions %}
+        <div class="table-responsive"><table class="table table-sm decision-table mb-0">
+            <thead><tr><th>Horário</th><th>Decisão</th><th>Confiança</th><th>Estágio</th><th>Estado</th><th>Motivo</th></tr></thead>
+            <tbody>{% for d in recent_decisions %}
+                <tr>
+                    <td>{{ d.datetime }}</td>
+                    <td>{% if d.decision == 'ALLOWED' %}<span class="badge badge-ok">ALLOWED</span>{% elif d.decision == 'BLOCKED' %}<span class="badge badge-critical">BLOCKED</span>{% elif d.decision == 'CONDITIONAL' %}<span class="badge badge-warning">CONDITIONAL</span>{% else %}{{ d.decision }}{% endif %}</td>
+                    <td>{{ "%.1f"|format((d.confidence or 0) * 100) }}%</td>
+                    <td>{{ d.stage or '—' }}</td>
+                    <td>{% if d.estado == 'NORMAL' %}<span class="badge badge-ok">NORMAL</span>{% elif d.estado == 'CONDITIONAL' %}<span class="badge badge-warning">CONDITIONAL</span>{% elif d.estado == 'CRITICAL' %}<span class="badge badge-critical">CRITICAL</span>{% else %}{{ d.estado }}{% endif %}</td>
+                    <td class="reason">{{ d.reason or 'Sem motivo registrado.' }}</td>
+                </tr>
+            {% endfor %}</tbody>
+        </table></div>
+        {% else %}<div class="decision-empty">Nenhuma decisão encontrada.</div>{% endif %}
+    </div>
+</details>
 {% endblock %}

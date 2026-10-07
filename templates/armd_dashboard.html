@@ -26,7 +26,7 @@
 <div class="row g-3">
     <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Estado</div><div class="card-body"><div class="metric-value {% if armd.present %}status-ok{% else %}status-warning{% endif %}">{{ 'ATIVO' if armd.present else 'INATIVO' }}</div><div class="metric-label">modo {{ armd.mode|upper }}</div></div></div></div>
     <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Atenção</div><div class="card-body"><div class="metric-value {% if armd.attention_level in ['critical', 'override'] %}status-critical{% elif armd.attention_level == 'guard' %}status-warning{% else %}status-ok{% endif %}">{{ armd.attention_level|upper }}</div><div class="metric-label">override: {{ 'SIM' if armd.override_applied else 'NÃO' }}</div></div></div></div>
-    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Confiança</div><div class="card-body"><div class="metric-value">{{ armd.confidence }}</div><div class="metric-label">fonte: {{ armd.source }}</div></div></div></div>
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Confiança</div><div class="card-body"><div class="metric-value">{{ armd.confidence }}</div><div class="metric-label">nível de confiança</div></div></div></div>
     <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-header">Políticas pendentes</div><div class="card-body"><div class="metric-value">{{ armd.pending_policies }}</div><div class="metric-label">aguardando confirmação A1</div></div></div></div>
 </div>
 

@@ -23,7 +23,7 @@ import json
 import time
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, redirect
 from greenran_paths import (
     STATE_DIR,
     TEMPLATES_DIR,
@@ -60,6 +60,15 @@ from apps.app3_veicular.backend.services import VehicleStateStore  # noqa: E402
 
 app = Flask(__name__, template_folder=as_str(TEMPLATES_DIR))
 RUNTIME_CONFIG = load_runtime_config()
+
+
+@app.after_request
+def _no_cache_html(response):
+    """HTML nunca fica preso no cache do browser (mudanças de layout aparecem no F5)."""
+    if (response.content_type or '').startswith('text/html'):
+        response.headers['Cache-Control'] = 'no-store, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+    return response
 
 DATA_LAKE = DataLake()
 PATTERN_ENGINE = PatternRecognition(DATA_LAKE)
@@ -104,6 +113,10 @@ CAMERA_THROUGHPUT_MIN_MBPS = float(RUNTIME_CONFIG.get("shared_resources", {}).ge
 CAMERA_THROUGHPUT_GUARD_MBPS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("camera_throughput_guard_mbps", 30.0) or 30.0)
 CAMERA_LATENCY_WARNING_MS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("camera_latency_warning_ms", 80.0) or 80.0)
 CAMERA_LATENCY_CRITICAL_MS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("camera_latency_target_ms", 100.0) or 100.0)
+P95_TARGET_MS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("p95_target_ms", 80.0) or 80.0)
+P95_CRITICAL_MS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("resource_p95_critical_ms", 120.0) or 120.0)
+CVAR_TARGET_MS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("cvar_target_ms", 120.0) or 120.0)
+CVAR_CRITICAL_MS = float(RUNTIME_CONFIG.get("shared_resources", {}).get("resource_cvar_critical_ms", 250.0) or 250.0)
 
 
 
@@ -127,15 +140,99 @@ def get_fixed_scenario_metadata():
         'vehicle_imsi_end': base_imsi + max(max_vehicles - 1, 0),
     }
 
+def _latest_extended_metrics_payload():
+    """Converte a última amostra do Data Lake para o formato dos cards.
+
+    Runs concluídos normalmente não deixam ``xapp_metrics/extended_metrics.json``
+    no diretório de estado.  Nesse caso, a última linha de ``extended_metrics``
+    é a fonte canônica do snapshot histórico.
+    """
+    try:
+        row = DATA_LAKE.conn.execute(
+            """
+            SELECT timestamp, datetime, sim_time_s, global_worst_latency_us,
+                   global_avg_latency_us, global_min_latency_us, global_max_latency_us,
+                   global_jitter_us, global_packet_loss_rate, total_active_ues,
+                   total_active_cameras, total_critical_ues, total_tx_bytes,
+                   total_rx_bytes, total_tx_pdus, total_rx_pdus, throughput_kbps,
+                   energy_state, slicer_state, latency_p5_us, latency_p95_us,
+                   latency_min_nonzero_us, valid_samples, latency_p95_per_ue_us,
+                   variance_per_ue_us2, cvar_per_ue_us, ue_count, collector_mode,
+                   throughput_source, real_latency_sample_count,
+                   proxy_latency_sample_count, pdcp_stale, rlc_stale, mac_stale,
+                   pdcp_trace_age_s, rlc_trace_age_s, mac_trace_age_s,
+                   pdcp_latest_sim_time_s
+            FROM extended_metrics
+            ORDER BY timestamp DESC LIMIT 1
+            """
+        ).fetchone()
+        if not row:
+            return None
+
+        def value(name, default=0):
+            try:
+                return row[name] if row[name] is not None else default
+            except (IndexError, KeyError):
+                return default
+
+        payload = {
+            'global_metrics': {
+                'global_worst_latency_us': float(value('global_worst_latency_us')),
+                'global_avg_latency_us': float(value('global_avg_latency_us')),
+                'global_min_latency_us': float(value('global_min_latency_us')),
+                'global_max_latency_us': float(value('global_max_latency_us')),
+                'global_jitter_us': float(value('global_jitter_us')),
+                'global_packet_loss_rate': float(value('global_packet_loss_rate')),
+                'latency_p5_us': float(value('latency_p5_us')),
+                'latency_p95_us': float(value('latency_p95_us')),
+                'cvar_per_ue_us': float(value('cvar_per_ue_us')),
+                'throughput_kbps': float(value('throughput_kbps')),
+                'total_active_ues': int(value('total_active_ues')),
+                'total_active_cameras': int(value('total_active_cameras')),
+                'total_critical_ues': int(value('total_critical_ues')),
+                'total_tx_bytes': int(value('total_tx_bytes')),
+                'total_rx_bytes': int(value('total_rx_bytes')),
+                'energy_state': value('energy_state', ''),
+                'slicer_state': value('slicer_state', ''),
+                'collector_mode': value('collector_mode', ''),
+                'throughput_source': value('throughput_source', ''),
+                'real_latency_sample_count': int(value('real_latency_sample_count')),
+                'proxy_latency_sample_count': int(value('proxy_latency_sample_count')),
+                'pdcp_stale': bool(value('pdcp_stale')),
+                'pdcp_latest_sim_time_s': float(value('pdcp_latest_sim_time_s')),
+            },
+            'active_cameras': int(value('total_active_cameras')),
+            'critical_cameras': int(value('total_critical_ues')),
+            'timestamp': int(value('timestamp')),
+            'datetime': value('datetime', ''),
+            'sim_time_s': float(value('sim_time_s')),
+            'data_mode': 'historical_db',
+            'data_source': str(RAPP_DB_PATH),
+            'snapshot_datetime': value('datetime', ''),
+        }
+        # These fields are consumed by the live/API normalization too.
+        payload['global_metrics']['latency_p95_per_ue_us'] = float(value('latency_p95_per_ue_us'))
+        payload['global_metrics']['variance_per_ue_us2'] = float(value('variance_per_ue_us2'))
+        payload['global_metrics']['ue_count'] = int(value('ue_count'))
+        return payload
+    except Exception as exc:
+        print(f"Erro ao obter último snapshot histórico: {exc}")
+        return None
+
+
 def get_current_metrics():
-    """Obtém métricas atuais."""
+    """Obtém métricas atuais ou o último snapshot histórico do run servido."""
     if os.path.exists(METRICS_FILE):
         try:
             with open(METRICS_FILE, 'r') as f:
-                return json.load(f)
+                payload = json.load(f)
+                if isinstance(payload, dict) and payload.get('global_metrics'):
+                    payload.setdefault('data_mode', 'runtime')
+                    payload.setdefault('data_source', METRICS_FILE)
+                    return payload
         except:
             pass
-    return None
+    return _latest_extended_metrics_payload()
 
 
 def get_xapp_status():
@@ -382,8 +479,41 @@ def evaluate_vehicle_sla(snapshot):
     }
 
 
+def _get_historical_app3_monitoring():
+    """Lê o último snapshot App3 do mesmo Data Lake, sem atualizar o runtime."""
+    try:
+        row = DATA_LAKE.conn.execute(
+            """
+            SELECT snapshot_json FROM app3_snapshots
+            ORDER BY timestamp DESC LIMIT 1
+            """
+        ).fetchone()
+        if row and row[0]:
+            snapshot = json.loads(row[0])
+            if isinstance(snapshot, dict):
+                snapshot['data_mode'] = 'historical_db'
+                snapshot['vehicle_sla'] = evaluate_vehicle_sla(snapshot)
+                return snapshot
+    except Exception as exc:
+        print(f"Erro ao obter snapshot histórico da App3: {exc}")
+    return {}
+
+
 def get_app3_monitoring():
-    """Obtém snapshot da App3-Veicular recalculando o estado vivo dos veículos."""
+    """Obtém snapshot App3 sem misturar estado atual com um run histórico."""
+    metrics = get_current_metrics() or {}
+    if metrics.get('data_mode') == 'historical_db':
+        historical = _get_historical_app3_monitoring()
+        if historical:
+            return historical
+        # Não chame refresh_snapshot para um run concluído.  O arquivo pode
+        # existir, mas deve ser tratado apenas como evidência congelada.
+        snapshot = _safe_read_json(APP3_MONITORING_FILE, {})
+        if isinstance(snapshot, dict) and snapshot:
+            snapshot['data_mode'] = 'historical_file'
+            snapshot['vehicle_sla'] = evaluate_vehicle_sla(snapshot)
+            return snapshot
+        return {}
     try:
         snapshot = APP3_STORE.refresh_snapshot()
         if isinstance(snapshot, dict):
@@ -502,12 +632,79 @@ def get_learned_conflict_assets():
     """Obtém o relatório e a adjacência aprendida do pipeline de conflitos."""
     report = _safe_read_json(CONFLICT_LEARNED_REPORT_FILE, {})
     adjacency = _safe_read_json(CONFLICT_LEARNED_ADJ_FILE, {})
+
+    # Alguns runs de coleta registram os caminhos de conflito no lake, mas
+    # não exportam os artefatos JSON do treino.  Nesse caso, não deixamos a
+    # seção vazia: montamos uma leitura observacional mínima a partir dos
+    # eventos persistidos, deixando claro na interface que é evidência do run.
+    if not report:
+        try:
+            rows = DATA_LAKE.conn.execute(
+                """
+                SELECT graph_path, COUNT(*) AS learned_count
+                FROM conflict_events
+                WHERE graph_path IS NOT NULL AND TRIM(graph_path) <> ''
+                GROUP BY graph_path
+                ORDER BY learned_count DESC
+                """
+            ).fetchall()
+            confirmed = []
+            for row in rows:
+                nodes = [part.strip() for part in str(row['graph_path'] or '').split('->') if part.strip()]
+                count = int(row['learned_count'] or 0)
+                for source, target in zip(nodes, nodes[1:]):
+                    confirmed.append({
+                        'source': source,
+                        'target': target,
+                        'relation': 'observado no run',
+                        'baseline_weight': 0,
+                        'learned_count': count,
+                        'learned_strength': 1.0,
+                    })
+            if confirmed:
+                report = {
+                    'summary': {
+                        'baseline_edges': 0,
+                        'learned_edges': len(confirmed),
+                        'confirmed_by_data': len(confirmed),
+                        'weak_or_low_support': 0,
+                        'spurious_in_baseline': 0,
+                        'emergent_from_data': len(confirmed),
+                    },
+                    'confirmed_by_data': confirmed,
+                    'weak_or_low_support': [],
+                    'generated_from_events': True,
+                }
+        except Exception as exc:
+            print(f"Erro ao derivar relações observadas dos conflitos: {exc}")
     return report, adjacency
 
 
 def get_decision_stats():
-    """Obtém estatísticas de decisões."""
-    return DATA_LAKE.get_decision_stats(24)
+    """Obtém estatísticas de decisões no escopo correto do run."""
+    metrics = get_current_metrics() or {}
+    if metrics.get('data_mode') == 'historical_db':
+        try:
+            rows = DATA_LAKE.conn.execute(
+                """
+                SELECT decision, COUNT(*) AS count
+                FROM decisions_history
+                GROUP BY decision
+                """
+            ).fetchall()
+            result = {'total': 0, 'blocked': 0, 'allowed': 0, 'conditional': 0, 'scope': 'run'}
+            for row in rows:
+                decision = str(row['decision'] or '').lower()
+                count = int(row['count'] or 0)
+                result['total'] += count
+                if decision in result:
+                    result[decision] += count
+            return result
+        except Exception as exc:
+            print(f"Erro ao obter estatísticas do run histórico: {exc}")
+    result = DATA_LAKE.get_decision_stats(24)
+    result.setdefault('scope', '24h')
+    return result
 
 
 def get_drl_stats():
@@ -732,11 +929,11 @@ def get_camera_protection():
         metrics = get_current_metrics()
         if not metrics:
             return {
-                'status': 'ATIVA',
+                'status': 'SEM DADOS',
                 'active_cameras': 0,
                 'max_latency': 0,
                 'min_throughput_mbps': 0,
-                'sla_compliant': True,
+                'sla_compliant': None,
                 'guard_active': False,
                 'reason': 'Sem métricas atuais'
             }
@@ -746,13 +943,28 @@ def get_camera_protection():
             if ue.get('device_type') == 'camera'
         ]
 
+        # A amostra histórica agregada não contém métricas por câmera.  Não
+        # invente uma violação nem classifique como "ATIVA": exponha o número
+        # de câmeras do snapshot e marque a evidência como histórica.
+        if not camera_entries and metrics.get('data_mode') == 'historical_db':
+            global_metrics = metrics.get('global_metrics', {}) or {}
+            return {
+                'status': 'HISTÓRICO',
+                'active_cameras': int(global_metrics.get('total_active_cameras', metrics.get('active_cameras', 0)) or 0),
+                'max_latency': float(global_metrics.get('latency_p95_us', 0.0) or 0.0),
+                'min_throughput_mbps': float(global_metrics.get('throughput_kbps', 0.0) or 0.0) / 1000.0,
+                'sla_compliant': None,
+                'guard_active': False,
+                'reason': 'Snapshot histórico agregado; sem métricas individuais por câmera.'
+            }
+
         if not camera_entries:
             return {
-                'status': 'ATIVA',
+                'status': 'SEM DADOS',
                 'active_cameras': 0,
                 'max_latency': 0,
                 'min_throughput_mbps': 0,
-                'sla_compliant': True,
+                'sla_compliant': None,
                 'guard_active': False,
                 'reason': 'Nenhuma câmera ativa'
             }
@@ -809,11 +1021,11 @@ def get_camera_protection():
     except Exception as e:
         print(f"Erro ao obter proteção das câmeras: {e}")
         return {
-            'status': 'ATIVA',
+            'status': 'SEM DADOS',
             'active_cameras': 0,
             'max_latency': 0,
             'min_throughput_mbps': 0,
-            'sla_compliant': True,
+            'sla_compliant': None,
             'guard_active': False,
             'reason': 'Erro ao ler métricas'
         }
@@ -853,7 +1065,35 @@ def get_recent_metrics(minutes=30):
     return DATA_LAKE.get_recent_metrics(minutes)
 
 
-def get_recent_decisions(minutes=60):
+def get_historical_metrics(limit=120):
+    """Obtém a série final do run quando não há janela de relógio atual."""
+    try:
+        rows = DATA_LAKE.conn.execute(
+            """
+            SELECT timestamp, global_avg_latency_us, total_active_cameras,
+                   total_critical_ues, energy_state, slicer_state
+            FROM extended_metrics
+            ORDER BY timestamp DESC LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [
+            {
+                'timestamp': int(row['timestamp'] or 0),
+                'latency_us': float(row['global_avg_latency_us'] or 0.0),
+                'cameras_active': int(row['total_active_cameras'] or 0),
+                'critical_cameras': int(row['total_critical_ues'] or 0),
+                'energy_state': row['energy_state'],
+                'slicer_state': row['slicer_state'],
+            }
+            for row in reversed(rows)
+        ]
+    except Exception as exc:
+        print(f"Erro ao obter série histórica de métricas: {exc}")
+        return []
+
+
+def get_recent_decisions(minutes=60, limit=60):
     """
     Obtém decisões recentes com estado.
     
@@ -863,7 +1103,9 @@ def get_recent_decisions(minutes=60):
     try:
         cursor = DATA_LAKE.conn.cursor()
         cursor.execute('''
-            SELECT timestamp, datetime, decision, reason,
+            SELECT timestamp, datetime, decision, reason, confidence,
+                   collection_event_stage_name, collection_event_cycle,
+                   collection_event_stage_index, energy_state,
                    CASE 
                        WHEN decision = 'BLOCKED' THEN 'CRITICAL'
                        WHEN decision = 'ALLOWED' THEN 'NORMAL'
@@ -873,8 +1115,8 @@ def get_recent_decisions(minutes=60):
             FROM decisions_history
             WHERE timestamp > (SELECT MAX(timestamp) - ? * 60 FROM decisions_history)
             ORDER BY timestamp DESC
-            LIMIT 20
-        ''', (minutes,))
+            LIMIT ?
+        ''', (minutes, int(limit)))
         
         decisions = []
         for row in cursor.fetchall():
@@ -883,7 +1125,12 @@ def get_recent_decisions(minutes=60):
                 'datetime': row[1],
                 'decision': row[2],
                 'reason': row[3],
-                'estado': row[4]
+                'confidence': round(float(row[4] or 0.0), 4),
+                'stage': row[5] or '',
+                'cycle': int(row[6] or 0),
+                'stage_index': int(row[7] or 0),
+                'energy_state': row[8] or '',
+                'estado': row[9]
             })
         
         return decisions
@@ -993,9 +1240,17 @@ def get_resource_summary():
     latest = get_latest_resource_allocation()
     metrics = get_current_metrics() or {}
     global_metrics = metrics.get('global_metrics', {}) if isinstance(metrics, dict) else {}
+    historical = metrics.get('data_mode') == 'historical_db'
     try:
+        latest_timestamp = int(metrics.get('timestamp', 0) or 0)
+        if historical and latest_timestamp > 0:
+            window_predicate = 'timestamp BETWEEN ? AND ?'
+            window_args = (latest_timestamp - 3600, latest_timestamp)
+        else:
+            window_predicate = "timestamp >= strftime('%s', 'now') - 3600"
+            window_args = ()
         row = DATA_LAKE.conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS samples,
                    AVG(resource_budget) AS resource_budget,
                    AVG(usable_budget) AS usable_budget,
@@ -1009,8 +1264,9 @@ def get_resource_summary():
                    ,AVG(reinforcement_ran) AS reinforcement_ran
                    ,AVG(reinforcement_ai) AS reinforcement_ai
             FROM resource_allocation_history
-            WHERE timestamp >= strftime('%s', 'now') - 3600
-            """
+            WHERE {window_predicate}
+            """,
+            window_args,
         ).fetchone()
         samples = int(row['samples'] or 0) if row else 0
         window = {
@@ -1037,9 +1293,15 @@ def get_resource_summary():
         'delivered_bandwidth_mbps': round(float(global_metrics.get('throughput_kbps', 0.0) or 0.0) / 1000.0, 3),
         'direct_bandwidth_allocation_available': False,
         'resource_unit': 'rApp budget share',
+        'window_scope': 'run' if historical else 'last_1h',
         'allocation_state': latest.get('allocation_state', 'ALLOWED') if latest else 'ALLOWED',
         'floor_feasible': latest.get('floor_feasible', True) if latest else True,
-        'note': 'PRB/RB físico indisponível no trace atual; throughput é banda entregue, não banda alocada.',
+        'note': (
+            'Janela relativa ao run histórico; PRB/RB físico indisponível no trace, '
+            'throughput é banda entregue, não banda alocada.'
+            if historical else
+            'PRB/RB físico indisponível no trace atual; throughput é banda entregue, não banda alocada.'
+        ),
     }
 
 
@@ -1108,6 +1370,8 @@ def get_latest_decision_snapshot():
         cursor.execute(
             """
             SELECT datetime, decision, energy_state, confidence, reason,
+                   collection_event_stage_name, collection_event_cycle,
+                   collection_event_stage_index,
                    network_improvement_pct, cvar_improvement_pct, p95_improvement_pct,
                    baseline_cvar_us, baseline_p95_us, improvement_source, improvement_valid
             FROM decisions_history
@@ -1124,13 +1388,16 @@ def get_latest_decision_snapshot():
             'energy_state': row[2],
             'confidence': round(float(row[3] or 0.0), 4),
             'reason': row[4] or '',
-            'network_improvement_pct': round(float(row[5] or 0.0), 3),
-            'cvar_improvement_pct': round(float(row[6] or 0.0), 3),
-            'p95_improvement_pct': round(float(row[7] or 0.0), 3),
-            'baseline_cvar_us': float(row[8] or 0.0),
-            'baseline_p95_us': float(row[9] or 0.0),
-            'improvement_source': row[10] or '',
-            'improvement_valid': bool(row[11] or 0),
+            'stage': row[5] or '',
+            'cycle': int(row[6] or 0),
+            'stage_index': int(row[7] or 0),
+            'network_improvement_pct': round(float(row[8] or 0.0), 3),
+            'cvar_improvement_pct': round(float(row[9] or 0.0), 3),
+            'p95_improvement_pct': round(float(row[10] or 0.0), 3),
+            'baseline_cvar_us': float(row[11] or 0.0),
+            'baseline_p95_us': float(row[12] or 0.0),
+            'improvement_source': row[13] or '',
+            'improvement_valid': bool(row[14] or 0),
         }
     except Exception as e:
         print(f"Erro ao obter última decisão: {e}")
@@ -1439,6 +1706,140 @@ def _db_latest_age_s():
     return None
 
 
+def _build_operational_summary(status, latest_metric, provenance, latest_decision, guards, online):
+    """Normalize the signals that determine what needs operator attention.
+
+    This is deliberately kept server-side so the dashboard and API consumers
+    use the same thresholds and do not each implement a partial risk model.
+    """
+    latest_metric = latest_metric or {}
+    provenance = provenance or {}
+    latest_decision = latest_decision or {}
+    guards = guards or {}
+    online = online or {}
+    status = str(status or 'unknown').lower()
+    p95_ms = float(latest_metric.get('p95_ms', 0.0) or 0.0)
+    cvar_ms = float(latest_metric.get('cvar_ms', 0.0) or 0.0)
+    throughput_mbps = float(latest_metric.get('throughput_kbps', 0.0) or 0.0) / 1000.0
+    active_cameras = int(latest_metric.get('active_cameras', 0) or 0)
+    has_metric = bool(latest_metric) and bool(
+        latest_metric.get('timestamp')
+        or latest_metric.get('datetime')
+        or p95_ms > 0.0
+        or cvar_ms > 0.0
+        or throughput_mbps > 0.0
+        or int(latest_metric.get('active_ues', 0) or 0) > 0
+        or int(latest_metric.get('active_cameras', 0) or 0) > 0
+        or int(latest_metric.get('real_latency_sample_count', 0) or 0) > 0
+        or int(latest_metric.get('proxy_latency_sample_count', 0) or 0) > 0
+    )
+    items = []
+
+    severity_rank = {'critical': 0, 'warning': 1, 'info': 2}
+
+    def add(severity, code, title, detail, panel='live'):
+        items.append({
+            'severity': severity,
+            'code': code,
+            'title': title,
+            'detail': detail,
+            'panel': panel,
+        })
+
+    if not has_metric:
+        add('critical', 'telemetry_missing', 'Telemetria ausente',
+            'Não há uma amostra de qualidade disponível para avaliar o run.')
+    elif status in ('stale', 'stopped', 'unknown'):
+        add('critical', 'telemetry_unavailable', 'Telemetria sem pulso',
+            f'Estado {status.upper()}; não é seguro tratar os KPIs como atuais.')
+    elif status == 'historical':
+        add('info', 'historical_run', 'Run histórico',
+            'Os valores abaixo são evidências congeladas de um run concluído.')
+
+    pdcp_stale = bool(latest_metric.get('pdcp_stale', False))
+    real_samples = int(provenance.get('real_samples', latest_metric.get('real_latency_sample_count', 0)) or 0)
+    proxy_samples = int(provenance.get('proxy_samples', latest_metric.get('proxy_latency_sample_count', 0)) or 0)
+    if pdcp_stale:
+        add('critical', 'pdcp_stale', 'PDCP obsoleto',
+            'A amostra PDCP mais recente não acompanha o tempo do cenário.', 'quality')
+    elif has_metric and real_samples <= 0 and proxy_samples > 0:
+        add('warning', 'pdcp_proxy', 'Telemetria proxy',
+            f'{proxy_samples} amostra(s) proxy; a qualidade não está comprovada por PDCP real.', 'quality')
+
+    if has_metric:
+        if p95_ms >= P95_CRITICAL_MS:
+            add('critical', 'p95_critical', 'P95 crítico',
+                f'{p95_ms:.1f} ms ≥ {P95_CRITICAL_MS:.1f} ms.', 'quality')
+        elif p95_ms >= P95_TARGET_MS:
+            add('warning', 'p95_guard', 'P95 acima da meta',
+                f'{p95_ms:.1f} ms ≥ {P95_TARGET_MS:.1f} ms.', 'quality')
+
+        if cvar_ms >= CVAR_CRITICAL_MS:
+            add('critical', 'cvar_critical', 'CVaR crítico',
+                f'{cvar_ms:.1f} ms ≥ {CVAR_CRITICAL_MS:.1f} ms.', 'quality')
+        elif cvar_ms >= CVAR_TARGET_MS:
+            add('warning', 'cvar_guard', 'CVaR acima da meta',
+                f'{cvar_ms:.1f} ms ≥ {CVAR_TARGET_MS:.1f} ms.', 'quality')
+
+        if active_cameras > 0 and throughput_mbps < CAMERA_THROUGHPUT_MIN_MBPS:
+            add('critical', 'throughput_sla', 'Throughput abaixo do SLA',
+                f'{throughput_mbps:.2f} Mbps < {CAMERA_THROUGHPUT_MIN_MBPS:.2f} Mbps.', 'sla')
+        elif active_cameras > 0 and throughput_mbps < CAMERA_THROUGHPUT_GUARD_MBPS:
+            add('warning', 'throughput_guard', 'Throughput na guarda',
+                f'{throughput_mbps:.2f} Mbps < {CAMERA_THROUGHPUT_GUARD_MBPS:.2f} Mbps.', 'sla')
+
+    rollback = bool(guards.get('rollback', False) or online.get('guard', {}).get('rollback', False))
+    floor_violations = int(guards.get('floor_violations', 0) or 0) + int(guards.get('per_ue_floor_violations', 0) or 0)
+    if rollback:
+        add('critical', 'rollback', 'Rollback ativo',
+            online.get('guard', {}).get('reason') or 'A proteção do modelo acionou rollback.', 'decision')
+    if guards.get('floor_feasible') is False or floor_violations > 0:
+        add('critical', 'floor_violation', 'Piso de recurso inviável',
+            f'{floor_violations} violação(ões) registrada(s).', 'allocation')
+
+    decision = str(latest_decision.get('decision', '') or '').upper()
+    if decision == 'BLOCKED':
+        add('warning', 'decision_blocked', 'Última decisão bloqueada',
+            latest_decision.get('reason') or 'A decisão rApp bloqueou a ação.', 'decision')
+    elif decision == 'CONDITIONAL':
+        add('warning', 'decision_conditional', 'Última decisão condicional',
+            latest_decision.get('reason') or 'A decisão rApp exige guarda.', 'decision')
+
+    items.sort(key=lambda item: (severity_rank.get(item['severity'], 9), item['code']))
+    critical_count = sum(item['severity'] == 'critical' for item in items)
+    warning_count = sum(item['severity'] == 'warning' for item in items)
+    if critical_count:
+        level, label = 'critical', 'ATENÇÃO CRÍTICA'
+    elif warning_count:
+        level, label = 'warning', 'ATENÇÃO'
+    elif status == 'historical':
+        level, label = 'info', 'HISTÓRICO'
+    elif has_metric:
+        level, label = 'ok', 'SAUDÁVEL'
+    else:
+        level, label = 'critical', 'SEM DADOS'
+
+    if not items:
+        add('info', 'telemetry_healthy', 'Telemetria saudável',
+            'PDCP real, guardas viáveis e nenhum limite operacional excedido.')
+
+    return {
+        'level': level,
+        'label': label,
+        'items': items,
+        'critical_count': critical_count,
+        'warning_count': warning_count,
+        'limits': {
+            'p95_target_ms': round(P95_TARGET_MS, 3),
+            'p95_critical_ms': round(P95_CRITICAL_MS, 3),
+            'cvar_target_ms': round(CVAR_TARGET_MS, 3),
+            'cvar_critical_ms': round(CVAR_CRITICAL_MS, 3),
+            'throughput_min_mbps': round(CAMERA_THROUGHPUT_MIN_MBPS, 3),
+            'throughput_guard_mbps': round(CAMERA_THROUGHPUT_GUARD_MBPS, 3),
+        },
+    }
+
+
 def build_live_collection_snapshot():
     """Compose the compact, polling-friendly view of the active online run."""
     status_info = _live_file_info(ONLINE_STATUS_FILE)
@@ -1514,6 +1915,8 @@ def build_live_collection_snapshot():
     ages = [info['age_s'] for info in (status_info, training_info) if info['exists'] and info['age_s'] is not None]
     freshest_age = min(ages) if ages else None
     status = str(online.get('status') or ('running' if latest_metric else 'unknown')).lower()
+    if status in ('finished', 'complete', 'completed', 'done'):
+        status = 'historical'
     if status == 'running' and freshest_age is not None and freshest_age > 90:
         status = 'stale'
     if status == 'running':
@@ -1522,6 +1925,29 @@ def build_live_collection_snapshot():
         db_age = _db_latest_age_s()
         if db_age is not None and db_age > 90:
             status = 'historical'
+    provenance = {
+        'collector_mode': latest_metric.get('collector_mode') or global_metrics.get('collector_mode', ''),
+        'pdcp_real': bool(global_metrics.get('pdcp_real', latest_metric.get('real_latency_sample_count', 0) > 0)),
+        'pdcp_provenance': global_metrics.get('pdcp_provenance', 'pdcp_real' if latest_metric.get('real_latency_sample_count', 0) > 0 else ''),
+        'scenario_override_active': bool(global_metrics.get('scenario_override_active', False)),
+        'effective_source': global_metrics.get('effective_source', 'pdcp_real'),
+        'real_samples': int(global_metrics.get('real_latency_sample_count', latest_metric.get('real_latency_sample_count', 0)) or 0),
+        'proxy_samples': int(global_metrics.get('proxy_latency_sample_count', latest_metric.get('proxy_latency_sample_count', 0)) or 0),
+    }
+    guards_snapshot = {
+        'floor_violations': int(guard.get('floor_violations', 0) or 0),
+        'rollback': bool(guard.get('rollback', False)),
+        'rollback_count': int(online.get('rollback_count', 0) or 0),
+        'allocation_state': allocation.get('allocation_state', ''),
+        'floor_feasible': allocation.get('floor_feasible', True),
+        'per_ue_floor_violations': int(allocation.get('floor_violations', 0) or 0),
+        'r_ran': allocation.get('r_ran', 0.0),
+        'r_ai': allocation.get('r_ai', 0.0),
+    }
+    operational_summary = _build_operational_summary(
+        status, latest_metric, provenance, db.get('latest_decision', {}),
+        guards_snapshot, {'guard': guard, **online},
+    )
     return {
         'generated_at': int(time.time()),
         'run_dir': str(RAPP_DB_PATH.parent),
@@ -1570,25 +1996,9 @@ def build_live_collection_snapshot():
             'decisions_last_minute': int(db.get('decisions_last_minute', 0) or 0),
         },
         'telemetry': latest_metric,
-        'provenance': {
-            'collector_mode': latest_metric.get('collector_mode') or global_metrics.get('collector_mode', ''),
-            'pdcp_real': bool(global_metrics.get('pdcp_real', latest_metric.get('real_latency_sample_count', 0) > 0)),
-            'pdcp_provenance': global_metrics.get('pdcp_provenance', 'pdcp_real' if latest_metric.get('real_latency_sample_count', 0) > 0 else ''),
-            'scenario_override_active': bool(global_metrics.get('scenario_override_active', False)),
-            'effective_source': global_metrics.get('effective_source', 'pdcp_real'),
-            'real_samples': int(global_metrics.get('real_latency_sample_count', latest_metric.get('real_latency_sample_count', 0)) or 0),
-            'proxy_samples': int(global_metrics.get('proxy_latency_sample_count', latest_metric.get('proxy_latency_sample_count', 0)) or 0),
-        },
-        'guards': {
-            'floor_violations': int(guard.get('floor_violations', 0) or 0),
-            'rollback': bool(guard.get('rollback', False)),
-            'rollback_count': int(online.get('rollback_count', 0) or 0),
-            'allocation_state': allocation.get('allocation_state', ''),
-            'floor_feasible': allocation.get('floor_feasible', True),
-            'per_ue_floor_violations': int(allocation.get('floor_violations', 0) or 0),
-            'r_ran': allocation.get('r_ran', 0.0),
-            'r_ai': allocation.get('r_ai', 0.0),
-        },
+        'provenance': provenance,
+        'guards': guards_snapshot,
+        'operational_summary': operational_summary,
         'database': {
             'path': str(Path(STATE_DIR) / 'rapp_data_lake.db'),
             'counts': db.get('counts', {}),
@@ -1720,10 +2130,24 @@ def build_mobile_ops_snapshot():
     }
 
 
-def get_recent_conflicts(minutes=60):
-    """Obtém conflitos O-RAN recentes derivados das decisões do rApp."""
+def _historical_conflict_end_timestamp():
+    """Return the last conflict timestamp when the selected run is historical."""
+    if (get_current_metrics() or {}).get('data_mode') != 'historical_db':
+        return None
     try:
-        return DATA_LAKE.get_recent_conflicts(minutes=minutes, limit=50)
+        row = DATA_LAKE.conn.execute("SELECT MAX(timestamp) FROM conflict_events").fetchone()
+        return int(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+
+
+def get_recent_conflicts(minutes=60):
+    """Obtém conflitos O-RAN recentes relativos ao run servido."""
+    try:
+        return DATA_LAKE.get_recent_conflicts(
+            minutes=minutes, limit=50,
+            end_timestamp=_historical_conflict_end_timestamp(),
+        )
     except Exception as e:
         print(f"Erro ao obter conflitos: {e}")
         return []
@@ -1736,7 +2160,8 @@ def get_vehicle_history(minutes=60, limit=60):
     estiver no caminho CARLA/mock, faz fallback para `app3_snapshots`, que é
     onde o App3 já persiste o estado veicular consolidado.
     """
-    cutoff = int(time.time()) - (minutes * 60)
+    historical = (get_current_metrics() or {}).get('data_mode') == 'historical_db'
+    cutoff = 0 if historical else int(time.time()) - (minutes * 60)
     history = []
     try:
         cursor = DATA_LAKE.conn.execute(
@@ -1819,12 +2244,22 @@ def index():
     
     # Métricas para gráficos
     recent = get_recent_metrics(120)  # 2 horas para incluir dados antigos
+    if not recent and isinstance(metrics, dict) and metrics.get('data_mode') == 'historical_db':
+        recent = get_historical_metrics(120)
     latency_history = [m['latency_us'] / 1000 for m in recent]  # ms
     cameras_history = [m['cameras_active'] for m in recent]
     
     # Obter métricas de coordenação rApp-xApps
     network_health = DATA_LAKE.get_network_health(window_minutes=5)
     latest_decision = get_latest_decision_snapshot()
+    if isinstance(metrics, dict) and metrics.get('data_mode') == 'historical_db':
+        historical_global = metrics.get('global_metrics', {}) or {}
+        network_health = dict(network_health or {})
+        network_health.update({
+            'cvar_us': float(historical_global.get('cvar_per_ue_us', 0.0) or 0.0),
+            'p95_us': float(historical_global.get('latency_p95_us', 0.0) or 0.0),
+            'window_scope': 'run',
+        })
     if latest_decision:
         network_health = dict(network_health or {})
         for field in (
@@ -1848,6 +2283,9 @@ def index():
     from rapp_trend_analysis import TrendAnalysis
     trend_analyzer = TrendAnalysis(DATA_LAKE)
     trend_analysis = trend_analyzer.calculate_latency_slope(window_minutes=5)
+    if isinstance(metrics, dict) and metrics.get('data_mode') == 'historical_db':
+        trend_analysis = dict(trend_analysis or {})
+        trend_analysis['scope'] = 'run'
     
     # Obter estado dos xApps
     slicer_state = xapp_status.get('SLICER', {}).get('status', 'UNKNOWN')
@@ -1911,14 +2349,28 @@ def index():
 def metrics_page():
     """Página de métricas detalhadas."""
     metrics = get_current_metrics()
-    extended = PATTERN_ENGINE.analyze_extended_metrics(30)
-    link = PATTERN_ENGINE.analyze_link_quality(30)
+    historical = isinstance(metrics, dict) and metrics.get('data_mode') == 'historical_db'
+    extended = PATTERN_ENGINE.analyze_extended_metrics(30, include_historical=historical)
+    link = PATTERN_ENGINE.analyze_link_quality(30, include_historical=historical)
+    snapshot = metrics.get('global_metrics', {}) if isinstance(metrics, dict) else {}
+    snapshot_info = {
+        'mode': 'HISTÓRICO' if historical else 'RUNTIME',
+        'label': 'último snapshot congelado do run' if historical else 'métricas do runtime',
+        'datetime': metrics.get('snapshot_datetime') or metrics.get('datetime', '') if isinstance(metrics, dict) else '',
+        'source': metrics.get('data_source', METRICS_FILE) if isinstance(metrics, dict) else METRICS_FILE,
+        'p95_ms': float(snapshot.get('latency_p95_us', 0.0) or 0.0) / 1000.0,
+        'cvar_ms': float(snapshot.get('cvar_per_ue_us', 0.0) or 0.0) / 1000.0,
+        'pdcp': 'REAL' if int(snapshot.get('real_latency_sample_count', 0) or 0) > 0 else ('PROXY' if int(snapshot.get('proxy_latency_sample_count', 0) or 0) > 0 else 'INDISPONÍVEL'),
+        'pdcp_samples': int(snapshot.get('real_latency_sample_count', 0) or 0),
+        'throughput_mbps': float(snapshot.get('throughput_kbps', 0.0) or 0.0) / 1000.0,
+    }
     
     return render_template(
         'metrics.html',
         metrics=metrics,
         extended=extended,
         link=link,
+        snapshot_info=snapshot_info,
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
 
@@ -1926,13 +2378,18 @@ def metrics_page():
 @app.route('/decisions')
 def decisions_page():
     """Página de histórico de decisões."""
+    metrics = get_current_metrics() or {}
     decision_stats = get_decision_stats()
-    recent_decisions = get_recent_decisions(60)
+    recent_decisions = get_recent_decisions(60, limit=60)
+    latest_decision = get_latest_decision_snapshot()
+    historical = metrics.get('data_mode') == 'historical_db'
     
     return render_template(
         'decisions.html',
         decision_stats=decision_stats,
         recent_decisions=recent_decisions,
+        latest_decision=latest_decision,
+        historical=historical,
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
 
@@ -1940,7 +2397,10 @@ def decisions_page():
 @app.route('/conflicts')
 def conflicts_page():
     """Página de gestão de conflitos O-RAN."""
-    conflict_stats = DATA_LAKE.get_conflict_stats(24)
+    historical = (get_current_metrics() or {}).get('data_mode') == 'historical_db'
+    conflict_end = _historical_conflict_end_timestamp()
+    conflict_stats = DATA_LAKE.get_conflict_stats(24, end_timestamp=conflict_end)
+    conflict_stats['scope'] = 'run' if historical else '24h'
     recent_conflicts = get_recent_conflicts(60)
     learned_report, learned_adjacency = get_learned_conflict_assets()
     service_slas = get_service_sla_status()
@@ -1952,6 +2412,7 @@ def conflicts_page():
         learned_report=learned_report,
         learned_adjacency=learned_adjacency,
         service_slas=service_slas,
+        historical=historical,
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
 
@@ -1959,10 +2420,23 @@ def conflicts_page():
 @app.route('/pattern')
 def pattern_page():
     """Página de análise de padrões."""
+    historical = (get_current_metrics() or {}).get('data_mode') == 'historical_db'
     summary = PATTERN_ENGINE.get_summary()
-    hourly = PATTERN_ENGINE.detect_seasonal_patterns(7)
-    daily = PATTERN_ENGINE.detect_day_of_week_pattern(7)
-    window = PATTERN_ENGINE.calculate_energy_window()
+    # A coleta nativa persiste os padrões em extended_metrics e pode ser um
+    # run congelado. Recalcula a leitura principal no escopo correto para não
+    # apresentar o relógio atual como se fosse o estado do experimento.
+    summary['current_analysis'] = PATTERN_ENGINE.analyze_current(
+        include_historical=historical
+    )
+    hourly = PATTERN_ENGINE.detect_seasonal_patterns(
+        7, include_historical=historical
+    )
+    daily = PATTERN_ENGINE.detect_day_of_week_pattern(
+        7, include_historical=historical
+    )
+    window = PATTERN_ENGINE.calculate_energy_window(
+        7, include_historical=historical
+    )
     
     return render_template(
         'pattern.html',
@@ -1970,6 +2444,7 @@ def pattern_page():
         hourly=hourly,
         daily=daily,
         window=window,
+        historical=historical,
         timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     )
 
@@ -1977,6 +2452,8 @@ def pattern_page():
 @app.route('/xapps')
 def xapps_page():
     """Página de status dos xApps."""
+    historical = (get_current_metrics() or {}).get('data_mode') == 'historical_db'
+    metrics = get_current_metrics() or {}
     xapp_status = get_xapp_status()
     policy_status = get_policy_status()
     app1_monitoring = get_app1_monitoring()
@@ -1994,6 +2471,8 @@ def xapps_page():
         app2_monitoring=app2_monitoring,
         app3_monitoring=app3_monitoring,
         ack_stats=ack_stats,
+        historical=historical,
+        snapshot_datetime=metrics.get('snapshot_datetime') or metrics.get('datetime') or '',
         grafana_url=f"http://localhost:{RUNTIME_CONFIG['monitoring']['grafana_port']}",
         app1_url="http://localhost:5100",
         app3_url="http://localhost:5300",
@@ -2003,6 +2482,12 @@ def xapps_page():
 
 @app.route('/ml')
 def ml_page():
+    # ML permanece disponível no backend para análise de pesquisa, mas não é
+    # uma superfície operacional independente da dashboard.
+    return redirect('/decisions')
+
+    # Código legado mantido abaixo para não perder o painel de pesquisa sem
+    # necessidade; a rota pública não o apresenta mais.
     """Página de Machine Learning."""
     # Load ML status
     ml_status = {
@@ -2176,14 +2661,20 @@ def api_collection_live():
 @app.route('/api/extended')
 def api_extended():
     """API: Métricas estendidas."""
-    extended = PATTERN_ENGINE.analyze_extended_metrics(30)
+    metrics = get_current_metrics() or {}
+    extended = PATTERN_ENGINE.analyze_extended_metrics(
+        30, include_historical=metrics.get('data_mode') == 'historical_db'
+    )
     return jsonify(extended)
 
 
 @app.route('/api/link')
 def api_link():
     """API: Qualidade do enlace."""
-    link = PATTERN_ENGINE.analyze_link_quality(30)
+    metrics = get_current_metrics() or {}
+    link = PATTERN_ENGINE.analyze_link_quality(
+        30, include_historical=metrics.get('data_mode') == 'historical_db'
+    )
     return jsonify(link)
 
 
@@ -2204,10 +2695,14 @@ def api_drl():
 @app.route('/drl')
 def drl_page():
     """Página: Visualização DRL."""
-    stats = get_drl_stats()
+    drl = get_drl_stats()
+    metrics = get_current_metrics() or {}
     return render_template('drl_dashboard.html', 
-                        predictions=stats.get('recent', []),
-                        stats=stats.get('stats', {}))
+                        predictions=drl.get('recent', []),
+                        stats=drl.get('stats', {}),
+                        runtime_status=drl.get('runtime_status', {}),
+                        historical=metrics.get('data_mode') == 'historical_db',
+                        snapshot_datetime=metrics.get('snapshot_datetime') or metrics.get('datetime') or '')
 
 
 @app.route('/api/history/<int:minutes>')
@@ -2291,6 +2786,18 @@ def api_resources():
 def api_energy_current():
     """API: Estado atual de energia."""
     import os
+    historical = (get_current_metrics() or {}).get('data_mode') == 'historical_db'
+    if historical:
+        return jsonify({
+            'action': 'UNKNOWN',
+            'power_percent': None,
+            'savings_percent': None,
+            'model_power_w': None,
+            'status_label': 'SEM COMANDO ATUAL',
+            'data_mode': 'historical',
+            'energy_metric_kind': 'calibrated_ru_mmwave_power_model',
+            'physical_meter_available': False,
+        })
     energy_file = as_str(XAPP_INTENTS_DIR / "energy_command.json")
     if os.path.exists(energy_file):
         try:
@@ -2320,14 +2827,17 @@ def api_energy_current():
                     'energy_metric_kind': 'calibrated_ru_mmwave_power_model',
                     'calibration_version': calibration_version,
                     'physical_meter_available': False,
+                    'data_mode': 'historical' if historical else 'runtime',
                 })
         except:
             pass
     return jsonify({
         'action': 'UNKNOWN',
         'power_percent': 100,
-        'savings_percent': 0,
+        'savings_percent': None,
         'model_power_w': None,
+        'status_label': 'SEM COMANDO ATUAL',
+        'data_mode': 'historical' if historical else 'unavailable',
         'energy_metric_kind': 'calibrated_ru_mmwave_power_model',
         'physical_meter_available': False,
     })
