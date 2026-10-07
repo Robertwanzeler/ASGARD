@@ -1,0 +1,36 @@
+{
+  "schema": "greenran.tasam.v2x.sla_floor.v1",
+  "contract": "greenran.tasam.v2x.sla_floor.v1",
+  "scope": "asgard_only_new_pilot",
+  "authoritative_source": "post_action_native_sla_evidence",
+  "historical_safe_power_floor_authority": false,
+  "du_cell_ids": [2, 3, 4],
+  "initial_floor_percent": 100,
+  "minimum_floor_percent": 25,
+  "step_percent": 10,
+  "healthy_consecutive_windows": 3,
+  "window_duration_s": 10,
+  "drain_s": 1,
+  "upper_multiplier": 1.15,
+  "required_imsis": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+  "requirements": {
+    "collector_mode": "pdcp_real",
+    "proxy_allowed": false,
+    "camera_throughput_min_kbps": 25000,
+    "camera_p95_max_us": 80000,
+    "sensor_delivery_min_percent": 95,
+    "sensor_loss_max_percent": 5,
+    "sensor_p95_max_us": 500000,
+    "vehicle_loss_max_percent_exclusive": 1,
+    "vehicle_p95_max_us_exclusive": 20000,
+    "vehicle_tx_pdus_min": 500,
+    "native_power_readback_exact": true,
+    "required_du_ids": [2, 3, 4]
+  },
+  "classifications": [
+    "healthy_descend",
+    "hold",
+    "restore_full_power",
+    "metric_invalid"
+  ]
+}

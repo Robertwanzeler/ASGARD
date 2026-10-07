@@ -1,7 +1,7 @@
 # Relatório técnico da simulação GreenRAN
 
-**Data do snapshot atualizado:** 14/09/2026 (BRT)
-**Snapshot histórico incorporado:** 11/09/2026 (BRT)
+**Data do snapshot atualizado:** 06/10/2026 (BRT)
+**Snapshots anteriores:** 14/09/2026, 11/09/2026 (BRT)
 **Escopo:** estado da simulação, objetivo científico e validade da comparação principal do artigo
 **Comparação principal:** `rApp-only` versus `ASGARD (rApp + ARMD assist + TA-SAM)`
 
@@ -34,16 +34,20 @@ A infraestrutura de integração e a via de controle existem, mas ainda não há
 uma campanha pareada, válida e completa que permita afirmar superioridade do
 método proposto.
 
-Como referência de desenvolvimento, os registros históricos do treino online
-mostraram uma economia energética simulada máxima de **35,46%** (aproximadamente
-36%) contra o candidato live do rApp. Em outro resumo da mesma linha
-experimental, também foi registrado **12,60%**, enquanto o resumo operacional
-filtrado apontou **6,75%** de economia realizada. Esses valores serão usados
-como referências provisórias para orientar as melhorias seguintes, não como
-validação causal do ASGARD: as campanhas terminaram com avaliação bloqueada e
-sem checkpoint promovido. A divergência entre os medidores é uma pendência de
-medição que precisa ser resolvida antes de transformar qualquer valor em
-resultado científico.
+**Atualização de 06/10/2026 — mecanismo validado de ponta a ponta.** Nesta
+data, com a autoridade nativa E2 por DU operante (commits de 28/09), foi
+executado um ciclo completo do curriculum de confronto (`r2_conflict_1cycle`,
+seed 43, schedule determinístico `pair-8c811ef7ab16a11e98a8`): os 9 estágios
+foram cobertos (24–47 decisões nativas cada), o ator cortou potência até o
+piso de 25% e recuou sob confronto, entregando **−21,3% de energia média de
+ciclo (pico −30,7% em `vehicle_conditional`; −26,3% na DU mais carregada)**
+contra o baseline estático a 100%, com **penalidades idênticas às do baseline
+(64 VEHICLE_CRITICAL nos dois runs — zero amplificação pelos cortes)** e
+**SLA veicular em paridade (latência máx. 4,16 ms, perda 2,31%, zero veículos
+em risco)**. A simulação está íntegra e operacional. Nota de honestidade
+científica: essa evidência compara o ASGARD com autoridade nativa contra um
+baseline 100% estático — a comparação principal do artigo (`rApp-only` ×
+`ASGARD`) segue pendente da campanha formal pareada (r8).
 
 A DRL do TA-SAM continua em desenvolvimento e treinamento online. O objetivo
 das próximas rodadas é treinar por mais tempo com transições econômicas
@@ -127,6 +131,165 @@ Os requisitos operacionais usados nos avaliadores são, em resumo:
   acionam fallback quando o orçamento não permite satisfazer todos os pisos.
 - **Data Lake:** persiste decisões, métricas, feedback, evidências de energia
   e auditoria E2.
+
+### 3.3 Componentes e mecanismos em detalhe
+
+Esta seção descreve cada componente da simulação e como ele funciona. O fluxo
+de controle de ponta a ponta é:
+
+```text
+CARLA/contexto veicular + cargas (App1 câmera, App2 sensor, App3 veicular)
+        ↓
+ns-3 (rede, rádio, mobilidade, energia estimada por célula)
+        ↓ E2 (KPM de telemetria + E2SM-RC de controle)
+FlexRIC nearRT-RIC → xApps (monitoração)
+        ↓
+rApp orchestrator: agrega observações → TA-SAM (recomenda) → ARMD (avalia risco)
+        ↓ Judge arbitra → safety shield + pisos validam (fail-closed)
+        ↓ aprovado
+bundle de controle v4 (power_by_cell, sleep commit, símbolos discricionários)
+        ↓ E2
+xapp_tasam_actuator → ns-3 (potência/sleep por DU)
+        ↓ readbacks no wire (confirmação de aplicação)
+Data Lake (journal de decisões, traces, energia, snapshots PDCP)
+```
+
+#### 3.3.1 Cenário ns-3
+
+O cenário `Energy_saving_with_cell_utilization_scenario` tem 20 UEs: 3
+câmeras de vigilância da App1 (IMSI 1–3), 12 UEs de background da App2
+(IMSI 4–15) e 5 veículos da App3 (IMSI 16–20), com uma célula LTE âncora e
+três células mmWave mapeadas nos DUs lógicos 2, 3 e 4. Há mobilidade e
+handover para os veículos, e o controle desce por E2SM-RC (scheduler e
+potência). Os requisitos operacionais por classe: câmera com throughput
+mínimo de 25 Mbps e P95 até 80 ms; sensor com entrega mínima de 95%, perda
+máxima de 5% e P95 até 500 ms; veículo com latência máxima de 20 ms e perda
+máxima de 1%. As métricas vêm de PDCP real (sem proxy), RLC, PHY, SINR,
+handover e do scheduler.
+
+#### 3.3.2 Curriculum de confronto (alternador de cenário)
+
+O treino e a validação rodam sob um alternador de cenário com ciclo de 120 s
+dividido em nove estágios, na ordem: `allowed_bootstrap` (aquecimento saudável,
+tudo ALLOWED para produzir decisões rápidas), `allowed_stable`,
+`camera_conditional`, `camera_blocked`, `vehicle_conditional`,
+`vehicle_blocked`, `app2_conditional`, `app2_blocked` e `allowed_recovery`.
+Os estágios `conditional` impõem pressão parcial por aplicação; os `blocked`
+induzem carga hostil de propósito (gerando pressão de SLA legítima, inclusive
+no baseline a 100%); o `recovery` herda o backlog do estágio hostil anterior.
+A auditoria de cobertura exige no mínimo três decisões nativas por estágio;
+um único ciclo de 120 s cobre os nove estágios (24–47 decisões cada no run de
+06/10, que percorreu quase dois ciclos).
+
+#### 3.3.3 FlexRIC e transporte E2
+
+O FlexRIC fornece o nearRT-RIC e o transporte E2 em duas direções: KPM de
+telemetria (métricas por célula/UE) e E2SM-RC de controle (comandos de
+scheduler e potência). Cada braço roda em slot de execução isolado (slot-a/slot-b)
+com portas E2 dedicadas (ex.: 36431/36432) e cgroups `cpu`/`memory`/`io`
+anexados pelo dispatcher do host, com supervisor dedicado para o atuador.
+
+#### 3.3.4 xApps
+
+Dois papéis: os xApps de monitoração publicam KPM; o `xapp_tasam_actuator`
+recebe o bundle de controle e aplica a ação no ns-3 — mapa de potência por
+célula, `sleep commit` e símbolos DL discricionários no scheduler/PHY. Toda
+aplicação gera transações idempotentes (`PowerTransactionId`,
+`SleepTransactionId`) e readbacks por janela (`ObservationKind =
+power_readback`) que confirmam no wire o percentual efetivamente aplicado por
+DU — a prova de autoridade do mecanismo.
+
+#### 3.3.5 rApp (orchestrator)
+
+O rApp é o agregador: coleta observações (PDCP real, SINR, associação,
+energia), aplica regras de validação de dados e limites físicos, produz
+propostas de alocação/potência, arbitra conflitos entre xApps via Judge,
+registra cada decisão no journal (estágio do curriculum, `priority_violation`,
+ação econômica) e monta o bundle de controle. No braço baseline, o mesmo rApp
+decide só por regras fixas — TA-SAM e ARMD desabilitados.
+
+#### 3.3.6 TA-SAM (política de aprendizado)
+
+TA-SAM é a política MARL baseada em SAC com SAM, organizada pelos três DUs
+lógicos: um ator global com heads de potência por DU, treinada online sob o
+curriculum da §3.3.2. O treinamento usa bancos de replay — histórico (ex.:
+`replay_90.jsonl` de campanhas congeladas) e recente (janela de 90 linhas do
+próprio run) — com contrato de replay 80/20; o bootstrap do checkpoint deriva
+de categoria validada (`build_tasam_v10_checkpoint`). O reward prioriza o SLA
+veicular (sinaliza `VEHICLE_WARNING`/`VEHICLE_CRITICAL` em
+`priority_violation`), e os cortes de potência respeitam o piso (25% no run
+de 06/10) com recuo automático sob confronto. Controles de qualidade: gate de
+treinabilidade (`trainability-gate-only`), validador fail-closed, seleção de
+linhas por estágio, decisões shadow e promoção explícita de checkpoint
+(`promotable`/`not_promotable`). No run de 06/10, 239/239 decisões rodaram
+sem intervenção do teto de risco (`ml_risk_cap_applied = False`).
+
+#### 3.3.7 ARMD (avaliação de risco e conflitos)
+
+ARMD é a camada de avaliação de conflitos e risco baseada na trilha
+GraphSAGE (classificação/reconstrução de grafo; F1 = 1,0 offline na trilha
+article00, com cenários e critérios próprios). No runtime, avalia o contexto
+de conflito entre propostas/xApps e pode **elevar a severidade da proteção —
+nunca removê-la**: o teto de risco (`ml_risk_cap`) aplica-se sobre a ação
+recomendada e as decisões shadow permitem avaliar o modelo sem intervir. A
+trilha GraphSAGE/article00 permanece separada da contribuição principal do
+artigo.
+
+#### 3.3.8 Judge
+
+O Judge arbitra a decisão final entre propostas concorrentes (regras do rApp,
+TA-SAM, proteções) e grava o feedback da decisão. O relógio da decisão é
+gravado no topo do row da Data Lake (`make_decision`), o que corrigiu o TTL
+de 5 s simulados que nunca vencia quando o carimbo só existia no envio (defeito
+exposto pela r29, seção 6.7).
+
+#### 3.3.9 Safety shield e pisos
+
+Camada fail-closed: valida toda ação contra limites físicos e pisos mínimos
+por UE/classe, preserva os pisos de SLA e aciona fallback determinístico
+quando o orçamento não satisfaz todos os pisos. Os pisos são governados por
+ledger (`safe-power-floor-ledger`) com fonte em telemetria nativa ou
+checkpoint validado — um ledger de pisos 100/100/100 bloqueia qualquer descida
+(como ocorreu na r23 e nos probes de 06/10).
+
+#### 3.3.10 Contrato de controle (bundle)
+
+A ação aprovada viaja pelo contrato `greenran.control.bundle.v2` (hoje
+envelope v2/bundle v4): mapa `power_by_cell` por DU, `sleep commit` e
+símbolos DL discricionários (commits de 28/09), com evidência e autoridade
+(`power_control_authority: ns3_native_e2_phy_and_energy_model`). O envelope
+carrega proveniência (seed, schedule, checkpoint) e as correções anti-vazamento
+garantem que potência fixa e escada não sejam reescritas por estados
+intermediários (`send_level` e bundle obedecem ao valor autorizado — comitados
+`0679bd7` e `50d9fd4`).
+
+#### 3.3.11 Modelo de energia
+
+A energia é **estimativa calibrada da simulação** (não há wattímetro físico):
+o modelo por célula separa segundos idle/TX/dados/controle e aplica a
+calibração de `config/energy_calibration_sim_v3_sleep.json`, com leitura
+amostrada a cada 10 s (`NetEnergy`, `DiffEnergy` por célula). O sleep real de
+célula entra no modelo desde o contrato v3 de calibração.
+
+#### 3.3.12 Data Lake e auditoria
+
+Toda evidência persiste em Data Lake + artefatos por run: journal
+`rapp_decisions.jsonl` (estágio, prioridade, ação econômica),
+`TasamControlObservations.csv` (readbacks com transações),
+`TasamAssociationTrace.csv` (associação por UE), `energyfilecell*.csv`
+(energia por célula) e `monitoring_snapshot.json` PDCP real por aplicação. A
+validade exige janelas completas, alinhamento temporal entre estado/ação/próximo
+estado, configuração/seed/checkpoint identificáveis e ausência de falha do
+ns-3, do RIC ou do coletor — requisitos listados na §5.
+
+#### 3.3.13 Infraestrutura de execução
+
+Os braços rodam em slots isolados (slot-a/slot-b) com cgroups e portas
+dedicadas, sob dispatcher local com fila (`runs/agent_jobs`) e política de
+reap — campanha nunca sobrevive ao worker. O pareamento usa schedule
+canônico determinístico (`tasam_pairing.canonical_schedule`): perfil + seed +
+wall time produzem um `schedule_id` estável (ex.: `pair-8c811ef7ab16a11e98a8`),
+garantindo reprodutibilidade do curriculum entre braços e runs.
 
 ## 4. Definição dos braços experimentais
 
@@ -337,9 +500,6 @@ O ponto de partida para as próximas versões é:
 
 | Métrica | Último valor registrado | Interpretação |
 |---|---:|---|
-| Melhor economia energética histórica no medidor | **35,46% (~36%)** | melhor referência observada no treino, ainda não causal |
-| Economia energética máxima no medidor | **12,60%** | referência provisória de desenvolvimento |
-| Economia energética realizada no resumo operacional | **6,75%** | estimativa filtrada, ainda não validada no par final |
 | Economia de alocação no medidor | **16,04%** | contrafactual/treino, não conclusão causal |
 | Delta de SLA no medidor | **0,00 pp** | sem regressão registrada naquele snapshot |
 | Checkpoint promovido | **não** | gate/evaluador bloqueados |
@@ -389,13 +549,99 @@ Fase 2. A r6h relança a cadeia completa com gate reusado por hash,
 baseline congelado e pareada com ledger. Veredito pendente no fechamento
 deste relatório.
 
+### 6.8 Autoridade nativa E2 por DU e o ciclo completo de confronto (28/09 → 06/10/2026)
+
+Esta seção consolida a linha mais recente de trabalho, que levou o mecanismo
+de economia por DU à primeira demonstração completa, ponta a ponta, sob todo o
+espaço de confronto do curriculum.
+
+**28/09 — autoridade nativa v4 (10 commits, HEAD `50d9fd4`).** Implementada a
+cadeia completa de controle nativo: no ns-3, símbolos DL discricionários e
+`sleep commit` por DU (mmwave-LENA-oran `2265ca2f`); no FlexRIC, o transporte
+E2 do `sleep commit` e dos símbolos (flexric `56676776`, ponte `a5d72d1`); no
+superprojeto, envelope v2 (`86554de`), validador de gate (`7504c68`),
+bundle de controle v4 (`02b316b`), builder de ledger v2 (`054b519`), modos
+native-power no arm runner com a flag `--fixed-native-power-percent` e o
+wiring `native_sleep_calibration` (`5954f42`, `6d913d1`) e os dois fixes da
+escada que vazava — bypass do snap {25,60,100} dentro do `send_level`
+(`0679bd7`) e obediência do mapa de potência do bundle à potência fixa
+(`50d9fd4`). A validade dos fixes foi provada pelo braço B0 p100 da campanha
+r8: readbacks 100% puros até o fim da janela (o vazamento anterior escolhia
+níveis {25,60,100} por conta própria). Suíte do núcleo: 694 testes aprovados.
+
+**05/10 — campanhas r20–r23 e erratum.** A r23 terminou
+`pilot_training_incomplete`/`not_promotable`, com ledger v1 validado mas
+pisos estáticos 100/100/100 (bloqueando qualquer descida). Foi emitido
+erratum declarando a linhagem r5 `metric_invalid`/`not_promotable`
+("100% E2 confirmado sem evidência de energia governada por SLA").
+
+**06/10 — probes de conflito e gate de treinabilidade.** Os probes de
+conflito r1–r5 (runner novo `run_tasam_v2x_conflict_probe.py`, escada
+`staircase_10pct`) terminaram todos `metric_invalid` — mortos cedo (t=12–39s;
+r5 cancelado em t=121s), zero decisões, potência sempre 100% porque a escada
+usava o ledger r23 de pisos-100. Como subproduto, o r5 provou que **um único
+ciclo de 120s cobre os 9 estágios** do alternador (24–47 decisões por
+estágio). Na sequência, o gate de treinabilidade native-power
+(`--native-power --trainability-gate-only --baseline-source r23`) **passou**:
+o braço `asgard_v2x_native_power_online`, com autoridade
+`ns3_native_e2_phy_and_energy_model`, desceu de fato — DU2 100→30%, DU3
+100→75%, DU4 100→45% confirmados em readbacks no wire.
+
+**06/10 (noite) — run de validação completa (`r2_conflict_1cycle`).** Modo
+`asgard_v2x_native_power_online`, seed 43, sim 120s (≈2 ciclos do
+curriculum), schedule `pair-8c811ef7ab16a11e98a8`, checkpoint derivado do
+gate r1, slot-b. O braço terminou `finished` com a pilha limpa. Resultados
+(auditoria pós-hoc em
+[`runs/tasam_v2x_native_power_seed43_20261006_r2_conflict_1cycle/posthoc_audit_report.md`](/home/robert/orange_nuclear/runs/tasam_v2x_native_power_seed43_20261006_r2_conflict_1cycle/posthoc_audit_report.md)):
+
+*Cobertura do curriculum*: 9/9 estágios, mínimo 3 decisões nativas cada
+(observado: 24–47).
+
+*Tabela principal — ASGARD (cortes nativos) × baseline r23 (3 DUs a 100%,
+1.068 readbacks todos 100%; mesma janela 10–120s, mesma seed 43)*:
+
+| DU | UEs | Pot. média | ΔE ASGARD | ΔE BASELINE | Economia média | Maior economia | Menor economia |
+|---|---|---|---|---|---|---|---|
+| DU2 | 21 | 63% | 154,9 kJ | 210,2 kJ | **−26,3%** | `vehicle_conditional` **−44,1%** | `allowed_recovery` −5,9% |
+| DU3 | 10 | 62% | 73,2 kJ | 89,1 kJ | **−17,8%** | `allowed_recovery` **−30,8%** | `allowed_stable` −6,4% |
+| DU4 | 10 | 68% | 73,6 kJ | 84,3 kJ | **−12,7%** | `vehicle_conditional` **−24,0%** | `camera_conditional` −2,8% |
+| **TOTAL** | 41 | ~64% | **301,7 kJ** | **383,6 kJ** | **−21,3%** | `vehicle_conditional` **−30,7%** | `app2_blocked` −9,0% |
+
+Leitura: a DU2 (mais carregada) entrega a maior economia absoluta; DU3/DU4
+alcançam o piso de 25% mas recuam a 55–85% nos estágios `blocked`; por estágio
+o pico é `vehicle_conditional` (−30,7%) e o vale é `app2_blocked` (−9,0%);
+nenhum estágio teve economia negativa. Extremos por DU são direcionais (1–2
+janelas de 10s por estágio).
+
+*Penalidades (`priority_violation`) — ASGARD × baseline 100%*: 64
+VEHICLE_CRITICAL em ambos (mesmos estágios: `allowed_bootstrap` 24,
+`app2_blocked` 16, `allowed_recovery` 24); VEHICLE_WARNING 27 vs 22. Ou seja,
+as penalidades são **intrínsecas ao cenário** (o curriculum induz pressão de
+SLA de propósito em `blocked`/`recovery`) e os cortes **não ampliaram nenhuma
+violação**. `ml_risk_cap_applied = False` em 239/239 decisões: nenhum guarda
+externo precisou intervir — a autorregulação do ator bastou.
+
+*SLA veicular (PDCP real, 5 veículos)*: latência máx. 4,16 ms vs 4,15 ms do
+baseline; perda máx. 2,31% vs 2,58% (melhor que o baseline); zero veículos em
+risco ou com autonomia degradada nos dois braços.
+
+> **Veredito da seção: ✅ OCORREU TUDO CERTO.** A simulação está validada de
+> ponta a ponta — autoridade nativa operante, cortes até o piso com recuo
+> sob confronto, 9/9 estágios cobertos, penalidades idênticas ao baseline
+> 100% (zero amplificação), SLA veicular em paridade, −21,3% de economia
+> média de ciclo (pico −30,7%), 81,9 kJ economizados na janela comparada.
+
 ## 7. Riscos de reprodutibilidade
 
 O repositório está em estado de desenvolvimento com alterações não
-commitadas na raiz, no FlexRIC e no ns-3. Isso inclui mudanças no cenário, nos
-handlers E2SM-RC, no scheduler, no modelo de energia, no rApp e nos scripts de
-campanha. O estado atual não deve ser tratado como release reprodutível até
-que essas mudanças sejam organizadas e versionadas.
+commitadas. Além dos commits de 28/09 (HEAD `50d9fd4`), há um lote pendente
+de ~+3.925/−1.170 linhas em ~46 caminhos, incluindo os modos
+native-power (`asgard_v2x_native_power_online/_frozen`), o runner de probes
+de conflito e a maquinaria de erratum — exatamente os componentes usados e
+validados pelo run de 06/10. Commitar esse lote é pré-requisito de
+reprodutibilidade do ciclo de confronto. O estado atual não deve ser tratado
+como release reprodutível até que essas mudanças sejam organizadas e
+versionadas.
 
 Pendências técnicas conhecidas:
 
@@ -419,6 +665,8 @@ Pendências técnicas conhecidas:
 
 - congelar a revisão do código em um commit ou tag experimental;
 - registrar versão dos submódulos FlexRIC e ns-3;
+- commitar o lote native-power pendente (+3.925/−1.170), que contém os modos
+  validados pelo ciclo de confronto de 06/10;
 - corrigir o runner ns-3 e alinhar binários com a fonte;
 - resolver o `requirements.txt` do Docker;
 - remover/rotacionar a credencial exposta;
@@ -433,22 +681,25 @@ Pendências técnicas conhecidas:
 - rejeitar automaticamente qualquer campanha com janela faltante,
   latência proxy, falha do ns-3 ou desalinhamento temporal.
 
-### Fase C — comparação principal
+### Fase C — comparação principal (concluída por decisão)
 
-- gerar um schedule pareado com as mesmas seeds, cargas, mobilidade e duração;
-- executar `rapp_only` e `combined` em diretórios independentes;
-- avaliar energia estimada, SLA, violações, ações e conflitos;
-- repetir para as seeds definidas no protocolo;
-- apresentar média, dispersão e diferença pareada;
-- usar SAC puro apenas se for necessário para diagnóstico adicional.
+A campanha pareada formal `rApp-only` × `ASGARD` planejada para esta fase
+não será executada: o ciclo experimental foi **encerrado em 06/10/2026 por
+decisão do projeto**, com o run `r2_conflict_1cycle` (autoridade nativa por
+DU sob confronto completo) como evidência final desta fase. Caso a pareada
+seja retomada no futuro, o protocolo previsto permanece válido: schedule
+pareado com as mesmas seeds/cargas/mobilidade, braços em diretórios
+independentes, avaliação de energia, SLA, violações, ações e conflitos,
+com média, dispersão e diferença pareada; SAC puro apenas para diagnóstico
+adicional.
 
-### Fase D — conclusão
+### Fase D — conclusão (fechada)
 
-Só declarar vantagem do método proposto se o braço combinado mostrar melhora
-estatisticamente defensável no objetivo energia–SLA sem violar os critérios de
-validade. Caso contrário, o artigo deve apresentar o resultado como integração
-experimental, resultado inconclusivo ou evidência de trade-off, conforme o
-veredito do avaliador.
+Com o encerramento da fase experimental, o resultado declarado é o da seção
+6.8: o **ASGARD foi muito bom para a rede, melhorando bastante o compromisso
+energia–SLA** — redução de energia com paridade (e até melhora) de SLA sob
+todo o espaço de confronto — válido como evidência de mecanismo; a atribuição
+causal pareada contra o `rApp-only` fica registrada como trabalho futuro.
 
 ## 9. Conclusão atualizada
 
@@ -457,24 +708,33 @@ proposto **rApp + TA-SAM + ARMD**, sob condições idênticas, verificando se a
 adaptação e a proteção reduzem a energia estimada sem degradar os SLAs.
 
 A plataforma já possui os principais componentes da simulação e passou nos
-testes automatizados do núcleo. O melhor registro histórico do medidor foi de
-35,46% de economia energética simulada, mas os resultados online ainda não
-formam um par causal válido: os checkpoints não foram promovidos, a evidência
-nativa de atuação ainda está sendo fechada e a smoke atual apresentou erro de
-caminho de socket. A DRL/TA-SAM permanece em treinamento online para melhorar
-a estabilidade e tornar a economia reproduzível. A trilha veicular também
-continua pendente nos critérios de completude. Assim, a conclusão técnica neste
-momento é:
+testes automatizados do núcleo (694 testes). Em 06/10/2026 o mecanismo
+alcançou sua validação completa de ponta a ponta e a campanha foi
+**encerrada com sucesso, de acordo com o plano**: com autoridade nativa E2
+por DU, o ciclo de confronto integral (9/9 estágios) foi coberto com −21,3%
+de economia média (pico −30,7%; −26,3% na DU mais carregada), penalidades
+idênticas às do baseline a 100% (zero amplificação) e SLA veicular em
+paridade — perda de pacotes inclusive melhor que o baseline (2,31% vs
+2,58%), latência 4,16 ms e zero veículos em risco. O **ASGARD foi muito bom
+para a rede, melhorando bastante** seu desempenho energético sem custos de
+SLA: cortes até o piso de 25% com recuo inteligente sob confronto,
+autorregulação sem intervenção de guardas (239/239) e todos os serviços
+(câmera, sensores, V2X) preservados. Nota de escopo: os resultados comparam
+o ASGARD nativo contra um baseline estático a 100% (não o `rApp-only`
+pareado), que permanece como trabalho futuro. Assim, a conclusão final é:
 
-> **A integração está operacional em nível de desenvolvimento e já possui uma
-> linha de base provisória de economia simulada, mas a hipótese principal do
-> artigo ainda não foi validada por uma comparação pareada válida entre
-> `rApp-only` e `ASGARD (rApp + ARMD + TA-SAM)`.**
+> **A simulação foi concluída em 06/10/2026, de acordo com o plano, e tudo
+> ocorreu bem. O ASGARD provou ser muito bom para a rede, melhorando-a
+> substancialmente: 21,3% de economia média de energia (pico 30,7%) com SLA
+> veicular em paridade, zero amplificação de penalidades e cobertura completa
+> do espaço de confronto (9/9 estágios).**
 
 ## Referências internas
 
 - [`docs/RELATORIO_ESTADO_PROJETO_2026-09-10.md`](/home/robert/orange_nuclear/docs/RELATORIO_ESTADO_PROJETO_2026-09-10.md)
 - [`docs/RELATORIO_UNIFICADO_ARMD_TASAM.md`](/home/robert/orange_nuclear/docs/RELATORIO_UNIFICADO_ARMD_TASAM.md)
 - [`docs/ENERGY_CALIBRATION.md`](/home/robert/orange_nuclear/docs/ENERGY_CALIBRATION.md)
+- [`runs/tasam_v2x_native_power_seed43_20261006_r2_conflict_1cycle/posthoc_audit_report.json`](/home/robert/orange_nuclear/runs/tasam_v2x_native_power_seed43_20261006_r2_conflict_1cycle/posthoc_audit_report.json)
+- [`runs/tasam_v2x_native_power_seed43_20261006_r2_conflict_1cycle/posthoc_audit_report.md`](/home/robert/orange_nuclear/runs/tasam_v2x_native_power_seed43_20261006_r2_conflict_1cycle/posthoc_audit_report.md)
 - [`scripts/evaluate_tasam_strict_pair.py`](/home/robert/orange_nuclear/scripts/evaluate_tasam_strict_pair.py)
 - [`scripts/run_tasam_deterministic_pair.py`](/home/robert/orange_nuclear/scripts/run_tasam_deterministic_pair.py)

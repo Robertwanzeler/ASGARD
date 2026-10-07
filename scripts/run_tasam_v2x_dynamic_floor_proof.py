@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import subprocess
 import sys
@@ -29,6 +30,51 @@ def _json(path: Path) -> dict:
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"JSON inválido ou ausente: {path}") from exc
     return value if isinstance(value, dict) else {}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _validate_frozen_replay(manifest_path: Path, historical: Path, recent: Path) -> dict:
+    manifest = _json(manifest_path)
+    if manifest.get("schema") != "greenran.tasam.v2x.frozen_replay_window90.v1":
+        raise SystemExit("manifesto de replay congelado tem schema inválido")
+    if manifest.get("status") != "frozen" or int(manifest.get("seed", -1)) != 43:
+        raise SystemExit("manifesto de replay congelado inválido")
+    if Path(str(manifest.get("historical_output") or "")).resolve() != historical:
+        raise SystemExit("banco histórico não corresponde ao manifesto congelado")
+    if Path(str(manifest.get("recent_output") or "")).resolve() != recent:
+        raise SystemExit("banco recente não corresponde ao manifesto congelado")
+    if int(manifest.get("historical_rows", 0)) != 72 or int(manifest.get("recent_rows", 0)) != 18:
+        raise SystemExit("replay congelado não contém a divisão 72/18")
+    if _sha256(historical) != str(manifest.get("historical_output_sha256") or ""):
+        raise SystemExit("hash do banco histórico congelado não confere")
+    if _sha256(recent) != str(manifest.get("recent_output_sha256") or ""):
+        raise SystemExit("hash do banco recente congelado não confere")
+    rows = [
+        json.loads(line) for line in recent.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(rows) != 18 or not all(row.get("frozen_recent_replay") is True for row in rows):
+        raise SystemExit("banco recente não comprova exatamente 18 transições congeladas")
+    source = Path(str(manifest.get("source") or "")).resolve()
+    source_hash = _sha256(source) if source.is_file() else ""
+    if not source_hash or source_hash != str(manifest.get("source_sha256") or ""):
+        raise SystemExit("fonte r26 do replay está ausente ou foi alterada")
+    return {
+        "manifest": str(manifest_path.resolve()),
+        "source": str(source),
+        "source_sha256_before": source_hash,
+        "historical_sha256_before": _sha256(historical),
+        "recent_sha256_before": _sha256(recent),
+        "historical_rows": 72,
+        "recent_rows": 18,
+    }
 
 
 def _assert_full_power_baseline(run_dir: Path) -> None:
@@ -68,6 +114,7 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--experience-bank", type=Path, required=True)
     parser.add_argument("--recent-experience-bank", type=Path, required=True)
+    parser.add_argument("--replay-freeze-manifest", type=Path, required=True)
     parser.add_argument("--dynamic-floor-ledger", type=Path, required=True)
     parser.add_argument("--baseline-signature", type=Path, required=True)
     parser.add_argument("--pairing-schedule-file", type=Path, required=True)
@@ -96,6 +143,11 @@ def main() -> int:
     if baseline_manifest.get("profile") != PROFILE:
         raise SystemExit("baseline usa perfil diferente do contrato seed-43")
     _assert_full_power_baseline(baseline)
+    replay_evidence = _validate_frozen_replay(
+        args.replay_freeze_manifest.resolve(),
+        args.experience_bank.resolve(),
+        args.recent_experience_bank.resolve(),
+    )
     schedule_id = str(baseline_manifest.get("pairing_schedule_id") or "")
     if not schedule_id:
         raise SystemExit("baseline não possui pairing_schedule_id")
@@ -180,6 +232,15 @@ def main() -> int:
             f"braço dynamic falhou com código {result.returncode}; veja {log_path}"
         )
 
+    source_after = Path(replay_evidence["source"])
+    replay_evidence["source_sha256_after"] = _sha256(source_after)
+    replay_evidence["source_unchanged"] = (
+        replay_evidence["source_sha256_before"] == replay_evidence["source_sha256_after"]
+    )
+    replay_evidence["recent_sha256_after"] = _sha256(args.recent_experience_bank.resolve())
+    if not replay_evidence["source_unchanged"]:
+        raise SystemExit("fonte r26 do replay foi alterada durante a prova")
+
     report = evaluate_pair(
         baseline,
         run_dir,
@@ -190,6 +251,7 @@ def main() -> int:
         expected_baseline_mode="fixed_100_native",
         minimum_energy_saving_fraction=0.36,
     )
+    report["replay_freeze_evidence"] = replay_evidence
     report_path = run_dir.parent / f"{run_dir.name}.strict_pair.json"
     report_path.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"

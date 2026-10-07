@@ -95,6 +95,55 @@ class TestTasamOnlineCampaign(unittest.TestCase):
         self.assertEqual(env["GREENRAN_E2_TERM_PORT"], "36431")
         self.assertEqual(env["GREENRAN_E2_LOCAL_PORT"], "38570")
 
+    def test_economic_vehicle_profile_uses_validated_mc_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = build_environment(
+                "asgard_v2x_window90_energy_online",
+                Path(tmp) / "economic-safe",
+                43,
+                "tasam_training_economic_vehicle_safe_v1",
+                9000,
+                sim_time=120,
+                native_fidelity=True,
+                energy_enabled=True,
+                disable_app_overrides=True,
+            )
+        self.assertEqual(env["GREENRAN_NS3_USE_MC_UE_DEVICES"], "true")
+        self.assertEqual(env["GREENRAN_NS3_E2LTE_ENABLED"], "true")
+        self.assertEqual(env["GREENRAN_NS3_E2NR_ENABLED"], "false")
+        self.assertEqual(
+            env["GREENRAN_V2X_FALLBACK_POLICY"],
+            "mmwave_primary_lte_risk_fallback_v2",
+        )
+
+    def test_native_asgard_power_uses_ns3_authority_without_legacy_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = build_environment(
+                "asgard_v2x_native_power_online",
+                Path(tmp) / "native-power",
+                43,
+                "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max",
+                9000,
+                120,
+                native_fidelity=True,
+                energy_enabled=True,
+                energy_staircase=True,
+                adaptive_energy_probe=True,
+                disable_app_overrides=True,
+            )
+        self.assertEqual(env["GREENRAN_TASAM_NATIVE_POWER_CONTROL"], "1")
+        self.assertEqual(env["GREENRAN_NS3_FIXED_POWER_PERCENT"], "100")
+        self.assertEqual(env["GREENRAN_TASAM_ALLOW_DU_SLEEP"], "0")
+        self.assertEqual(env["GREENRAN_TASAM_NATIVE_POWER_BOUNDS"], "25,100")
+        self.assertEqual(env["GREENRAN_TASAM_NATIVE_POWER_STEP_PERCENT"], "5")
+        self.assertNotIn("GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT", env)
+        self.assertNotIn("GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT", env)
+        self.assertNotIn("GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER", env)
+        self.assertEqual(
+            mode_contract("asgard_v2x_native_power_online")["native_power_mode"],
+            True,
+        )
+
     def test_combined_contract_keeps_armd_context_and_frozen_tasam(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = build_environment("combined", Path(tmp), 47, "tasam_training_balanced_v3", 600)

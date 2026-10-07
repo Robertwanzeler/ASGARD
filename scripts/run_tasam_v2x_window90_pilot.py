@@ -44,6 +44,8 @@ STAGES = (
 BASELINE_CONTRACT = "rapp_only_actuating_window90"
 ASGARD_CONTRACT = "asgard_v2x_window90_online"
 ASGARD_ENERGY_CONTRACT = "asgard_v2x_window90_energy_online"
+ASGARD_NATIVE_POWER_CONTRACT = "asgard_v2x_native_power_online"
+ASGARD_NATIVE_POWER_FROZEN_CONTRACT = "asgard_v2x_native_power_frozen"
 REPLAY_SCHEMA = "greenran.tasam.v2x.window90.replay_80_20.v1"
 REWARD_CONTRACT = "greenran.tasam.v2x.reward_adaptive.v1"
 
@@ -93,6 +95,8 @@ def validate_fixed(args: argparse.Namespace) -> None:
         raise SystemExit(f"binário release ausente/não executável: {args.binary}")
     if not args.category_source.is_dir():
         raise SystemExit(f"checkpoint da cabeça categórica ausente: {args.category_source}")
+    if args.native_power and not args.energy_enabled:
+        raise SystemExit("--native-power exige --energy-enabled")
 
 
 def build_bootstrap(args: argparse.Namespace, output: Path) -> None:
@@ -138,6 +142,7 @@ def run_arm(
     if mode in {
         "rapp_only_actuating", "asgard_v2x_window90_online",
         "asgard_v2x_window90_energy_online",
+        ASGARD_NATIVE_POWER_CONTRACT,
     }:
         # Both arms consume only native observations.  The ASGARD arm must
         # not inherit the scenario-control override merely because it is the
@@ -151,6 +156,8 @@ def run_arm(
         "asgard_v2x_window90_energy_frozen",
     }:
         command.append("--energy-staircase")
+        if args.adaptive_energy_probe:
+            command.append("--adaptive-energy-probe")
         if safe_power_floor_ledger is not None:
             command.extend(["--safe-power-floor-ledger", str(safe_power_floor_ledger)])
     if mode != "rapp_only_actuating":
@@ -358,6 +365,7 @@ def select_stage_transitions(
     require_asgard: bool = False,
     reference_arm: bool = False,
     energy_enabled: bool = False,
+    require_economic_reduction: bool = False,
     min_per_stage: int = 10,
     max_total: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -372,6 +380,33 @@ def select_stage_transitions(
         if stage not in STAGES:
             continue
         decision = row.get("decision") if isinstance(row.get("decision"), dict) else {}
+        # The data-lake export keeps the authoritative economic flags inside
+        # the finalized decision object.  Older exporters also copied some
+        # of them to the row root, but not all of them.  Normalize both
+        # representations before applying the ASGARD trainability gate.
+        def decision_flag(name: str) -> bool:
+            value = row.get(name)
+            if value is None:
+                value = decision.get(name)
+            if value is None and isinstance(row.get("economic_action"), dict):
+                value = row["economic_action"].get(name)
+            return value is True or value == 1
+
+        decision_economic_transition_eligible = decision_flag(
+            "economic_transition_eligible"
+        )
+        decision_economic_training_eligible = decision_flag(
+            "economic_training_eligible"
+        )
+        decision_economic_promotion_eligible = decision_flag(
+            "economic_promotion_eligible"
+        )
+        decision_application_status = row.get("economic_application_status")
+        if decision_application_status is None:
+            decision_application_status = decision.get("economic_application_status")
+        decision_execution_mode = row.get("economic_execution_mode")
+        if decision_execution_mode is None:
+            decision_execution_mode = decision.get("economic_execution_mode")
         try:
             decision_id = int(row.get("decision_id") or decision.get("id") or 0)
         except (TypeError, ValueError):
@@ -428,6 +463,17 @@ def select_stage_transitions(
             valid, _ = validate_online_transition(
                 live_row, require_adaptive_reward=True, require_judge=True
             )
+        if valid and require_asgard and energy_enabled:
+            # A complete E2/readback trace alone is insufficient for the
+            # online energy arm. The short gate and the 9x10 selector must
+            # observe an actually applied, non-neutral causal transition
+            # before they can claim trainability.
+            if (
+                not decision_economic_transition_eligible
+                or not decision_economic_training_eligible
+            ):
+                valid = False
+                rejected["economic_transition_not_trainable"] += 1
         if not valid:
             rejected["invalid_transition"] += 1
             continue
@@ -474,6 +520,32 @@ def select_stage_transitions(
         if energy_enabled and not energy_evidence.get("native", False):
             rejected["energy_evidence_invalid"] += 1
             continue
+        if require_economic_reduction:
+            # A 100%-power readback proves the E2 path but not the economic
+            # path.  The short ASGARD gate must wait for a native reduction
+            # before authorizing the long pilot; otherwise a neutral action
+            # can make the campaign appear trainable while saving nothing.
+            observed_power = energy_evidence.get("power_percent_by_cell") or {}
+            if not observed_power and isinstance(row.get("economic_action"), dict):
+                observed_power = (
+                    (row["economic_action"].get("applied") or {}).get("power_percent_by_cell")
+                    or (row["economic_action"].get("native_observation") or {}).get("power_percent_by_cell")
+                    or {}
+                )
+            try:
+                power_reduced = bool(observed_power) and any(
+                    float(value) < 100.0 for value in observed_power.values()
+                )
+            except (TypeError, ValueError):
+                power_reduced = False
+            try:
+                native_cost = float(energy_evidence.get("cost"))
+                cost_reduced = native_cost < 0.995
+            except (TypeError, ValueError):
+                cost_reduced = False
+            if not (power_reduced and (cost_reduced or "cost" not in energy_evidence)):
+                rejected["native_energy_reduction_not_observed"] += 1
+                continue
         item = dict(row)
         quality.update({
             "collector_mode": "pdcp_real", "pdcp_real": True,
@@ -502,8 +574,16 @@ def select_stage_transitions(
             "tasam_experience_id": _transition_id(row, phase),
             "economic_reference_eligible": bool(reference_arm),
             "economic_transition_eligible": bool(
-                not reference_arm and row.get("economic_transition_eligible") is True
+                not reference_arm and decision_economic_transition_eligible
             ),
+            "economic_training_eligible": bool(
+                not reference_arm and decision_economic_training_eligible
+            ),
+            "economic_promotion_eligible": bool(
+                not reference_arm and decision_economic_promotion_eligible
+            ),
+            "economic_application_status": decision_application_status,
+            "economic_execution_mode": decision_execution_mode,
         })
         grouped[stage].append(item)
 
@@ -533,6 +613,7 @@ def select_stage_transitions(
         "proxy_count": sum(float(r.get("collection_quality", {}).get("proxy_latency_sample_count", 0) or 0) for r in selected),
         "ack_count": sum(1 for r in selected if r.get("e2_ack_complete") is True),
         "require_asgard": require_asgard,
+        "require_economic_reduction": require_economic_reduction,
     }
     return selected, report
 
@@ -565,10 +646,25 @@ def arm_summary(arm_dir: Path, returncode: int, selection: dict[str, Any]) -> di
     }
 
 
+def resolve_reusable_baseline_root(source: Path) -> Path:
+    """Accept a pilot training root or its enclosing energy-campaign root."""
+    source = source.resolve()
+    direct = source / "baseline" / "arm"
+    nested = source / "training" / "baseline" / "arm"
+    if direct.is_dir():
+        return source
+    if nested.is_dir():
+        return source / "training"
+    raise SystemExit(
+        "baseline de referência ausente: esperado baseline/arm ou training/baseline/arm"
+    )
+
+
 def validate_reusable_baseline(
     source: Path, *, expected_profile: str
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     """Validate a completed rApp arm before referencing it from a new run."""
+    source = resolve_reusable_baseline_root(source)
     arm = source / "baseline" / "arm"
     selection_path = source / "baseline" / "selection_manifest.json"
     bank_path = source / "baseline" / "replay_90.jsonl"
@@ -625,7 +721,9 @@ def run(args: argparse.Namespace) -> int:
         "energy_enabled": bool(args.energy_enabled), "stages": list(STAGES),
         "baseline_contract": BASELINE_CONTRACT,
         "asgard_contract": (
-            ASGARD_ENERGY_CONTRACT if args.energy_enabled else ASGARD_CONTRACT
+            ASGARD_NATIVE_POWER_CONTRACT
+            if args.native_power else
+            (ASGARD_ENERGY_CONTRACT if args.energy_enabled else ASGARD_CONTRACT)
         ), "replay_contract": REPLAY_SCHEMA,
         "promotion_eligible": False,
         "resumed_complete_baseline": resuming,
@@ -638,14 +736,16 @@ def run(args: argparse.Namespace) -> int:
     floor_ledger = root / "baseline" / "safe_power_floor_ledger.json"
     baseline_source_manifest: dict[str, Any] = {}
     if resuming:
-        source = (args.baseline_source or root).resolve()
+        source_campaign = (args.baseline_source or root).resolve()
+        source = resolve_reusable_baseline_root(source_campaign)
         baseline_manifest, baseline_rows, baseline_selection = validate_reusable_baseline(
             source, expected_profile=args.profile
         )
         baseline_summary_arm = source / "baseline" / "arm"
         floor_ledger = source / "baseline" / "safe_power_floor_ledger.json"
         baseline_source_manifest = {
-            "campaign_root": str(source),
+            "campaign_root": str(source_campaign),
+            "baseline_training_root": str(source),
             "arm_manifest_sha256": sha256(source / "baseline" / "arm" / "arm_manifest.json"),
             "selection_manifest_sha256": sha256(source / "baseline" / "selection_manifest.json"),
             "replay_90_sha256": sha256(source / "baseline" / "replay_90.jsonl"),
@@ -667,9 +767,10 @@ def run(args: argparse.Namespace) -> int:
             baseline_arm, baseline_raw, "baseline_rapp_only",
             energy_enabled=args.energy_enabled, reference_arm=True,
         )
-        build_safe_power_floor_ledger(baseline_arm, floor_ledger)
+        if not args.native_power:
+            build_safe_power_floor_ledger(baseline_arm, floor_ledger)
     if resuming:
-        baseline_bank = (args.baseline_source.resolve() / "baseline" / "replay_90.jsonl")
+        baseline_bank = source / "baseline" / "replay_90.jsonl"
         bank_report = {
             "schema": "greenran.tasam.v2x.window90.replay_source.v1",
             "path": str(baseline_bank), "rows": len(baseline_rows),
@@ -683,12 +784,13 @@ def run(args: argparse.Namespace) -> int:
     asgard_arm = root / "asgard" / "arm"
     recent_bank = root / "asgard" / "recent_replay.jsonl"
     asgard_mode = (
-        "asgard_v2x_window90_energy_online"
-        if args.energy_enabled else ASGARD_CONTRACT
+        ASGARD_NATIVE_POWER_CONTRACT
+        if args.native_power else
+        ("asgard_v2x_window90_energy_online" if args.energy_enabled else ASGARD_CONTRACT)
     )
     asgard_rc = run_arm(
         args, asgard_arm, asgard_mode, bootstrap, baseline_bank, recent_bank,
-        safe_power_floor_ledger=floor_ledger,
+        safe_power_floor_ledger=(None if args.native_power else floor_ledger),
     )
     cleanup_finished_arm(
         asgard_arm,
@@ -736,7 +838,7 @@ def run(args: argparse.Namespace) -> int:
         "replay": bank_report,
         "asgard_online_state": update_status,
         "replay_update_manifests": updates,
-        "safe_power_floor_ledger": read_json(floor_ledger),
+        "safe_power_floor_ledger": read_json(floor_ledger) if not args.native_power else {},
         "required_update_milestones": [18, 36, 54, 72, 90],
         "seeds_used": {"training": [43], "evaluation_excluded": [45, 46, 47]},
         "checkpoint": {
@@ -747,7 +849,11 @@ def run(args: argparse.Namespace) -> int:
         },
         "contracts": {
             "baseline": BASELINE_CONTRACT,
-            "asgard": ASGARD_ENERGY_CONTRACT if args.energy_enabled else ASGARD_CONTRACT,
+            "asgard": (
+                ASGARD_NATIVE_POWER_CONTRACT
+                if args.native_power else
+                (ASGARD_ENERGY_CONTRACT if args.energy_enabled else ASGARD_CONTRACT)
+            ),
             "replay": REPLAY_SCHEMA, "reward": REWARD_CONTRACT,
         },
     }
@@ -781,8 +887,16 @@ def main() -> int:
     )
     parser.add_argument("--energy-enabled", action="store_true")
     parser.add_argument(
+        "--native-power", action="store_true",
+        help="usa o modo ASGARD com potência por DU aplicada pelo E2/PHY ns-3",
+    )
+    parser.add_argument(
         "--energy-staircase", action="store_true",
         help="habilita a escada econômica V2X somente no braço TA-SAM",
+    )
+    parser.add_argument(
+        "--adaptive-energy-probe", action="store_true",
+        help="usa 100%% como fallback e reduz 5%% após três decisões saudáveis",
     )
     parser.add_argument(
         "--energy-calibration", type=Path,

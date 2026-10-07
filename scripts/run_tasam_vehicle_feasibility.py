@@ -47,13 +47,15 @@ V6_PROFILES = {
     "tasam_training_balanced_v6_v2x_gbr_deadline_mc_fallback",
     "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max",
 }
-STRICT_V2X_PROFILES = V5_PROFILES | V6_PROFILES
+SAFE_V2X_PROFILES = {"tasam_training_economic_vehicle_safe_v1"}
+STRICT_V2X_PROFILES = V5_PROFILES | V6_PROFILES | SAFE_V2X_PROFILES
 V2X_PROFILES = {
     "tasam_training_balanced_v4_v2x",
     "tasam_training_balanced_v4_v2x_gbr",
     "tasam_training_balanced_v4_v2x_gbr_priority",
     *V5_PROFILES,
     *V6_PROFILES,
+    *SAFE_V2X_PROFILES,
 }
 SCHEDULER_TRACE_HEADER = [
     "Time", "CellId", "Rnti", "Imsi", "Cqi", "Mcs", "RlcQueueBytes",
@@ -273,6 +275,29 @@ def _simulation_completion(candidate_dir: Path, required_sim_time: float) -> dic
         observed = float(observed)
     except (TypeError, ValueError):
         observed = None
+    observed_source = "simulation_performance"
+    # rApp-only feasibility arms do not start the xApp metrics publisher, so
+    # ``extended_metrics.json`` can be absent even when the native PDCP
+    # contract has completed.  Use the latest native packet timestamp as a
+    # conservative simulator-clock lower bound in that case.  This is real
+    # evidence from the same trace used for the SLA decision, never a wall
+    # clock estimate or a synthetic target value.
+    if observed is None or observed <= 0.0:
+        native_max_s = 0.0
+        native_trace = candidate_dir / "ns3_energy" / "VehiclePdcpPduTrace.csv"
+        try:
+            with native_trace.open(newline="", encoding="utf-8", errors="replace") as handle:
+                for row in csv.DictReader(handle):
+                    for field in ("TxTimeNs", "RxTimeNs"):
+                        try:
+                            native_max_s = max(native_max_s, float(row.get(field) or 0.0) / 1_000_000_000.0)
+                        except (TypeError, ValueError):
+                            continue
+        except OSError:
+            native_max_s = 0.0
+        if native_max_s > 0.0:
+            observed = native_max_s
+            observed_source = "native_vehicle_pdcp_pdu_trace"
     stop_request = {}
     request_path = candidate_dir / "decision_target_stop.json"
     if request_path.is_file():
@@ -287,6 +312,7 @@ def _simulation_completion(candidate_dir: Path, required_sim_time: float) -> dic
         "valid": valid,
         "reason": "ok" if valid else "simulation_ended_before_required_time",
         "observed_sim_time_s": observed,
+        "observed_sim_time_source": observed_source,
         "required_sim_time_s": required_sim_time,
         "tolerance_s": 0.25,
     }
@@ -1123,9 +1149,33 @@ def _candidate_classification(candidate_dir: Path, evidence: dict[str, Any]) -> 
 
 def _lowest_valid_candidate(results: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return the shortest interval with complete, valid native evidence."""
+    def finite_native_exit(result: dict[str, Any]) -> bool:
+        if result.get("exit_code") == 0:
+            return True
+        if result.get("exit_code") not in {143, -15, 15}:
+            return False
+        evidence = result.get("evidence") or {}
+        completion = evidence.get("simulation_completion") or {}
+        if completion.get("valid") is not True:
+            return False
+        command = result.get("command") or []
+        try:
+            run_dir = Path(command[command.index("--run-dir") + 1])
+        except (ValueError, IndexError, TypeError):
+            return False
+        ns3_log = run_dir / "ns3.log"
+        try:
+            text = ns3_log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        # The arm wrapper may finish with SIGTERM after the finite supervisor
+        # has already observed a clean ns-3 exit.  Accept that parent status
+        # only with both native completion and the child code-0 marker.
+        return "[NS3_SUPERVISOR] ns3 exited code 0" in text
+
     approved = [
         result for result in results
-        if result.get("exit_code") == 0 and (result.get("evidence") or {}).get("valid") is True
+        if finite_native_exit(result) and (result.get("evidence") or {}).get("valid") is True
     ]
     return min(approved, key=lambda result: int(result["interval_us"])) if approved else None
 
@@ -1233,7 +1283,10 @@ def main() -> int:
         result["classification"] = _candidate_classification(candidate_dir, result["evidence"])
         write_json(candidate_dir / "feasibility_result.json", result)
         results.append(result)
-        if result["exit_code"] == 0 and result["evidence"].get("valid") and not args.evaluate_all_intervals:
+        if (
+            _lowest_valid_candidate([result]) is not None
+            and not args.evaluate_all_intervals
+        ):
             selected = result
             break
     if args.evaluate_all_intervals:

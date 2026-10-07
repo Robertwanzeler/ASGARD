@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -407,6 +408,12 @@ class MARLShadowRuntimeEvaluator:
         self._recommendation_history: deque[str] = deque(maxlen=self.stability_window)
         self._last_temporal_state = None
         self._last_temporal_resource = None
+        # The online V2X campaign uses deterministic, bounded exploration
+        # when the checkpoint remains stuck at full power.  The counter is
+        # advanced only by the orchestrator after native confirmation and a
+        # causal PDCP window have closed; rejected/shadow proposals do not
+        # make the policy less exploratory.
+        self._economic_exploration_completed = 0
         if self.enabled:
             self._try_load_checkpoint(bootstrap=True)
 
@@ -958,13 +965,14 @@ class MARLShadowRuntimeEvaluator:
         global_advice = self._global_budget_advice(marl_state)
         if global_advice.get('enabled'):
             percent = float(global_advice['power_percent'])
-            return {
+            advice = {
                 'enabled': True,
                 'power_percent': percent,
                 'intent': f'POWER_{int(percent)}',
                 'source': 'global_energy_infra_actor',
                 'global_budget': global_advice,
             }
+            return self._apply_causal_economic_exploration(advice, category, marl_state)
         if getattr(self, '_power_head', None) is not None and getattr(self, '_torch', None) is not None:
             values = list((marl_state.get('global_state') or {}).get('state_vector', []) or [])
             expected = int(self.checkpoint_meta.get('global_state_dim', len(values)) or len(values))
@@ -991,17 +999,101 @@ class MARLShadowRuntimeEvaluator:
                         60.0: 'REDUCE_60',
                         100.0: 'FULL_POWER',
                     }.get(percent, f'POWER_{int(percent)}')
-                    return {
+                    advice = {
                         'enabled': True,
                         'power_percent': percent,
                         'intent': intent,
                         'confidence': round(float(probabilities[index].item()), 6),
                         'source': 'power_head',
                     }
+                    return self._apply_causal_economic_exploration(advice, category, marl_state)
         # Compatibility fallback for old checkpoints: category is the only
         # learned signal, and CONDITIONAL stays in the middle power band.
         percent = 25.0 if category == 'ALLOWED' else 60.0
-        return {'enabled': True, 'power_percent': percent, 'intent': 'ECO_25' if percent == 25.0 else 'REDUCE_60', 'source': 'category_compatibility'}
+        advice = {
+            'enabled': True,
+            'power_percent': percent,
+            'intent': 'ECO_25' if percent == 25.0 else 'REDUCE_60',
+            'source': 'category_compatibility',
+        }
+        return self._apply_causal_economic_exploration(advice, category, marl_state)
+
+    def record_economic_transition(self, *, training_eligible: bool) -> None:
+        """Advance exploration only after a fully causal economic outcome."""
+        if training_eligible:
+            self._economic_exploration_completed += 1
+
+    def _apply_causal_economic_exploration(
+        self,
+        advice: Dict[str, Any],
+        category: str,
+        marl_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply seed-stable epsilon exploration to non-critical V2X actions.
+
+        This is intentionally part of the TA-SAM action policy, rather than a
+        runner-side fixed-power override.  It is enabled only by the current
+        campaign environment and never changes a BLOCKED safety action.
+        """
+        if os.environ.get('GREENRAN_TASAM_CAUSAL_EXPLORATION', '').strip().lower() not in {
+            '1', 'true', 'yes', 'on'
+        }:
+            return advice
+        category = str(category or '').upper()
+        if category not in {'ALLOWED', 'CONDITIONAL'}:
+            return advice
+        completed = max(0, int(self._economic_exploration_completed))
+        epsilon = max(0.05, 0.35 - (0.30 * min(completed, 18) / 18.0))
+        seed_text = os.environ.get('GREENRAN_TASAM_EXPLORATION_SEED', '43')
+        state = list((marl_state.get('global_state') or {}).get('state_vector', []) or [])
+        fingerprint = hashlib.sha256(
+            (f'{seed_text}|{completed}|{category}|{state!r}').encode('utf-8')
+        ).digest()
+        draw = int.from_bytes(fingerprint[:8], 'big') / float(1 << 64)
+        result = dict(advice)
+        result['exploration_probability'] = round(epsilon, 6)
+        result['exploration_completed_transitions'] = completed
+        result['action_origin'] = 'checkpoint_actor'
+        base_by_cell = (
+            (result.get('global_budget') or {}).get('power_percent_by_cell')
+            or result.get('power_percent_by_cell')
+            or {}
+        )
+        if isinstance(base_by_cell, dict) and base_by_cell:
+            result['power_percent_by_cell'] = {
+                str(cell): float(power) for cell, power in base_by_cell.items()
+            }
+            result['power_percent'] = float(min(result['power_percent_by_cell'].values()))
+        if draw >= epsilon:
+            return result
+        # ALLOWED may examine the entire calibrated action space; the guard
+        # band stays deliberately conservative while still allowing energy
+        # reduction.  The low-power bias makes early evidence useful without
+        # ever leaving the physical 25--100% envelope.
+        levels = list(range(25, 101, 5)) if category == 'ALLOWED' else list(range(60, 101, 5))
+        weighted = []
+        for index, level in enumerate(levels):
+            weighted.extend([level] * (len(levels) - index))
+        selected = weighted[int.from_bytes(fingerprint[8:16], 'big') % len(weighted)]
+        if result.get('power_percent_by_cell'):
+            selected_by_cell = {}
+            for offset, raw_cell in enumerate(sorted(result['power_percent_by_cell'], key=int)):
+                cell_digest = hashlib.sha256(
+                    fingerprint + f'|{raw_cell}|{offset}'.encode('utf-8')
+                ).digest()
+                selected_by_cell[str(raw_cell)] = float(
+                    weighted[int.from_bytes(cell_digest[:8], 'big') % len(weighted)]
+                )
+            selected = int(min(selected_by_cell.values()))
+            result['power_percent_by_cell'] = selected_by_cell
+        result.update({
+            'power_percent': float(selected),
+            'intent': 'ECO_25' if selected == 25 else f'POWER_{selected}',
+            'source': 'causal_epsilon_exploration',
+            'action_origin': 'causal_epsilon_exploration',
+            'exploration_draw': round(draw, 8),
+        })
+        return result
 
     def _global_budget_advice(self, marl_state: Dict[str, Any]) -> Dict[str, Any]:
         actor = getattr(self, '_global_actor', None)
@@ -1633,9 +1725,13 @@ class MARLShadowRuntimeEvaluator:
         energy_advice.update(self._power_advice(marl_state, predicted_category, resource_snapshot))
         global_budget = energy_advice.get('global_budget') or self._global_budget_advice(marl_state)
         if global_budget.get('power_percent_by_cell'):
-            energy_advice['power_percent_by_cell'] = dict(global_budget['power_percent_by_cell'])
+            # A causal epsilon decision may deliberately replace the actor's
+            # per-DU map.  Preserve it; falling back here used to erase every
+            # exploration action before the orchestrator saw it.
+            if not energy_advice.get('power_percent_by_cell'):
+                energy_advice['power_percent_by_cell'] = dict(global_budget['power_percent_by_cell'])
             energy_advice['sleep_requested_cells'] = [
-                int(cell) for cell, value in global_budget['power_percent_by_cell'].items()
+                int(cell) for cell, value in energy_advice['power_percent_by_cell'].items()
                 if float(value) == 0.0
             ]
             energy_advice['total_budget_fraction'] = global_budget.get('total_budget_fraction')

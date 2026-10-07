@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 
 from scripts.run_tasam_v2x_energy_r5 import (
+    NATIVE_POWER_FROZEN_MODE,
+    NATIVE_POWER_ONLINE_MODE,
     PROFILE,
+    _all_dus_at_full_power,
     _arm_command,
     _native_gate_ready,
     _parse_slots,
@@ -38,6 +41,76 @@ def test_energy_arm_command_pins_profile_and_slot(tmp_path: Path):
     assert command[command.index("--decision-target") + 1] == "0"
     assert "--energy-enabled" in command
     assert "--disable-app-overrides" in command
+
+
+def test_energy_asgard_command_passes_validated_floor_ledger(tmp_path: Path):
+    ledger = tmp_path / "safe_power_floor_ledger.json"
+    command = _arm_command(
+        "asgard_v2x_window90_energy_online",
+        tmp_path / "asgard",
+        tmp_path / "checkpoint",
+        tmp_path / "schedule.json",
+        "schedule-id",
+        tmp_path / "calibration.json",
+        wall_time=9000,
+        binary=tmp_path / "ns3",
+        profile=PROFILE,
+        execution_slot="slot-b",
+        safe_power_floor_ledger=ledger,
+    )
+    assert "--energy-staircase" in command
+    assert command[command.index("--safe-power-floor-ledger") + 1] == str(ledger)
+
+
+def test_energy_asgard_command_can_enable_safe_probe(tmp_path: Path):
+    command = _arm_command(
+        "asgard_v2x_window90_energy_online", tmp_path / "asgard",
+        tmp_path / "checkpoint", tmp_path / "schedule.json", "schedule-id",
+        tmp_path / "calibration.json", wall_time=9000, binary=tmp_path / "ns3",
+        profile=PROFILE, execution_slot="slot-b", adaptive_energy_probe=True,
+    )
+    assert "--adaptive-energy-probe" in command
+
+
+def test_native_power_command_omits_legacy_staircase_and_floor(tmp_path: Path):
+    command = _arm_command(
+        NATIVE_POWER_ONLINE_MODE,
+        tmp_path / "asgard",
+        tmp_path / "checkpoint",
+        tmp_path / "schedule.json",
+        "schedule-id",
+        tmp_path / "calibration.json",
+        wall_time=9000,
+        binary=tmp_path / "ns3",
+        profile=PROFILE,
+        execution_slot="slot-b",
+        safe_power_floor_ledger=tmp_path / "historical-ledger.json",
+        adaptive_energy_probe=True,
+    )
+    assert "--energy-staircase" not in command
+    assert "--adaptive-energy-probe" not in command
+    assert "--safe-power-floor-ledger" not in command
+    assert command[command.index("--mode") + 1] == NATIVE_POWER_ONLINE_MODE
+
+    frozen = _arm_command(
+        NATIVE_POWER_FROZEN_MODE,
+        tmp_path / "frozen",
+        tmp_path / "checkpoint",
+        tmp_path / "schedule.json",
+        "schedule-id",
+        tmp_path / "calibration.json",
+        wall_time=9000,
+        binary=tmp_path / "ns3",
+        profile=PROFILE,
+        execution_slot="slot-b",
+    )
+    assert frozen[frozen.index("--mode") + 1] == NATIVE_POWER_FROZEN_MODE
+    assert "--energy-staircase" not in frozen
+
+
+def test_all_full_power_floors_block_an_economic_pilot():
+    assert _all_dus_at_full_power({"2": 100.0, "3": 100.0, "4": 100.0})
+    assert not _all_dus_at_full_power({"2": 100.0, "3": 95.0, "4": 100.0})
 
 
 def _write_native_gate_fixture(

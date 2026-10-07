@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from greenran_control_bundle import (  # noqa: E402
     ACK_SCHEMA,
+    ECONOMIC_ACTION_V3_CONTRACT,
+    V3_SCHEMA,
     ControlBundleClient,
     ControlBundleError,
     SCHEMA,
@@ -61,6 +63,80 @@ def test_bundle_requires_each_canonical_ue_exactly_once():
     broken["cells"][0]["ue_policies"].pop()
     with pytest.raises(ControlBundleError, match="missing"):
         validate_bundle(broken)
+
+
+def test_scheduler_renewal_can_preserve_the_last_power_command():
+    bundle = _bundle()
+    for cell in bundle["cells"]:
+        cell["apply_power"] = 0
+    valid = validate_bundle(bundle)
+    assert [cell["apply_power"] for cell in valid["cells"]] == [0, 0, 0]
+    bundle["cells"][0]["apply_power"] = 2
+    with pytest.raises(ControlBundleError, match="apply_power"):
+        validate_bundle(bundle)
+
+
+def test_bootstrap_power_only_preserves_checkpoint_scheduler_budget():
+    bundle = {
+        "schema": V3_SCHEMA,
+        "economic_action_contract": ECONOMIC_ACTION_V3_CONTRACT,
+        "policy_id": "bootstrap-test",
+        "sequence": 1,
+        "issued_at_ns": time.time_ns(),
+        "ttl_ms": 12000,
+        "mode": ECONOMIC_ACTION_V3_CONTRACT,
+        "bootstrap": True,
+        "bootstrap_origin": "tasam_bootstrap",
+        "bootstrap_symbol_policy": "checkpoint",
+        "power_percent_by_cell": {"2": 25, "3": 25, "4": 25},
+        "cells": [
+            {"cell_id": cell, "tx_power_percent": 25, "apply_power": 1, "ue_policies": []}
+            for cell in (2, 3, 4)
+        ],
+        "infra": build_physical_budget(1.0),
+    }
+    normalized = validate_bundle(bundle)
+    assert normalized["bootstrap"] is True
+    assert normalized["power_percent_by_cell"] == {"2": 25, "3": 25, "4": 25}
+    assert all(not cell["ue_policies"] for cell in normalized["cells"])
+
+
+def test_non_bootstrap_power_only_bundle_still_requires_all_ues():
+    bundle = {
+        "schema": V3_SCHEMA,
+        "economic_action_contract": ECONOMIC_ACTION_V3_CONTRACT,
+        "policy_id": "not-bootstrap-test",
+        "sequence": 1,
+        "issued_at_ns": time.time_ns(),
+        "ttl_ms": 12000,
+        "mode": ECONOMIC_ACTION_V3_CONTRACT,
+        "power_percent_by_cell": {"2": 25, "3": 25, "4": 25},
+        "cells": [
+            {"cell_id": cell, "tx_power_percent": 25, "apply_power": 1, "ue_policies": []}
+            for cell in (2, 3, 4)
+        ],
+        "infra": build_physical_budget(1.0),
+    }
+    with pytest.raises(ControlBundleError, match="missing"):
+        validate_bundle(bundle)
+
+
+def test_native_power_contract_requires_three_dus_and_disables_sleep(monkeypatch):
+    bundle = _bundle()
+    bundle["schema"] = V3_SCHEMA
+    bundle["economic_action_contract"] = ECONOMIC_ACTION_V3_CONTRACT
+    for cell in bundle["cells"]:
+        cell["tx_power_percent"] = 65
+    bundle["power_percent_by_cell"] = {"2": 65, "3": 65, "4": 65}
+    monkeypatch.setenv("GREENRAN_TASAM_NATIVE_POWER_CONTROL", "1")
+    normalized = validate_bundle(bundle)
+    assert normalized["power_percent_by_cell"] == {"2": 65, "3": 65, "4": 65}
+
+    sleeping = json.loads(json.dumps(bundle))
+    sleeping["cells"][0]["tx_power_percent"] = 0
+    sleeping["power_percent_by_cell"]["2"] = 0
+    with pytest.raises(ControlBundleError, match="does not permit DU sleep"):
+        validate_bundle(sleeping)
 
 
 def test_client_requires_applied_e2_ack(tmp_path, monkeypatch):

@@ -12,7 +12,11 @@ from scripts.run_tasam_online_controlled import (
     build_v2x_replay_window90,
     run_update,
 )
-from scripts.run_tasam_v2x_window90_pilot import STAGES, select_stage_transitions
+from scripts.run_tasam_v2x_window90_pilot import (
+    STAGES,
+    resolve_reusable_baseline_root,
+    select_stage_transitions,
+)
 from src.greenran_v2x_window90 import validate_online_transition
 
 
@@ -72,6 +76,130 @@ def test_window90_selects_exactly_ten_per_stage(tmp_path: Path):
     assert len(selected) == 90
     assert all(report["per_stage"][stage] == 10 for stage in STAGES)
     assert len({row["tasam_experience_id"] for row in selected}) == 90
+
+
+def test_window90_reads_economic_trainability_from_finalized_decision(tmp_path: Path):
+    """Nested finalizer flags must not be lost by the data-lake export."""
+    arm = tmp_path / "arm"
+    rows = [_row("allowed_bootstrap", 1)]
+    rows[0]["economic_transition_eligible"] = True
+    rows[0].update({
+        "action_correlation_valid": True,
+        "judge_feedback_observed": True,
+        "energy_evidence": {
+            "native": True,
+            "e2_ack": True,
+            "evidence_version": "v6",
+            "action_correlation_id": "corr-1",
+            "power_percent_by_cell": {"2": 95, "3": 95, "4": 95},
+        },
+        "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+        "adaptive_reward": {
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+        },
+        "judge_feedback": {
+            "outcome_observed": True,
+            "tasam_reward_source": "observed_real_metrics",
+        },
+    })
+    rows[0]["decision"].update({
+        "economic_transition_eligible": 1,
+        "economic_training_eligible": 1,
+        "economic_promotion_eligible": 0,
+        "economic_application_status": "applied",
+        "economic_execution_mode": "economic",
+        "native_readback_observed": True,
+    })
+    rows[0]["collection_quality"]["valid_for_training"] = True
+    raw = tmp_path / "raw.jsonl"
+    _write_rows(raw, rows)
+    _native_files(arm, 1)
+    # The helper fixture is intentionally small; add the three native cells
+    # needed by the ASGARD energy gate.
+    trace = arm / "ns3_energy" / "TasamControlObservations.csv"
+    with trace.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "DecisionId", "ObservationKind", "ActionCorrelationId",
+                "CellId", "TxPowerPercent",
+            ],
+        )
+        writer.writeheader()
+        for cell in (2, 3, 4):
+            for kind in ("power_readback", "state_snapshot"):
+                writer.writerow({
+                    "DecisionId": 1, "ObservationKind": kind,
+                    "ActionCorrelationId": "corr-1", "CellId": cell,
+                    "TxPowerPercent": 95,
+                })
+
+    selected, _report = select_stage_transitions(
+        arm, raw, "asgard_gate", require_asgard=True, energy_enabled=True,
+        require_economic_reduction=True,
+    )
+
+    assert len(selected) == 1
+    assert selected[0]["economic_training_eligible"] is True
+    assert selected[0]["economic_application_status"] == "applied"
+
+
+def test_window90_energy_gate_rejects_full_power_noop(tmp_path: Path):
+    arm = tmp_path / "arm"
+    row = _row("allowed_bootstrap", 1)
+    row.update({
+        "economic_transition_eligible": True,
+        "action_correlation_valid": True,
+        "judge_feedback_observed": True,
+        "energy_evidence": {
+            "native": True, "e2_ack": True, "evidence_version": "v6",
+            "action_correlation_id": "corr-1", "cost": 1.0,
+            "power_percent_by_cell": {"2": 100, "3": 100, "4": 100},
+        },
+        "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+        "adaptive_reward": {"reward_contract": "greenran.tasam.v2x.reward_adaptive.v1"},
+        "judge_feedback": {"outcome_observed": True, "tasam_reward_source": "observed_real_metrics"},
+    })
+    row["decision"].update({
+        "economic_transition_eligible": 1,
+        "economic_training_eligible": 1,
+        "economic_application_status": "applied",
+        "economic_execution_mode": "economic",
+        "native_readback_observed": True,
+    })
+    row["collection_quality"]["valid_for_training"] = True
+    raw = tmp_path / "raw.jsonl"
+    _write_rows(raw, [row])
+    _native_files(arm, 1)
+    trace = arm / "ns3_energy" / "TasamControlObservations.csv"
+    with trace.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[
+            "DecisionId", "ObservationKind", "ActionCorrelationId", "CellId", "TxPowerPercent",
+        ])
+        writer.writeheader()
+        for cell in (2, 3, 4):
+            for kind in ("power_readback", "state_snapshot"):
+                writer.writerow({
+                    "DecisionId": 1, "ObservationKind": kind,
+                    "ActionCorrelationId": "corr-1", "CellId": cell,
+                    "TxPowerPercent": 100,
+                })
+
+    selected, report = select_stage_transitions(
+        arm, raw, "asgard_gate", require_asgard=True, energy_enabled=True,
+        require_economic_reduction=True,
+    )
+
+    assert selected == []
+    assert report["rejected"]["native_energy_reduction_not_observed"] == 1
+
+
+def test_window90_reusable_baseline_accepts_campaign_root(tmp_path: Path):
+    training_root = tmp_path / "campaign" / "training"
+    (training_root / "baseline" / "arm").mkdir(parents=True)
+
+    assert resolve_reusable_baseline_root(tmp_path / "campaign") == training_root
+    assert resolve_reusable_baseline_root(training_root) == training_root
 
 
 def test_window90_replay_is_exact_72_18(tmp_path: Path):

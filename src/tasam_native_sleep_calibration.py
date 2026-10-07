@@ -225,7 +225,12 @@ def make_sleep_bundle(
 
 
 def _pdcp_window_valid(path: Path, *, after_s: float) -> bool:
-    """Require fresh real PDCP evidence for every vehicle IMSI after drain."""
+    """Require fresh real PDCP evidence for every vehicle IMSI after drain.
+
+    The association gate covers all twenty IMSIs.  The native vehicle-PDCP
+    trace is the SLA authority for IMSIs 16--20 in this scenario, and its
+    header is ``IMSI`` (uppercase) in the ns-3 producer.
+    """
     seen: set[int] = set()
     try:
         with path.open(newline="", encoding="utf-8", errors="replace") as handle:
@@ -233,7 +238,7 @@ def _pdcp_window_valid(path: Path, *, after_s: float) -> bool:
                 if _number(row.get("Time"), -1.0) < after_s:
                     continue
                 try:
-                    imsi = int(row.get("Imsi", -1))
+                    imsi = int(row.get("IMSI", row.get("Imsi", -1)))
                 except (TypeError, ValueError):
                     continue
                 if 16 <= imsi <= 20:
@@ -309,6 +314,10 @@ def execute_native_sleep_calibration(
                     "status": "draining", "source_cell_id": source,
                     "drain_sequence": sequence, "handover_plan": handover_plan,
                     "drain_sim_time_s": sim_time,
+                    "association_coverage_imsis": sorted(set().union(*(
+                        set(snapshot.get(cell, {}).get("imsis") or set())
+                        for cell in DU_CELLS
+                    ))),
                 })
                 _write_json(evidence_path, result)
                 sequence += 1
@@ -334,6 +343,8 @@ def execute_native_sleep_calibration(
                 result.update({
                     "status": "committed_waiting_native", "commit_sequence": sequence,
                     "empty_source_sim_time_s": empty_since, "pdcp_window_s": 10.0,
+                    "association_coverage_imsis": sorted(target_coverage),
+                    "pdcp_required_imsis": list(range(16, 21)),
                 })
                 _write_json(evidence_path, result)
                 sequence += 1
@@ -345,7 +356,12 @@ def execute_native_sleep_calibration(
                         and str(confirmed.get("sleep_transaction_id") or "") == sleep_id
                         and _sleep_readback_present(control_path, source=source, sleep_id=sleep_id)
                     ):
-                        result.update({"status": "completed", "native_commit_confirmed": True})
+                        result.update({
+                            "status": "completed",
+                            "native_commit_confirmed": True,
+                            "association_coverage_imsis": sorted(target_coverage),
+                            "pdcp_required_imsis": list(range(16, 21)),
+                        })
                         _write_json(evidence_path, result)
                         return
                     time.sleep(0.25)

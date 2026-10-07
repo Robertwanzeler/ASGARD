@@ -171,6 +171,36 @@ class TestMARLShadow(unittest.TestCase):
         self.assertEqual(blocked['power_percent'], 100.0)
         self.assertEqual(blocked['source'], 'safety_envelope')
 
+    def test_causal_exploration_is_seed_stable_and_respects_safety_bands(self):
+        state = {'global_state': {'state_vector': [0.21, 0.34, 0.55]}}
+        actor = {
+            'enabled': True,
+            'power_percent': 100.0,
+            'source': 'global_energy_infra_actor',
+            'global_budget': {
+                'power_percent_by_cell': {'2': 100.0, '3': 100.0, '4': 100.0},
+            },
+        }
+        with mock.patch.dict(os.environ, {
+            'GREENRAN_TASAM_CAUSAL_EXPLORATION': '1',
+            'GREENRAN_TASAM_EXPLORATION_SEED': '43',
+        }, clear=False):
+            first = MARLShadowRuntimeEvaluator({'mode': 'shadow'})._apply_causal_economic_exploration(
+                actor, 'ALLOWED', state
+            )
+            second = MARLShadowRuntimeEvaluator({'mode': 'shadow'})._apply_causal_economic_exploration(
+                actor, 'ALLOWED', state
+            )
+            conditional = MARLShadowRuntimeEvaluator({'mode': 'shadow'})._apply_causal_economic_exploration(
+                actor, 'CONDITIONAL', state
+            )
+        assert first == second
+        assert first['action_origin'] in {'checkpoint_actor', 'causal_epsilon_exploration'}
+        assert all(25.0 <= value <= 100.0 and value % 5 == 0
+                   for value in first['power_percent_by_cell'].values())
+        assert all(60.0 <= value <= 100.0 and value % 5 == 0
+                   for value in conditional['power_percent_by_cell'].values())
+
     def test_armd_envelope_bounds_tasam_inside_policy_floors(self):
         evaluator = MARLShadowRuntimeEvaluator({'mode': 'shadow'})
         shadow = {

@@ -13,12 +13,17 @@ from tasam_economic_v3 import (
     CONTRACT,
     DUSleepCoordinator,
     ENERGY_STAIRCASE_CONTRACT,
+    ENERGY_STAIRCASE_PROBE_CONTRACT,
+    ENERGY_STAIRCASE_PROBE_10_CONTRACT,
     EconomicActionV3Error,
     build_energy_staircase,
     normalize_power_by_cell,
     project_total_budget_fraction,
     quantize_power_percent_v3,
     realized_economic_reward,
+    safe_probe_staircase_candidate,
+    safe_probe_staircase_observe,
+    safe_probe_staircase_selected,
     staircase_candidate,
 )
 
@@ -195,3 +200,70 @@ def test_energy_staircase_rejects_missing_floor_and_sleep_is_explicit():
         allow_sleep=True,
     )
     assert selected[2] == 0
+
+
+def test_safe_probe_descends_after_three_healthy_results_and_restores_full_power():
+    requested = {2: 25, 3: 25, 4: 25}
+    state = {"contract": ENERGY_STAIRCASE_PROBE_CONTRACT}
+    for _ in range(3):
+        selected, state = safe_probe_staircase_candidate(
+            requested, state=state, healthy=True, healthy_required=3
+        )
+    assert selected == {2: 95, 3: 95, 4: 95}
+    selected, state = safe_probe_staircase_candidate(
+        requested, state=state, healthy=False, healthy_required=3
+    )
+    assert selected == {2: 100, 3: 100, 4: 100}
+    assert state["probe_reason"] == "critical_or_incomplete_restore_full_power"
+
+
+def test_safe_probe_10_percent_contract_descends_by_ten_and_keeps_fail_safe():
+    requested = {2: 25, 3: 25, 4: 25}
+    state = {"contract": ENERGY_STAIRCASE_PROBE_10_CONTRACT}
+    for _ in range(3):
+        selected, state = safe_probe_staircase_candidate(
+            requested, state=state, healthy=True, healthy_required=3
+        )
+    assert selected == {2: 90, 3: 90, 4: 90}
+    assert state["step_percent"] == 10
+    selected, state = safe_probe_staircase_candidate(
+        requested, state=state, healthy=False, healthy_required=3
+    )
+    assert selected == {2: 100, 3: 100, 4: 100}
+
+
+def test_safe_probe_advances_only_once_per_native_sequence():
+    state = {"contract": ENERGY_STAIRCASE_PROBE_CONTRACT, "healthy_required": 3}
+    for sequence in (11, 12, 13):
+        state = safe_probe_staircase_observe(
+            state,
+            observation_sequence=sequence,
+            healthy=True,
+            critical=False,
+        )
+    assert safe_probe_staircase_selected(state) == {2: 95, 3: 95, 4: 95}
+
+    duplicate = safe_probe_staircase_observe(
+        state,
+        observation_sequence=13,
+        healthy=True,
+        critical=False,
+    )
+    assert duplicate == state
+
+
+def test_safe_probe_incomplete_per_ue_observation_restores_full_power():
+    state = {
+        "contract": ENERGY_STAIRCASE_PROBE_CONTRACT,
+        "next_selected_power_by_cell": {"2": 75, "3": 75, "4": 75},
+        "trial_by_cell": {"2": 75, "3": 75, "4": 75},
+        "last_confirmed_by_cell": {"2": 80, "3": 80, "4": 80},
+        "last_processed_observation_sequence": 20,
+    }
+    state = safe_probe_staircase_observe(
+        state,
+        observation_sequence=21,
+        healthy=False,
+        critical=True,
+    )
+    assert safe_probe_staircase_selected(state) == {2: 100, 3: 100, 4: 100}

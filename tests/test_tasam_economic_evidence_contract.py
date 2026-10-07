@@ -2,10 +2,16 @@ import json
 import csv
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from scripts.run_tasam_online_controlled import _economic_row_is_eligible
 from src.rapp_data_lake import DataLake
+from src.rapp_orchestrator import (
+    RappResourceOptimizer,
+    _native_bundle_cell_power_percent,
+    causal_energy_saving_fraction,
+)
 from src.tasam_learning_meter import build_learning_meter
 
 
@@ -44,6 +50,188 @@ def _row(**overrides):
 
 
 class TestTasamEconomicEvidenceContract(unittest.TestCase):
+    def test_native_v3_power_reaches_empty_du_without_policy_rows(self):
+        power = {2: 90, 3: 90, 4: 90}
+        self.assertEqual(
+            _native_bundle_cell_power_percent(
+                power, 2, 90, economic_power_command=True,
+                bootstrap_pending=False, cell_policies=[], sleep_transition=None,
+            ),
+            90,
+        )
+        self.assertEqual(
+            _native_bundle_cell_power_percent(
+                power, 2, 90, economic_power_command=False,
+                bootstrap_pending=False, cell_policies=[], sleep_transition=None,
+            ),
+            100,
+        )
+
+    def test_native_control_intent_is_persisted_before_transport(self):
+        decision = {}
+        contract = {"correlation_id": "economic:test:1"}
+        bundle = {
+            "sequence": 7,
+            "sim_time_s": 12.5,
+            "ttl_ms": 12000,
+            "power_percent_by_cell": {"2": 70, "3": 75, "4": 80},
+            "cells": [
+                {"cell_id": 2, "tx_power_percent": 70},
+                {"cell_id": 3, "tx_power_percent": 75},
+                {"cell_id": 4, "tx_power_percent": 80},
+            ],
+        }
+
+        persisted = RappResourceOptimizer._persist_native_control_intent(
+            decision, contract, bundle
+        )
+
+        self.assertEqual(decision["tasam_control_intent_status"], "intent_persisted")
+        self.assertEqual(contract["native_control_intent_status"], "intent_persisted")
+        self.assertEqual(contract["native_control_intent"]["cell_ids"], [2, 3, 4])
+        self.assertEqual(persisted["power_percent_by_cell"], {"2": 70, "3": 75, "4": 80})
+        bundle["cells"][0]["tx_power_percent"] = 100
+        self.assertEqual(contract["native_control_bundle"]["cells"][0]["tx_power_percent"], 70)
+
+    def test_energy_reward_uses_native_pre_action_not_synthetic_candidate(self):
+        observed = causal_energy_saving_fraction(430.0, 383.5)
+        synthetic = causal_energy_saving_fraction(197.5, 383.5)
+        self.assertGreater(observed, 0.0)
+        self.assertLess(synthetic, 0.0)
+
+    def test_native_pre_action_and_symbol_state_require_all_three_dus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lake = DataLake(Path(tmp) / "native.db")
+            for cell in (2, 3, 4):
+                lake.conn.execute(
+                    """INSERT INTO tasam_control_observations
+                       (source_path, sim_time_s, cell_id, transaction_id,
+                        power_transaction_id, active_ues, tx_power_percent,
+                        tx_power_dbm, observation_kind, native_allocated_dl_symbols,
+                        native_dl_symbol_capacity, power_lease_fresh, imported_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ("native.csv", 10.0, cell, cell, cell, 20, 75.0,
+                     10.0, "power_readback", 700, 1000, 1, 1),
+                )
+                lake.conn.execute(
+                    """INSERT INTO tasam_control_observations
+                       (source_path, sim_time_s, cell_id, transaction_id,
+                        power_transaction_id, active_ues, tx_power_percent,
+                        tx_power_dbm, observation_kind, native_allocated_dl_symbols,
+                        native_dl_symbol_capacity, power_lease_fresh, imported_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ("native.csv", 10.0, cell, cell, cell, 20, 75.0,
+                     10.0, "state_snapshot", 700, 1000, 1, 1),
+                )
+            lake.conn.commit()
+            self.assertTrue(lake.latest_native_power_state()["valid"])
+            self.assertTrue(lake.latest_native_symbol_state()["valid"])
+            lake.conn.execute(
+                "UPDATE tasam_control_observations "
+                "SET native_allocated_dl_symbols=0, native_dl_symbol_capacity=0"
+            )
+            lake.conn.commit()
+            # A complete zero-capacity snapshot is still authoritative native
+            # state before the first scheduler policy materializes.  It must
+            # not deadlock the first TA-SAM bundle; no synthetic budget is
+            # inferred from it.
+            self.assertTrue(lake.latest_native_symbol_state()["valid"])
+            lake.conn.execute(
+                "DELETE FROM tasam_control_observations WHERE cell_id=4"
+            )
+            lake.conn.commit()
+            self.assertFalse(lake.latest_native_power_state()["valid"])
+
+    def test_current_native_replay_accepts_empty_du_allocation_snapshot(self):
+        row = _row(
+            economic_action_contract="economic_action_v3_per_du_sleep",
+            economic_application_status="applied",
+        )
+        row["economic_action"]["contract"] = "economic_action_v3_per_du_sleep"
+        row["decision"] = {
+            "tasam_fallback_used": False,
+            "tasam_checkpoint_valid": True,
+        }
+        row["economic_action"]["native_observation"] = {
+            "evidence_version": "v5",
+            "transaction_id": 7,
+            "native_control_sequence": 7,
+            "action_correlation_id": "economic:test",
+            "cell_ids": [2, 3, 4],
+            "observations": [
+                {
+                    "cell_id": 2,
+                    "power_readback_sim_time_s": 2.0,
+                    "policy_active_sim_time_s": 2.0,
+                    "tx_power_percent": 35.0,
+                    "native_allocation_fraction": None,
+                    "active_ues": 0,
+                    "active_dl_symbol_capacity": 0,
+                },
+                {
+                    "cell_id": 3,
+                    "power_readback_sim_time_s": 2.0,
+                    "policy_active_sim_time_s": 2.0,
+                    "tx_power_percent": 75.0,
+                    "native_allocation_fraction": 0.5,
+                    "active_ues": 1,
+                    "active_dl_symbol_capacity": 10,
+                },
+                {
+                    "cell_id": 4,
+                    "power_readback_sim_time_s": 2.0,
+                    "policy_active_sim_time_s": 2.0,
+                    "tx_power_percent": 30.0,
+                    "native_allocation_fraction": None,
+                    "active_ues": 0,
+                    "active_dl_symbol_capacity": 0,
+                },
+            ],
+        }
+        with patch.dict(
+            "os.environ",
+            {"GREENRAN_NATIVE_EVIDENCE_VERSION": "v5"},
+            clear=False,
+        ):
+            self.assertTrue(_economic_row_is_eligible(row, current_native_only=True))
+
+    def test_current_native_replay_accepts_v6_sequence_on_action(self):
+        row = _row(
+            economic_action_contract="economic_action_v3_per_du_sleep",
+            economic_application_status="applied",
+        )
+        row["economic_action"]["contract"] = "economic_action_v3_per_du_sleep"
+        row["economic_action"]["native_control_sequence"] = 8
+        row["decision"] = {
+            "tasam_fallback_used": False,
+            "tasam_checkpoint_valid": True,
+        }
+        row["economic_action"]["native_observation"] = {
+            "evidence_version": "v6",
+            "transaction_id": 8,
+            "action_correlation_id": "economic:v6",
+            "cell_ids": [2, 3, 4],
+            "observations": [
+                {
+                    "cell_id": cell_id,
+                    "native_control_sequence": 8,
+                    "power_readback_sim_time_s": 2.0,
+                    "policy_active_sim_time_s": 2.0,
+                    "tx_power_percent": 75.0,
+                    "native_allocation_fraction": None,
+                    "active_ues": 0,
+                    "active_dl_symbol_capacity": 0,
+                }
+                for cell_id in (2, 3, 4)
+            ],
+        }
+        with patch.dict(
+            "os.environ",
+            {"GREENRAN_NATIVE_EVIDENCE_VERSION": "v6"},
+            clear=False,
+        ):
+            self.assertTrue(_economic_row_is_eligible(row, current_native_only=True))
+
     def test_explicit_unconfirmed_action_is_rejected(self):
         row = _row()
         row["economic_action"]["actuation_confirmed"] = False

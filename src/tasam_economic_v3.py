@@ -15,6 +15,8 @@ from typing import Any, Mapping
 
 CONTRACT = "economic_action_v3_per_du_sleep"
 ENERGY_STAIRCASE_CONTRACT = "greenran.tasam.v2x.energy_staircase.v1"
+ENERGY_STAIRCASE_PROBE_CONTRACT = "greenran.tasam.v2x.energy_staircase.v2_safe_probe"
+ENERGY_STAIRCASE_PROBE_10_CONTRACT = "greenran.tasam.v2x.energy_staircase.v3_safe_probe_10"
 POWER_LEVELS_V3 = (0, *range(25, 101, 5))
 ACTIVE_POWER_LEVELS_V3 = tuple(range(25, 101, 5))
 DU_CELL_IDS = (2, 3, 4)
@@ -127,6 +129,152 @@ def staircase_candidate(
         "allow_sleep": bool(allow_sleep),
     }
     return selected, next_state
+
+
+def safe_probe_staircase_candidate(
+    requested_power_by_cell: Mapping[Any, Any] | None,
+    *,
+    state: Mapping[Any, Any] | None = None,
+    healthy: bool = False,
+    critical: bool = False,
+    healthy_required: int = 3,
+    step_percent: int | None = None,
+) -> tuple[dict[int, int], dict[str, Any]]:
+    """Descend in a versioned step only after three healthy observations.
+
+    A historical rApp command at 100% is a safe reference, not a measured RF
+    minimum. Any failed, critical, or incomplete observation restores every
+    DU to 100%; a lower rung is committed only after three healthy outcomes.
+    """
+    normalize_power_by_cell(requested_power_by_cell)
+    previous = dict(state or {})
+    default_step = 10 if previous.get("contract") == ENERGY_STAIRCASE_PROBE_10_CONTRACT else 5
+    try:
+        step = int(step_percent if step_percent is not None else previous.get("step_percent", default_step))
+    except (TypeError, ValueError):
+        step = 5
+    if step not in {5, 10}:
+        raise EconomicActionV3Error("safe probe step must be 5 or 10 percent")
+    required = max(1, int(healthy_required))
+    confirmed_raw = previous.get("last_confirmed_by_cell") or {}
+    trial_raw = previous.get("trial_by_cell") or {}
+    confirmed = {
+        cell: int(confirmed_raw.get(str(cell), confirmed_raw.get(cell, 100)))
+        for cell in DU_CELL_IDS
+    }
+    trial = {
+        cell: int(trial_raw.get(str(cell), trial_raw.get(cell, confirmed[cell])))
+        for cell in DU_CELL_IDS
+    }
+    streak = int(previous.get("trial_healthy_streak", 0) or 0)
+    if critical or not healthy:
+        selected = {cell: 100 for cell in DU_CELL_IDS}
+        confirmed = dict(selected)
+        trial = dict(selected)
+        streak = 0
+        reason = "critical_or_incomplete_restore_full_power"
+    else:
+        streak += 1
+        if streak >= required:
+            for cell in DU_CELL_IDS:
+                if trial[cell] < confirmed[cell]:
+                    confirmed[cell] = trial[cell]
+                trial[cell] = max(25, confirmed[cell] - step)
+            streak = 0
+        selected = dict(trial)
+        reason = "healthy_probe_hold_or_descend"
+    return selected, {
+        "contract": (
+            ENERGY_STAIRCASE_PROBE_10_CONTRACT
+            if step == 10 else ENERGY_STAIRCASE_PROBE_CONTRACT
+        ),
+        "step_percent": step,
+        "healthy_required": required,
+        "trial_healthy_streak": streak,
+        "last_confirmed_by_cell": {str(cell): confirmed[cell] for cell in DU_CELL_IDS},
+        "trial_by_cell": {str(cell): trial[cell] for cell in DU_CELL_IDS},
+        "probe_reason": reason,
+    }
+
+
+def safe_probe_staircase_selected(
+    state: Mapping[Any, Any] | None,
+) -> dict[int, int]:
+    """Return the next safe-probe command without consuming an observation.
+
+    The control loop can issue several planning cycles while an E2/PDCP
+    observation is still in flight.  Planning must therefore be a read-only
+    operation: only the finalizer that owns the correlated native observation
+    is allowed to advance the staircase.
+    """
+    previous = dict(state or {})
+    trial_raw = (
+        previous.get("next_selected_power_by_cell")
+        or previous.get("trial_by_cell")
+        or previous.get("last_confirmed_by_cell")
+        or {}
+    )
+    selected: dict[int, int] = {}
+    for cell in DU_CELL_IDS:
+        raw = trial_raw.get(str(cell), trial_raw.get(cell, 100))
+        try:
+            selected[cell] = quantize_power_percent_v3(raw)
+        except EconomicActionV3Error:
+            # Corrupted controller state must fail closed rather than creating
+            # an unverified low-power command.
+            selected[cell] = 100
+    return selected
+
+
+def safe_probe_staircase_observe(
+    state: Mapping[Any, Any] | None,
+    *,
+    observation_sequence: Any,
+    healthy: bool,
+    critical: bool,
+    healthy_required: int | None = None,
+    step_percent: int | None = None,
+) -> dict[str, Any]:
+    """Advance a safe probe exactly once for its correlated E2/PDCP result.
+
+    ``observation_sequence`` is the native control sequence that issued the
+    candidate.  Duplicate, late, or re-finalized observations are ignored so
+    an asynchronous controller cannot count the same healthy result more than
+    once.  Incomplete evidence is deliberately treated as critical and
+    restores full power in the next command.
+    """
+    previous = dict(state or {})
+    try:
+        sequence = int(observation_sequence)
+    except (TypeError, ValueError):
+        sequence = -1
+    try:
+        processed = int(previous.get("last_processed_observation_sequence", -1))
+    except (TypeError, ValueError):
+        processed = -1
+    if sequence < 0 or sequence <= processed:
+        return previous
+
+    required = (
+        int(healthy_required)
+        if healthy_required is not None
+        else int(previous.get("healthy_required", 3) or 3)
+    )
+    selected, next_state = safe_probe_staircase_candidate(
+        {cell: 100 for cell in DU_CELL_IDS},
+        state=previous,
+        healthy=bool(healthy),
+        critical=bool(critical),
+        healthy_required=max(1, required),
+        step_percent=step_percent,
+    )
+    next_state["next_selected_power_by_cell"] = {
+        str(cell): int(selected[cell]) for cell in DU_CELL_IDS
+    }
+    next_state["last_processed_observation_sequence"] = sequence
+    next_state["last_observation_healthy"] = bool(healthy and not critical)
+    next_state["last_observation_critical"] = bool(critical or not healthy)
+    return next_state
 
 
 def quantize_power_percent_v3(value: Any) -> int:

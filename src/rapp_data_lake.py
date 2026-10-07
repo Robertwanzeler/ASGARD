@@ -26,6 +26,7 @@ Uso:
 """
 
 import os
+import csv
 import sqlite3
 import time
 import json
@@ -992,6 +993,7 @@ class DataLake:
                 action_correlation_id TEXT DEFAULT '',
                 native_control_sequence INTEGER,
                 evidence_version TEXT DEFAULT 'v1',
+                power_lease_fresh INTEGER NOT NULL DEFAULT 1,
                 imported_at INTEGER NOT NULL,
                 UNIQUE(source_path, sim_time_s, cell_id, scheduler_transaction_id,
                        power_transaction_id, observation_kind)
@@ -1027,6 +1029,7 @@ class DataLake:
             ("action_correlation_id", "TEXT DEFAULT ''"),
             ("native_control_sequence", "INTEGER"),
             ("evidence_version", "TEXT DEFAULT 'v1'"),
+            ("power_lease_fresh", "INTEGER NOT NULL DEFAULT 1"),
         ):
             if column_name not in existing_observation_columns:
                 cursor.execute(
@@ -3787,6 +3790,8 @@ class DataLake:
                             (None if row.get("DiscretionaryDlSymbols") in (None, "") else int(row.get("DiscretionaryDlSymbols"))),
                             (None if row.get("WithheldDlSymbols") in (None, "") else int(row.get("WithheldDlSymbols"))),
                             str(row.get("SleepTransactionId") or "").strip(),
+                            1 if str(row.get("PowerLeaseFresh", "1") or "1").strip().lower()
+                            in {"1", "true", "yes"} else 0,
                         )
                     except (KeyError, TypeError, ValueError):
                         self._last_native_import_invalid_rows += 1
@@ -3809,8 +3814,8 @@ class DataLake:
                            native_allocation_fraction,
                            campaign_id, campaign_generation, decision_id,
                            action_correlation_id, native_control_sequence,
-                           evidence_version, imported_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           evidence_version, power_lease_fresh, imported_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (resolved_path, values[0], values[1], values[2], values[6],
                          values[2], values[3], values[4], values[5], values[7],
@@ -3824,7 +3829,7 @@ class DataLake:
                          values[17] or (
                              "v3" if values[8] in {"power_readback", "state_snapshot"} else
                              ("v2" if values[6] > 0 else "v1")
-                         ), int(time.time())),
+                         ), values[28], int(time.time())),
                     )
                     imported += int(cursor.rowcount or 0)
             self.conn.execute(
@@ -4214,7 +4219,8 @@ class DataLake:
                        native_allocated_dl_symbols, native_dl_symbol_capacity,
                        native_allocation_source, native_allocation_fraction,
                        campaign_id, evidence_version, campaign_generation,
-                       decision_id, action_correlation_id, native_control_sequence
+                       decision_id, action_correlation_id, native_control_sequence,
+                       power_lease_fresh
                   FROM tasam_control_observations
                  WHERE (power_transaction_id=? OR scheduler_transaction_id=?)
                    AND (? IS NULL OR campaign_id=?)
@@ -4225,6 +4231,7 @@ class DataLake:
             return {"valid": False, "reason": "native_observation_query_failed"}
         selected_power = {}
         selected_policy = {}
+        stale_power_cells = set()
         for row in rows:
             cell_id = int(row[0])
             if cell_id not in expected_cells:
@@ -4271,7 +4278,10 @@ class DataLake:
                     )
                 ) <= 0.1
             ) and cell_id not in selected_power:
-                selected_power[cell_id] = row
+                if int(row[23] or 0) != 1:
+                    stale_power_cells.add(cell_id)
+                else:
+                    selected_power[cell_id] = row
             if (
                 str(row[8] or "") == "state_snapshot"
                 and cell_id not in selected_policy
@@ -4291,7 +4301,9 @@ class DataLake:
                 selected_policy[cell_id] = row
         if set(selected_power) != expected_cells or set(selected_policy) != expected_cells:
             reason = "native_observation_missing_cell"
-            if selected_power or selected_policy:
+            if stale_power_cells:
+                reason = "native_observation_power_lease_stale"
+            elif selected_power or selected_policy:
                 reason = "native_observation_transaction_power_policy_or_window_mismatch"
             return {
                 "valid": False,
@@ -4337,6 +4349,80 @@ class DataLake:
                 "observed_policy_cells": sorted(selected_policy),
                 "invalid_policy_cells": sorted(set(invalid_policy_cells)),
             }
+        native_energy_evidence = None
+        native_power_mode = os.environ.get(
+            "GREENRAN_TASAM_NATIVE_POWER_CONTROL", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if native_power_mode and str(require_evidence_version) == "v6":
+            state_dir_raw = str(os.environ.get("GREENRAN_STATE_DIR", "") or "").strip()
+            state_dir = Path(state_dir_raw).resolve() if state_dir_raw else None
+            energy_dir = state_dir / "ns3_energy" if state_dir is not None else None
+            if energy_dir is None or not energy_dir.is_dir():
+                return {
+                    "valid": False,
+                    "reason": "native_energy_trace_missing",
+                    "observed_power_cells": sorted(selected_power),
+                    "observed_policy_cells": sorted(selected_policy),
+                }
+            native_energy_evidence = {}
+            for cell in sorted(expected_cells):
+                path = energy_dir / f"energyfilecell{cell}.csv"
+                try:
+                    with path.open(newline="", encoding="utf-8", errors="strict") as handle:
+                        matching = [
+                            row for row in csv.DictReader(handle)
+                            if str(row.get("PowerTransactionId", "")).strip()
+                            == str(transaction_id)
+                        ]
+                except (OSError, UnicodeError, csv.Error):
+                    matching = []
+                if not matching:
+                    return {
+                        "valid": False,
+                        "reason": "native_energy_transaction_missing",
+                        "energy_cell": cell,
+                    }
+                row = matching[-1]
+                try:
+                    tx_power = float(row["TxPowerPercent"])
+                    model_power = float(row["ModelTxPowerPercent"])
+                    tasam_power = float(row["TasamTxPowerPercent"])
+                    lease_fresh = int(float(row["PowerLeaseFresh"]))
+                    expected = (
+                        expected_power_by_cell[cell]
+                        if expected_power_by_cell is not None
+                        else float(expected_power_percent)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return {
+                        "valid": False,
+                        "reason": "native_energy_power_fields_invalid",
+                        "energy_cell": cell,
+                    }
+                if (
+                    not all(math.isfinite(value) for value in
+                            (tx_power, model_power, tasam_power, expected))
+                    or abs(tx_power - model_power) > 0.1
+                    or abs(tx_power - tasam_power) > 0.1
+                    or abs(tx_power - expected) > 0.1
+                    or lease_fresh != 1
+                ):
+                    return {
+                        "valid": False,
+                        "reason": "native_energy_power_readback_mismatch",
+                        "energy_cell": cell,
+                        "tx_power_percent": tx_power,
+                        "model_tx_power_percent": model_power,
+                        "tasam_tx_power_percent": tasam_power,
+                        "expected_power_percent": expected,
+                        "power_lease_fresh": lease_fresh,
+                    }
+                native_energy_evidence[str(cell)] = {
+                    "tx_power_percent": tx_power,
+                    "model_tx_power_percent": model_power,
+                    "tasam_tx_power_percent": tasam_power,
+                    "power_lease_fresh": True,
+                }
         powers = [float(selected_power[cell][3]) for cell in sorted(expected_cells)]
         return {
             "valid": True,
@@ -4356,6 +4442,7 @@ class DataLake:
             "power_control_cells": sorted(expected_cells),
             "policy_scope": "serving_cells_only",
             "evidence_version": require_evidence_version,
+            "native_energy_evidence": native_energy_evidence,
             "active_ues": sum(int(selected_policy[cell][2] or 0) for cell in expected_cells),
             "sim_time_s": max(float(selected_policy[cell][1]) for cell in expected_cells),
             "model_component_mode": "combined_radio_relative" if True else "separate_components",
@@ -4380,6 +4467,7 @@ class DataLake:
                     "tx_power_percent": float(selected_power[cell][3]),
                     "tx_power_dbm": float(selected_power[cell][4]),
                     "power_transaction_id": int(selected_power[cell][5] or 0),
+                    "power_lease_fresh": bool(int(selected_power[cell][23] or 0)),
                     "scheduler_transaction_id": int(selected_policy[cell][6] or 0),
                     "nominal_tx_power_dbm": selected_power[cell][7],
                     "active_dl_symbols": int(selected_policy[cell][13] or 0),
@@ -4538,6 +4626,123 @@ class DataLake:
         if row is None:
             return {}
         return {str(key): row[key] for key in row.keys()}
+
+    def _latest_native_rows_by_cell(self, observation_kind: str) -> list[dict]:
+        """Return the newest native evidence row for each managed DU.
+
+        This is deliberately a read-only view.  It never synthesizes a
+        startup state and it keeps campaign/generation boundaries intact so a
+        previous run cannot become the causal reference for a new action.
+        """
+        kind = str(observation_kind or '').strip()
+        if not kind:
+            return []
+        filters = ["cell_id IN (2, 3, 4)", "observation_kind=?"]
+        params: list[object] = [kind]
+        campaign = str(os.environ.get('GREENRAN_CAMPAIGN_ID', '') or '').strip()
+        generation = str(os.environ.get('GREENRAN_NATIVE_SOURCE_GENERATION', '') or '').strip()
+        evidence = str(os.environ.get('GREENRAN_NATIVE_EVIDENCE_VERSION', '') or '').strip()
+        if campaign:
+            filters.append("campaign_id=?")
+            params.append(campaign)
+        if generation:
+            filters.append("source_generation=?")
+            params.append(generation)
+        if evidence:
+            filters.append("evidence_version=?")
+            params.append(evidence)
+        try:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM tasam_control_observations
+                 WHERE {' AND '.join(filters)}
+                 ORDER BY sim_time_s DESC, id DESC
+                """,
+                tuple(params),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        selected: dict[int, dict] = {}
+        for row in rows:
+            try:
+                cell = int(row['cell_id'])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if cell not in {2, 3, 4} or cell in selected:
+                continue
+            selected[cell] = {str(key): row[key] for key in row.keys()}
+        return [selected[cell] for cell in (2, 3, 4) if cell in selected]
+
+    def latest_native_power_state(self) -> dict:
+        """Return a complete, fresh native power state for the three DUs."""
+        try:
+            self.ingest_native_control_observations()
+        except Exception:
+            # A partial native CSV write is not evidence.  The query below
+            # will either return the last complete rows or an invalid state.
+            pass
+        rows = self._latest_native_rows_by_cell('power_readback')
+        if len(rows) != 3:
+            return {'valid': False, 'reason': 'native_pre_action_readback_incomplete', 'rows': rows}
+        try:
+            sim_times = [float(row['sim_time_s']) for row in rows]
+            power = {int(row['cell_id']): float(row['tx_power_percent']) for row in rows}
+            transactions = {int(row['cell_id']): int(row['power_transaction_id'] or 0) for row in rows}
+            leases = {int(row['cell_id']): bool(int(row['power_lease_fresh'] or 0)) for row in rows}
+        except (TypeError, ValueError, KeyError):
+            return {'valid': False, 'reason': 'native_pre_action_readback_invalid', 'rows': rows}
+        if (
+            any(not math.isfinite(value) for value in sim_times + list(power.values()))
+            or max(sim_times) - min(sim_times) > 5.0
+            or any(value <= 0 for value in transactions.values())
+            or not all(leases.values())
+        ):
+            return {'valid': False, 'reason': 'native_pre_action_readback_stale_or_expired', 'rows': rows}
+        return {
+            'valid': True,
+            'sim_time_s': max(sim_times),
+            'power_percent_by_cell': power,
+            'power_transaction_ids': transactions,
+            'power_lease_fresh_by_cell': leases,
+            'rows': rows,
+        }
+
+    def latest_native_symbol_state(self) -> dict:
+        """Return symbol-capacity/readback state for all managed DUs."""
+        try:
+            self.ingest_native_control_observations()
+        except Exception:
+            pass
+        rows = self._latest_native_rows_by_cell('state_snapshot')
+        if len(rows) != 3:
+            return {'valid': False, 'reason': 'native_symbol_state_incomplete', 'rows': rows}
+        try:
+            sim_times = [float(row['sim_time_s']) for row in rows]
+            capacities = {int(row['cell_id']): int(row['native_dl_symbol_capacity']) for row in rows}
+            allocated = {int(row['cell_id']): int(row['native_allocated_dl_symbols'] or 0) for row in rows}
+        except (TypeError, ValueError, KeyError):
+            return {'valid': False, 'reason': 'native_symbol_state_invalid', 'rows': rows}
+        if (
+            any(not math.isfinite(value) for value in sim_times)
+            or max(sim_times) - min(sim_times) > 5.0
+            # Capacity zero is a valid native scheduler state before the
+            # first policy has materialized.  The snapshot is still complete
+            # readback; treating it as invalid here deadlocks bootstrap:
+            # TA-SAM waits for symbols while the scheduler waits for the
+            # first accepted TA-SAM bundle.  No synthetic budget is inferred
+            # from this state; the bundle path still records the native zero
+            # capacity and the next native observation must confirm use.
+            or any(value < 0 for value in capacities.values())
+            or any(value < 0 for value in allocated.values())
+        ):
+            return {'valid': False, 'reason': 'native_symbol_state_stale_or_invalid', 'rows': rows}
+        return {
+            'valid': True,
+            'sim_time_s': max(sim_times),
+            'capacity_by_cell': capacities,
+            'allocated_by_cell': allocated,
+            'rows': rows,
+        }
 
     def real_pdcp_loss_coverage(self, metric_snapshot_id=None) -> dict:
         """Return complete canonical loss coverage for one real-PDCP window."""
@@ -4759,6 +4964,108 @@ class DataLake:
             "observed_imsis": sorted(by_imsi),
             "violation_keys": sorted(keys),
             "violations": details,
+        }
+
+    def sla_floor_window_health(self, metric_snapshot_id=None) -> dict:
+        """Evaluate the all-UE window contract used by the SLA floor.
+
+        The historical ``sla_violation_keys`` contract intentionally remains
+        unchanged.  This stricter companion adds the V2X TX quota and rejects
+        duplicate/incomplete rows before the floor state machine can descend.
+        """
+        base = self.sla_violation_keys(metric_snapshot_id)
+        expected = set(range(1, 21))
+        timestamp = base.get("timestamp")
+        if timestamp is None:
+            return {
+                "valid": False,
+                "reason": str(base.get("reason") or "sla_snapshot_invalid"),
+                "complete": False,
+                "window_id": base.get("window_s"),
+                "metric_snapshot_id": base.get("metric_snapshot_id"),
+                "violations": base.get("violations") or [],
+            }
+        try:
+            rows = self.conn.execute(
+                """SELECT imsi, tx_pdus, rx_pdus, latency_p95_us,
+                          latency_max_us, latency_is_proxy, pdcp_provenance,
+                          has_latency_samples, packet_loss_percent
+                     FROM ue_metrics
+                    WHERE timestamp=?
+                    ORDER BY id""",
+                (timestamp,),
+            ).fetchall()
+        except sqlite3.Error:
+            return {
+                "valid": False,
+                "reason": "sla_floor_metric_query_failed",
+                "window_id": base.get("window_s"),
+                "metric_snapshot_id": base.get("metric_snapshot_id"),
+                "violations": [],
+            }
+        by_imsi: dict[int, tuple] = {}
+        duplicates: set[int] = set()
+        violations = list(base.get("violations") or [])
+        for row in rows:
+            try:
+                imsi = int(row[0])
+            except (TypeError, ValueError):
+                continue
+            if imsi not in expected:
+                continue
+            if imsi in by_imsi:
+                duplicates.add(imsi)
+            by_imsi[imsi] = row
+        if duplicates:
+            violations.append({
+                "window_s": base.get("window_s"),
+                "imsi": 0,
+                "reasons": ["duplicate_imsi_rows"],
+                "duplicate_imsis": sorted(duplicates),
+            })
+        for imsi in sorted(expected):
+            row = by_imsi.get(imsi)
+            reasons = []
+            if row is None:
+                reasons.append("missing_ue_window")
+            else:
+                tx_pdus = float(row[1] or 0.0)
+                rx_pdus = float(row[2] or 0.0)
+                p95 = float(row[3] if row[3] is not None else row[4] or 0.0)
+                real = (
+                    int(row[5] or 0) == 0
+                    and str(row[6] or "") == "pdcp_real"
+                    and int(row[7] or 0) == 1
+                )
+                if not real:
+                    reasons.append("non_real_or_missing_pdcp")
+                if tx_pdus <= 0 or rx_pdus <= 0:
+                    reasons.append("no_pdcp_traffic")
+                if 16 <= imsi <= 20 and tx_pdus < 500:
+                    reasons.append("vehicle_tx_below_500")
+                if p95 < 0:
+                    reasons.append("invalid_p95")
+            if reasons:
+                violations.append({
+                    "window_s": base.get("window_s"),
+                    "imsi": imsi,
+                    "reasons": reasons,
+                })
+        complete = len(rows) == len(expected) and set(by_imsi) == expected and not duplicates
+        valid = bool(complete and base.get("valid") and not base.get("violation_keys") and not violations)
+        return {
+            "valid": valid,
+            "reason": "ok" if valid else "sla_floor_window_unhealthy",
+            "window_id": base.get("window_s"),
+            "window_s": base.get("window_s"),
+            "timestamp": int(timestamp),
+            "metric_snapshot_id": base.get("metric_snapshot_id"),
+            "expected_imsis": sorted(expected),
+            "observed_imsis": sorted(by_imsi),
+            "duplicate_imsis": sorted(duplicates),
+            "complete": complete,
+            "violations": violations,
+            "base_sla": base,
         }
 
     def record_app2_snapshot(self, snapshot=None, sensors=None, timestamp=None):

@@ -287,6 +287,23 @@ def test_incomplete_scientific_execution_is_metric_invalid(tmp_path):
     assert _candidate_classification(candidate, evidence) == "metric_invalid"
 
 
+def test_simulation_completion_uses_native_pdu_clock_when_metrics_publisher_is_absent(tmp_path):
+    candidate = tmp_path / "candidate"
+    (candidate / "ns3_energy").mkdir(parents=True)
+    (candidate / "arm_manifest.json").write_text(json.dumps({
+        "simulation_performance": {"sim_time_observed_s": 0.0},
+    }))
+    (candidate / "ns3_energy" / "VehiclePdcpPduTrace.csv").write_text(
+        "Event,EventId,TxTimeNs,RxTimeNs,CellId,IMSI,RNTI,LCID,PacketSize,DelayNs,CorrelationStatus\n"
+        "TX,1,16000000000,,4,16,2,3,100,0,tx\n"
+        "RX,1,16000000000,16400000000,4,16,2,3,100,4000000,matched\n",
+        encoding="utf-8",
+    )
+    result = _simulation_completion(candidate, 16.5)
+    assert result["valid"] is True
+    assert result["observed_sim_time_source"] == "native_vehicle_pdcp_pdu_trace"
+
+
 def test_matrix_selection_uses_lowest_valid_interval_after_all_results_exist():
     results = [
         {"interval_us": 4000, "exit_code": 0, "evidence": {"valid": False}},
@@ -295,6 +312,24 @@ def test_matrix_selection_uses_lowest_valid_interval_after_all_results_exist():
         {"interval_us": 12000, "exit_code": 3, "evidence": {"valid": True}},
     ]
     assert _lowest_valid_candidate(results)["interval_us"] == 6000
+
+
+def test_matrix_selection_accepts_supervisor_sigterm_only_after_native_completion(tmp_path):
+    run_dir = tmp_path / "candidate"
+    run_dir.mkdir()
+    (run_dir / "ns3.log").write_text(
+        "[NS3_SUPERVISOR] ns3 exited code 0 at test\n", encoding="utf-8"
+    )
+    result = {
+        "interval_us": 4000,
+        "exit_code": 143,
+        "command": ["python", "arm.py", "--run-dir", str(run_dir)],
+        "evidence": {
+            "valid": True,
+            "simulation_completion": {"valid": True},
+        },
+    }
+    assert _lowest_valid_candidate([result]) == result
 
 
 def test_non_vehicle_scheduler_deficits_do_not_classify_vehicle_sla(tmp_path):

@@ -21,6 +21,7 @@ from scripts.run_tasam_online_controlled import (
     publish_learning_meter,
     _economic_candidate_gate,
     _candidate_shadow_gate,
+    _current_causal_transition_count,
     _checkpoint_temporal_dim,
     prune_candidate_artifacts,
     runtime_guard,
@@ -30,6 +31,34 @@ from drlexp.src.drl.ta_sam_marl_sac import POWER_LEVELS, _safe_power_target, loa
 
 
 class TasamOnlineControlledTests(unittest.TestCase):
+    def test_current_causal_transition_count_joins_decision_safety_columns(self):
+        """The durable 72/18 counter must use the current DB schema."""
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "causal_count.db"
+            with sqlite3.connect(database) as conn:
+                conn.execute(
+                    "CREATE TABLE decisions_history ("
+                    "id INTEGER PRIMARY KEY, economic_safety_isolated INTEGER, "
+                    "armd_safety_level TEXT)"
+                )
+                conn.execute(
+                    "CREATE TABLE tasam_economic_transition_history ("
+                    "decision_id INTEGER, economic_application_status TEXT, "
+                    "economic_transition_eligible INTEGER, economic_training_eligible INTEGER)"
+                )
+                conn.executemany(
+                    "INSERT INTO decisions_history VALUES (?, ?, ?)",
+                    [(101, 0, "CLEAR"), (102, 0, "ADVISORY")],
+                )
+                conn.executemany(
+                    "INSERT INTO tasam_economic_transition_history VALUES (?, ?, ?, ?)",
+                    [(101, "applied", 1, 1), (102, "applied", 1, 1)],
+                )
+            self.assertEqual(
+                _current_causal_transition_count(SimpleNamespace(db=database)),
+                2,
+            )
+
     def test_repeated_online_polling_closes_sqlite_connections(self):
         """Long wall-clock polling must not exhaust the controller FD limit."""
         with tempfile.TemporaryDirectory() as tmp:

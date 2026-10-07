@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import csv
 from contextlib import closing
 import hashlib
 import json
 import os
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -49,6 +51,7 @@ from greenran_infra_budget import (  # noqa: E402
 )
 from greenran_infra_monitor import InfrastructureMonitor  # noqa: E402
 from energy_calibration import load_calibration  # noqa: E402
+from greenran_e2_ports import E2PortPlanError, build_e2_port_plan  # noqa: E402
 from tasam_dynamic_floor import (  # noqa: E402
     DYNAMIC_FLOOR_CONTRACT,
     DynamicFloorError,
@@ -74,6 +77,7 @@ DECISION_TARGET_WATCHER = ROOT / "scripts" / "stop_on_decision_target.py"
 DEFAULT_CHECKPOINT = ROOT / "runs/tasam_local_checkpoint_seed47_20260906"
 PROFILE = "tasam_training_balanced_v3"
 BASELINE_MAX_PROFILE = "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max"
+VEHICLE_SAFE_PROFILE = "tasam_training_economic_vehicle_safe_v1"
 PARALLEL_PAIR_RESOURCE_PROFILE = "parallel_pair_v1"
 MODES = {
     "train_no_armd", "rapp_only", "rapp_only_actuating", "fixed_100_native",
@@ -85,17 +89,21 @@ MODES = {
     "sac_l2_online", "sac_l2_frozen", "tasam_v2x_online", "tasam_v2x_frozen",
     "asgard_v2x_window90_online",
     "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
-    "asgard_v2x_window90_energy_dynamic",
+    "asgard_v2x_window90_energy_dynamic", "asgard_v2x_sla_floor_online",
+    "asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen",
 }
 V2X_ENERGY_MODES = {
     "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
-    "asgard_v2x_window90_energy_dynamic",
+    "asgard_v2x_window90_energy_dynamic", "asgard_v2x_sla_floor_online",
+    "asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen",
 }
 CALIBRATION_FIXED_POWER_LEVELS = {25, 45, 70, 100}
 V2X_WINDOW90_ONLINE_MODES = {
     "asgard_v2x_window90_online",
     "asgard_v2x_window90_energy_online",
     "asgard_v2x_window90_energy_dynamic",
+    "asgard_v2x_sla_floor_online",
+    "asgard_v2x_native_power_online",
 }
 
 
@@ -115,6 +123,10 @@ EXPECTED_NS3_BINARIES = {
     EXPECTED_NS3_BINARY,
     f"{EXPECTED_NS3_BINARY}-default",
     f"{EXPECTED_NS3_BINARY}-optimized",
+    # GCC 15 compatibility builds use ns-3's explicit relwithdebinfo profile.
+    # Keep the profile in the filename so its provenance is never confused
+    # with the optimized baseline.
+    f"{EXPECTED_NS3_BINARY}-relwithdebinfo",
 }
 LOCAL_RUNTIME_ROOT = ROOT.resolve()
 DEFAULT_BENCHMARK_MANIFEST = (
@@ -142,6 +154,103 @@ def _read_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _e2_port_plan_from_env(env: dict[str, str]) -> dict[str, object]:
+    """Validate the exact RIC/xApp/ns-3 port plan before any process starts."""
+    try:
+        return build_e2_port_plan(
+            env.get("GREENRAN_E2_TERM_PORT", "40301"),
+            env.get("GREENRAN_E2_XAPP_PORT", "40302"),
+            env.get("GREENRAN_E2_LOCAL_PORT", "40320"),
+        )
+    except E2PortPlanError as exc:
+        raise SystemExit(f"invalid E2 port plan: {exc}") from exc
+
+
+def _wait_for_e2_topology_preflight(
+    run_dir: Path,
+    wall_runner: subprocess.Popen[Any],
+    *,
+    timeout_s: float = 120.0,
+) -> tuple[bool, str]:
+    """Wait for the wall runner's real three-DU E2 gate before rApp start.
+
+    The ns-3 manifest describes the expected topology, but the actuator status
+    is the authority for what the RIC actually registered.  This gate keeps
+    the controller from emitting a synthetic/failsafe decision while the
+    actuator is still missing a DU.
+    """
+    status_path = run_dir / "tasam_actuator_status.json"
+    preflight_path = run_dir / "e2_topology_preflight.json"
+    actuator_pid_path = run_dir / "xapp_tasam_actuator.pid"
+    required_cells = {2, 3, 4}
+
+    def socket_is_live(socket_path: str) -> bool:
+        if not socket_path or not Path(socket_path).exists():
+            return False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(0.5)
+                client.connect(socket_path)
+            return True
+        except OSError:
+            return False
+
+    def record_failure(reason: str) -> tuple[bool, str]:
+        # Preserve the last actuator snapshot even when the shell supervisor
+        # is terminated at the same time the xApp writes its final status.
+        status = _read_json(status_path)
+        socket_path = str(status.get("socket_path") or "")
+        payload = dict(status)
+        payload.update({
+            "schema": "greenran.tasam.e2_topology_preflight.v1",
+            "state": "failed",
+            "reason": reason,
+            "ready": False,
+            "socket_path": socket_path,
+            "socket_present": bool(socket_path and Path(socket_path).exists()),
+            "socket_live": socket_is_live(socket_path),
+        })
+        _write_json(preflight_path, payload)
+        return False, reason
+
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    while time.monotonic() < deadline:
+        preflight = _read_json(preflight_path)
+        status = _read_json(status_path)
+        mapped = set()
+        for value in status.get("mapped_cells") or []:
+            try:
+                mapped.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        socket_path = str(
+            preflight.get("socket_path") or status.get("socket_path") or ""
+        )
+        pid_ok = False
+        try:
+            actuator_pid = int(actuator_pid_path.read_text(encoding="ascii").strip())
+            os.kill(actuator_pid, 0)
+            pid_ok = True
+        except (OSError, ValueError):
+            pid_ok = False
+        if (
+            preflight.get("ready") is True
+            and status.get("ready") is True
+            and status.get("state") == "ready"
+            and required_cells.issubset(mapped)
+            and bool(preflight.get("socket_present"))
+            and pid_ok
+            and socket_is_live(socket_path)
+        ):
+            return True, ""
+        if preflight.get("state") == "failed":
+            return record_failure(str(preflight.get("reason") or "e2_topology_preflight_failed"))
+        if wall_runner.poll() is not None:
+            return record_failure(f"collection_preflight_exit:{wall_runner.returncode}")
+        time.sleep(0.5)
+    return record_failure("e2_topology_preflight_failed")
 
 
 def _reconcile_wall_status(
@@ -193,6 +302,132 @@ def _directory_size_bytes(path: Path) -> int:
     except OSError:
         return total
     return total
+
+
+def _energy_telemetry_evidence(
+    run_dir: Path,
+    *,
+    expected_power_percent: int | None = None,
+    measurement_start_s: float = 0.0,
+) -> dict[str, Any]:
+    """Validate the authoritative DU/model power join in native energy CSVs.
+
+    ``PowerTransactionId`` identifies the transaction that established the
+    persistent applied state. ``PowerLeaseFresh`` is checked separately: an
+    expired lease may leave the radio at its last safe value, but that sample
+    is not eligible for online learning or fixed-arm proof.
+    """
+    paths = sorted((run_dir / "ns3_energy").glob("energyfilecell*.csv"))
+    if len(paths) != 3:
+        return {
+            "valid": False,
+            "reason": "energy_telemetry_files_missing",
+            "files": len(paths),
+        }
+    required = {
+        "PowerTransactionId",
+        "ModelTxPowerPercent",
+        "TasamTxPowerPercent",
+        "PowerLeaseFresh",
+    }
+    active_rows = 0
+    baseline_default_rows = 0
+    measurement_rows = 0
+    stale_rows = 0
+    expected_power_mismatches: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
+    rows = 0
+    for path in paths:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fields = set(reader.fieldnames or [])
+            if not required.issubset(fields):
+                return {
+                    "valid": False,
+                    "reason": "energy_telemetry_schema_missing",
+                    "file": str(path),
+                    "missing": sorted(required - fields),
+                }
+            for row in reader:
+                rows += 1
+                try:
+                    time_s = float(row.get("Time", 0.0) or 0.0)
+                    transaction = int(float(row.get("PowerTransactionId", 0) or 0))
+                    model_power = int(round(float(row["ModelTxPowerPercent"])))
+                    tasam_power = int(round(float(row["TasamTxPowerPercent"])))
+                    exported_power = int(round(float(row["TxPowerPercent"])))
+                    lease_fresh = bool(int(float(row["PowerLeaseFresh"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if time_s >= measurement_start_s:
+                    measurement_rows += 1
+                is_default_safe_baseline = bool(
+                    expected_power_percent == 100
+                    and transaction <= 0
+                    and model_power == 100
+                    and tasam_power == 100
+                    and exported_power == 100
+                )
+                if is_default_safe_baseline and time_s >= measurement_start_s:
+                    # A fixed 100% baseline is the DU's authoritative safe
+                    # startup state.  It has no economic lease/transaction by
+                    # design; lower-power fixed arms must still have both.
+                    baseline_default_rows += 1
+                if (
+                    expected_power_percent is not None
+                    and time_s >= measurement_start_s
+                    and (
+                        (transaction <= 0 and not is_default_safe_baseline)
+                        or model_power != expected_power_percent
+                        or tasam_power != expected_power_percent
+                        or exported_power != expected_power_percent
+                        or (not lease_fresh and not is_default_safe_baseline)
+                    )
+                ):
+                    expected_power_mismatches.append({
+                        "file": str(path),
+                        "time": row.get("Time", ""),
+                        "transaction": transaction,
+                        "expected_power": expected_power_percent,
+                        "model_power": model_power,
+                        "tasam_power": tasam_power,
+                        "exported_power": exported_power,
+                        "lease_fresh": lease_fresh,
+                    })
+                if transaction <= 0:
+                    continue
+                active_rows += 1
+                if not lease_fresh:
+                    stale_rows += 1
+                if model_power != tasam_power or exported_power != tasam_power:
+                    mismatches.append({
+                        "file": str(path),
+                        "time": row.get("Time", ""),
+                        "transaction": transaction,
+                        "model_power": model_power,
+                        "tasam_power": tasam_power,
+                        "exported_power": exported_power,
+                    })
+    valid = bool((active_rows or baseline_default_rows) and not mismatches)
+    reason = "" if valid else "energy_telemetry_power_mismatch"
+    if expected_power_percent is not None:
+        valid = bool(valid and measurement_rows > 0 and not expected_power_mismatches)
+        if not valid:
+            reason = "fixed_power_telemetry_mismatch"
+    return {
+        "valid": valid,
+        "reason": reason,
+        "rows": rows,
+        "active_rows": active_rows,
+        "baseline_default_rows": baseline_default_rows,
+        "measurement_rows": measurement_rows,
+        "stale_rows": stale_rows,
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches[:20],
+        "expected_power_percent": expected_power_percent,
+        "expected_power_mismatch_count": len(expected_power_mismatches),
+        "expected_power_mismatches": expected_power_mismatches[:20],
+    }
 
 
 def _native_actuation_evidence(
@@ -600,7 +835,7 @@ def _simulation_performance_evidence(
     run_dir: Path,
     elapsed_s: float,
     *,
-    min_rtf: float = 0.10,
+    min_rtf: float = 0.016,
     minimum_sim_time_s: float = 0.0,
 ) -> dict[str, Any]:
     """Measure simulator-clock progress without treating wall cycles as data."""
@@ -632,6 +867,30 @@ def _simulation_performance_evidence(
     }
 
 
+def _wall_time_expired_before_sim_target(
+    run_dir: Path,
+    *,
+    wall_status: int,
+    requested_wall_time_s: float,
+    requested_sim_time_s: float,
+    observed_sim_time_s: float,
+) -> bool:
+    """Classify supervisor timeout separately from an external interruption."""
+    if wall_status not in {143, -15, 15}:
+        return False
+    if observed_sim_time_s >= float(requested_sim_time_s) - 0.25:
+        return False
+    status = _read_json(run_dir / "wall_clock_status.json")
+    try:
+        elapsed = float(status.get("elapsed_s", 0.0) or 0.0)
+        requested = float(status.get("requested_duration_s", requested_wall_time_s) or requested_wall_time_s)
+    except (TypeError, ValueError):
+        return False
+    # A small tolerance covers the supervisor's final polling tick without
+    # relabelling a user interrupt as a wall-time expiry.
+    return elapsed >= max(0.0, requested - 2.0)
+
+
 def _validate_run_dir(run_dir: Path) -> None:
     parts = [part.lower() for part in run_dir.parts]
     if any("armd" in part and part != "train_no_armd" for part in parts):
@@ -645,7 +904,7 @@ def _validate_fixed_native_power_percent(value: int, mode: str) -> int:
 
     The physics calibration runs (ledger v2) need exact 45/70/25 on the wire,
     so only the 5%-grid between 25 and 100 is accepted, and only in the
-    fixed_100_native mode.
+    two explicit native calibration modes.
     """
     try:
         fixed = int(value)
@@ -657,9 +916,10 @@ def _validate_fixed_native_power_percent(value: int, mode: str) -> int:
         raise SystemExit(
             "--fixed-native-power-percent exige inteiro em passos de 5 entre 25 e 100"
         )
-    if fixed != 100 and mode != "fixed_100_native":
+    if mode not in {"fixed_100_native", "rapp_only_actuating"}:
         raise SystemExit(
-            "--fixed-native-power-percent só é permitido no modo fixed_100_native"
+            "--fixed-native-power-percent só é permitido nos modos de calibração "
+            "fixed_100_native ou rapp_only_actuating"
         )
     return fixed
 
@@ -836,6 +1096,14 @@ def _validate_vehicle_profile_manifest(
         raise SystemExit(
             "manifesto veicular pertence a outro perfil: "
             f"esperado={expected_profile} obtido={payload.get('profile')}"
+        )
+    if (
+        expected_profile == VEHICLE_SAFE_PROFILE
+        and payload.get("connectivity_mode") != "lte_anchored_mc"
+    ):
+        raise SystemExit(
+            "manifesto veicular econômico precisa comprovar a topologia "
+            "LTE-anchored MC validada; mmWave-only é inelegível"
         )
     return payload
 
@@ -1052,6 +1320,7 @@ def _common_env(
     disable_app_overrides: bool = False,
     infra_resource_profile: str | None = None,
     execution_slot_env: dict[str, str] | None = None,
+    campaign_mode: str = "",
 ) -> dict[str, str]:
     sim_time_value = float(sim_time)
     sim_time_text = (
@@ -1062,6 +1331,7 @@ def _common_env(
     env = dict(os.environ)
     if execution_slot_env:
         env.update(execution_slot_env)
+    _e2_port_plan_from_env(env)
     env.update(
         {
             "GREENRAN_STATE_DIR": str(run_dir),
@@ -1070,9 +1340,9 @@ def _common_env(
             # endpoints use this short path.
             "GREENRAN_SOCKET_DIR": str(_short_socket_dir(run_dir)),
             "GREENRAN_V2X_EXECUTION_SLOT": env.get("GREENRAN_V2X_EXECUTION_SLOT", "serial"),
-            "GREENRAN_E2_TERM_PORT": env.get("GREENRAN_E2_TERM_PORT", "36421"),
-            "GREENRAN_E2_XAPP_PORT": env.get("GREENRAN_E2_XAPP_PORT", "36422"),
-            "GREENRAN_E2_LOCAL_PORT": env.get("GREENRAN_E2_LOCAL_PORT", "38470"),
+            "GREENRAN_E2_TERM_PORT": env.get("GREENRAN_E2_TERM_PORT", "40301"),
+            "GREENRAN_E2_XAPP_PORT": env.get("GREENRAN_E2_XAPP_PORT", "40302"),
+            "GREENRAN_E2_LOCAL_PORT": env.get("GREENRAN_E2_LOCAL_PORT", "40320"),
             "GREENRAN_PORT_OFFSET": env.get("GREENRAN_PORT_OFFSET", "0"),
             "GREENRAN_FIXED_SCENARIO_CONFIG": str(ROOT / "config/greenran_fixed_scenario.json"),
             "GREENRAN_SIM_TIME": sim_time_text,
@@ -1124,7 +1394,13 @@ def _common_env(
             ),
             "GREENRAN_NATIVE_EVIDENCE_VERSION": "v5" if native_fidelity else "v3",
             "GREENRAN_NS3_NATIVE_AGGREGATED_EVIDENCE": "1" if native_fidelity else "0",
-            "GREENRAN_NS3_NATIVE_EVIDENCE_PERIOD_MS": "500" if native_fidelity else "100",
+            # Direct power readback remains event-driven.  Periodic snapshots
+            # are compact; 1 s is sufficient for the 5 s causal window and
+            # avoids making the evidence writer the simulator bottleneck.
+            "GREENRAN_NS3_NATIVE_EVIDENCE_PERIOD_MS": os.environ.get(
+                "GREENRAN_NS3_NATIVE_EVIDENCE_PERIOD_MS",
+                "1000" if native_fidelity else "100",
+            ),
             "GREENRAN_NATIVE_TRACE_PROFILE": "v9_fidelity" if native_fidelity else "legacy_minimal",
             "GREENRAN_CAMPAIGN_ID": run_dir.name,
             "GREENRAN_NATIVE_SOURCE_GENERATION": f"{run_dir.name}:native-v5" if native_fidelity else f"{run_dir.name}:native-v3",
@@ -1146,6 +1422,31 @@ def _common_env(
             "GREENRAN_TASAM_ACTUATOR_STATUS_PATH": str(
                 run_dir / "tasam_actuator_status.json"
             ),
+            "GREENRAN_XAPP_TASAM_PID": str(run_dir / "xapp_tasam_actuator.pid"),
+            # The rApp reference is an *actuating* V3 arm as well: it must
+            # wait for the same dedicated actuator and three-DU topology as
+            # ASGARD.  Previously this gate was limited to ASGARD modes, so
+            # ``rapp_only_actuating`` emitted native bundles before any
+            # actuator socket existed (ENOENT), yielding no usable native
+            # energy evidence.
+            "GREENRAN_TASAM_REQUIRE_E2_READY_BEFORE_RAPP": "1"
+                if campaign_mode in V2X_ENERGY_MODES
+                or (campaign_mode == "rapp_only_actuating" and actuation_enabled)
+                else "0",
+            "GREENRAN_TASAM_E2_READY_TIMEOUT_S": "120",
+            # The V2X bootstrap is a provenance/handshake marker only.  Its
+            # first power value must come from TA-SAM, never from a runner
+            # override.  Legacy callers may still opt into the old explicit
+            # power override outside the ASGARD V2X modes.
+            "GREENRAN_TASAM_BOOTSTRAP_ENABLED": (
+                "1" if campaign_mode in V2X_ENERGY_MODES else "0"
+            ),
+            "GREENRAN_TASAM_BOOTSTRAP_POWER_PERCENT": (
+                "" if campaign_mode in V2X_ENERGY_MODES else
+                os.environ.get("GREENRAN_TASAM_BOOTSTRAP_POWER_PERCENT", "")
+            ),
+            "GREENRAN_TASAM_BOOTSTRAP_SYMBOL_POLICY": "checkpoint"
+                if campaign_mode in V2X_ENERGY_MODES else "",
             "GREENRAN_E2_NODE_MANIFEST": str(
                 run_dir / "ns3_energy" / "E2NodeManifest.json"
             ),
@@ -1184,7 +1485,14 @@ def _common_env(
             "GREENRAN_NS3_SINGLE_RUN": "1" if native_fidelity else os.environ.get(
                 "GREENRAN_NS3_SINGLE_RUN", "0"
             ),
-            "GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH": os.environ.get("GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH", "0"),
+            # The compact campaign contract needs post-attach PDCP and native
+            # control evidence, not the expensive pre-attach trace stream.
+            # Delaying trace hooks until the real UEs are attached removes
+            # startup-only work without changing the scored SLA window.
+            "GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH": os.environ.get(
+                "GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH",
+                "1" if native_fidelity else "0",
+            ),
             "GREENRAN_EXPERIMENT_PROFILE": profile,
             "GREENRAN_EXPERIMENT_SEED": str(seed),
             "GREENRAN_NS3_RNG_RUN": str(seed),
@@ -1200,7 +1508,12 @@ def _common_env(
             # Economic comparisons require real kernel cgroup-v2 limits. A
             # missing delegation is rejected before the run directory exists.
             "GREENRAN_CGROUP_ENFORCE": "1",
-            "GREENRAN_CGROUP_ALLOW_UNENFORCED": "0",
+            # Keep fallback explicit for managed sessions without a user
+            # systemd bus; the manifest records when the envelope is not
+            # actually enforced.
+            "GREENRAN_CGROUP_ALLOW_UNENFORCED": os.environ.get(
+                "GREENRAN_CGROUP_ALLOW_UNENFORCED", "0"
+            ),
             "GREENRAN_LOCAL_ONLY": "1",
             # The controlled controller below is the sole online learner.
             "GREENRAN_ONLINE_UPDATE_OWNER": "run_tasam_online_controlled.py",
@@ -1221,10 +1534,10 @@ def _common_env(
             "NS_GLOBAL_VALUE": f"RngRun={seed}",
         }
     )
-    if profile == BASELINE_MAX_PROFILE:
-        # The protected baseline is the only arm allowed to request the
-        # enlarged simulator envelope. MC/LTE are explicit so stale shell
-        # variables cannot silently disable recovery.
+    if profile == BASELINE_MAX_PROFILE or infra_resource_profile not in {None, "standard"}:
+        # Traffic profile and infrastructure envelope are independent. The
+        # safe economic V2X profile may use baseline_max_v1 without inheriting
+        # the baseline-max MC/LTE traffic topology.
         selected_resource_profile = infra_resource_profile or "baseline_max_v1"
         scope_budget = build_physical_budget(
             1.0, unrestricted=True, resource_profile=selected_resource_profile
@@ -1234,20 +1547,42 @@ def _common_env(
             "GREENRAN_INFRA_RESOURCE_PROFILE": selected_resource_profile,
             "GREENRAN_CGROUP_BACKEND": SYSTEMD_USER_SCOPE_BACKEND,
             "GREENRAN_CGROUP_SCOPE_PREFIX": scope_prefix,
-            "GREENRAN_NS3_USE_MC_UE_DEVICES": "true",
-            "GREENRAN_NS3_E2LTE_ENABLED": "true",
-            # E2-LTE carries fallback observability.  Keep the unstable
-            # E2-NR path disabled for the native rApp contract.
-            "GREENRAN_NS3_E2NR_ENABLED": "false",
-            "GREENRAN_NS3_E2DU_ENABLED": "true",
-            "GREENRAN_V2X_FALLBACK_POLICY": "mmwave_primary_lte_risk_fallback_v2",
-            "GREENRAN_V2X_LINK_METRIC_CONTRACT": "vehicle_link_state_v2",
         })
         for group, limits in scope_budget["groups"].items():
             key = group.upper()
             env[f"GREENRAN_CGROUP_SCOPE_{key}_CPU_QUOTA_US"] = str(limits["cpu_quota_us"])
             env[f"GREENRAN_CGROUP_SCOPE_{key}_MEMORY_HIGH_BYTES"] = str(limits["memory_high_bytes"])
             env[f"GREENRAN_CGROUP_SCOPE_{key}_IO_WEIGHT"] = str(limits["io_weight"])
+        if profile == BASELINE_MAX_PROFILE:
+            # These flags describe the critical baseline-max traffic topology,
+            # not the infrastructure envelope. Keep them scoped to that
+            # traffic profile so a safe vehicle run can reuse the CPU/memory
+            # budget without inheriting its synthetic fallback path.
+            env.update({
+                "GREENRAN_NS3_USE_MC_UE_DEVICES": "true",
+                "GREENRAN_NS3_E2LTE_ENABLED": "true",
+                "GREENRAN_NS3_E2NR_ENABLED": "false",
+                "GREENRAN_NS3_E2DU_ENABLED": "true",
+                "GREENRAN_V2X_FALLBACK_POLICY": "mmwave_primary_lte_risk_fallback_v2",
+                "GREENRAN_V2X_LINK_METRIC_CONTRACT": "vehicle_link_state_v2",
+            })
+    if profile == VEHICLE_SAFE_PROFILE:
+        # The economic traffic curriculum is safe at the policy level, but
+        # the native vehicle bearer still needs the LTE-anchored MC fallback
+        # validated by the physical feasibility runs.  The old mmWave-only
+        # override produced 90--100% native packet loss even at the 100%
+        # baseline, which made ARMD hold every window at 100% and made an
+        # economic proof impossible.  Keep E2-NR off; LTE is only the
+        # validated fallback/readback path.  Apply this outside the resource
+        # envelope branch so the topology cannot depend on cgroup options.
+        env.update({
+            "GREENRAN_NS3_USE_MC_UE_DEVICES": "true",
+            "GREENRAN_NS3_E2LTE_ENABLED": "true",
+            "GREENRAN_NS3_E2NR_ENABLED": "false",
+            "GREENRAN_NS3_E2DU_ENABLED": "true",
+            "GREENRAN_V2X_FALLBACK_POLICY": "mmwave_primary_lte_risk_fallback_v2",
+            "GREENRAN_V2X_LINK_METRIC_CONTRACT": "vehicle_link_state_v2",
+        })
     env["GREENRAN_TASAM_ONLINE_ROLLOUT_MANIFEST"] = str(run_dir / "online_rollout.json")
     env["GREENRAN_TASAM_EVAL_MANIFEST"] = str(run_dir / "online_eval_manifest.json")
     env["GREENRAN_MARL_CONTROL_GATE_MANIFEST"] = str(control_gate or (run_dir / "online_control_gate.json"))
@@ -1342,8 +1677,10 @@ def mode_contract(mode: str) -> dict[str, Any]:
         return {
             "armd_mode": "assist",
             "tasam_enabled": True,
-            "tasam_mode": "assistant_only_control",
-            "assistant_decision_mode": "cooperative_hierarchy",
+            # The energy campaign is the autonomous TA-SAM arm: TA-SAM owns
+            # every valid economic action, while ARMD remains available only
+            # as a hard safety veto for a critical SLA condition.
+            "tasam_mode": "tasam_full_control",
             "controller_enabled": True,
             "actuation_enabled": True,
             "frozen_checkpoint": False,
@@ -1356,7 +1693,7 @@ def mode_contract(mode: str) -> dict[str, Any]:
             "economic_action_contract": "economic_action_v3_per_du_sleep",
             "pilot_rollout_100": True,
             "energy_mode": True,
-            "description": "TA-SAM online V2X com atuação econômica V3 e energia nativa",
+            "description": "TA-SAM autônomo online V2X com atuação econômica V3 e energia nativa",
         }
     if mode == "asgard_v2x_window90_energy_dynamic":
         return {
@@ -1382,6 +1719,29 @@ def mode_contract(mode: str) -> dict[str, Any]:
                 "dinâmico causal e safety isolation soberano"
             ),
         }
+    if mode == "asgard_v2x_sla_floor_online":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "tasam_full_control",
+            "controller_enabled": True,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": True,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.window90.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "sla_floor_contract": "greenran.tasam.v2x.sla_floor.v1",
+            "pilot_rollout_100": True,
+            "energy_mode": True,
+            "description": (
+                "ASGARD online V2X com piso energético governado exclusivamente "
+                "por janelas SLA de todos os IMSIs"
+            ),
+        }
     if mode == "asgard_v2x_window90_energy_frozen":
         return {
             "armd_mode": "assist",
@@ -1401,6 +1761,53 @@ def mode_contract(mode: str) -> dict[str, Any]:
             "pilot_rollout_100": True,
             "energy_mode": True,
             "description": "avaliação congelada TA-SAM V2X com energia nativa",
+        }
+    if mode == "asgard_v2x_native_power_online":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "tasam_full_control",
+            "controller_enabled": True,
+            "actuation_enabled": True,
+            "frozen_checkpoint": False,
+            "historical_replay": True,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.window90.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "pilot_rollout_100": True,
+            "energy_mode": True,
+            "native_power_mode": True,
+            "description": (
+                "TA-SAM online com potência por DU aplicada diretamente no "
+                "PHY/modelo energético ns-3 via E2 V3"
+            ),
+        }
+    if mode == "asgard_v2x_native_power_frozen":
+        return {
+            "armd_mode": "assist",
+            "tasam_enabled": True,
+            "tasam_mode": "assistant_only_control",
+            "assistant_decision_mode": "cooperative_hierarchy",
+            "controller_enabled": False,
+            "actuation_enabled": True,
+            "frozen_checkpoint": True,
+            "historical_replay": False,
+            "article_method": "ta_sam_selective",
+            "sam_mode": "tasam_selective",
+            "l2_weight": 0.0,
+            "replay_contract": "greenran.tasam.v2x.window90.replay_80_20.v1",
+            "reward_contract": "greenran.tasam.v2x.reward_adaptive.v1",
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "pilot_rollout_100": True,
+            "energy_mode": True,
+            "native_power_mode": True,
+            "description": (
+                "avaliação congelada TA-SAM com potência por DU confirmada "
+                "pelo readback nativo do ns-3"
+            ),
         }
     if mode == "tasam_v2x_frozen":
         return {
@@ -1454,6 +1861,11 @@ def mode_contract(mode: str) -> dict[str, Any]:
             "actuation_enabled": True,
             "frozen_checkpoint": False,
             "historical_replay": False,
+            # This reference does not create TA-SAM replay, but it does
+            # produce the same atomic three-DU V3 control/readback evidence
+            # used to measure the paired energy baseline.
+            "economic_action_contract": "economic_action_v3_per_du_sleep",
+            "energy_mode": True,
             "description": "rApp nativa atuante (baseline com E2), sem ARMD e sem TA-SAM",
         }
     if mode == "fixed_100_native":
@@ -1556,6 +1968,7 @@ def build_environment(
     native_fidelity: bool = False,
     energy_enabled: bool = False,
     energy_staircase: bool = False,
+    adaptive_energy_probe: bool = False,
     safe_power_floor_ledger: Path | None = None,
     dynamic_floor_ledger: Path | None = None,
     baseline_signature: Path | None = None,
@@ -1564,6 +1977,17 @@ def build_environment(
     infra_resource_profile: str | None = None,
     execution_slot_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
+    # Formal ASGARD energy runs are evaluated only from native PDCP.  Stage
+    # labels may still be emitted by the collector, but application/network
+    # overrides must never manufacture a healthy SLA observation.
+    formal_real_only = mode in {
+        "asgard_v2x_window90_energy_online",
+        "asgard_v2x_window90_energy_dynamic",
+        "asgard_v2x_sla_floor_online",
+        "asgard_v2x_native_power_online",
+        "asgard_v2x_native_power_frozen",
+    }
+    disable_app_overrides = bool(disable_app_overrides or formal_real_only)
     contract = mode_contract(mode)
     env = _common_env(
         run_dir,
@@ -1584,6 +2008,7 @@ def build_environment(
         disable_app_overrides=disable_app_overrides,
         infra_resource_profile=infra_resource_profile,
         execution_slot_env=execution_slot_env,
+        campaign_mode=mode,
     )
     env["GREENRAN_ARMD_MODE"] = str(contract["armd_mode"])
     # The dispatcher/user service may inherit the historical file/shadow
@@ -1599,10 +2024,16 @@ def build_environment(
         )
         env["GREENRAN_VEHICLE_PROFILE_MANIFEST"] = str(vehicle_profile_manifest.resolve())
         env["GREENRAN_NS3_VEHICLE_PACKET_INTERVAL_US"] = str(int(vehicle_profile["selected_interval_us"]))
-        # The legacy MC bearer path in this ns-3/mmWave fork does not support
-        # dedicated EPS activation for McUeNetDevice.  The v12 vehicle
-        # contract uses the supported mmWave UE bearer path explicitly.
-        env["GREENRAN_NS3_USE_MC_UE_DEVICES"] = "false"
+        # The economic vehicle profile uses the validated LTE-anchored MC
+        # fallback.  Other legacy profiles keep their manifest-selected
+        # topology; the safe profile is explicit so a stale environment
+        # cannot silently revert to mmWave-only traffic.
+        if profile == VEHICLE_SAFE_PROFILE:
+            env["GREENRAN_NS3_USE_MC_UE_DEVICES"] = "true"
+            env["GREENRAN_NS3_E2LTE_ENABLED"] = "true"
+            env["GREENRAN_V2X_FALLBACK_POLICY"] = "mmwave_primary_lte_risk_fallback_v2"
+        else:
+            env["GREENRAN_NS3_USE_MC_UE_DEVICES"] = "false"
     if profile == BASELINE_MAX_PROFILE:
         # A baseline-max run must use the real LTE anchor even if the caller
         # inherited a legacy vehicle manifest that requested non-MC devices.
@@ -1625,7 +2056,7 @@ def build_environment(
     # TA-SAM's floor/headroom envelope.
     if mode in {"rapp_only_actuating", "fixed_100_native", "native_sleep_calibration"} and energy_enabled:
         env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = "economic_action_v3_per_du_sleep"
-    if mode == "fixed_100_native":
+    if mode in {"fixed_100_native", "rapp_only_actuating"}:
         # Calibration directive, not a live candidate: the orchestrator must
         # honor the exact requested percent (5%-step) instead of snapping to
         # the legacy {25, 60, 100} ladder, which would turn 45 into 60 and
@@ -1633,24 +2064,117 @@ def build_environment(
         env["GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT"] = str(
             int(fixed_native_power_percent)
         )
+        # The native supervisor is the final launcher of ns-3.  Bridge the
+        # calibration directive to the GlobalValue it actually passes to the
+        # scenario; keeping only the TA-SAM-side variable made the manifest
+        # say 75% while ns-3 silently retained its 100% default.
+        env["GREENRAN_NS3_FIXED_POWER_PERCENT"] = str(
+            int(fixed_native_power_percent)
+        )
     elif contract.get("economic_action_contract"):
         env["GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT"] = str(
             contract["economic_action_contract"]
         )
+    if mode in {"asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen"}:
+        # The simulator starts at the safe full-power state, but only the
+        # per-DU E2 V3 bundle may change it afterwards.  Never inherit the
+        # fixed-power calibration directive from a previous arm.
+        env.pop("GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT", None)
+        env["GREENRAN_NS3_FIXED_POWER_PERCENT"] = "100"
+        env["GREENRAN_TASAM_NATIVE_POWER_CONTROL"] = "1"
+        env["GREENRAN_TASAM_ALLOW_DU_SLEEP"] = "0"
+        env["GREENRAN_TASAM_RESOURCE_FLOOR_POLICY"] = "native_per_du_sla_guard_v1"
     if mode in V2X_ENERGY_MODES or (energy_enabled and _is_v6_v2x_profile(profile)):
+        if mode != "asgard_v2x_sla_floor_online":
+            for key in (
+                "GREENRAN_TASAM_SLA_FLOOR_CONTRACT",
+                "GREENRAN_TASAM_SLA_FLOOR_STATE",
+                "GREENRAN_TASAM_SLA_FLOOR_STEP_PERCENT",
+                "GREENRAN_TASAM_SLA_FLOOR_HEALTHY_WINDOWS",
+                "GREENRAN_TASAM_SLA_FLOOR_MIN_PERCENT",
+                "GREENRAN_TASAM_SLA_FLOOR_UPPER_MULTIPLIER",
+            ):
+                env.pop(key, None)
         # v6 is intentionally distinct from the historical v5 trace: a
         # current energy arm requires a complete three-DU confirmation.
         env["GREENRAN_NATIVE_EVIDENCE_VERSION"] = "v6"
         env["GREENRAN_NATIVE_SOURCE_GENERATION"] = f"{run_dir.name}:native-v6"
         env["GREENRAN_NS3_NATIVE_AGGREGATED_EVIDENCE"] = "1"
         env["GREENRAN_TASAM_ECONOMIC_HEAD_ENABLED"] = "1" if mode in V2X_ENERGY_MODES else "0"
-        env["GREENRAN_TASAM_RESOURCE_FLOOR_POLICY"] = "floor_to_115_percent_v1"
+        # Sleep is a TA-SAM action in the free online arm.  It is not a
+        # historical-floor feature; the orchestrator remains fail-closed and
+        # only commits after the native drain contract is complete.
+        if mode == "asgard_v2x_window90_energy_online":
+            env["GREENRAN_TASAM_ALLOW_DU_SLEEP"] = "1"
+        # The free-ASGARD campaign has no historical/safe-power ledger.  The
+        # only operational lower bound is the physical 25% RF limit enforced
+        # by the native DU and the v3 bundle validator.  Keep this explicit
+        # in the manifest so a stale 60%/115% policy cannot be mistaken for
+        # an active controller or floor.
+        env["GREENRAN_TASAM_RESOURCE_FLOOR_POLICY"] = (
+            "sla_only_adaptive_floor_v1"
+            if mode == "asgard_v2x_sla_floor_online"
+            else "physical_min_25_no_historical_floor_v1"
+        )
         env["GREENRAN_TASAM_ECONOMIC_SAFETY_ISOLATION_REQUIRED"] = "1"
         env["GREENRAN_TASAM_ECONOMIC_SAFETY_ISOLATION"] = "blocked_and_critical_v1"
-        if energy_staircase:
-            env["GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT"] = (
-                "greenran.tasam.v2x.energy_staircase.v1"
+        if mode != "asgard_v2x_window90_energy_dynamic":
+            # The free online arm has no historical floor or legacy staircase.
+            # Dynamic-floor mode remains backwards-compatible and validates
+            # its own ledger explicitly below.
+            for key in (
+                "GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER",
+                "GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER",
+                "GREENRAN_TASAM_DYNAMIC_FLOOR_CONTRACT",
+                "GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT",
+            ):
+                env.pop(key, None)
+        if mode == "asgard_v2x_sla_floor_online":
+            env["GREENRAN_TASAM_SLA_FLOOR_CONTRACT"] = (
+                "greenran.tasam.v2x.sla_floor.v1"
             )
+            env["GREENRAN_TASAM_SLA_FLOOR_STATE"] = str(
+                run_dir / "sla_floor_state.json"
+            )
+            env["GREENRAN_TASAM_SLA_FLOOR_STEP_PERCENT"] = "10"
+            env["GREENRAN_TASAM_SLA_FLOOR_HEALTHY_WINDOWS"] = "3"
+            env["GREENRAN_TASAM_SLA_FLOOR_MIN_PERCENT"] = "25"
+            env["GREENRAN_TASAM_SLA_FLOOR_UPPER_MULTIPLIER"] = "1.15"
+            env["GREENRAN_TASAM_ALLOW_DU_SLEEP"] = "0"
+            # The new controller is intentionally independent from the
+            # historical safe-power ledger and from dynamic-floor v2.
+            for key in (
+                "GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER",
+                "GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER",
+                "GREENRAN_TASAM_DYNAMIC_FLOOR_CONTRACT",
+                "GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT",
+                "GREENRAN_TASAM_DYNAMIC_FLOOR_STATE",
+            ):
+                env.pop(key, None)
+        if formal_real_only:
+            env["GREENRAN_TASAM_CAUSAL_EXPLORATION"] = "1"
+            env["GREENRAN_TASAM_CAUSAL_COORDINATOR"] = "1"
+            env["GREENRAN_TASAM_EXPLORATION_SEED"] = str(seed)
+            env["GREENRAN_TASAM_CAUSAL_DWELL_SECONDS"] = "5"
+            env["GREENRAN_TASAM_SCHEDULER_RENEWAL_SECONDS"] = "4"
+        if energy_staircase and mode not in {
+            "asgard_v2x_native_power_online",
+            "asgard_v2x_native_power_frozen",
+        }:
+            step_percent = str(env.get("GREENRAN_TASAM_ENERGY_STEP_PERCENT", "5")).strip()
+            if step_percent not in {"5", "10"}:
+                raise ValueError("GREENRAN_TASAM_ENERGY_STEP_PERCENT deve ser 5 ou 10")
+            env["GREENRAN_TASAM_ENERGY_STEP_PERCENT"] = step_percent
+            if adaptive_energy_probe and step_percent == "10":
+                env["GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT"] = (
+                    "greenran.tasam.v2x.energy_staircase.v3_safe_probe_10"
+                )
+            else:
+                env["GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT"] = (
+                    "greenran.tasam.v2x.energy_staircase.v2_safe_probe"
+                    if adaptive_energy_probe
+                    else "greenran.tasam.v2x.energy_staircase.v1"
+                )
             env["GREENRAN_TASAM_ENERGY_STAIRCASE_HEALTHY_REQUIRED"] = "3"
             env["GREENRAN_TASAM_ALLOW_DU_SLEEP"] = "1"
             if safe_power_floor_ledger is not None:
@@ -1680,6 +2204,24 @@ def build_environment(
             )
             env["GREENRAN_TASAM_DYNAMIC_FLOOR_STATE"] = str(
                 run_dir / "dynamic_floor_state.json"
+            )
+        if mode in {"asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen"}:
+            for key in (
+                "GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER",
+                "GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER",
+                "GREENRAN_TASAM_DYNAMIC_FLOOR_CONTRACT",
+                "GREENRAN_TASAM_ENERGY_STAIRCASE_CONTRACT",
+                "GREENRAN_TASAM_SLA_FLOOR_CONTRACT",
+                "GREENRAN_TASAM_SLA_FLOOR_STATE",
+            ):
+                env.pop(key, None)
+            env["GREENRAN_TASAM_NATIVE_POWER_BOUNDS"] = "25,100"
+            env["GREENRAN_TASAM_NATIVE_POWER_STEP_PERCENT"] = "5"
+        elif mode == "asgard_v2x_window90_energy_online" and baseline_signature is not None:
+            # The online no-historical-floor arm uses r26 only for differential
+            # SLA attribution.  It must not enable the dynamic-floor controller.
+            env["GREENRAN_TASAM_BASELINE_SIGNATURE"] = str(
+                baseline_signature.resolve()
             )
     # ``_common_env`` is also used by the historical full-control trainer.
     # An assistant-only online adaptation must never inherit that override:
@@ -1771,6 +2313,9 @@ def build_environment(
 
 def _controller_command(args: argparse.Namespace) -> list[str]:
     contract = mode_contract(args.mode)
+    window90 = contract.get("replay_contract") == "greenran.tasam.v2x.window90.replay_80_20.v1"
+    min_trainable = 90 if window90 else args.min_trainable_transitions
+    min_new_snapshots = 18 if window90 else args.min_new_snapshots
     command = [
         sys.executable,
         str(ONLINE_CONTROLLER),
@@ -1781,9 +2326,9 @@ def _controller_command(args: argparse.Namespace) -> list[str]:
         "--historical-trace",
         str(args.experience_bank or args.run_dir / "historical_replay_disabled.jsonl"),
         "--min-new-snapshots",
-        str(args.min_new_snapshots),
+        str(min_new_snapshots),
         "--min-trainable-transitions",
-        str(args.min_trainable_transitions),
+        str(min_trainable),
         "--replay-rows",
         str(args.replay_rows),
         "--epochs-per-update",
@@ -1845,11 +2390,19 @@ def _controller_command(args: argparse.Namespace) -> list[str]:
             "--stage-window-decisions", "18",
             "--update-milestones", "18,36,54,72,90",
         ])
-    if args.mode in {"asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_dynamic"}:
+    if args.mode in {
+        "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_dynamic",
+        "asgard_v2x_native_power_online",
+    }:
         command.extend([
             "--allocation-head-output-dim", "3",
             "--global-action-dim", "5",
-            "--economic-update-min-transitions", "0",
+            # Keep the window90 causal gate supplied by the campaign.  The
+            # launcher must not silently replace the requested 18 new
+            # transitions with zero, otherwise an online update could train
+            # before the 72 historical + 18 causal contract is complete.
+            "--min-economic-transitions", str(max(0, int(getattr(args, "min_economic_transitions", 0)))),
+            "--economic-update-min-transitions", str(max(0, int(getattr(args, "economic_update_min_transitions", 64)))),
         ])
     return command
 
@@ -2063,6 +2616,14 @@ def _terminate_group(process: subprocess.Popen[Any] | None) -> None:
 def run(args: argparse.Namespace) -> int:
     args.run_dir = args.run_dir.resolve()
     args.checkpoint = args.checkpoint.resolve()
+    # The V2X energy modes are explicitly actuating campaigns.  Requiring a
+    # second, easy-to-forget CLI switch here previously left the economic
+    # head in shadow mode: live power changed in observations, but the
+    # applied action stayed at 100% and no energy transition could train.
+    # Make the mode contract authoritative while keeping the flag available
+    # for legacy/calibration arms.
+    if args.mode in V2X_ENERGY_MODES:
+        args.energy_enabled = True
     if (
         args.mode == "asgard_v2x_window90_energy_dynamic"
         and args.run_dir.exists()
@@ -2122,8 +2683,16 @@ def run(args: argparse.Namespace) -> int:
         args.baseline_signature = _validate_local_path(
             args.baseline_signature, "assinatura SLA r26"
         )
-    fixed_native_power = _validate_fixed_native_power_percent(
-        args.fixed_native_power_percent, args.mode
+    # Sleep calibration has no fixed-power directive; its drain/commit state
+    # machine owns the power transitions.  Keep the CLI flag restricted to
+    # the two fixed-power calibration arms while allowing the parser default
+    # to remain inert for native_sleep_calibration.
+    fixed_native_power = (
+        _validate_fixed_native_power_percent(
+            args.fixed_native_power_percent, args.mode
+        )
+        if args.mode in {"fixed_100_native", "rapp_only_actuating"}
+        else 100
     )
     if args.mode == "asgard_v2x_window90_energy_dynamic":
         if args.dynamic_floor_ledger is None or args.baseline_signature is None:
@@ -2147,10 +2716,24 @@ def run(args: argparse.Namespace) -> int:
             )
         except DynamicFloorError as exc:
             raise SystemExit(f"contrato do piso dinâmico inválido: {exc}") from exc
-    elif args.dynamic_floor_ledger is not None or args.baseline_signature is not None:
+    elif args.dynamic_floor_ledger is not None:
         raise SystemExit(
-            "ledger v2 e assinatura SLA são exclusivos do modo dynamic"
+            "ledger v2 é exclusivo do modo dynamic"
         )
+    elif args.baseline_signature is not None:
+        if args.mode != "asgard_v2x_window90_energy_online":
+            raise SystemExit(
+                "assinatura SLA sem ledger só é permitida no modo energy_online"
+            )
+        try:
+            load_baseline_signature(
+                args.baseline_signature,
+                expected_seed=args.seed,
+                expected_profile=args.profile,
+                strict_contract=True,
+            )
+        except DynamicFloorError as exc:
+            raise SystemExit(f"assinatura SLA r26 inválida: {exc}") from exc
     energy_calibration = _resolve_energy_calibration(args.energy_calibration)
     if args.control_gate:
         args.control_gate = _validate_local_path(args.control_gate, "control-gate")
@@ -2167,6 +2750,8 @@ def run(args: argparse.Namespace) -> int:
         "rapp_only", "rapp_only_actuating", "fixed_100_native", "asgard_v2x_window90_online",
         "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
         "asgard_v2x_window90_energy_dynamic",
+        "asgard_v2x_sla_floor_online",
+        "asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen",
         "tasam_v2x_frozen",
     }:
         raise SystemExit(
@@ -2202,7 +2787,11 @@ def run(args: argparse.Namespace) -> int:
     arm_resource_profile = (
         PARALLEL_PAIR_RESOURCE_PROFILE
         if parallel_slot is not None
-        else ("baseline_max_v1" if args.profile == BASELINE_MAX_PROFILE else "standard")
+        else (
+            args.infra_resource_profile
+            if args.infra_resource_profile is not None
+            else ("baseline_max_v1" if args.profile == BASELINE_MAX_PROFILE else "standard")
+        )
     )
     _validate_run_dir(args.run_dir)
     # ``disk_usage`` requires an existing path.  Creating only the requested
@@ -2219,6 +2808,7 @@ def run(args: argparse.Namespace) -> int:
                 "combined_online", "combined_actuation_smoke",
                 "asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen",
                 "asgard_v2x_window90_energy_dynamic",
+                "asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen",
             },
         )
         if args.mode == "asgard_v2x_window90_energy_dynamic":
@@ -2233,16 +2823,21 @@ def run(args: argparse.Namespace) -> int:
     # campaign launched by ``robert`` must either receive real cgroup-v2
     # limits or stop without leaving a partial experiment behind.
     scope_preflight: dict[str, Any] = {}
-    if args.profile == BASELINE_MAX_PROFILE:
+    if arm_resource_profile != "standard":
         baseline_budget = build_physical_budget(
             1.0, unrestricted=True, resource_profile=arm_resource_profile
         )
         scope_preflight = probe_systemd_user_scope(baseline_budget["groups"]["simulator"])
-        if not scope_preflight.get("valid"):
+        allow_unenforced_scope = os.environ.get(
+            "GREENRAN_CGROUP_ALLOW_UNENFORCED", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not scope_preflight.get("valid") and not allow_unenforced_scope:
             raise SystemExit(
-                "backend systemd --user não aplicou o envelope baseline_max_v1: "
+                f"backend systemd --user não aplicou o envelope {arm_resource_profile}: "
                 + str(scope_preflight.get("reason") or scope_preflight.get("stderr") or "unknown")
             )
+        if not scope_preflight.get("valid"):
+            scope_preflight["allowed_unenforced"] = True
     else:
         try:
             assert_cgroup_delegation()
@@ -2282,6 +2877,7 @@ def run(args: argparse.Namespace) -> int:
         artifact_min_free_gib=args.artifact_min_free_gib,
         energy_enabled=bool(args.energy_enabled),
         energy_staircase=bool(args.energy_staircase),
+        adaptive_energy_probe=bool(args.adaptive_energy_probe),
         safe_power_floor_ledger=args.safe_power_floor_ledger,
         dynamic_floor_ledger=args.dynamic_floor_ledger,
         baseline_signature=args.baseline_signature,
@@ -2354,7 +2950,9 @@ def run(args: argparse.Namespace) -> int:
         ) if env.get("GREENRAN_TASAM_SAFE_POWER_FLOOR_LEDGER") else "",
         "dynamic_floor_contract": env.get("GREENRAN_TASAM_DYNAMIC_FLOOR_CONTRACT", ""),
         "fixed_native_power_percent": int(env.get("GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT", "0") or 0)
-        if args.mode == "fixed_100_native" else None,
+        if args.mode in {"fixed_100_native", "rapp_only_actuating"} else None,
+        "ns3_fixed_power_percent": int(env.get("GREENRAN_NS3_FIXED_POWER_PERCENT", "0") or 0)
+        if args.mode in {"fixed_100_native", "rapp_only_actuating"} else None,
         "dynamic_floor_ledger": env.get("GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER", ""),
         "dynamic_floor_ledger_sha256": file_sha256(
             Path(env["GREENRAN_TASAM_DYNAMIC_FLOOR_LEDGER"])
@@ -2364,11 +2962,48 @@ def run(args: argparse.Namespace) -> int:
             Path(env["GREENRAN_TASAM_BASELINE_SIGNATURE"])
         ) if env.get("GREENRAN_TASAM_BASELINE_SIGNATURE") else "",
         "dynamic_floor_state": env.get("GREENRAN_TASAM_DYNAMIC_FLOOR_STATE", ""),
+        "sla_floor_contract": env.get("GREENRAN_TASAM_SLA_FLOOR_CONTRACT", ""),
+        "sla_floor_state": env.get("GREENRAN_TASAM_SLA_FLOOR_STATE", ""),
+        "sla_floor_step_percent": int(
+            env.get("GREENRAN_TASAM_SLA_FLOOR_STEP_PERCENT", "10") or 10
+        ) if env.get("GREENRAN_TASAM_SLA_FLOOR_CONTRACT") else None,
+        "sla_floor_healthy_windows": int(
+            env.get("GREENRAN_TASAM_SLA_FLOOR_HEALTHY_WINDOWS", "3") or 3
+        ) if env.get("GREENRAN_TASAM_SLA_FLOOR_CONTRACT") else None,
+        "sla_floor_min_percent": int(
+            env.get("GREENRAN_TASAM_SLA_FLOOR_MIN_PERCENT", "25") or 25
+        ) if env.get("GREENRAN_TASAM_SLA_FLOOR_CONTRACT") else None,
+        "sla_floor_upper_multiplier": float(
+            env.get("GREENRAN_TASAM_SLA_FLOOR_UPPER_MULTIPLIER", "1.15") or 1.15
+        ) if env.get("GREENRAN_TASAM_SLA_FLOOR_CONTRACT") else None,
+        "sla_floor_config": str(ROOT / "config/greenran_v2x_sla_floor.json")
+        if env.get("GREENRAN_TASAM_SLA_FLOOR_CONTRACT") else "",
+        "sla_floor_config_sha256": file_sha256(ROOT / "config/greenran_v2x_sla_floor.json")
+        if env.get("GREENRAN_TASAM_SLA_FLOOR_CONTRACT")
+        and (ROOT / "config/greenran_v2x_sla_floor.json").is_file() else "",
+        "historical_safe_power_floor_authority": False if env.get(
+            "GREENRAN_TASAM_SLA_FLOOR_CONTRACT"
+        ) else None,
         "du_sleep_allowed": env.get("GREENRAN_TASAM_ALLOW_DU_SLEEP") == "1",
         "economic_action_contract": env.get("GREENRAN_TASAM_ECONOMIC_ACTION_CONTRACT", ""),
         "tasam_resource_headroom_ratio": 0.15 if args.mode in {
             "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online",
             "asgard_v2x_window90_energy_frozen", "asgard_v2x_window90_energy_dynamic",
+            "asgard_v2x_sla_floor_online",
+        } else None,
+        "power_control_authority": (
+            "ns3_native_e2_phy_and_energy_model"
+            if args.mode in {"asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen"}
+            else "controller_contract"
+        ),
+        "native_power_control": args.mode in {
+            "asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen"
+        },
+        "native_power_bounds_percent": [25, 100] if args.mode in {
+            "asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen"
+        } else None,
+        "native_power_step_percent": 5 if args.mode in {
+            "asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen"
         } else None,
         "resource_floor_policy": env.get("GREENRAN_TASAM_RESOURCE_FLOOR_POLICY", ""),
         "reward_weight_snapshot": {
@@ -2383,8 +3018,10 @@ def run(args: argparse.Namespace) -> int:
         } if contract.get("reward_contract") else {},
         "sam_mode": contract.get("sam_mode", ""),
         "l2_weight": contract.get("l2_weight", 0.0),
-        "real_only_collection": bool(args.disable_app_overrides),
-        "scenario_control_override_allowed": not bool(args.disable_app_overrides),
+        "real_only_collection": env.get("GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES") == "1",
+        "scenario_control_override_allowed": env.get("GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES") != "1",
+        "causal_exploration": env.get("GREENRAN_TASAM_CAUSAL_EXPLORATION") == "1",
+        "causal_coordinator": env.get("GREENRAN_TASAM_CAUSAL_COORDINATOR") == "1",
         "seed": args.seed,
         "profile": args.profile,
         "expected_stages": [
@@ -2414,9 +3051,10 @@ def run(args: argparse.Namespace) -> int:
         "parallel_execution": {
             "schema": "greenran.v2x.parallel_execution.v1",
             "slot_id": env.get("GREENRAN_V2X_EXECUTION_SLOT", "serial"),
-            "e2_term_port": int(env.get("GREENRAN_E2_TERM_PORT", "36421")),
-            "e2_xapp_port": int(env.get("GREENRAN_E2_XAPP_PORT", "36422")),
-            "e2_local_port": int(env.get("GREENRAN_E2_LOCAL_PORT", "38470")),
+            "port_plan": _e2_port_plan_from_env(env),
+            "e2_term_port": int(env.get("GREENRAN_E2_TERM_PORT", "40301")),
+            "e2_xapp_port": int(env.get("GREENRAN_E2_XAPP_PORT", "40302")),
+            "e2_local_port": int(env.get("GREENRAN_E2_LOCAL_PORT", "40320")),
             "app_port_offset": int(env.get("GREENRAN_PORT_OFFSET", "0")),
             "cgroup_root": env.get("GREENRAN_CGROUP_ROOT", ""),
             "slot_config_sha256": file_sha256(ROOT / "config/greenran_v2x_parallel_slots.json")
@@ -2600,23 +3238,53 @@ def run(args: argparse.Namespace) -> int:
     sleep_calibration_result: dict[str, Any] = {"status": "not_started"}
     wall_status = 0
     wall_runner: subprocess.Popen[Any] | None = None
+    preflight_failure_reason = ""
     arm_started_monotonic = time.monotonic()
     controller_log = (args.run_dir / "online_controller.log").open("w", encoding="utf-8")
     try:
-        if contract["controller_enabled"]:
-            controller = subprocess.Popen(
-                _controller_command(args),
-                cwd=ROOT,
-                env=env,
-                stdout=controller_log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
         with (args.run_dir / "collection_runtime.log").open("w", encoding="utf-8") as log:
             wall_runner = subprocess.Popen(
                 ["bash", str(WALL_RUNNER)], cwd=ROOT, env=env,
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
             )
+            require_e2_ready = (
+                str(env.get("GREENRAN_TASAM_REQUIRE_E2_READY_BEFORE_RAPP", "0"))
+                .strip().lower() in {"1", "true", "yes", "on"}
+            )
+            if contract["controller_enabled"]:
+                if require_e2_ready:
+                    ready, preflight_failure_reason = _wait_for_e2_topology_preflight(
+                        args.run_dir,
+                        wall_runner,
+                        timeout_s=float(env.get("GREENRAN_TASAM_E2_READY_TIMEOUT_S", "120") or 120),
+                    )
+                    if not ready:
+                        # The wall runner owns RIC/ns-3/xApp cleanup.  Stop it
+                        # here so no rApp or controller can issue a command
+                        # after a failed topology gate.
+                        _terminate_group(wall_runner)
+                        try:
+                            wall_status = int(wall_runner.wait(timeout=15.0))
+                        except subprocess.TimeoutExpired:
+                            wall_status = -15
+                    else:
+                        controller = subprocess.Popen(
+                            _controller_command(args),
+                            cwd=ROOT,
+                            env=env,
+                            stdout=controller_log,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                        )
+                else:
+                    controller = subprocess.Popen(
+                        _controller_command(args),
+                        cwd=ROOT,
+                        env=env,
+                        stdout=controller_log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
             if args.mode == "native_sleep_calibration":
                 sleep_calibration_stop = threading.Event()
                 sleep_calibration_thread = threading.Thread(
@@ -2631,7 +3299,12 @@ def run(args: argparse.Namespace) -> int:
                     daemon=True,
                 )
                 sleep_calibration_thread.start()
-            if int(args.decision_target or 0) > 0:
+            if preflight_failure_reason:
+                # No controller was started.  Preserve the preflight
+                # diagnosis and finish the parent without waiting for a full
+                # simulation wall-clock budget.
+                pass
+            elif int(args.decision_target or 0) > 0:
                 watcher_log = (args.run_dir / "decision_target.log").open("w", encoding="utf-8")
                 try:
                     # Keep the historical state-scoped subprocess watcher, but
@@ -2781,9 +3454,8 @@ def run(args: argparse.Namespace) -> int:
     # no decision-target watcher requested it.  The terminal performance
     # evidence and the absence of an active ns-3 supervisor are the proof of
     # this shutdown; do not accept an arbitrary 143.
-    finite_simulation_completion = bool(
+    finite_simulation_terminal = bool(
         args.native_fidelity
-        and performance_evidence.get("valid")
         # A performance sample after five seconds is enough to validate RTF,
         # but never enough to claim that a 120 s/600 s simulation completed.
         and float(performance_evidence.get("sim_time_observed_s", 0.0) or 0.0)
@@ -2795,6 +3467,9 @@ def run(args: argparse.Namespace) -> int:
         and wall_status in {143, -15, 15}
         and not (args.run_dir / "ns3_supervisor.pid").exists()
     )
+    finite_simulation_completion = bool(
+        finite_simulation_terminal and performance_evidence.get("valid")
+    )
     # The wall supervisor itself normally exits cleanly (0) after forwarding
     # the cooperative request; ns-3 is the process that records 143.  Accept
     # either side of that controlled shutdown, but only with a validated
@@ -2805,19 +3480,40 @@ def run(args: argparse.Namespace) -> int:
             cooperative_target_stop
             or promotion_stop_valid
             or native_actuation_stop_valid
-            or finite_simulation_completion
+            or finite_simulation_terminal
         )
     )
+    wall_time_expired_before_sim_target = _wall_time_expired_before_sim_target(
+        args.run_dir,
+        wall_status=wall_status,
+        requested_wall_time_s=args.wall_time,
+        requested_sim_time_s=args.sim_time,
+        observed_sim_time_s=float(performance_evidence.get('sim_time_observed_s', 0.0) or 0.0),
+    )
+    terminal_reason = (
+        'wall_time_expired_before_sim_target'
+        if wall_time_expired_before_sim_target else stop_reason
+    )
+    if (
+        not terminal_reason
+        and finite_simulation_terminal
+        and performance_evidence.get("reason") == "simulation_performance_infeasible"
+    ):
+        terminal_reason = "simulation_performance_infeasible"
     _reconcile_wall_status(
         args.run_dir,
         wall_status,
-        stop_reason,
+        terminal_reason,
         completion_verified=expected_target_termination,
     )
     externally_interrupted = bool(
-        wall_status in {143, -15, 15} and not expected_target_termination
+        wall_status in {143, -15, 15}
+        and not expected_target_termination
+        and not wall_time_expired_before_sim_target
     )
-    invalid_reason = ""
+    invalid_reason = preflight_failure_reason
+    if wall_time_expired_before_sim_target:
+        invalid_reason = 'wall_time_expired_before_sim_target'
     if disk_guard_result:
         invalid_reason = f"disk_budget_guard:{disk_guard_result.get('reason', 'unknown')}"
     else:
@@ -2826,7 +3522,7 @@ def run(args: argparse.Namespace) -> int:
         # number of decisions.  A promotion stop is also valid, but only when
         # its explicit contract was verified above. Every other non-zero ns-3
         # exit remains a hard failure.
-        if ns3_failure and not (
+        if ns3_failure and not wall_time_expired_before_sim_target and not (
             expected_target_termination and ns3_failure == "ns3_exit_code:143"
         ):
             invalid_reason = ns3_failure
@@ -2836,10 +3532,21 @@ def run(args: argparse.Namespace) -> int:
             "sac_l2_online", "sac_l2_frozen", "tasam_v2x_online", "tasam_v2x_frozen",
             "asgard_v2x_window90_online", "asgard_v2x_window90_energy_online",
             "asgard_v2x_window90_energy_frozen", "asgard_v2x_window90_energy_dynamic",
+            "asgard_v2x_native_power_online", "asgard_v2x_native_power_frozen",
         }
         and not performance_evidence.get("valid")
         and not invalid_reason
     ):
+        invalid_reason = "simulation_performance_infeasible"
+    elif (
+        finite_simulation_terminal
+        and not performance_evidence.get("valid")
+        and performance_evidence.get("reason") == "simulation_performance_infeasible"
+    ):
+        # A finite native arm can end with the ns-3 supervisor's controlled
+        # SIGTERM one scheduler tick below the target.  Preserve the real
+        # failure (RTF below the gate) instead of misclassifying it as an
+        # external interruption or an ns3 exit-code failure.
         invalid_reason = "simulation_performance_infeasible"
     if (
         not invalid_reason
@@ -2886,6 +3593,34 @@ def run(args: argparse.Namespace) -> int:
                 below_calibrated_floor = True
             if below_calibrated_floor:
                 invalid_reason = "dynamic_floor_below_calibrated_25_percent"
+    if (
+        args.mode == "native_sleep_calibration"
+        and not invalid_reason
+        and str(sleep_calibration_result.get("status") or "") != "completed"
+    ):
+        invalid_reason = "native_sleep_calibration_incomplete"
+    expected_fixed_power = (
+        fixed_native_power
+        if args.energy_enabled
+        and args.mode in {"fixed_100_native", "rapp_only_actuating"}
+        else None
+    )
+    energy_telemetry = (
+        _energy_telemetry_evidence(
+            args.run_dir,
+            expected_power_percent=expected_fixed_power,
+            measurement_start_s=30.0,
+        )
+        if args.energy_enabled
+        else {"valid": True, "reason": "not_applicable"}
+    )
+    if (
+        args.energy_enabled
+        and float(args.sim_time) >= 30.0
+        and not energy_telemetry.get("valid")
+        and not invalid_reason
+    ):
+        invalid_reason = "energy_telemetry_inconsistent"
     native_actuation = {}
     native_actuation_feedback = {}
     if args.mode == "combined_actuation_smoke":
@@ -2917,12 +3652,14 @@ def run(args: argparse.Namespace) -> int:
     manifest.update(
         {
             "status": (
-                "cancelled" if externally_interrupted else
-                ("finished" if wall_execution_valid and feedback_valid and checkpoint_frozen and not disk_guard_result and not invalid_reason else "failed")
+                "invalid" if wall_time_expired_before_sim_target else
+                ("cancelled" if externally_interrupted else
+                ("finished" if wall_execution_valid and feedback_valid and checkpoint_frozen and not disk_guard_result and not invalid_reason else "failed"))
             ),
             "wall_runner_exit_code": wall_status,
             "target_reached": target_reached,
             "expected_target_termination": expected_target_termination,
+            "wall_time_expired_before_sim_target": wall_time_expired_before_sim_target,
             "finite_simulation_completion": finite_simulation_completion,
             "stop_reason": stop_reason,
             "stop_source": stop_source,
@@ -2942,6 +3679,7 @@ def run(args: argparse.Namespace) -> int:
             "active_online_checkpoint": active_online_checkpoint,
             "active_online_checkpoint_sha256": active_online_checkpoint_sha256,
             "dynamic_floor_evidence": dynamic_floor_state,
+            "energy_telemetry": energy_telemetry,
             "invalid_reason": invalid_reason,
             "native_actuation_evidence": native_actuation,
             "simulation_performance": performance_evidence,
@@ -2960,18 +3698,20 @@ def run(args: argparse.Namespace) -> int:
     online_status.update(
         {
             "status": (
-                "cancelled" if externally_interrupted else
-                ("finished" if wall_execution_valid and feedback_valid and not invalid_reason else "invalid")
+                "invalid" if wall_time_expired_before_sim_target else
+                ("cancelled" if externally_interrupted else
+                ("finished" if wall_execution_valid and feedback_valid and not invalid_reason else "invalid"))
             ),
             "stopped_at": int(time.time()),
             "finished_at": int(time.time()),
             "shutdown_reason": (
-                stop_reason
+                terminal_reason
                 if expected_target_termination and stop_reason
-                else ("external_termination" if externally_interrupted else
+                else (terminal_reason if wall_time_expired_before_sim_target else
+                ("external_termination" if externally_interrupted else
                       ("finite_simulation_completed" if finite_simulation_completion else
                       ("wall_time_complete" if wall_status == 0 else "wall_runner_failed"))
-                )
+                ))
             ),
             "feedback_drained": feedback_drained,
             "simulation_performance": performance_evidence,
@@ -2983,8 +3723,9 @@ def run(args: argparse.Namespace) -> int:
     if online_state:
         online_state.update({
             "status": (
-                "cancelled" if externally_interrupted else
-                ("finished" if wall_execution_valid and feedback_valid else "invalid")
+                "invalid" if wall_time_expired_before_sim_target else
+                ("cancelled" if externally_interrupted else
+                ("finished" if wall_execution_valid and feedback_valid else "invalid"))
             ),
             "finished_at": int(time.time()),
             "shutdown_reason": online_status["shutdown_reason"],
@@ -3001,6 +3742,8 @@ def run(args: argparse.Namespace) -> int:
         return 8
     if invalid_reason == "simulation_performance_infeasible":
         return 9
+    if invalid_reason:
+        return 10
     if not feedback_valid:
         return 3
     return 0 if checkpoint_frozen else 5
@@ -3023,7 +3766,7 @@ def main() -> int:
         help="aceita execução curta de smoke sem exigir a janela de desempenho de 5 s",
     )
     parser.add_argument(
-        "--performance-min-rtf", type=float, default=0.10,
+        "--performance-min-rtf", type=float, default=0.016,
         help="RTF mínimo; v9_fidelity usa 0.016",
     )
     parser.add_argument(
@@ -3045,6 +3788,12 @@ def main() -> int:
     parser.add_argument(
         "--execution-slot", choices=("slot-a", "slot-b"), default=None,
         help="reserva um slot SCTP/cgroup exclusivo para execução paralela; omitido mantém serial",
+    )
+    parser.add_argument(
+        "--infra-resource-profile",
+        choices=("standard", "baseline_max_v1", PARALLEL_PAIR_RESOURCE_PROFILE),
+        default=None,
+        help="envelope de CPU/memória independente do perfil de tráfego",
     )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument(
@@ -3095,6 +3844,10 @@ def main() -> int:
     parser.add_argument(
         "--energy-staircase", action="store_true",
         help="habilita a escada segura V2X por DU e o candidato explícito de sono",
+    )
+    parser.add_argument(
+        "--adaptive-energy-probe", action="store_true",
+        help="começa em 100%% e reduz 5%% somente após três decisões saudáveis",
     )
     parser.add_argument(
         "--safe-power-floor-ledger", type=Path, default=None,

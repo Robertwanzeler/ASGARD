@@ -513,6 +513,7 @@ def _v2x_replay_identity(row: dict[str, Any]) -> tuple[str, str, int, str] | Non
 def _v2x_replay_rows(
     path: Path, *, require_adaptive_reward: bool = False,
     require_judge: bool = False,
+    allow_frozen_recent: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Load only native, identified, non-evaluation transition rows."""
     accepted: list[dict[str, Any]] = []
@@ -527,10 +528,7 @@ def _v2x_replay_rows(
         "scenario_control_override_excluded": 0,
     }
     seen: set[tuple[str, str, int, str]] = set()
-    source_rows = (
-        iter_v2x_valid_rows(path, require_judge=True)
-        if require_judge else iter_valid_rows(path)
-    )
+    source_rows = iter_valid_rows(path)
     for row in source_rows:
         try:
             seed = int(row.get("replay_seed", row.get("seed")))
@@ -548,6 +546,14 @@ def _v2x_replay_rows(
                 continue
             if row.get("collection_quality", {}).get("valid_for_training") is not True:
                 rejected["adaptive_reward_invalid"] += 1
+                continue
+        frozen_recent = bool(allow_frozen_recent and row.get("frozen_recent_replay") is True)
+        if require_judge and not frozen_recent:
+            valid, _reasons = validate_online_transition(
+                row, require_adaptive_reward=True, require_judge=True
+            )
+            if not valid:
+                rejected["invalid_native_transition"] += 1
                 continue
             snapshot = row.get("adaptive_reward")
             if not isinstance(snapshot, dict) or snapshot.get("reward_contract") != REWARD_CONTRACT:
@@ -598,6 +604,7 @@ def build_v2x_replay_80_20(
     recent_rows, recent_rejected = _v2x_replay_rows(
         recent, require_adaptive_reward=require_adaptive_reward,
         require_judge=strict_recent_evidence,
+        allow_frozen_recent=True,
     )
     historical_quota = int(target * 0.80)
     recent_quota = target - historical_quota
@@ -813,12 +820,24 @@ def _economic_row_is_eligible(row: dict[str, Any], *, current_native_only: bool 
     if native_observation.get("evidence_version") not in allowed_versions:
         return False
     if current_native_only:
-        if native_observation.get("evidence_version") != "v5":
+        current_required_version = os.environ.get(
+            "GREENRAN_NATIVE_EVIDENCE_VERSION", "v5"
+        ).strip() or "v5"
+        if native_observation.get("evidence_version") != current_required_version:
             return False
         try:
             if int(native_observation.get("transaction_id") or 0) <= 0:
                 return False
-            if int(native_observation.get("native_control_sequence") or 0) <= 0:
+            # v6 stores the control sequence authoritatively on the action
+            # and on every per-DU observation. Older exporters also copied
+            # it to the aggregate object, but requiring that redundant copy
+            # made valid applied actions invisible to the 72/18 causal
+            # window.
+            control_sequence = (
+                native_observation.get("native_control_sequence")
+                or action.get("native_control_sequence")
+            )
+            if int(control_sequence or 0) <= 0:
                 return False
         except (TypeError, ValueError):
             return False
@@ -837,10 +856,29 @@ def _economic_row_is_eligible(row: dict[str, Any], *, current_native_only: bool 
                 return False
             for field in (
                 "power_readback_sim_time_s", "policy_active_sim_time_s",
-                "tx_power_percent", "native_allocation_fraction",
+                "tx_power_percent",
             ):
                 try:
                     if not math.isfinite(float(item.get(field))):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            # A native state snapshot for a DU with no attached UE is valid
+            # evidence, but it has no scheduler allocation fraction.  Require
+            # the fraction only when that DU actually carried active traffic;
+            # otherwise a truthful null must not block causal replay.
+            allocation_fraction = item.get("native_allocation_fraction")
+            if allocation_fraction is None:
+                try:
+                    active_ues = int(item.get("active_ues") or 0)
+                    active_capacity = int(item.get("active_dl_symbol_capacity") or 0)
+                except (TypeError, ValueError):
+                    return False
+                if active_ues > 0 or active_capacity > 0:
+                    return False
+            else:
+                try:
+                    if not math.isfinite(float(allocation_fraction)):
                         return False
                 except (TypeError, ValueError):
                     return False
@@ -892,6 +930,18 @@ def _economic_row_is_eligible(row: dict[str, Any], *, current_native_only: bool 
         return False
     if not bool(feedback.get("economic_action_alignment_valid", False)):
         return False
+    # New causal rows must carry the native state observed immediately before
+    # the action. Legacy rows without this field remain readable, but an
+    # explicit invalid reference can never enter the trainer window.
+    if "pre_action_reference" in action:
+        reference = action.get("pre_action_reference") or {}
+        if not bool(reference.get("valid")):
+            return False
+        try:
+            if float(reference.get("power_w")) <= 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
     live = action.get("live_candidate") or {}
     applied = action.get("applied") or {}
     try:
@@ -902,6 +952,35 @@ def _economic_row_is_eligible(row: dict[str, Any], *, current_native_only: bool 
     except (TypeError, ValueError):
         return False
     return live_power > 0.0 and applied_power > 0.0 and live_total > 0.0 and applied_total >= 0.0
+
+
+def _current_causal_transition_count(args: argparse.Namespace) -> int:
+    """Count durable current-run transitions before exporting a candidate.
+
+    The window90 learner used to materialize a large ``recent_trace.jsonl``
+    on every milestone and only then discover that fewer than 18 current
+    native transitions existed.  The durable transition table already has
+    the authoritative eligibility flags, so this cheap read-only query keeps
+    rejected milestones from creating candidate artifacts or doing bulk I/O.
+    """
+    try:
+        with closing(sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                  FROM tasam_economic_transition_history AS t
+                  JOIN decisions_history AS d
+                    ON d.id = t.decision_id
+                 WHERE t.economic_application_status = 'applied'
+                   AND t.economic_transition_eligible = 1
+                   AND t.economic_training_eligible = 1
+                   AND COALESCE(d.economic_safety_isolated, 0) = 0
+                   AND (d.armd_safety_level IS NULL OR UPPER(d.armd_safety_level) != 'HARD_VETO')
+                """
+            ).fetchone()
+            return int(row[0] or 0) if row else 0
+    except (sqlite3.Error, TypeError, ValueError):
+        return 0
 
 
 def economic_replay_evidence(path: Path) -> dict[str, Any]:
@@ -2906,10 +2985,6 @@ def advance_rollout(args: argparse.Namespace, state: dict[str, Any], decision_co
 
 def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: int) -> dict[str, Any]:
     update_id = int(state.get("updates_completed", 0) or 0) + 1
-    update_dir = args.state_dir / "candidates" / f"candidate_{update_id:04d}"
-    update_dir.mkdir(parents=True, exist_ok=True)
-    recent_trace = update_dir / "recent_trace.jsonl"
-    export_summary = update_dir / "recent_export_summary.json"
     economic_contract = state.get("economic_action_contract") in {
         "applied_action_v2", "economic_action_v3_per_du_sleep"
     }
@@ -2930,6 +3005,24 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
         raise ValueError("replay V2X 80/20 exige --experience-bank histórico")
     if v2x_replay and not args.recent_experience_bank:
         raise ValueError("replay V2X 80/20 exige --recent-experience-bank privado")
+    if v2x_replay_window90:
+        current_count = _current_causal_transition_count(args)
+        if current_count < 18:
+            return {
+                "status": "waiting_current_causal_transitions",
+                "update_id": update_id,
+                "snapshot_count": snapshot_count,
+                "replay": {
+                    "schema": replay_schema,
+                    "historical_required": 72,
+                    "recent_required": 18,
+                    "current_causal_transitions": current_count,
+                },
+            }
+    update_dir = args.state_dir / "candidates" / f"candidate_{update_id:04d}"
+    update_dir.mkdir(parents=True, exist_ok=True)
+    recent_trace = update_dir / "recent_trace.jsonl"
+    export_summary = update_dir / "recent_export_summary.json"
     # The durable economic bank already contains every training transition.
     # Exporting a second article trace here used to duplicate multi-gigabyte
     # decision snapshots before the learner even started.
@@ -2937,6 +3030,31 @@ def run_update(args: argparse.Namespace, state: dict[str, Any], snapshot_count: 
         export_recent(args, recent_trace, export_summary)
     if v2x_replay:
         _annotate_v2x_recent_trace(recent_trace, args, update_id)
+        if v2x_replay_window90:
+            current_causal_rows = [
+                row for row in iter_valid_rows(recent_trace)
+                if _economic_row_is_eligible(row, current_native_only=True)
+            ]
+            if len(current_causal_rows) < 18:
+                replay = {
+                    "schema": replay_schema,
+                    "status": "waiting_current_causal_transitions",
+                    "historical_required": 72,
+                    "recent_required": 18,
+                    "current_causal_transitions": len(current_causal_rows),
+                }
+                save_json(update_dir / "replay_manifest.json", {
+                    "schema": replay_schema,
+                    "update_id": update_id,
+                    "replay": replay,
+                    "training_started": False,
+                })
+                return {
+                    "status": "waiting_current_causal_transitions",
+                    "update_id": update_id,
+                    "snapshot_count": snapshot_count,
+                    "replay": replay,
+                }
     bank_manifest = None
     if args.experience_bank and not sqlite_economic_replay and not v2x_replay:
         bank_manifest = persist_experience_bank(
@@ -3452,6 +3570,11 @@ def main() -> int:
             raise SystemExit(
                 "contrato V2X 80/20 exige exatamente "
                 f"{expected_rows} transições ({int(expected_rows * 0.8)}/{int(expected_rows * 0.2)})"
+            )
+        if args.min_trainable_transitions > expected_rows:
+            raise SystemExit(
+                "min_trainable_transitions excede a capacidade do replay V2X: "
+                f"{args.min_trainable_transitions}>{expected_rows}"
             )
     if args.sam_mode == "l2" and args.l2_weight <= 0.0:
         raise SystemExit("baseline SAC-L2 exige --l2-weight positivo")

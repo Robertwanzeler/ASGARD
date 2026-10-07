@@ -35,6 +35,8 @@ SIM_TIME = 120.0
 WALL_TIME = 9000.0
 MIN_RTF = 0.016
 CALIBRATION = ROOT / "config/energy_calibration_sim_v3_sleep.json"
+NATIVE_POWER_ONLINE_MODE = "asgard_v2x_native_power_online"
+NATIVE_POWER_FROZEN_MODE = "asgard_v2x_native_power_frozen"
 
 sys.path.insert(0, str(SCRIPTS))
 from evaluate_tasam_strict_pair import causal_energy, e2_audit, evaluate_ue_windows  # noqa: E402
@@ -47,6 +49,8 @@ from run_tasam_v2x_window90_pilot import (  # noqa: E402
     select_stage_transitions,
     sha256,
     tree_sha256,
+    resolve_reusable_baseline_root,
+    validate_reusable_baseline,
     write_json,
 )
 from greenran_v2x_binary_freshness import build_provenance  # noqa: E402
@@ -80,6 +84,7 @@ def _arm_command(
     profile: str = PROFILE,
     execution_slot: str | None = None,
     safe_power_floor_ledger: Path | None = None,
+    adaptive_energy_probe: bool = False,
 ) -> list[str]:
     binary_path = binary or globals().get("_binary_from_args")
     if binary_path is None:
@@ -99,7 +104,11 @@ def _arm_command(
         command.extend(["--execution-slot", execution_slot])
     if mode in {"asgard_v2x_window90_energy_online", "asgard_v2x_window90_energy_frozen"}:
         command.append("--energy-staircase")
-    if safe_power_floor_ledger is not None:
+        if adaptive_energy_probe:
+            command.append("--adaptive-energy-probe")
+    if safe_power_floor_ledger is not None and mode not in {
+        NATIVE_POWER_ONLINE_MODE, NATIVE_POWER_FROZEN_MODE,
+    }:
         # A escada de energia é fail-closed: sem o ledger de pisos derivado
         # do baseline nativo, o braço cai no caminho full-power (r6g: 130/130
         # failsafe na pareada). O treino recebia o ledger via piloto; a
@@ -108,6 +117,11 @@ def _arm_command(
             "--safe-power-floor-ledger", str(safe_power_floor_ledger),
         ])
     return command
+
+
+def _all_dus_at_full_power(floor_percent_by_du: dict[str, float]) -> bool:
+    """True only when the baseline proves no legal power reduction exists."""
+    return all(floor_percent_by_du[str(du)] >= 100.0 for du in (2, 3, 4))
 
 
 def _run_parallel(
@@ -475,7 +489,8 @@ def _run_e2_v3_smoke(
 
 
 def _run_trainability_gate(
-    root: Path, args: argparse.Namespace, calibration: Path, slots: tuple[str, ...]
+    root: Path, args: argparse.Namespace, calibration: Path, slots: tuple[str, ...],
+    *, native_power: bool = False,
 ) -> dict[str, Any]:
     """Run a short real-control probe before spending hours on the pilot.
 
@@ -498,40 +513,61 @@ def _run_trainability_gate(
     # diagnostic gate, but allow the association/readback contract to settle;
     # the scientific/pilot duration remains unchanged at 120 s.
     gate_sim_time_s = 30.0
-    # A sonda de treinabilidade deve falhar rápido quando a cadeia nativa
-    # está quebrada; o piloto de 120 s continua regido pelo wall-time do
-    # usuário.  O piso de 5 s simulados exige RTF ≥ 0.0104 dentro da janela
-    # (5/480); o braço asgard (treino online + overhead de E2) opera perto
-    # de RTF 0.013 sob contenção — 360 s ficava na borda exata (r18 passou
-    # com 5.0 s por sorte; os smokes de 2026-09-25 falharam com 4.5-4.9 s).
-    gate_wall_time_s = min(float(args.wall_time), 480.0)
+    # A sonda exige uma janela PDCP completa (10 s) e a métrica posterior.
+    # No RTF observado do arm ASGARD, 480 s de parede terminavam em ~9,3 s
+    # simulados, antes de qualquer transição poder ser confirmada. O gate
+    # continua autocancelável na primeira transição válida; o teto precisa
+    # comportar o atraso de execução observado mais uma janela PDCP completa
+    # após o primeiro degrau econômico. O piloto de 120 s não é alterado.
+    gate_wall_time_s = min(float(args.wall_time), 1800.0)
     schedule_file = gate_root / "pairing_schedule.json"
     schedule = canonical_schedule(args.profile, SEED, gate_sim_time_s, tick_s=0.25)
     write_schedule(schedule_file, schedule)
     baseline_dir = gate_root / "slot-a"
     asgard_dir = gate_root / "slot-b"
-    historical = gate_root / "historical_replay.jsonl"
+    baseline_reused = args.baseline_source is not None
+    baseline_provenance: dict[str, Any] = {}
+    if baseline_reused:
+        baseline_root = resolve_reusable_baseline_root(args.baseline_source)
+        baseline_manifest, baseline_rows, baseline_selection = validate_reusable_baseline(
+            baseline_root, expected_profile=args.profile,
+        )
+        historical = baseline_root / "baseline" / "replay_90.jsonl"
+        baseline_provenance = {
+            "campaign_root": str(args.baseline_source.resolve()),
+            "baseline_training_root": str(baseline_root),
+            "arm_manifest_sha256": sha256(baseline_root / "baseline" / "arm" / "arm_manifest.json"),
+            "selection_manifest_sha256": sha256(baseline_root / "baseline" / "selection_manifest.json"),
+            "replay_90_sha256": sha256(historical),
+            "rows": len(baseline_rows),
+            "selection_complete": bool(baseline_selection.get("complete")),
+            "profile": baseline_manifest.get("profile"),
+            "safe_power_floor_authority": False,
+        }
+    else:
+        historical = gate_root / "historical_replay.jsonl"
+        historical.touch()
     recent = gate_root / "recent_replay.jsonl"
-    historical.touch()
     recent.touch()
-    baseline_command = _arm_command(
-        "rapp_only_actuating", baseline_dir, bootstrap, schedule_file,
-        schedule["schedule_id"], calibration, wall_time=gate_wall_time_s,
-        sim_time=gate_sim_time_s, binary=args.binary.resolve(), profile=args.profile,
-        execution_slot="slot-a",
-    )
+    baseline_command = None
+    if not baseline_reused:
+        baseline_command = _arm_command(
+            "rapp_only_actuating", baseline_dir, bootstrap, schedule_file,
+            schedule["schedule_id"], calibration, wall_time=gate_wall_time_s,
+            sim_time=gate_sim_time_s, binary=args.binary.resolve(), profile=args.profile,
+            execution_slot="slot-a",
+        )
+    asgard_mode = NATIVE_POWER_ONLINE_MODE if native_power else "asgard_v2x_window90_energy_online"
     asgard_command = _arm_command(
-        "asgard_v2x_window90_energy_online", asgard_dir, bootstrap, schedule_file,
+        asgard_mode, asgard_dir, bootstrap, schedule_file,
         schedule["schedule_id"], calibration, wall_time=gate_wall_time_s,
         sim_time=gate_sim_time_s, binary=args.binary.resolve(), profile=args.profile,
         execution_slot="slot-b",
+        safe_power_floor_ledger=None,
+        adaptive_energy_probe=False,
     )
-    # The short gate runs before the rApp reference exists.  It proves the
-    # native V3 economic path at the conservative confirmed power level;
-    # the staircase itself is enabled only in the long ASGARD arm after the
-    # baseline-derived native floor ledger has been sealed.
-    if "--energy-staircase" in asgard_command:
-        asgard_command.remove("--energy-staircase")
+    # The gate exercises the same conservative 100%-then-descend probe as
+    # training. It proves native confirmation before the long campaign.
     asgard_command.extend([
         "--experience-bank", str(historical),
         "--recent-experience-bank", str(recent),
@@ -558,7 +594,11 @@ def _run_trainability_gate(
             rows, _selection = select_stage_transitions(
                 arm_dir, live_export, f"trainability_gate_live_{label}",
                 require_asgard=(label == "asgard"), energy_enabled=True,
-                reference_arm=(label == "rapp"), min_per_stage=1, max_total=1,
+                reference_arm=(label == "rapp"),
+                # The ASGARD gate is an economic gate, not merely a transport
+                # smoke.  A full-power readback cannot end it successfully.
+                require_economic_reduction=(label == "asgard"),
+                min_per_stage=1, max_total=1,
             )
             return bool(rows) and all(
                 isinstance(row.get("energy_evidence"), dict)
@@ -578,18 +618,16 @@ def _run_trainability_gate(
     # The gate is intentionally serial.  It is a trainability probe, not the
     # paired evaluation, and sharing host CPU between two ns-3 instances can
     # push both below the RTF floor before either delayed Judge result lands.
-    commands = {
-        "rapp": baseline_command,
-        "asgard": asgard_command,
-    }
-    run_dirs = {"rapp": baseline_dir, "asgard": asgard_dir}
-    logs = {
-        "rapp": gate_root / "slot-a.launcher.log",
-        "asgard": gate_root / "slot-b.launcher.log",
-    }
+    commands = {"asgard": asgard_command}
+    run_dirs = {"asgard": asgard_dir}
+    logs = {"asgard": gate_root / "slot-b.launcher.log"}
+    if baseline_command is not None:
+        commands = {"rapp": baseline_command, **commands}
+        run_dirs["rapp"] = baseline_dir
+        logs["rapp"] = gate_root / "slot-a.launcher.log"
     codes: dict[str, int] = {}
     stopped_after_native = True
-    for label in ("rapp", "asgard"):
+    for label in commands:
         arm_codes, arm_stopped = _run_parallel_until_native_gate(
             {label: commands[label]}, env=env,
             run_dirs={label: run_dirs[label]}, logs={label: logs[label]},
@@ -607,10 +645,9 @@ def _run_trainability_gate(
                 baseline_dir, gate_root / "cleanup_audit_rapp_interim",
                 reason="trainability_gate_serial_slot_handoff",
             )
-    arms = {
-        "rapp": (baseline_dir, False),
-        "asgard": (asgard_dir, True),
-    }
+    arms = {"asgard": (asgard_dir, True)}
+    if baseline_command is not None:
+        arms = {"rapp": (baseline_dir, False), **arms}
     reports: dict[str, dict[str, Any]] = {}
     try:
         for label, (arm_dir, require_asgard) in arms.items():
@@ -635,6 +672,7 @@ def _run_trainability_gate(
                 arm_dir, raw, f"trainability_gate_{label}",
                 require_asgard=require_asgard, energy_enabled=True,
                 reference_arm=(label == "rapp"),
+                require_economic_reduction=require_asgard,
                 min_per_stage=1, max_total=1,
             )
             native_proof = _native_gate_ready(
@@ -687,10 +725,13 @@ def _run_trainability_gate(
         "sim_time_s": gate_sim_time_s,
         "wall_time_s": gate_wall_time_s,
         "parallel": False,
-        "slots": {"rapp": "slot-a", "asgard": "slot-b"},
+        "slots": ({"asgard": "slot-b"} if baseline_reused else {"rapp": "slot-a", "asgard": "slot-b"}),
         "arms": reports,
+        "baseline_reused_immutable": baseline_reused,
+        "baseline_provenance": baseline_provenance,
         "native_evidence_version": "v6",
         "economic_action_contract": "economic_action_v3_per_du_sleep",
+        "power_control_authority": "ns3_native_e2_phy_and_energy_model" if native_power else "legacy_energy_staircase",
     }
     write_json(gate_root / "gate_report.json", report)
     return report
@@ -740,6 +781,16 @@ def _load_reusable_smoke(source_root: Path, args: argparse.Namespace) -> dict[st
 def _load_reusable_trainability_gate(source_root: Path, args: argparse.Namespace) -> dict[str, Any]:
     """Reuse only a passed trainability gate with matching build provenance."""
     source_root = source_root.resolve()
+    # A later immutable erratum takes precedence over a historical report.
+    # This prevents a transport-only 100% readback from being reused after we
+    # learned it did not establish any economic headroom.
+    for erratum_path in sorted(source_root.glob("erratum*.json")):
+        erratum = read_json(erratum_path)
+        if erratum.get("status") != "passed":
+            raise SystemExit(
+                "gate de treinabilidade possui errata não aprovada: "
+                f"{erratum_path.name}"
+            )
     report_path = source_root / "smoke" / "trainability_gate" / "gate_report.json"
     report = read_json(report_path)
     if report.get("status") != "passed" or report.get("native_evidence_version") != "v6":
@@ -938,6 +989,21 @@ def _run_campaign(args: argparse.Namespace) -> int:
         raise SystemExit("o piloto longo exige 9000 s de parede")
     if args.profile != PROFILE or args.decision_target != 0 or args.performance_min_rtf != MIN_RTF:
         raise SystemExit("o piloto exige perfil baseline_max, decision-target=0 e RTF mínimo 0.016")
+    if args.native_power and not args.baseline_source:
+        raise SystemExit(
+            "--native-power exige --baseline-source com replay rApp 90/90 "
+            "validado; o piloto não coleta um histórico novo implicitamente"
+        )
+    if args.native_power and args.reuse_trainability_gate_root is not None:
+        raise SystemExit(
+            "--native-power não reutiliza gate antigo; execute o gate nativo "
+            "de 30 s nesta campanha"
+        )
+    if args.native_power and args.reuse_training_root is not None:
+        raise SystemExit(
+            "--native-power exige bootstrap e treino V10 novos; "
+            "--reuse-training-root não é compatível"
+        )
     if not _binary_from_args.is_file() or not os.access(_binary_from_args, os.X_OK):
         raise SystemExit(f"binário ausente/não executável: {_binary_from_args}")
     calibration = args.calibration.resolve()
@@ -951,7 +1017,10 @@ def _run_campaign(args: argparse.Namespace) -> int:
     write_json(root / "host_preflight.json", host_preflight)
 
     if args.trainability_gate_only:
-        gate = _run_trainability_gate(root, args, calibration, args.parallel_slots)
+        gate = _run_trainability_gate(
+            root, args, calibration, args.parallel_slots,
+            native_power=bool(args.native_power),
+        )
         report = {
             "schema": "greenran.tasam.v2x.energy_engineering.gate_only_report.v1",
             "status": gate.get("status"),
@@ -983,7 +1052,8 @@ def _run_campaign(args: argparse.Namespace) -> int:
         write_json(root / "smoke" / "trainability_gate_reused.json", trainability_gate)
     else:
         trainability_gate = _run_trainability_gate(
-            root, args, calibration, args.parallel_slots
+            root, args, calibration, args.parallel_slots,
+            native_power=bool(args.native_power),
         )
     smoke_report = {
         "schema": "greenran.tasam.v2x.energy_engineering.smoke_chain.v1",
@@ -993,20 +1063,30 @@ def _run_campaign(args: argparse.Namespace) -> int:
     }
     write_json(root / "smoke" / "smoke_report.json", smoke_report)
     if smoke_report.get("status") != "passed":
+        gate_status = trainability_gate.get("status")
+        terminal_status = (
+            "no_economic_headroom"
+            if gate_status == "no_economic_headroom"
+            else "metric_invalid"
+        )
+        terminal_reason = (
+            "baseline_safe_floor_at_100_percent_all_dus"
+            if terminal_status == "no_economic_headroom"
+            else "e2_v3_smoke_failed_before_long_pilot"
+        )
         report = {
             "schema": "greenran.tasam.v2x.energy_engineering.report.v1",
             "campaign_revision": "engineering_r13_energy_staircase",
-            "status": "metric_invalid",
+            "status": terminal_status,
             "scientific_decision": "not_promotable",
             "promotion_eligible": False,
             "campaign_kind": "v2x_energy_window90_rapp_x_asgard",
             "economic_action_contract": "economic_action_v3_per_du_sleep",
-            "energy_staircase_contract": "greenran.tasam.v2x.energy_staircase.v1",
-            "energy_staircase_config_sha256": sha256(ROOT / "config/greenran_v2x_energy_staircase.json"),
-            "du_sleep_policy": "at_most_one_du_after_handover_and_10s_pdcp",
+            "power_control_authority": "ns3_native_e2_phy_and_energy_model" if args.native_power else "legacy_energy_staircase",
+            "du_sleep_policy": "disabled_for_native_power" if args.native_power else "at_most_one_du_after_handover_and_10s_pdcp",
             "native_evidence_version": "v6",
             "smoke": smoke_report,
-            "reason": "e2_v3_smoke_failed_before_long_pilot",
+            "reason": terminal_reason,
         }
         write_json(root / "campaign_report.json", report)
         write_json(root / "campaign_manifest.json", {**report, "profile": args.profile, "seed": SEED})
@@ -1036,7 +1116,9 @@ def _run_campaign(args: argparse.Namespace) -> int:
         # Com --baseline-source o treino não tem baseline/ próprio: o
         # ledger vive na raiz registrada em baseline_provenance.
         reuse_ledger = training_root / "baseline" / "safe_power_floor_ledger.json"
-        if not reuse_ledger.is_file():
+        if args.native_power:
+            reuse_ledger = Path("")
+        elif not reuse_ledger.is_file():
             reuse_provenance_root = str(
                 (reuse_report.get("baseline_provenance") or {}).get("campaign_root") or ""
             )
@@ -1047,7 +1129,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
                 )
             reuse_ledger = Path(reuse_provenance_root) / "baseline" / "safe_power_floor_ledger.json"
         training_report = reuse_report
-        reuse_ledger_path = reuse_ledger
+        reuse_ledger_path = None if args.native_power else reuse_ledger
     else:
         reuse_ledger_path = None
         pilot_command = [
@@ -1057,8 +1139,11 @@ def _run_campaign(args: argparse.Namespace) -> int:
             "--decision-target", "0", "--performance-min-rtf", str(MIN_RTF),
             "--energy-enabled", "--energy-calibration", str(calibration),
             "--energy-staircase",
+            "--adaptive-energy-probe",
             "--execution-slot", args.training_slot,
         ]
+        if args.native_power:
+            pilot_command.append("--native-power")
         if args.baseline_source is not None:
             # O baseline computa uma vez e fica congelado: o piloto valida o
             # manifest sha + replay_90 + perfil antes de reusar e grava a
@@ -1080,9 +1165,8 @@ def _run_campaign(args: argparse.Namespace) -> int:
                 "training_report": training_report,
                 "training_root": str(training_root),
                 "economic_action_contract": "economic_action_v3_per_du_sleep",
-                "energy_staircase_contract": "greenran.tasam.v2x.energy_staircase.v1",
-                "energy_staircase_config_sha256": sha256(ROOT / "config/greenran_v2x_energy_staircase.json"),
-                "du_sleep_policy": "at_most_one_du_after_handover_and_10s_pdcp",
+                "power_control_authority": "ns3_native_e2_phy_and_energy_model" if args.native_power else "legacy_energy_staircase",
+                "du_sleep_policy": "disabled_for_native_power" if args.native_power else "at_most_one_du_after_handover_and_10s_pdcp",
                 "native_evidence_version": "v6",
             }
             write_json(root / "campaign_report.json", report)
@@ -1091,13 +1175,15 @@ def _run_campaign(args: argparse.Namespace) -> int:
 
     frozen = root / "frozen" / "asgard"
     selection = _freeze_active_checkpoint(training_root, frozen)
-    if reuse_ledger_path is not None:
+    if args.native_power:
+        floor_ledger_path = None
+    elif reuse_ledger_path is not None:
         floor_ledger_path = reuse_ledger_path
     else:
         floor_ledger_path = training_root / "baseline" / "safe_power_floor_ledger.json"
-    if not floor_ledger_path.is_file() or (
+    if not args.native_power and (not floor_ledger_path.is_file() or (
         (read_json(floor_ledger_path).get("status") or "") != "validated"
-    ):
+    )):
         raise SystemExit(
             "pareada exige o ledger de piso seguro validado do treino: "
             f"{floor_ledger_path} ausente ou sem status=validated"
@@ -1110,7 +1196,10 @@ def _run_campaign(args: argparse.Namespace) -> int:
     env = _pair_environment(schedule_file, schedule["schedule_id"])
     arms = {
         "rapp": ("rapp_only_actuating", paired / "rapp", False, "slot-a"),
-        "asgard": ("asgard_v2x_window90_energy_frozen", paired / "asgard", True, "slot-b"),
+        "asgard": (
+            NATIVE_POWER_FROZEN_MODE if args.native_power else "asgard_v2x_window90_energy_frozen",
+            paired / "asgard", True, "slot-b",
+        ),
     }
     commands = {
         label: _arm_command(
@@ -1118,8 +1207,9 @@ def _run_campaign(args: argparse.Namespace) -> int:
             wall_time=args.wall_time, binary=_binary_from_args, profile=args.profile,
             execution_slot=slot,
             safe_power_floor_ledger=(
-                floor_ledger_path if label == "asgard" else None
+                floor_ledger_path if label == "asgard" and not args.native_power else None
             ),
+            adaptive_energy_probe=(label == "asgard" and not args.native_power),
         )
         for label, (mode, arm_dir, _require_asgard, slot) in arms.items()
     }
@@ -1189,9 +1279,23 @@ def _run_campaign(args: argparse.Namespace) -> int:
         "promotion_eligible": False,
         "campaign_kind": "v2x_energy_window90_rapp_x_asgard",
         "economic_action_contract": "economic_action_v3_per_du_sleep",
-        "energy_staircase_contract": "greenran.tasam.v2x.energy_staircase.v1",
-        "energy_staircase_config_sha256": sha256(ROOT / "config/greenran_v2x_energy_staircase.json"),
-        "du_sleep_policy": "at_most_one_du_after_handover_and_10s_pdcp",
+        "power_control_authority": (
+            "ns3_native_e2_phy_and_energy_model"
+            if args.native_power else "legacy_energy_staircase"
+        ),
+        "native_power_control": bool(args.native_power),
+        "native_power_bounds_percent": [25, 100] if args.native_power else None,
+        "native_power_step_percent": 5 if args.native_power else None,
+        "energy_staircase_contract": (
+            "" if args.native_power else "greenran.tasam.v2x.energy_staircase.v1"
+        ),
+        "energy_staircase_config_sha256": (
+            "" if args.native_power else sha256(ROOT / "config/greenran_v2x_energy_staircase.json")
+        ),
+        "du_sleep_policy": (
+            "disabled_for_native_power"
+            if args.native_power else "at_most_one_du_after_handover_and_10s_pdcp"
+        ),
         "native_evidence_version": "v6",
         "comparison_mode": "parallel_isolated_frozen_pair",
         "profile": args.profile, "seed": SEED, "sim_time_s": SIM_TIME,
@@ -1252,6 +1356,13 @@ def main() -> int:
     parser.add_argument(
         "--trainability-gate-only", action="store_true",
         help="executa apenas o gate nativo de 30 s e não inicia o piloto longo",
+    )
+    parser.add_argument(
+        "--native-power", action="store_true",
+        help=(
+            "ativa o contrato ASGARD de potência nativa por DU; exige "
+            "replay rApp validado em --baseline-source e um gate novo"
+        ),
     )
     args = parser.parse_args()
     return _run_campaign(args)

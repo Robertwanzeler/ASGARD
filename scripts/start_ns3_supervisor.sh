@@ -44,12 +44,29 @@ NS3_BACKGROUND_PACKET_INTERVAL_US="${GREENRAN_NS3_BACKGROUND_PACKET_INTERVAL_US:
 NS3_VEHICLE_PACKET_SIZE_BYTES="${GREENRAN_NS3_VEHICLE_PACKET_SIZE_BYTES:-800}"
 NS3_VEHICLE_PACKET_INTERVAL_US="${GREENRAN_NS3_VEHICLE_PACKET_INTERVAL_US:-4000}"
 NS3_ACTIVE_CELLS="${GREENRAN_NS3_ACTIVE_CELLS:-$NS3_MMWAVE_ENB_NODES}"
+E2_PORT_PLAN_JSON="$(python3 "$PROJECT_ROOT/src/greenran_e2_ports.py" \
+  --e2-term-port "${GREENRAN_E2_TERM_PORT:-40301}" \
+  --e2-xapp-port "${GREENRAN_E2_XAPP_PORT:-40302}" \
+  --e2-local-port "${GREENRAN_E2_LOCAL_PORT:-40320}")" || {
+  echo "ERRO: plano de portas E2 inválido; ns-3 não será iniciado" >&2
+  exit 2
+}
+echo "E2 port plan: $E2_PORT_PLAN_JSON"
 
 if [[ "$RAN_PRESSURE" == "tasam_training_balanced_v6_1_v2x_gbr_deadline_mc_fallback_baseline_max" ]]; then
   NS3_USE_MC_UE_DEVICES=true
   NS3_E2LTE_ENABLED=true
   # E2-LTE provides the fallback readback. The rApp native contract keeps
   # E2-NR disabled because that report path is not part of this campaign.
+  NS3_E2NR_ENABLED=false
+  NS3_E2DU_ENABLED=true
+fi
+if [[ "$RAN_PRESSURE" == "tasam_training_economic_vehicle_safe_v1" ]]; then
+  # The economic curriculum is safe at the policy level, but native vehicle
+  # traffic uses the validated LTE-anchored MC fallback.  The previous
+  # mmWave-only path produced 90--100% packet loss even at the 100% baseline.
+  NS3_USE_MC_UE_DEVICES=true
+  NS3_E2LTE_ENABLED=true
   NS3_E2NR_ENABLED=false
   NS3_E2DU_ENABLED=true
 fi
@@ -122,8 +139,8 @@ while true; do
     --nativeEvidencePeriodMs="$NS3_NATIVE_EVIDENCE_PERIOD_MS" \
     --useMcUeDevices="$NS3_USE_MC_UE_DEVICES" \
     --enableE2FileLogging="$NS3_ENABLE_E2_FILE_LOGGING" \
-    --e2TermPort="${GREENRAN_E2_TERM_PORT:-36421}" \
-    --e2LocalPort="${GREENRAN_E2_LOCAL_PORT:-38470}" \
+    --e2TermPort="${GREENRAN_E2_TERM_PORT:-40301}" \
+    --e2LocalPort="${GREENRAN_E2_LOCAL_PORT:-40320}" \
     --e2lteEnabled="$NS3_E2LTE_ENABLED" \
     --e2nrEnabled="$NS3_E2NR_ENABLED" \
     --e2du="$NS3_E2DU_ENABLED" \

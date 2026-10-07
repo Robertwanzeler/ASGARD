@@ -11,7 +11,7 @@ class RappOrchestratorCameraMetricsTests(unittest.TestCase):
     def test_economic_projected_power_uses_actuator_level(self):
         optimizer = RappResourceOptimizer.__new__(RappResourceOptimizer)
 
-        self.assertEqual(optimizer._canonical_energy_command_power(50.0), 60.0)
+        self.assertEqual(optimizer._canonical_energy_command_power(50.0), 50.0)
         self.assertEqual(optimizer._canonical_energy_command_power(25.0), 25.0)
         self.assertEqual(optimizer._canonical_energy_command_power(100.0), 100.0)
 

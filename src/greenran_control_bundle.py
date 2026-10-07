@@ -162,6 +162,7 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
         raise ControlBundleError(f"expected schema {SCHEMA}, {V3_SCHEMA} or {V4_SCHEMA}")
     v3 = bundle.get("schema") in {V3_SCHEMA, V4_SCHEMA}
     v4 = bundle.get("schema") == V4_SCHEMA
+    bootstrap = bool(bundle.get("bootstrap", False))
     if v3 and bundle.get("economic_action_contract") != ECONOMIC_ACTION_V3_CONTRACT:
         raise ControlBundleError(
             f"v3 bundle requires economic_action_contract={ECONOMIC_ACTION_V3_CONTRACT}"
@@ -226,6 +227,17 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
             )
         except EconomicActionV3Error as exc:
             raise ControlBundleError(str(exc)) from exc
+        # A scheduler renewal may intentionally carry the current power for
+        # correlation while leaving the energy control untouched.  Keep this
+        # explicit in the V3/V4 contract so the xApp never mistakes a symbol
+        # renewal for a new power command.
+        raw_apply_power = raw_cell.get("apply_power", 1)
+        if isinstance(raw_apply_power, bool):
+            apply_power = int(raw_apply_power)
+        elif isinstance(raw_apply_power, (int, float)) and raw_apply_power in {0, 1}:
+            apply_power = int(raw_apply_power)
+        else:
+            raise ControlBundleError("apply_power must be boolean or 0/1")
         if v4:
             discretionary = _basis_points(
                 raw_cell.get("max_discretionary_dl_symbols_bp"),
@@ -236,10 +248,11 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
         normalized_cells.append({
             "cell_id": cell_id,
             "tx_power_percent": tx_power,
+            "apply_power": apply_power,
             "ue_policies": normalized_ues,
             **({"max_discretionary_dl_symbols_bp": discretionary} if v4 else {}),
         })
-    if require_all_ues and seen_imsis != set(range(1, UE_COUNT + 1)):
+    if require_all_ues and not bootstrap and seen_imsis != set(range(1, UE_COUNT + 1)):
         missing = sorted(set(range(1, UE_COUNT + 1)) - seen_imsis)
         raise ControlBundleError(f"bundle must cover all 20 UEs; missing={missing}")
 
@@ -254,6 +267,27 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
         cell_power = {int(cell["cell_id"]): int(cell["tx_power_percent"]) for cell in normalized_cells}
         if cell_power != normalized_power:
             raise ControlBundleError("power_percent_by_cell diverges from per-cell bundle power")
+        native_power_mode = os.environ.get(
+            "GREENRAN_TASAM_NATIVE_POWER_CONTROL", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if native_power_mode:
+            if set(normalized_power) != {2, 3, 4}:
+                raise ControlBundleError(
+                    "native ASGARD power bundle must cover DUs 2, 3 and 4"
+                )
+            if any(int(cell.get("tx_power_percent", 100)) == 0 for cell in normalized_cells):
+                raise ControlBundleError(
+                    "native ASGARD power pilot does not permit DU sleep"
+                )
+            invalid_native_power = [
+                (cell, power) for cell, power in normalized_power.items()
+                if power < 25 or power > 100 or power % 5 != 0
+            ]
+            if invalid_native_power:
+                raise ControlBundleError(
+                    "native ASGARD power must be between 25 and 100 in 5% steps: "
+                    f"{invalid_native_power}"
+                )
         sleeping = [cell for cell, power in normalized_power.items() if power == 0]
         if v4 and bundle.get("sleep_transition"):
             normalized_sleep_transition = _validate_sleep_transition(
@@ -300,6 +334,7 @@ def validate_bundle(bundle: dict[str, Any], *, require_all_ues: bool = True) -> 
         "mode": str(bundle.get("mode", "combined")),
         "cells": normalized_cells,
         "infra": normalized_infra,
+        "bootstrap": bootstrap,
     })
     if v3:
         normalized["power_percent_by_cell"] = {
@@ -373,7 +408,10 @@ class ControlBundleClient:
             os.fsync(audit.fileno())
 
     def send(self, bundle: dict[str, Any], *, integration: bool = True) -> dict[str, Any]:
-        normalized = validate_bundle(bundle, require_all_ues=bundle.get("mode") != "failsafe")
+        normalized = validate_bundle(
+            bundle,
+            require_all_ues=(bundle.get("mode") != "failsafe" and not bool(bundle.get("bootstrap"))),
+        )
         self._atomic_json(self.shadow_path, normalized)
         if not integration:
             return {

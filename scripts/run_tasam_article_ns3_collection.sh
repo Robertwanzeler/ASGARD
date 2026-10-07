@@ -19,6 +19,14 @@ export GREENRAN_COLLECTION_EVENT_TIME_SOURCE="${GREENRAN_COLLECTION_EVENT_TIME_S
 export GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES="${GREENRAN_COLLECTION_DISABLE_APP_OVERRIDES:-1}"
 export GREENRAN_START_RIC="${GREENRAN_START_RIC:-0}"
 export GREENRAN_XAPP_MODE="${GREENRAN_XAPP_MODE:-file}"
+export GREENRAN_E2_TERM_PORT="${GREENRAN_E2_TERM_PORT:-36421}"
+export GREENRAN_E2_XAPP_PORT="${GREENRAN_E2_XAPP_PORT:-36422}"
+export GREENRAN_E2_LOCAL_PORT="${GREENRAN_E2_LOCAL_PORT:-38470}"
+
+python3 "$PROJECT_ROOT/src/greenran_e2_ports.py" \
+  --e2-term-port "$GREENRAN_E2_TERM_PORT" \
+  --e2-xapp-port "$GREENRAN_E2_XAPP_PORT" \
+  --e2-local-port "$GREENRAN_E2_LOCAL_PORT" >/dev/null
 
 . "$SCRIPT_DIR/core_runtime.sh"
 load_greenran_runtime
@@ -173,6 +181,7 @@ start_ns3() {
     GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH="$GREENRAN_NS3_ENABLE_TRACES_AFTER_ATTACH" \
     GREENRAN_NS3_ENABLE_ENERGY_CSV="$GREENRAN_NS3_ENABLE_ENERGY_CSV" \
     GREENRAN_E2_TERM_PORT="${GREENRAN_E2_TERM_PORT:-36421}" \
+    GREENRAN_E2_XAPP_PORT="${GREENRAN_E2_XAPP_PORT:-36422}" \
     GREENRAN_E2_LOCAL_PORT="${GREENRAN_E2_LOCAL_PORT:-38470}" \
     GREENRAN_NS3_ENERGY_OUTPUT_DIR="$GREENRAN_NS3_ENERGY_OUTPUT_DIR" \
     GREENRAN_NS3_RNG_RUN="$GREENRAN_NS3_RNG_RUN" \
@@ -189,6 +198,140 @@ start_ns3() {
   sleep 1
 }
 
+start_tasam_actuator() {
+  local actuator_bin="$PROJECT_ROOT/flexric/build_e2ap_v1/examples/xApp/c/xapp_tasam_actuator"
+  if [[ ! -x "$actuator_bin" ]]; then
+    echo "TA-SAM actuator não encontrado: $actuator_bin" >&2
+    return 1
+  fi
+  mkdir -p "${GREENRAN_SOCKET_DIR:-$GREENRAN_STATE_DIR/sockets}"
+  export GREENRAN_TASAM_CONTROL_SOCKET_PATH="${GREENRAN_SOCKET_DIR:-$GREENRAN_STATE_DIR/sockets}/tasam_control.sock"
+  export GREENRAN_TASAM_ACTUATOR_STATUS_PATH="${GREENRAN_TASAM_ACTUATOR_STATUS_PATH:-$GREENRAN_STATE_DIR/tasam_actuator_status.json}"
+  export GREENRAN_E2_NODE_MANIFEST="${GREENRAN_E2_NODE_MANIFEST:-$GREENRAN_STATE_DIR/ns3_energy/E2NodeManifest.json}"
+  export LD_LIBRARY_PATH="$PROJECT_ROOT/flexric/build_e2ap_v1/src/ric:$PROJECT_ROOT/flexric_lib:$PROJECT_ROOT/flexric/build_e2ap_v1/src/xApp:${LD_LIBRARY_PATH:-}"
+  setsid env \
+    GREENRAN_TASAM_CONTROL_SOCKET_PATH="$GREENRAN_TASAM_CONTROL_SOCKET_PATH" \
+    GREENRAN_TASAM_ACTUATOR_STATUS_PATH="$GREENRAN_TASAM_ACTUATOR_STATUS_PATH" \
+    GREENRAN_E2_NODE_MANIFEST="$GREENRAN_E2_NODE_MANIFEST" \
+    GREENRAN_TASAM_EXPECTED_E2_NODES="${GREENRAN_TASAM_EXPECTED_E2_NODES:-3}" \
+    "$PROJECT_ROOT/scripts/tasam_actuator_supervisor.sh" \
+    "$actuator_bin" \
+    "$PROJECT_ROOT/flexric/flexric.conf" \
+    "$PROJECT_ROOT/flexric_lib" \
+    "${GREENRAN_E2_XAPP_PORT:-36422}" \
+    > "${GREENRAN_XAPP_TASAM_LOG:-$GREENRAN_STATE_DIR/xapp_tasam_actuator.log}" 2>&1 &
+  echo $! > "${GREENRAN_XAPP_TASAM_PID:-$GREENRAN_STATE_DIR/xapp_tasam_actuator.pid}"
+  sleep 1
+}
+
+write_e2_preflight() {
+  local state="$1"
+  local reason="$2"
+  python3 - "$GREENRAN_STATE_DIR/e2_topology_preflight.json" "$state" "$reason" "$GREENRAN_TASAM_ACTUATOR_STATUS_PATH" "$GREENRAN_TASAM_CONTROL_SOCKET_PATH" <<'PY'
+import json
+import pathlib
+import socket
+import sys
+
+out, state, reason, status_path, socket_path = sys.argv[1:]
+status_file = pathlib.Path(status_path)
+payload = {}
+if status_file.exists():
+    try:
+        payload = json.loads(status_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+payload.update({
+    "schema": "greenran.tasam.e2_topology_preflight.v1",
+    "state": state,
+    "reason": reason,
+    "ready": state == "ready",
+    "socket_path": socket_path,
+    "socket_present": pathlib.Path(socket_path).exists(),
+})
+socket_live = False
+if pathlib.Path(socket_path).exists():
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.5)
+            client.connect(socket_path)
+        socket_live = True
+    except OSError:
+        socket_live = False
+payload["socket_live"] = socket_live
+pathlib.Path(out).write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+}
+
+stop_instance_pid_file() {
+  local pid_file="$1"
+  [[ -f "$pid_file" ]] || return 0
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+}
+
+wait_for_tasam_actuator_ready() {
+  local timeout_s="${GREENRAN_TASAM_E2_READY_TIMEOUT_S:-120}"
+  local deadline=$((SECONDS + timeout_s))
+  while (( SECONDS < deadline )); do
+    if [[ -f "$GREENRAN_TASAM_ACTUATOR_STATUS_PATH" ]]; then
+      local ready
+      ready="$(python3 - "$GREENRAN_TASAM_ACTUATOR_STATUS_PATH" "$GREENRAN_TASAM_CONTROL_SOCKET_PATH" <<'PY'
+import json
+import pathlib
+import socket
+import sys
+
+try:
+    data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    data = {}
+ready = bool(data.get("ready")) and data.get("state") == "ready"
+ready = ready and set(data.get("mapped_cells") or []) >= {2, 3, 4}
+socket_path = pathlib.Path(sys.argv[2])
+ready = ready and socket_path.exists()
+if ready:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(str(socket_path))
+    except OSError:
+        ready = False
+print("1" if ready else "0")
+PY
+      )"
+      if [[ "$ready" == "1" ]]; then
+        write_e2_preflight "ready" "three_du_e2_ready"
+        return 0
+      fi
+    fi
+    local actuator_pid=""
+    local actuator_pid_file="${GREENRAN_XAPP_TASAM_PID:-$GREENRAN_STATE_DIR/xapp_tasam_actuator.pid}"
+    if [[ -f "$actuator_pid_file" ]]; then
+      actuator_pid="$(cat "$actuator_pid_file" 2>/dev/null || true)"
+      if [[ "$actuator_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$actuator_pid" 2>/dev/null; then
+        write_e2_preflight "failed" "tasam_actuator_exited_before_e2_ready"
+        return 1
+      fi
+    fi
+    sleep 1
+  done
+  write_e2_preflight "failed" "e2_topology_preflight_failed"
+  return 1
+}
+
+stop_instance_services_after_preflight_failure() {
+  stop_instance_pid_file "${GREENRAN_XAPP_TASAM_PID:-$GREENRAN_STATE_DIR/xapp_tasam_actuator.pid}"
+  stop_instance_pid_file "$GREENRAN_CSV_PID"
+  stop_instance_pid_file "$GREENRAN_NS3_SUPERVISOR_PID"
+  stop_instance_pid_file "$GREENRAN_RIC_PID"
+}
+
 start_collector() {
   set_cgroup_prefix collectors
   setsid "${CGROUP_PREFIX[@]}" /bin/bash -lc "cd '$PROJECT_ROOT' && export GREENRAN_STATE_DIR='$GREENRAN_STATE_DIR' GREENRAN_DB_PATH='$GREENRAN_DB_PATH' GREENRAN_FIXED_SCENARIO_CONFIG='$GREENRAN_FIXED_SCENARIO_CONFIG' GREENRAN_PDCP_STALE_SECONDS='$GREENRAN_PDCP_STALE_SECONDS' GREENRAN_REQUIRE_REAL_PDCP='$GREENRAN_REQUIRE_REAL_PDCP' && while true; do python3 ./src/csv_to_metrics.py --input-dir '$GREENRAN_NS3_CWD' --output '$GREENRAN_STATE_DIR/xapp_metrics/metrics.json' --extended-output '$GREENRAN_STATE_DIR/xapp_metrics/extended_metrics.json' --poll-interval '$GREENRAN_COLLECTOR_POLL_INTERVAL'; code=\$?; echo \"[CSV_METRICS_SUPERVISOR] collector exited with code \$code at \$(date -Is); restarting in 2s\"; sleep 2; done" > "$GREENRAN_CSV_LOG" 2>&1 &
@@ -198,7 +341,14 @@ start_collector() {
 
 start_rapp() {
   set_cgroup_prefix rapp_armd
-  setsid "${CGROUP_PREFIX[@]}" env GREENRAN_STATE_DIR="$GREENRAN_STATE_DIR" GREENRAN_DB_PATH="$GREENRAN_DB_PATH" GREENRAN_FIXED_SCENARIO_CONFIG="$GREENRAN_FIXED_SCENARIO_CONFIG" GREENRAN_CLEAN_SCOPE="$GREENRAN_CLEAN_SCOPE" python3 "$PROJECT_ROOT/src/rapp_orchestrator.py" --synthetic 0 --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" > "$GREENRAN_RAPP_LOG" 2>&1 &
+  setsid "${CGROUP_PREFIX[@]}" env \
+    GREENRAN_STATE_DIR="$GREENRAN_STATE_DIR" \
+    GREENRAN_DB_PATH="$GREENRAN_DB_PATH" \
+    GREENRAN_FIXED_SCENARIO_CONFIG="$GREENRAN_FIXED_SCENARIO_CONFIG" \
+    GREENRAN_CLEAN_SCOPE="$GREENRAN_CLEAN_SCOPE" \
+    GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT="${GREENRAN_TASAM_FIXED_NATIVE_POWER_PERCENT:-}" \
+    GREENRAN_NS3_FIXED_POWER_PERCENT="${GREENRAN_NS3_FIXED_POWER_PERCENT:-}" \
+    python3 "$PROJECT_ROOT/src/rapp_orchestrator.py" --synthetic 0 --interval "$GREENRAN_ORCHESTRATOR_INTERVAL" > "$GREENRAN_RAPP_LOG" 2>&1 &
   echo $! > "$GREENRAN_RAPP_PID"
   sleep 1
 }
@@ -276,7 +426,17 @@ start_collection_event_service() {
 
 start_if_missing "$GREENRAN_RIC_PID" start_ric
 start_if_missing "$GREENRAN_NS3_SUPERVISOR_PID" start_ns3
+if [[ "${GREENRAN_TASAM_REQUIRE_E2_READY_BEFORE_RAPP:-0}" == "1" ]]; then
+  start_if_missing "${GREENRAN_XAPP_TASAM_PID:-$GREENRAN_STATE_DIR/xapp_tasam_actuator.pid}" start_tasam_actuator
+fi
 start_if_missing "$GREENRAN_CSV_PID" start_collector
+if [[ "${GREENRAN_TASAM_REQUIRE_E2_READY_BEFORE_RAPP:-0}" == "1" ]]; then
+  if ! wait_for_tasam_actuator_ready; then
+    echo "TA-SAM E2 preflight falhou; rApp não será iniciado" >&2
+    stop_instance_services_after_preflight_failure
+    exit 42
+  fi
+fi
 start_if_missing "$GREENRAN_RAPP_PID" start_rapp
 if [[ "${GREENRAN_DB_SNAPSHOT_ENABLED:-1}" == "1" ]]; then
   start_if_missing "$GREENRAN_DB_SNAPSHOT_PID" start_db_snapshot_service
