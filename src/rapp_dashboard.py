@@ -33,6 +33,7 @@ from greenran_paths import (
     RAPP_LOG_PATH,
     XAPP_INTENTS_DIR,
     ARTICLE00_SCENARIO_CONTROL_PATH,
+    RAPP_DB_PATH,
     as_str,
     load_fixed_scenario_config,
     get_fixed_total_ues,
@@ -1417,6 +1418,22 @@ def _live_db_snapshot():
     return result
 
 
+def _db_latest_age_s():
+    """Idade (s) da amostra mais recente no DB servido; None se indisponível."""
+    try:
+        import sqlite3
+        con = sqlite3.connect(str(RAPP_DB_PATH))
+        try:
+            row = con.execute("SELECT MAX(timestamp) FROM metrics_history").fetchone()
+        finally:
+            con.close()
+        if row and row[0]:
+            return max(0.0, time.time() - float(row[0]))
+    except Exception:
+        pass
+    return None
+
+
 def build_live_collection_snapshot():
     """Compose the compact, polling-friendly view of the active online run."""
     status_info = _live_file_info(ONLINE_STATUS_FILE)
@@ -1494,12 +1511,19 @@ def build_live_collection_snapshot():
     status = str(online.get('status') or ('running' if latest_metric else 'unknown')).lower()
     if status == 'running' and freshest_age is not None and freshest_age > 90:
         status = 'stale'
+    if status == 'running':
+        # sem arquivos de pulso no STATE_DIR, decide pela idade dos dados no DB:
+        # evita "RODANDO" eterno ao servir um run concluído (DB histórico)
+        db_age = _db_latest_age_s()
+        if db_age is not None and db_age > 90:
+            status = 'historical'
     return {
         'generated_at': int(time.time()),
-        'run_dir': str(STATE_DIR),
+        'run_dir': str(RAPP_DB_PATH.parent),
         'status': status,
         'status_label': {
             'running': 'RODANDO', 'stale': 'SEM PULSO', 'stopped': 'PARADA',
+            'historical': 'HISTÓRICO — CONCLUÍDO',
         }.get(status, status.upper()),
         'freshness': {
             'status_age_s': status_info.get('age_s'),
@@ -1809,6 +1833,11 @@ def index():
         ):
             if field in latest_decision:
                 network_health[field] = latest_decision[field]
+    if network_health is not None:
+        # chaves consumidas por templates/dashboard.html; ausentes quando a
+        # janela de 5 min não tem amostras per-UE ou agregadas
+        network_health.setdefault('cvar_us', 0.0)
+        network_health.setdefault('p95_us', 0.0)
     
     # Obter trend analysis (CORRETO!)
     from rapp_trend_analysis import TrendAnalysis
