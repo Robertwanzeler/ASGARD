@@ -7,6 +7,8 @@
 
 O ASGARD é um **piloto O-RAN completo de autonomia energética**: um rApp (Non-RT RIC) orquestra aprendizado por reforço multi-agente (TA-SAM — SAC com atores Dirichlet e otimização *sharpness-aware*) que decide, epoch a epoch, a potência e o sleep de cada célula mmWave — e atua essa decisão via contratos versionados (`greenran.control.bundle v2/v3/v4`) em um xApp atuador que a traduz em **E2SM-RC nativo** no simulador ns-3.
 
+É o **runtime ASGARD v10** sobre a plataforma GreenRAN: cadeia econômica de energia com escada (piso → 115%), contratos safe-probe, orçamento por DU e autochain systemd — tudo sob a mesma disciplina de evidência.
+
 O que o distingue não é a IA, mas a **arquitetura de segurança que a cerca**: juiz determinístico, guardiã ARMD que só escala severidade, escudo de SLA por UE, transações fail-closed com TTL e fallback `FULL_POWER`, e uma cadeia de promoção **shadow → gate manual → canário 10% → controle**. Nenhuma transição vale sem evidência nativa: PDCP real, ack E2, readback do rádio e auditoria assinada (sha256).
 
 ## O que ele faz
@@ -17,6 +19,22 @@ O que o distingue não é a IA, mas a **arquitetura de segurança que a cerca**:
 4. **Promove política com disciplina** — shadow (não atua) → readiness `shadow_outperforming` → aprovação manual com expiração → canário 10% com rollback → controle; medidor de aprendizado que só pontua decisão aplicada.
 5. **Audita tudo** — `TasamControlObservations.csv`, ack/readback nativos, `sleep_calibration_evidence.json`, contratos científicos validados na CI.
 6. **Experimenta com rigor** — arm runner de braços A/B (`rapp_only`, `combined`, `fixed_100_native`, `native_sleep_calibration`), seeds, avaliação pareada, orçamentos cgroup-v2.
+
+## O cenário
+
+Cenário canônico congelado (`greenran_fixed_baseline_v1`), com invariantes entre runs (`freeze_camera_vehicle_ue_counts`): **20 UEs** sobre macro LTE âncora + células mmWave em dual connectivity, três serviços disputando a mesma rede:
+
+| App | Domínio | UEs | Slice | SLA |
+|---|---|---|---|---|
+| App1 vigilância | Câmeras 4K | IMSI 1–3 | eMBB | throughput alvo 25 Mbps (aviso 30); latência 60 ms aviso / 80 ms violação |
+| App2 monitoramento | Sensores | IMSI 4–15 | mMTC | entrega ≥ 95%, perda ≤ 5%, latência ≤ 500 ms |
+| App3 veicular | Frota + ego | IMSI 16–20 | URLLC | GBR reservada no scheduler, escudo por UE |
+
+**Topologia MARL** (`greenran_fixed_marl_v1`) — 3 DUs lógicos, um agente TA-SAM cada: `du_camera_edge` (mix 85% eMBB / 10% mMTC / 5% URLLC), `du_sensor_mixed` (primária mMTC) e `du_vehicle_edge` (primária URLLC).
+
+**Prioridades com preempção** (`priority_classes`): CRITICAL câmeras 50% de PRB · HIGH sensores 30% · NORMAL 15% · LOW background 5%.
+
+**Dinâmica**: câmeras com off-time de 3 s; background on 1 s / off 10 s; veículos a 10–20 m/s com contexto de condução CARLA. Perfis de pressão nomeados e reprodutíveis por seed (`vehicle_stressed_safe`, `camera_blocked`, `tasam_training_balanced_v6`, …).
 
 ## Arquitetura
 
@@ -60,6 +78,9 @@ O orquestrador (`rapp_orchestrator`, loop de 5 s) compõe especialistas independ
 | TA-SAM shadow (`rapp_marl_shadow`) | Avalia política MARL congelada contra o alocador vivo **sem atuar** |
 | Judge (`rapp_judge`) | Arbitragem determinística: prioridades de rede, ordem de segurança, reward V2X adaptativo |
 | A1 + AgentOpenRAN | Políticas JSON com ACK; intenções do usuário viram políticas técnicas |
+| Pattern Engine (`rapp_pattern_engine`) | Padrões de uso: sazonalidade por hora/dia da semana, janelas de baixa atividade e janelas ótimas de economia |
+| Trend Analysis (`rapp_trend_analysis`) | Regressão de latência e preempção preventiva (`should_preempt_energy`) antes da violação |
+| Alerts (`rapp_alerts`) | `SLA_VIOLATION_IMMINENT`, `XAPP_UNRESPONSIVE`, `LINK_QUALITY_DEGRADED` — cooldown e e-mail |
 | XAppManager | Ciclo de vida dos xApps com orçamentos cgroup-v2 |
 
 ### ARMD — o guardião que nasce dos grafos
@@ -78,6 +99,7 @@ Em produção, o pacote híbrido roda **congelado** (`rapp_armd_runtime`): class
 - **Orçamentos físicos cgroup-v2** por grupo: `simulator`, `ric_xapps`, `rapp_armd`, `tasam`, `collectors`
 - **Arm runner** de braços reprodutíveis (train_no_armd / rapp_only / combined / fixed_100_native / native_sleep_calibration) com provenance do binário ns-3
 - **Dispatcher autônomo** de campanhas + unidades systemd (piloto causal, calibração de energia, autochain v10)
+- **Observabilidade externa**: pushers InfluxDB/Grafana (`push/`), watchdog de xApps com heartbeat 30 s e restart em 60 s
 - IPC por sockets Unix + arquivos JSON com TTL e ack; portas E2 validadas sem colisão
 
 ## Cadeia de segurança
@@ -94,6 +116,7 @@ Em produção, o pacote híbrido roda **congelado** (`rapp_armd_runtime`): class
 | Guarda `real_only` | Transições válidas exigem PDCP real — sem proxy, sem stale |
 | Calibração nativa de sleep | Transação fail-closed drain→commit→readback, timeout 720 s |
 | Medidor de aprendizado (`tasam_learning_meter`) | Só decisão **aplicada** pontua; shadow/rejeitada não conta |
+| Autoridade externa (`greenran_external_network_authority`) | JSON editável pelo operador — juiz de última instância em empates/baixa confiança |
 
 ## O loop, passo a passo
 
@@ -104,6 +127,16 @@ Em produção, o pacote híbrido roda **congelado** (`rapp_armd_runtime`): class
 5. Decisão vira bundle versionado → `tasam_actuator` → **E2SM-RC** no rádio simulado
 6. Evidência volta: ack, readback, observações nativas, outcome do Judge → Data Lake
 7. Treino offline consome o Data Lake → novo checkpoint → ciclo de promoção recomeça
+
+## Trilhas científicas e avaliação
+
+O MARL segue o método **TA-SAM** (Lotfi et al., 2025 — *Task-Specific Sharpness-Aware O-RAN Resource Management Using MARL*), com três trilhas registradas (`config/tasam_drl_tracks.json`):
+
+- `greenran_tasam` — adaptação shadow ao cenário operacional (3 DUs acima)
+- `tasam_article_reproduction` — reprodução do artigo com coleta real ns-3 (200 UEs, 80 câmeras, 40 veículos, 6 gNBs)
+- `tasam_reference_base` — base de comparação metodológica
+
+Avaliação com rigor: braços em **pares determinísticos** (mesma seed, mesmo binário), seeds de campanha 45/46/47 com calibração física na seed 43, melhoria de **CVaR/P95** contra baseline congelado (`pre_fix_degraded_baseline`) e validação **fail-closed** do piloto V2X window90 — transição só existe com evidência nativa completa (PDCP real, ack E2, readback, feedback do Judge).
 
 ## Estrutura
 
