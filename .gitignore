@@ -77,3 +77,6 @@ carla/
 /docs/-greenran-oran--master.zip
 /docs/.~lock.*
 /state/live_carla_real/
+
+# ns-3 upstream vanilla (sem customização; re-clonável de gitlab.com/nsnam/ns-3-dev)
+/ns3-base/

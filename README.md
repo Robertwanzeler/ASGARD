@@ -46,4 +46,11 @@ Não use o checkout de outra simulação como `ORAN_DEBUG_ROOT`. O Git de debug 
 
 ## Licença e origem
 
-O código de terceiros permanece nos repositórios originais. Este Git documenta o procedimento de instalação do stack Orange-Nuclear e não redistribui os fontes.
+O stack de terceiros está vendido como diretórios comuns neste repositório (snapshot de trabalho):
+
+- `ns-O-RAN-flexric/` — fork ns-3.42 O-RAN (inclui `mmwave-LENA-oran`, `e2sim-kpmv3`, `contrib/oran-interface`, `src/nr`), com branches de trabalho GreenRAN preservadas no backup local de submódulos
+- `flexric/` — FlexRIC 2.0.0 (EURECOM) com xApps custom (branch `greenran-xapps-tasam`)
+- `ns3-base/` — **não incluído**: ns-3 upstream vanilla, sem customização. Re-clonável com:
+  `git clone https://gitlab.com/nsnam/ns-3-dev.git ns3-base`
+
+Os créditos e licenças de cada componente permanecem nos repositórios originais (Orange-OpenSource, MinaYonan123, EURECOM/mosaic5g, nsnam).

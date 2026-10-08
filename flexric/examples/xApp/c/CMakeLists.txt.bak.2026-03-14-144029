@@ -1,0 +1,12 @@
+add_subdirectory(ctrl)
+add_subdirectory(helloworld)
+add_subdirectory(keysight)
+add_subdirectory(monitor)
+add_subdirectory(slice)
+add_subdirectory(tc)
+add_subdirectory(kpm_rc)
+add_subdirectory(orange)
+
+
+add_executable(xapp_slicer slicer/xapp_slicer.c)
+target_link_libraries(xapp_slicer e42_xapp)

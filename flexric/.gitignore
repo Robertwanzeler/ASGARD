@@ -1,0 +1,9 @@
+*.out 
+*.py
+*.swp
+*.json
+build/
+build_e2ap_v1/
+tags
+archives/
+test_results*.html

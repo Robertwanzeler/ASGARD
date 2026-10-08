@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package greenran;
+
+// Service definition for the Energy Saver xApp actuator
+service EnergySaverService {
+  // Receives commands from the rApp to adjust RU/mmWave power states
+  rpc SetEnergyState (EnergyCommand) returns (EnergyResponse);
+  
+  // Health check
+  rpc GetStatus (StatusRequest) returns (StatusResponse);
+}
+
+// Request message for energy state commands
+message EnergyCommand {
+  // Maps to energy_action_e in C implementation
+  enum Action {
+    FULL_POWER = 0;
+    CONDITIONAL_REDUCE = 1;
+    POWER_DOWN = 2;
+    POWER_DOWN_ECO = 3;
+    MAINTAIN = 4;
+  }
+  
+  Action action = 1;
+  int32 power_level = 2; // 0-100
+  uint64 timestamp = 3;  // Unix timestamp
+  int32 ttl_seconds = 4; // Watchdog timeout
+  string reason = 5;     // Optional reason string
+}
+
+// Response message for the rApp
+message EnergyResponse {
+  bool success = 1;
+  string message = 2;
+  int32 current_power_level = 3;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string state = 1;
+  int32 commands_received = 2;
+  bool watchdog_triggered = 3;
+}
