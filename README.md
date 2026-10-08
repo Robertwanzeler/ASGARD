@@ -56,11 +56,22 @@ O orquestrador (`rapp_orchestrator`, loop de 5 s) compõe especialistas independ
 |---|---|
 | Data Lake (SQLite, 25+ tabelas) | Persistência auditável: métricas, decisões, observações TA-SAM, conflitos, outcomes |
 | RandomForest (`rapp_ml_predictor`) | Decisão runtime + previsão de CVaR, retreino 2×/dia via manifest |
-| ARMD (`rapp_armd_runtime`) | GraphSAGE congelado classifica cenário (ALLOWED/CONDITIONAL/BLOCKED) — **só pode escalar severidade**, confiança mínima 0.85 |
+| ARMD (`rapp_armd_runtime`) | GraphSAGE congelado classifica cenário (ALLOWED/CONDITIONAL/BLOCKED) — **só pode escalar severidade**, confiança mínima 0.85 (treinado sobre grafos tipados do sistema — ver seção ARMD) |
 | TA-SAM shadow (`rapp_marl_shadow`) | Avalia política MARL congelada contra o alocador vivo **sem atuar** |
 | Judge (`rapp_judge`) | Arbitragem determinística: prioridades de rede, ordem de segurança, reward V2X adaptativo |
 | A1 + AgentOpenRAN | Políticas JSON com ACK; intenções do usuário viram políticas técnicas |
 | XAppManager | Ciclo de vida dos xApps com orçamentos cgroup-v2 |
+
+### ARMD — o guardião que nasce dos grafos
+
+O ARMD não é um classificador treinado em métricas soltas: ele é treinado sobre **grafos do próprio sistema**, construídos em duas frentes:
+
+- **Protocolo `article00`** — séries temporais + referência de grafo por seed (10 seeds: 42–47, 52, 53, 61, 62), com reconstrução temporal e de adjacência
+- **Datasets de conflitos** (subsets 50/150/450) — nós tipados (`agent / parameter / kpi / service / mitigation / arbiter`) ligados por arestas de interferência, com features de pressão P1–P7 e KPIs K1–K4
+
+O encoder é **GraphSAGE temporal em PyTorch puro** (sem DGL/PyG): aprende reconstruindo as séries (MSE) e **reconstruindo a própria adjacência do grafo** por correlação com threshold — ou seja, aprende a estrutura do sistema, não só seus valores. Um **link predictor** sobre o mesmo encoder detecta conflitos **diretos, indiretos e implícitos** entre agentes de IA: arestas que ainda nem aconteceram.
+
+Em produção, o pacote híbrido roda **congelado** (`rapp_armd_runtime`): classifica o cenário vivo (ALLOWED/CONDITIONAL/BLOCKED) como assistente do rApp, com confiança mínima 0.85 e autoridade assimétrica — **só pode escalar severidade, nunca reduzir**. As adjacências que a GNN aprendeu ficam visíveis no dashboard `/conflicts`: arestas "quentes" confirmadas vs. baixo suporte.
 
 ### Camada 4 — Infraestrutura auditável
 
